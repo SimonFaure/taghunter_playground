@@ -1,0 +1,59 @@
+id,game_id,game_meta,game_meta_value
+1881,212,number_of_enigmas,12
+1882,212,points_units,points
+1883,212,font,TrajanPro
+1884,212,score_full_game,50
+1885,212,overscore_steps,6
+1886,212,animation_image_duration,1
+1887,212,animation_enigma_duration,1
+1888,212,default_time,60
+1889,212,default_time_malus,1
+1890,212,levels,"{""1"":{""points"":""10"",""name"":""Apprenti Chercheur"",""description"":""Tu d\u00e9butes dans l\u0027art de la recherche, cherchant des indices pour trouver les ingr\u00e9dients n\u00e9cessaires \u00e0 la potion de d\u00e9zombification""},""2"":{""points"":""20"",""name"":""Expert des Indices"",""description"":""Tu es capable de rep\u00e9rer des indices subtils et de les interpr\u00e9ter pour progresser dans la qu\u00eate de la potion""},""3"":{""points"":""30"",""name"":""Apprenti Alchimiste"",""description"":""Tu commences \u00e0 ma\u00eetriser les bases de l\u0027alchimie, m\u00e9langeant les ingr\u00e9dients pour cr\u00e9er des potions rudimentaires""},""4"":{""points"":""40"",""name"":""Gardien contre les Zombies"",""description"":""Ayant d\u00e9velopp\u00e9 des comp\u00e9tences de combat, tu prot\u00e8ges les lieux contre les zombies tout en cherchant les ingr\u00e9dients""},""5"":{""points"":""50"",""name"":""Alchimiste Expert"",""description"":""Poss\u00e9dant une connaissance approfondie des propri\u00e9t\u00e9s des ingr\u00e9dients, tu es capable de cr\u00e9er des potions plus puissantes""},""6"":{""points"":""60"",""name"":""Virtuose des Myst\u00e8res"",""description"":""Tu excelles \u00e0 r\u00e9soudre les myst\u00e8res complexes qui entourent les ingr\u00e9dients n\u00e9cessaires \u00e0 la potion de d\u00e9zombification""},""7"":{""points"":""70"",""name"":""Mage des Enigmes"",""description"":""Ma\u00eetre des \u00e9nigmes et des puzzles, tu utilises ton intelligence pour progresser dans la qu\u00eate des ingr\u00e9dients de la potion de d\u00e9zombification""},""8"":{""points"":""80"",""name"":""Gardien des Potions"",""description"":""Tu sais comment trouver les ingr\u00e9dients, stocker et pr\u00e9server les potions, assurant qu\u0027elles soient pr\u00eates \u00e0 \u00eatre utilis\u00e9es en cas d\u0027urgence.""},""9"":{""points"":""90"",""name"":""Ma\u00eetre de la R\u00e9solution"",""description"":""Habile \u00e0 r\u00e9soudre les probl\u00e8mes qui se dressent sur ton chemin, tu ne laisses aucun d\u00e9fi sans r\u00e9ponse""},""10"":{""points"":""100"",""name"":""Champion de lutte contre les Zombies"",""description"":""Ta capacit\u00e9 \u00e0 affronter les zombies est in\u00e9gal\u00e9e, faisant de toi un d\u00e9fenseur intr\u00e9pide de la s\u00e9curit\u00e9""},""11"":{""points"":""110"",""name"":""Alchimiste Supr\u00eame"",""description"":""Tu as atteint le sommet de ton art, cr\u00e9ant des potions de d\u00e9zombification d\u0027une puissance incroyable""},""12"":{""points"":""120"",""name"":""L\u00e9gende Anti-Zombie"",""description"":""Ton nom est devenu l\u00e9gendaire, et tu es reconnu comme le ma\u00eetre ultime dans la lutte contre les zombies, prot\u00e9geant le monde avec tes potions et ta bravoure""}}"
+1891,212,overscore_step_1,10
+1892,212,name_overscore_step_1,"Mage des Enigmes"
+1893,212,overscore_step_2,20
+1894,212,name_overscore_step_2,"Gardien des Potions"
+1895,212,overscore_step_3,30
+1896,212,name_overscore_step_3,"Maître de la Résolution"
+1897,212,overscore_step_4,40
+1898,212,name_overscore_step_4,"Champion de la lutte contre les Zombies"
+1899,212,overscore_step_5,50
+1900,212,name_overscore_step_5,"Alchimiste Suprême"
+1901,212,overscore_step_6,60
+1902,212,name_overscore_step_6,"Légende Anti-Zombie"
+1903,212,overscore_step_7,0
+1904,212,name_overscore_step_7,0
+1905,212,image_overscore_step_1,3695
+1906,212,image_overscore_step_2,3696
+1907,212,image_overscore_step_3,3697
+1908,212,image_overscore_step_4,3698
+1909,212,image_overscore_step_5,3699
+1910,212,image_overscore_step_6,3700
+1911,212,animation_message_duration,2
+1912,212,background_image,3701
+1913,212,scenario,"Le monde est plongé dans le chaos et les zombies sont de plus en plus nombreux.
+Heureusement, nous sommes sur le point de trouver la formule de dézombification !
+Nous avons besoin de toi !
+Cherche les indices, découvre les bonnes molécules et fabrique l’antidote qui nous libèrera de cette invasion."
+1914,212,top_1_image,3702
+1915,212,top_3_image,3703
+1916,212,top_10_image,3704
+1917,212,game_public,kids
+1918,212,gauge_filling,"linear-gradient(90deg, rgba(0,106,255,1) 0%, rgba(0,178,254,1) 35%, rgba(0,255,220,0.6741290266106443) 100%)"
+1919,212,team_name_background_image,3705
+1920,212,game_instructions_image,3706
+1921,212,game_instructions_button_image,3707
+1922,212,game_instructions_button_hover_image,3708
+1923,212,time_background_image,3709
+1924,212,game_refresh_button_image,3710
+1925,212,game_refresh_button_hover_image,3711
+1926,212,levels_gauge_image,3712
+1927,212,levels_gauge_image_with_content,3713
+1928,212,levels_gauge_player_icon_image,3714
+1929,212,levels_gauge_level_icon_image,3715
+1930,212,steps_container_image,3716
+1931,212,score_background_image,3717
+1932,212,enigmas_header_image,3718
+1933,212,level_font_color,#000000
+2129,212,game_version,1.1
+2456,212,font_color,#000000

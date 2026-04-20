@@ -1,0 +1,8 @@
+id,game_id,image_number,sound_id
+590,212,enigma_no_answer,3719
+591,212,full_image,3720
+592,212,enigma_success,3721
+593,212,enigma_error,3722
+594,212,top_10,3723
+595,212,top_1,3724
+596,212,top_3,3725

@@ -1,0 +1,13 @@
+id,game_id,number,text,answer_type,good_answer,good_answer_image,good_answer_points,wrong_answer_points
+185,212,1,"Plume de l'Oiseau Sauvage",image,,3726,10,5
+186,212,2,"Fiole de Potion des Gnomes",image,,3727,10,5
+187,212,3,"Venin de Serpent Troglodyte",image,,3728,10,5
+188,212,4,"Poil de Nez du Géant sans Ombre",image,,3729,10,5
+189,212,5,"Bave du Crapaud Costaud",image,,3730,10,5
+190,212,6,"Toile de l'Araignée à 9 pattes",image,,3731,10,5
+191,212,7,"Poudre de Fée des Marécages",image,,3732,10,5
+192,212,8,"Dard de Fourmi de Feu",image,,3733,10,5
+193,212,9,"Cheveux du Zombie Gourmand",image,,3734,10,5
+194,212,10,"Ingrédient Secret",image,,3735,10,5
+195,212,11,"Composé Chimique du Laboratoire",image,,3736,10,5
+196,212,12,"Bonbon Empoisonné",image,,3737,10,5

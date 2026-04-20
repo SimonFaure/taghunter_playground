@@ -1,0 +1,7 @@
+id,game_id,meta,value
+153,212,late_malus,"Votre temps en zone contaminé est trop élevé, votre vaccin perdra en efficacité"
+154,212,search_new_data_timeout,"Humm. Un zombie est probablement en train de mâchouiller un câble. Bipez votre doigt à nouveau. Si ça ne marche toujours pas relancer Sportident et TagHunter"
+155,212,start_team,"%team%. Début de l'infiltration en territoire zombie, bonne chance !"
+156,212,game_ended,"Votre mission est terminée"
+157,212,all_teams_ended,"Toutes les équipes ont terminées leur mission"
+158,212,team_game_ended,"Mission terminée"

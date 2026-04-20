@@ -1,0 +1,761 @@
+/************/
+/* Mystery */
+/************/
+
+/***** Print Button*******/
+/* #top_page_ancre{
+    width: 0;
+} */
+#print_team {
+    /* opacity: 0; */
+    /* position: fixed;
+    top: 20px;
+    right: 20px;   */
+}
+
+/* #print_team i{
+    width: 50px;
+    height: 50px;
+    font-size: 30px; 
+} */
+.game_instructions_wrapper {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    opacity: 1;
+    height: 100vh;
+    width: 100vw;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+/* #enigma_container_2{
+    opacity: 1;
+}
+.game_page_wrapper_mystery .enigmas_wrapper {
+    opacity: 1;
+} */
+/* .game_instructions_wrapper, .enigmas_wrapper, .enigmas_subwrapper, #game_main_image, #final_score_container, .enigma_container, #game_overscore, #game_respawn_container, #game_score_container{
+    position: absolute;
+    top: 0;
+
+} */
+.mystery_game_instructions_container {
+    width: 100%;
+    height: 100vh;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: contain;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+#game_instructions_button_hover_image {
+    /* display: none; */
+}
+
+#game_instructions_button_image_container {
+    position: absolute;
+    bottom: 10%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 200px;
+    height: 200px;
+    z-index: 1000;
+    cursor: pointer;
+}
+
+.game_instructions_button {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 200px;
+    transition: opacity 0.3s ease;
+}
+
+.game_instructions_button img {
+    width: 200px;
+}
+
+#game_instructions_button_image_container:hover #game_instructions_button_image {
+    opacity: 0;
+}
+
+#game_instructions_button_image_container:hover #game_instructions_button_hover_image {
+    opacity: 1;
+}
+
+#game_instructions_button_hover_image {
+    opacity: 0;
+}
+
+.progress_bar_container {
+    display: none !important;
+}
+
+.enigma_wrapper{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+}
+
+.enigmas_wrapper,
+.enigmas_subwrapper,
+#game_main_image,
+#final_score_container,
+.enigma_container {
+    height: 80vh;
+}
+
+#final_score_container,
+.enigma_container,
+#game_respawn_container,
+#game_score_container,
+#enigmas_grid_score {
+    display: none;
+    opacity: 0;
+}
+
+
+.game_page_wrapper_mystery {
+    background-position: center;
+    background-size: cover;
+    background-repeat: no-repeat;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.mystery_action_icon {
+    width: 150px !important;
+    height: 150px;
+    cursor: pointer;
+    border-radius: 150px;
+    z-index: 100;
+}
+
+.mystery_action_icon .game_instructions_summary {
+    margin-top: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.mystery_action_icon:hover {
+    border: 4px solid rgb(38, 155, 22);
+}
+
+.mystery_action_icon:hover i {
+    color: rgb(38, 155, 22);
+}
+
+.mystery_action_icon i {
+    font-size: 80px;
+    color: black;
+}
+
+#enigmas_grid_wrapper {
+    width: 100%;
+    display: flex;
+    opacity: 1;
+    position: relative;
+}
+
+#overscore_score {
+    opacity: 0;
+}
+
+#enigmas_grid_score,
+#overscore_score {
+    top: 10%;
+    right: 10%;
+    position: fixed;
+    z-index: 10;
+}
+
+#floating_total_score,
+#floating_overscore_total_score {
+    border: 1px solid grey;
+    width: 150px;
+    border-radius: 150px;
+    height: 150px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 60px;
+    background-color: #ffffff99;
+}
+
+#floating_enigma_score,
+#floating_overscore_score {
+    opacity: 0;
+    /* position: absolute;
+    top: 0px;
+    right: -29px; */
+    font-size: 30px;
+}
+
+#floating_enigma_score {
+    position: absolute;
+    top: 0;
+    right: -20px;
+}
+
+#time_background_image_text {
+    opacity: 0;
+    position: absolute;
+}
+
+.enigmas_wrapper {
+    opacity: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    height: 80vh;
+    /* flex-direction: column; */
+    /* padding: 50px 0; */
+}
+
+.enigmas_subwrapper {
+    /* margin-bottom: 50px; */
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    /* flex-wrap: wrap; */
+}
+
+.team_name_container {
+    font-size: 70px;
+}
+
+.enigma_container,
+.enigma_answer,
+.enigma_success,
+.enigma_fail,
+.enigma_success_container {
+    display: flex;
+}
+
+.enigma_answer {
+    flex-direction: column;
+    align-items: center;
+}
+
+#game_main_image {
+    position: absolute;
+    display: none;
+    opacity: 0;
+    padding: 15px;
+}
+
+.game_page_wrapper_survival #game_images_container {
+    padding-left: 0;
+
+
+}
+
+.team_bonus_container.bonus_showing {
+    opacity: 1;
+}
+
+#game_images_container {
+    padding-top: 0;
+}
+
+.enigma_container {
+    padding: 15px;
+    font-size: 1.5em;
+    display: flex;
+    justify-content: center;
+    height: 80vh;
+}
+#time_full_container_detail{
+    padding-left: 5px;
+}
+#final_score_container {
+    /* min-height: 100vh; */
+    opacity: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    /* background-color: #00000026; */
+    font-size: 60px;
+    position: absolute;
+}
+
+#final_score_container_data {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+
+}
+
+#final_score_container_data div {
+    text-align: center;
+}
+
+#game_respawn_container {
+    position: absolute;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    padding: 0 30px;
+}
+
+#game_respawn_container .game_instructions {
+    width: 100%;
+    text-align: center;
+    margin: 0 15px;
+}
+
+#game_respawn_container .game_instructions_container {
+    justify-content: center;
+}
+
+#game_respawn_container .survival_action_icon i {
+    font-size: 50px;
+}
+
+#game_respawn_container .survival_action_icon {
+    width: 100px !important;
+    height: 100px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+#game_overscore {
+    display: flex;
+    /* flex-direction: column; */
+    justify-content: center;
+    width: 100%;
+    /* align-items: center; */
+    /* padding: 50px 0; */
+    height: -webkit-fill-available;
+}
+
+#final_score_level_container {
+    text-align: center;
+}
+
+#final_score_level_description {
+    font-size: 25px;
+    text-align: center;
+    margin-top: 15px;
+}
+
+.game_overscore_image {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+
+.enigma_subcontainer,
+.enigma_fail_container {
+    display: flex;
+}
+
+.enigma_text {
+    font-weight: bold;
+}
+
+.enigma_text,
+.enigma_answer,
+#game_overscore_text {
+    text-align: center;
+}
+.enigma_answer_image {
+    /* width: 300px; */
+    margin: 0 auto;
+}
+.enigmas_subwrapper .enigma_answer_image {
+    /* width: 300px; */
+    margin: 0 auto;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.enigma_answer_image_icon{
+    opacity: 0;
+    position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.enigma_answer_image_icon i{
+    font-size: 120px;
+}
+
+.enigmas_recap_enigma_container .enigma_answer_image_background {
+    margin: 0;
+}
+.enigmas_subwrapper .enigma_answer_image_background {
+    position: absolute;
+}
+.enigmas_subwrapper .enigma_answer_image img {
+    /* margin: -18px; */
+    position: absolute;
+}
+
+.enigmas_recap_enigma_subcontainer .enigma_answer_image img {
+    margin: 0;
+}
+
+.enigma_texts_container {
+    flex-direction: column;
+    align-items: center;
+}
+
+.enigma_scores_container {
+    /* width: 30% */
+}
+
+.enigma_answer,
+.enigma_score_container {
+    /* width: 50%; */
+}
+
+/* .enigma_answer,
+.enigma_text,
+.enigma_success,
+.enigma_fail_icon,
+.enigma_fail,
+.enigma_score_container,
+#game_score_container,
+
+#game_main_image, #game_overscore_text, .game_overscore_image_container, #time_container {
+    opacity: 1;
+} */
+
+
+.enigma_plus,
+.enigma_equal {
+    display: none;
+}
+
+/* #game_overscore_images_container{
+    display: none;
+} */
+/* .enigma_text span:empty {
+    display: none !important;
+} */
+
+/* .enigma_answer {
+    flex-direction: column;
+} */
+
+
+/* Survival Final page*/
+
+.final_team_box {
+    display: flex;
+}
+
+.game_main_image_overlay_wrapper {
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 1;
+    display: flex;
+    justify-content: center;
+    width: 100%;
+    height: -webkit-fill-available;
+}
+
+
+.game_main_image_overlay_container {
+    width: 100%;
+}
+
+.game_main_image_overlay {
+    background: #000000de;
+    height: -webkit-fill-available;
+    filter: blur(1.5rem);
+}
+
+#game_overscore_images_container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.game_overscore_image_container {
+    position: relative;
+    width: 300px;
+    padding: 20px;
+}
+
+.game_overscore_image img {
+    width: 100%;
+}
+
+.overscore_blur {
+    filter: blur(1.5rem);
+    transition: 0.5s;
+    -webkit-transition: 0.5s;
+    -moz-transition: 0.5s;
+}
+
+
+
+.mystery_team_name_container img,
+#artefacts_container img,
+.time_background_image img,
+.team_score_container img {
+    width: 100%;
+}
+.team_score_container_text, .mystery_team_name_container_text {
+    position: absolute;
+}
+.left_column_mystery,
+.right_column_mystery {
+    width: 40%;
+    height: 80vh;
+    padding: 15px 15px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.team_score_container,
+.mystery_team_name_container,
+.artefacts_container,
+.time_background_image {
+    width: 100%;
+    background-position: center;
+    background-size: contain;
+    background-repeat: no-repeat;
+}
+
+#artefacts_container{
+    margin: 20px 0 10px 0;
+}
+.time_background_image {
+    width: 100%;
+    background-position: center;
+    background-size: contain;
+    background-repeat: no-repeat;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+}
+
+.mystery_team_name_container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+}
+
+
+.team_score_container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    color: white;
+    margin: 20px 0;
+    font-size: 1.2em;
+}
+
+
+
+.team_bonus_wrapper {
+    width: 100%;
+    position: relative;
+}
+
+.team_bonus_container {
+    position: absolute;
+    opacity: 0;
+    display: flex;
+    width: 100%;
+    justify-content: center;
+}
+
+.team_bonus_container_empty {
+    opacity: 1;
+}
+
+.team_bonus_container img {
+
+    width: 100%;
+}
+
+.team_enigmas_recap_container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-evenly;
+    padding-top: 15px;
+}
+
+.enigmas_recap_enigma_container {
+    flex: 1 0 33%;
+    margin-bottom: 5px;
+}
+
+.enigmas_recap_enigma_container {
+    flex: 1 0 33%;
+    margin-bottom: 5px;
+}
+
+.team_enigmas_recap_container .enigma_answer .enigma_answer_image img {
+    width: 100%;
+}
+
+.team_enigmas_recap_container .enigma_answer .enigma_answer_image.blur img {
+    filter: blur(1.5rem);
+    transition: 1s;
+    -webkit-transition: 1s;
+    -moz-transition: 1s;
+}
+
+.team_enigmas_recap_container .enigma_answer .enigma_answer_image.no_blur.blur img {
+    filter: blur(0);
+    transition: 1s;
+    -webkit-transition: 1s;
+    -moz-transition: 1s;
+}
+
+#reload_page {}
+
+#refresh_button_container {
+    position: relative;
+    width: 100px;
+    height: 100px;
+    margin-bottom: 30px;
+    z-index: 1000;
+    cursor: pointer;
+}
+
+.refresh_button {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+}
+
+.refresh_button img {
+    width: 100px;
+}
+
+/* Game Message Container */
+#game_message_container {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 9999;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+#game_message_container.active {
+    opacity: 1;
+}
+
+.game_message_text {
+    background: rgba(0, 0, 0, 0.9);
+    color: white;
+    padding: 30px 50px;
+    border-radius: 15px;
+    font-size: 24px;
+    text-align: center;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+/* Game Loading Overlay */
+#game_loading_wrapper {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9998;
+}
+
+#game_loading_container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#loading_image img {
+    width: 150px;
+    height: 150px;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+.spinner {
+    width: 60px;
+    height: 60px;
+    border: 5px solid rgba(255, 255, 255, 0.3);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.7; transform: scale(1.1); }
+}
+
+/* Final Score Container */
+#final_score_container.active {
+    display: flex;
+    opacity: 1;
+    animation: fadeIn 0.5s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+#final_score_score {
+    font-size: 80px;
+    font-weight: bold;
+    color: #4ade80;
+}
+
+/* Blur utilities */
+.blur {
+    filter: blur(1.5rem);
+    transition: 0.5s;
+}
+
+.no_blur {
+    filter: blur(0) !important;
+    transition: 1s;
+}
+
+/* Hide utility */
+.hide {
+    display: none !important;
+}

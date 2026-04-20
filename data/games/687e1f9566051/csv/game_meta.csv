@@ -1,0 +1,65 @@
+id,game_id,game_meta,game_meta_value
+2457,230,background_image,4959
+2458,230,team_name_background_image,4738
+2459,230,game_instructions_image,4739
+2460,230,game_instructions_button_image,4740
+2461,230,game_instructions_button_hover_image,4741
+2462,230,game_refresh_button_image,4742
+2463,230,game_refresh_button_hover_image,4743
+2464,230,game_public,mini_kids
+2465,230,number_of_enigmas,12
+2466,230,points_units,points
+2467,230,font,TrajanPro
+2468,230,score_full_game,30
+2469,230,overscore_steps,9
+2470,230,animation_image_duration,1
+2471,230,animation_enigma_duration,1
+2472,230,animation_message_duration,2
+2473,230,scenario,"Mamie Citrouille prépare un grand festin sucré… mais ses bonbons rigolos se sont cachés un peu partout !
+Les enfants doivent l’aider à les retrouver avant que son chaudron ne déborde de sucre magique !
+Ouvre bien l’œil, certains bonbons sont très farceurs…"
+2474,230,default_time,60
+2475,230,gauge_filling,"linear-gradient(90deg, rgba(0,187,255,1) 0%, rgba(0,254,232,1) 40%, rgba(0,255,220,0.6741290266106443) 73%)"
+2476,230,level_font_color,#000000
+2477,230,game_version,1.1
+2478,230,default_time_malus,0
+2479,230,font_color,#000000
+2480,230,levels,"{""1"":{""points"":null,""name"":null,""description"":""Tu as d\u00e9couvert la cuisine de Mamie Citrouille et appris \u00e0 reconna\u00eetre les bonbons rigolos, bravo !""},""2"":{""points"":""20"",""name"":""D\u00e9gustateur D\u00e9butant"",""description"":""Tu es capable de reconna\u00eetre les go\u00fbts sucr\u00e9s et de rep\u00e9rer les bonbons les moins farceurs, bravo !""},""3"":{""points"":""30"",""name"":""D\u00e9nicheur de Friandises"",""description"":""Tu sais suivre les odeurs de sucre et trouver les cachettes secr\u00e8tes des bonbons, bravo !""},""4"":{""points"":""40"",""name"":""Attrape-Bonbons"",""description"":""Tu es capable d\u2019attraper les bonbons qui courent partout et de les ramener \u00e0 Mamie, bravo !""},""5"":{""points"":""50"",""name"":""Ma\u00eetre du Go\u00fbter Magique"",""description"":""Tu sais rep\u00e9rer les bonbons magiques et les ranger dans le chaudron sans te tromper, bravo !""},""6"":{""points"":""60"",""name"":""Chef du Chaudron Sucr\u00e9"",""description"":""Tu sais g\u00e9rer les \u00e9claboussures de sucre et m\u00e9langer la potion de bonbons sans d\u00e9border, bravo !""},""7"":{""points"":""70"",""name"":""Ami des Bonbons Farceurs"",""description"":""Tu es capable de calmer les bonbons les plus rigolos et de jouer avec eux sans les perdre, bravo !""},""8"":{""points"":""80"",""name"":""H\u00e9ros du Plan Sucr\u00e9"",""description"":""Tu aides Mamie \u00e0 retrouver tous les bonbons perdus gr\u00e2ce \u00e0 ton flair et ton \u00e9nergie, bravo !""},""9"":{""points"":""90"",""name"":""Magicien des Saveurs"",""description"":""Tu es capable de reconna\u00eetre tous les go\u00fbts rien qu\u2019\u00e0 l\u2019odeur, m\u00eame les plus surprenants, bravo !""},""10"":{""points"":""100"",""name"":""Gardien du Sucre Magique"",""description"":""Tu prot\u00e8ges les bonbons enchant\u00e9s avec courage et attention, bravo !""},""11"":{""points"":""110"",""name"":""Sorcier du Go\u00fbter"",""description"":""Ta rapidit\u00e9 et ton habilet\u00e9 font de toi un expert du festin de Mamie Citrouille, bravo !""},""12"":{""points"":""120"",""name"":""Ma\u00eetre des Bonbons en Folie"",""description"":""Tu es le ma\u00eetre incontest\u00e9 de la chasse aux bonbons, capable de tous les rassembler \u00e0 temps, bravo !""}}"
+2481,230,top_1_image,4748
+2482,230,top_3_image,4750
+2483,230,top_10_image,4752
+2484,230,levels_gauge_image,4753
+2485,230,levels_gauge_image_with_content,4754
+2486,230,levels_gauge_player_icon_image,4755
+2487,230,levels_gauge_level_icon_image,4756
+2488,230,time_background_image,4758
+2489,230,score_background_image,4759
+2490,230,enigmas_header_image,4760
+2491,230,steps_container_image,4761
+2492,230,overscore_step_1,10
+2493,230,name_overscore_step_1,Attrape-Bonbons
+2494,230,image_overscore_step_1,4762
+2495,230,overscore_step_2,20
+2496,230,name_overscore_step_2,"Maître du Goûter Magique"
+2497,230,overscore_step_3,30
+2498,230,name_overscore_step_3,"Chef du Chaudron Sucré"
+2499,230,overscore_step_4,40
+2500,230,name_overscore_step_4,"Ami des Bonbons Farceurs"
+2501,230,overscore_step_5,50
+2502,230,name_overscore_step_5,"Héros du Plan Sucré"
+2503,230,overscore_step_6,60
+2504,230,name_overscore_step_6,"Magicien des Saveurs"
+2505,230,overscore_step_7,70
+2506,230,name_overscore_step_7,"Gardien du Sucre Magique"
+2507,230,overscore_step_8,80
+2508,230,name_overscore_step_8,"Sorcier du Goûter"
+2509,230,overscore_step_9,90
+2510,230,name_overscore_step_9,"Maître des Bonbons en Folie"
+2511,230,image_overscore_step_2,4763
+2512,230,image_overscore_step_3,4764
+2513,230,image_overscore_step_4,4765
+2514,230,image_overscore_step_5,4766
+2515,230,image_overscore_step_6,4767
+2516,230,image_overscore_step_7,4768
+2517,230,image_overscore_step_8,4769
+2518,230,image_overscore_step_9,4770

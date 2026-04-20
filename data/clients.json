@@ -1,0 +1,14 @@
+[
+  {
+    "id": "client1",
+    "name": "Client 1",
+    "email": "client1@example.com",
+    "url": "192.168.129.250"
+  },
+  {
+    "id": "client2",
+    "name": "Client 2",
+    "email": "client2@example.com",
+    "url": "192.168.129.251"
+  }
+]

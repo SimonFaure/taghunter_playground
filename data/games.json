@@ -1,0 +1,15 @@
+{
+  "game_types": [
+    {
+      "id": "1",
+      "name": "Mystery",
+      "description": "Immersive mystery adventures with puzzles and investigations"
+    },
+    {
+      "id": "2",
+      "name": "TagQuest",
+      "description": "Action-packed quest missions with tactical challenges"
+    }
+  ],
+  "scenarios": []
+}
