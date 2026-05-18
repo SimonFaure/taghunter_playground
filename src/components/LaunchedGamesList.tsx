@@ -1,7 +1,23 @@
 import { useState, useEffect } from 'react';
 import { Play, Trash2, Users, Save, Clock, CheckCircle, Flag, Trophy, Gamepad2, Search, ArrowUpDown, Import as SortAsc, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, UserPlus, PlusCircle, X, BarChart2, RefreshCw, ExternalLink } from 'lucide-react';
-import { supabase } from '../lib/db';
 import { GamePage } from './GamePage';
+import { useAuth } from './auth/AuthProvider';
+import * as cardsStore from '../services/cardsStore';
+import * as cardsRepo from '../services/cardsRepo';
+import * as scenarioStore from '../services/scenarioStore';
+import {
+  listLaunchedGames,
+  getLaunchedGameMeta,
+  updateLaunchedGameMeta,
+  getLaunchedGameState,
+  endLaunchedGame,
+  deleteLaunchedGame,
+  updateTeam,
+  addTeamToLaunchedGame,
+  listCompletedQuests,
+  getLaunchedGameDevices,
+} from '../services/launchedGames';
+import { ApiError } from '../services/api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
@@ -52,6 +68,7 @@ interface Device {
 }
 
 export function LaunchedGamesList() {
+  const { user } = useAuth();
   const [games, setGames] = useState<LaunchedGame[]>([]);
   const [selectedGameId, setSelectedGameId] = useState<number | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
@@ -104,45 +121,38 @@ export function LaunchedGamesList() {
   const [timeRangePage, setTimeRangePage] = useState<{ scenario: ScenarioOption; timeRange: TimeRange } | null>(null);
   const [activeGamesPage, setActiveGamesPage] = useState<ActiveGameOption[] | null>(null);
 
-  const parseChipsCsv = (text: string): SiPuce[] => {
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) return [];
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-    const idIdx = headers.indexOf('id');
-    const numIdx = headers.indexOf('key_number');
-    const nameIdx = headers.indexOf('key_name');
-    const colorIdx = headers.indexOf('color');
-    const chips: SiPuce[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-      const id = parseInt(vals[idIdx]);
-      const key_number = parseInt(vals[numIdx]);
-      const key_name = vals[nameIdx] || '';
-      if (isNaN(id) || isNaN(key_number)) continue;
-      chips.push({ id, key_number, key_name, color: colorIdx !== -1 ? vals[colorIdx] || null : null, created_at: '', updated_at: '' });
-    }
-    return chips.sort((a, b) => a.key_number - b.key_number);
-  };
-
   useEffect(() => {
     loadGames();
     const loadChips = async () => {
-      const { data: files, error } = await supabase.storage.from('resources').list('cards', { limit: 100 });
-      if (error || !files) return;
-      const csvFiles = files.filter(f => f.name && f.name.endsWith('.csv') && f.name !== '.emptyFolderPlaceholder');
-      const allParsed: SiPuce[] = [];
-      for (const file of csvFiles) {
-        const { data: blob } = await supabase.storage.from('resources').download(`cards/${file.name}`);
-        if (blob) {
-          const parsed = parseChipsCsv(await blob.text());
-          allParsed.push(...parsed);
-        }
+      if (!user) return;
+      try {
+        const rows = await cardsRepo.list();
+        const regularChips: SiPuce[] = rows.map((r) => ({
+          id: r.id,
+          key_number: r.key_number,
+          key_name: r.key_name,
+          color: r.color,
+          created_at: '',
+          updated_at: '',
+        }));
+        const onDemandJson = await cardsStore.getOnDemandCardsJson();
+        const onDemandRecords = (onDemandJson as { cards?: Array<{ id?: number; key_number: number; key_name: string; color?: string | null }> } | null)?.cards ?? [];
+        const onDemandMapped: SiPuce[] = onDemandRecords.map((c) => ({
+          id: c.id ?? c.key_number,
+          key_number: c.key_number,
+          key_name: c.key_name,
+          color: c.color ?? null,
+          created_at: '',
+          updated_at: '',
+        }));
+        const all = [...regularChips, ...onDemandMapped].sort((a, b) => a.key_number - b.key_number);
+        setAllChips(all);
+      } catch (err) {
+        console.error('[LaunchedGamesList] failed to load chips:', err);
       }
-      allParsed.sort((a, b) => a.key_number - b.key_number);
-      setAllChips(allParsed);
     };
     loadChips();
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     if (games.length > 0) {
@@ -157,63 +167,73 @@ export function LaunchedGamesList() {
       setMinimizedTeams(new Set());
       setSelectedGamePlayMode(null);
       setSelectedGameTeamsConfig([]);
-      supabase
-        .from('launched_game_meta')
-        .select('meta_name, meta_value')
-        .eq('launched_game_id', selectedGameId)
-        .in('meta_name', ['playMode', 'teamsConfig'])
-        .then(({ data }) => {
-          if (data) {
-            const map: Record<string, string> = {};
-            data.forEach(row => { map[row.meta_name] = row.meta_value || ''; });
-            if (map.playMode === 'solo' || map.playMode === 'team') {
-              setSelectedGamePlayMode(map.playMode);
-            }
-            if (map.teamsConfig) {
-              try { setSelectedGameTeamsConfig(JSON.parse(map.teamsConfig)); } catch {}
-            }
+      getLaunchedGameMeta(selectedGameId)
+        .then((map) => {
+          if (map.playMode === 'solo' || map.playMode === 'team') {
+            setSelectedGamePlayMode(map.playMode);
           }
-        });
+          if (map.teamsConfig) {
+            try { setSelectedGameTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
+          }
+        })
+        .catch((err) => console.error('[LaunchedGamesList] meta load failed:', err));
     }
   }, [selectedGameId]);
 
   const loadGames = async () => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from('launched_games')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('Error loading launched games:', error);
-    } else {
-      setGames(data || []);
+    try {
+      const rows = await listLaunchedGames();
+      // Server returns ended as 0/1 int; LaunchedGame interface expects boolean.
+      const normalized = rows.map((g) => ({
+        id: g.id,
+        game_uniqid: g.game_uniqid,
+        name: g.name,
+        number_of_teams: g.number_of_teams ?? 0,
+        game_type: g.game_type,
+        ended: Boolean(g.ended),
+        created_at: g.created_at ?? '',
+      }));
+      setGames(normalized);
+    } catch (err) {
+      console.error('Error loading launched games:', err);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const loadTeams = async (gameId: number) => {
-    const { data, error } = await supabase
-      .from('teams')
-      .select('*')
-      .eq('launched_game_id', gameId)
-      .order('team_number', { ascending: true });
-
-    if (error) {
-      console.error('Error loading teams:', error);
+    let teamsData: Team[] = [];
+    let questRows: { team_id: number; quest_number: string; points_awarded: number }[] = [];
+    try {
+      const state = await getLaunchedGameState(gameId, 0);
+      teamsData = state.teams.map((t) => ({
+        id: t.id,
+        team_number: t.team_number,
+        team_name: t.team_name ?? '',
+        score: t.score,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        key_id: t.key_id ?? 0,
+      }));
+    } catch (err) {
+      console.error('Error loading teams:', err);
       return;
     }
-
-    const teamsData = data || [];
-
-    const { data: questRows } = await supabase
-      .from('team_completed_quests')
-      .select('team_id, quest_number, points_awarded')
-      .eq('launched_game_id', gameId);
+    try {
+      const rows = await listCompletedQuests(gameId);
+      questRows = rows.map((r) => ({
+        team_id: r.team_id,
+        quest_number: r.quest_number,
+        points_awarded: r.points_awarded,
+      }));
+    } catch (err) {
+      console.warn('[LaunchedGamesList] completed quests fetch failed:', err);
+    }
 
     const scoreByTeam: Record<number, number> = {};
     const questCountByTeam: Record<number, Record<string, number>> = {};
-    for (const row of questRows || []) {
+    for (const row of questRows) {
       scoreByTeam[row.team_id] = (scoreByTeam[row.team_id] ?? 0) + (row.points_awarded ?? 0);
       if (!questCountByTeam[row.team_id]) questCountByTeam[row.team_id] = {};
       questCountByTeam[row.team_id][row.quest_number] = (questCountByTeam[row.team_id][row.quest_number] ?? 0) + 1;
@@ -224,23 +244,15 @@ export function LaunchedGamesList() {
     let gameLevels: Record<string, { name: string | null; points: string | null }> | null = null;
     if (game?.game_uniqid) {
       try {
-        const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-        let gameDataJson: any = null;
-        if (isElectron && (window as any).electron?.games?.readFile) {
-          const content = await (window as any).electron.games.readFile(game.game_uniqid, 'game-data.json');
-          gameDataJson = JSON.parse(content);
-        } else {
-          const { data: urlData } = supabase.storage.from('resources').getPublicUrl(`scenarios/${game.game_uniqid}/game-data.json`);
-          const resp = await fetch(urlData.publicUrl);
-          if (resp.ok) gameDataJson = await resp.json();
-        }
+        // Slice 2: scenario game-data.json comes from the local SQLite/FS store.
+        const gameDataJson = (await scenarioStore.getGameData(game.game_uniqid)) as any;
         const gameMeta = gameDataJson?.game_data?.game_meta ?? gameDataJson?.game_meta;
         const parseVal = (v: any) => (v === undefined || v === null) ? 0 : (typeof v === 'string' ? parseInt(v, 10) || 0 : v);
         pts6 = parseVal(gameMeta?.combo_6_quests);
         pts4 = parseVal(gameMeta?.combo_4_quests);
         pts2 = parseVal(gameMeta?.combo_2_quests);
         gameLevels = gameMeta?.levels ?? null;
-      } catch {}
+      } catch { /* swallow — combos default to 0 */ }
     }
 
     const computeLevelForScore = (score: number): { level: number; name: string } | null => {
@@ -297,60 +309,31 @@ export function LaunchedGamesList() {
   };
 
   const loadGameData = async () => {
+    // Slice 3: game-data.json now comes from slice-2's local FS for any
+    // scenario the user has downloaded. For game_uniqids we never downloaded
+    // (e.g., a scenario referenced by a historical launched_game that was
+    // since removed), fall back to the row title from scenarioStore — there's
+    // no longer a remote scenarios endpoint to query.
     try {
-      const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-      console.log('🎮 Loading game data...');
-      console.log('  - isElectron:', isElectron);
-      console.log('  - electron.games.readFile available:', !!(window as any).electron?.games?.readFile);
-      console.log('  - Games:', games);
-
-      const uniqueUniqids = [...new Set(games.map(g => g.game_uniqid))];
-      console.log('  - Unique uniqids to load:', uniqueUniqids);
+      const uniqueUniqids = [...new Set(games.map((g) => g.game_uniqid))];
       const dataMap: Record<string, GameData> = {};
-
       for (const uniqid of uniqueUniqids) {
         try {
-          console.log(`  - Loading ${uniqid}...`);
-          let gameData;
-
-          if (isElectron && (window as any).electron?.games?.readFile) {
-            const gameDataContent = await (window as any).electron.games.readFile(uniqid, 'game-data.json');
-            gameData = JSON.parse(gameDataContent);
-          } else {
-            const { data: scenarioData, error: scenarioError } = await supabase
-              .from('scenarios')
-              .select('*')
-              .eq('uniqid', uniqid)
-              .maybeSingle();
-
-            if (!scenarioError && scenarioData) {
-              gameData = {
-                game: {
-                  id: scenarioData.id.toString(),
-                  uniqid: scenarioData.uniqid,
-                  type: scenarioData.game_type,
-                  title: scenarioData.title,
-                  slug: scenarioData.uniqid
-                }
-              };
-            } else {
-              const response = await fetch(`/data/games/${uniqid}/game-data.json`);
-              if (response.ok) {
-                gameData = await response.json();
-              }
-            }
+          const gd = (await scenarioStore.getGameData(uniqid)) as any;
+          const title = gd?.game?.title ?? gd?.scenario?.title ?? gd?.title ?? null;
+          const type = gd?.game?.type ?? gd?.scenario?.game_type ?? gd?.game_type ?? '';
+          if (title) {
+            dataMap[uniqid] = { game: { uniqid, title, type } };
+            continue;
           }
-
-          console.log(`  ✓ Loaded ${uniqid}:`, gameData?.game?.title);
-          if (gameData) {
-            dataMap[uniqid] = gameData;
+          const row = await scenarioStore.get(uniqid);
+          if (row) {
+            dataMap[uniqid] = { game: { uniqid, title: row.title, type: row.game_type } };
           }
         } catch (err) {
-          console.error(`  ✗ Error loading game data for ${uniqid}:`, err);
+          console.warn(`[LaunchedGamesList] game-data lookup failed for ${uniqid}:`, err);
         }
       }
-
-      console.log('  - Final gameDataMap:', dataMap);
       setGameDataMap(dataMap);
     } catch (error) {
       console.error('Error loading game data:', error);
@@ -364,22 +347,28 @@ export function LaunchedGamesList() {
       message: 'Are you sure you want to end this game? This action will mark the game as completed.',
       variant: 'warning',
       confirmText: 'End Game',
-      onConfirm: async () => {
-        const { error } = await supabase
-          .from('launched_games')
-          .update({ ended: true })
-          .eq('id', gameId);
+      onConfirm: () => {
+        // Close the dialog and flip the optimistic ended flag synchronously
+        // so the badge + button set update immediately. end_game on the
+        // server only sets ended=1 (teams untouched), so no team refetch.
+        setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
+        const snapshot = games;
+        setGames((prev) => prev.map((g) => (g.id === gameId ? { ...g, ended: true } : g)));
 
-        if (error) {
-          console.error('Error ending game:', error);
-          alert('Failed to end game');
-        } else {
-          loadGames();
-          if (selectedGameId === gameId) {
-            loadTeams(gameId);
+        (async () => {
+          try {
+            await endLaunchedGame(gameId);
+          } catch (err) {
+            // 404 → row gone (deleted elsewhere); treat as success since the
+            // user's "no longer active" intent still holds.
+            if (err instanceof ApiError && err.status === 404) {
+              return;
+            }
+            console.error('Error ending game:', err);
+            setGames(snapshot);
+            alert('Failed to end game');
           }
-        }
-        setConfirmDialog({ ...confirmDialog, isOpen: false });
+        })();
       },
     });
   };
@@ -391,59 +380,33 @@ export function LaunchedGamesList() {
       message: 'Are you sure you want to delete this game? This will permanently remove the game and all associated data (teams, devices, configuration). This action cannot be undone.',
       variant: 'danger',
       confirmText: 'Delete Game',
-      onConfirm: async () => {
-        const { error: teamsError } = await supabase
-          .from('teams')
-          .delete()
-          .eq('launched_game_id', gameId);
-
-        if (teamsError) {
-          console.error('Error deleting teams:', teamsError);
-          alert('Failed to delete teams');
-          setConfirmDialog({ ...confirmDialog, isOpen: false });
-          return;
+      onConfirm: () => {
+        // Close the dialog and update local state synchronously so the UI
+        // doesn't sit on a spinner during the cascade DELETE + any retries.
+        setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
+        const snapshot = games;
+        setGames((prev) => prev.filter((g) => g.id !== gameId));
+        if (selectedGameId === gameId) {
+          setSelectedGameId(null);
+          setTeams([]);
         }
 
-        const { error: devicesError } = await supabase
-          .from('launched_game_devices')
-          .delete()
-          .eq('launched_game_id', gameId);
-
-        if (devicesError) {
-          console.error('Error deleting devices:', devicesError);
-          alert('Failed to delete devices');
-          setConfirmDialog({ ...confirmDialog, isOpen: false });
-          return;
-        }
-
-        const { error: metaError } = await supabase
-          .from('launched_game_meta')
-          .delete()
-          .eq('launched_game_id', gameId);
-
-        if (metaError) {
-          console.error('Error deleting game meta:', metaError);
-          alert('Failed to delete game meta');
-          setConfirmDialog({ ...confirmDialog, isOpen: false });
-          return;
-        }
-
-        const { error: gameError } = await supabase
-          .from('launched_games')
-          .delete()
-          .eq('id', gameId);
-
-        if (gameError) {
-          console.error('Error deleting game:', gameError);
-          alert('Failed to delete game');
-        } else {
-          if (selectedGameId === gameId) {
-            setSelectedGameId(null);
-            setTeams([]);
+        // Fire and forget. Server-side FK ON DELETE CASCADE handles meta +
+        // devices + teams + raw_data. If withRetry's first attempt succeeded
+        // but the response was slow/5xx, the second attempt sees a 404 (row
+        // already gone) — that's the desired end state, not an error.
+        (async () => {
+          try {
+            await deleteLaunchedGame(gameId);
+          } catch (err) {
+            if (err instanceof ApiError && err.status === 404) {
+              return;
+            }
+            console.error('Error deleting game:', err);
+            setGames(snapshot);
+            alert('Failed to delete game');
           }
-          loadGames();
-        }
-        setConfirmDialog({ ...confirmDialog, isOpen: false });
+        })();
       },
     });
   };
@@ -492,28 +455,31 @@ export function LaunchedGamesList() {
   };
 
   const handleSaveTeam = async (teamId: number) => {
-    const { error } = await supabase
-      .from('teams')
-      .update(editedTeam)
-      .eq('id', teamId);
-
-    if (error) {
-      console.error('Error updating team:', error);
-      alert('Failed to update team');
-    } else {
+    try {
+      const fields: Parameters<typeof updateTeam>[1] = {};
+      if (editedTeam.team_name !== undefined) fields.team_name = editedTeam.team_name ?? null;
+      if (editedTeam.score !== undefined) fields.score = editedTeam.score;
+      if (editedTeam.start_time !== undefined) fields.start_time = editedTeam.start_time ?? null;
+      if (editedTeam.end_time !== undefined) fields.end_time = editedTeam.end_time ?? null;
+      await updateTeam(teamId, fields);
       setEditingTeamId(null);
       setEditedTeam({});
-      if (selectedGameId !== null) {
-        loadTeams(selectedGameId);
-      }
+      if (selectedGameId !== null) loadTeams(selectedGameId);
+    } catch (err) {
+      console.error('Error updating team:', err);
+      alert('Failed to update team');
     }
   };
 
   const handleRenameTeam = async (teamId: number) => {
     const name = renameValue.trim();
     if (!name) { setRenamingTeamId(null); return; }
-    const { error } = await supabase.from('teams').update({ team_name: name }).eq('id', teamId);
-    if (!error && selectedGameId !== null) loadTeams(selectedGameId);
+    try {
+      await updateTeam(teamId, { team_name: name });
+      if (selectedGameId !== null) loadTeams(selectedGameId);
+    } catch (err) {
+      console.error('Error renaming team:', err);
+    }
     setRenamingTeamId(null);
     setRenameValue('');
   };
@@ -531,11 +497,15 @@ export function LaunchedGamesList() {
   const persistTeamsConfig = async (updated: ConfigTeam[]) => {
     if (!selectedGameId) return;
     setSelectedGameTeamsConfig(updated);
-    await supabase
-      .from('launched_game_meta')
-      .update({ meta_value: JSON.stringify(updated) })
-      .eq('launched_game_id', selectedGameId)
-      .eq('meta_name', 'teamsConfig');
+    try {
+      // Read-modify-write: update_meta replaces the whole bag, so we need
+      // the full current set, not just teamsConfig.
+      const current = await getLaunchedGameMeta(selectedGameId);
+      const next = { ...current, teamsConfig: JSON.stringify(updated) };
+      await updateLaunchedGameMeta(selectedGameId, next);
+    } catch (err) {
+      console.error('[LaunchedGamesList] persistTeamsConfig failed:', err);
+    }
   };
 
   const handleAddTeammate = async () => {
@@ -570,21 +540,16 @@ export function LaunchedGamesList() {
 
     const nextTeamNumber = (teams.length > 0 ? Math.max(...teams.map(t => t.team_number)) : 0) + 1;
 
-    const { data: newTeam, error } = await supabase
-      .from('teams')
-      .insert({
+    try {
+      await addTeamToLaunchedGame({
         launched_game_id: selectedGameId,
         team_number: nextTeamNumber,
         team_name: addTeamState.name.trim(),
         pattern: 0,
-        score: 0,
         key_id: chip.id,
-      })
-      .select()
-      .maybeSingle();
-
-    if (error || !newTeam) {
-      console.error('Error adding team:', error);
+      });
+    } catch (err) {
+      console.error('Error adding team:', err);
       setSavingTeam(false);
       return;
     }
@@ -604,18 +569,27 @@ export function LaunchedGamesList() {
   };
 
   const handleShowRankings = async (gameId: number, gameName: string) => {
-    const [teamsRes, metaRes] = await Promise.all([
-      supabase.from('teams').select('*').eq('launched_game_id', gameId).order('score', { ascending: false }),
-      supabase.from('launched_game_meta').select('meta_name, meta_value').eq('launched_game_id', gameId),
-    ]);
-
-    if (teamsRes.error) {
-      console.error('Error loading rankings:', teamsRes.error);
+    let teamsForRankings: Team[] = [];
+    let metaMap: Record<string, string> = {};
+    try {
+      const [state, meta] = await Promise.all([
+        getLaunchedGameState(gameId, 0),
+        getLaunchedGameMeta(gameId),
+      ]);
+      teamsForRankings = state.teams.map((t) => ({
+        id: t.id,
+        team_number: t.team_number,
+        team_name: t.team_name ?? '',
+        score: t.score,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        key_id: t.key_id ?? 0,
+      })).sort((a, b) => b.score - a.score);
+      metaMap = meta;
+    } catch (err) {
+      console.error('Error loading rankings:', err);
       return;
     }
-
-    const metaMap: Record<string, string> = {};
-    metaRes.data?.forEach(row => { metaMap[row.meta_name] = row.meta_value || ''; });
 
     const config: GameConfig = {
       name: gameName,
@@ -631,46 +605,41 @@ export function LaunchedGamesList() {
       testMode: metaMap.testMode === 'true',
       victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
       playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
-      usbPort: metaMap.usbPort || undefined,
     };
 
-    setRankings(teamsRes.data || []);
+    setRankings(teamsForRankings);
     setRankingsGameName(gameName);
     setRankingsConfig(config);
     setShowRankings(gameId);
   };
 
   const handleShowDevices = async (gameId: number) => {
-    const { data, error } = await supabase
-      .from('launched_game_devices')
-      .select('*')
-      .eq('launched_game_id', gameId)
-      .order('last_connexion_attempt', { ascending: false });
-
-    if (error) {
-      console.error('Error loading devices:', error);
-    } else {
-      setDevices(data || []);
+    try {
+      const rows = await getLaunchedGameDevices(gameId);
+      // The Device type expected by this component uses string device_id +
+      // last_connexion_attempt; the new server returns int device_id +
+      // last_connection_attempt. Map for compatibility.
+      const mapped: Device[] = rows.map((r) => ({
+        id: r.id,
+        device_id: r.device_label ?? `device-${r.device_id}`,
+        connected: Boolean(r.connected),
+        last_connexion_attempt: r.last_connection_attempt,
+      }));
+      setDevices(mapped);
       setShowDevices(gameId);
+    } catch (err) {
+      console.error('Error loading devices:', err);
     }
   };
 
   const handlePlayGame = async (game: LaunchedGame) => {
-    const { data: metaData, error } = await supabase
-      .from('launched_game_meta')
-      .select('*')
-      .eq('launched_game_id', game.id);
-
-    if (error) {
-      console.error('Error loading game meta:', error);
+    let metaMap: Record<string, string> = {};
+    try {
+      metaMap = await getLaunchedGameMeta(game.id);
+    } catch (err) {
+      console.error('Error loading game meta:', err);
       return;
     }
-
-    const metaMap: Record<string, string> = {};
-    metaData?.forEach(meta => {
-      metaMap[meta.meta_name] = meta.meta_value || '';
-    });
-
     const config: GameConfig = {
       name: game.name,
       numberOfTeams: game.number_of_teams,
@@ -685,7 +654,6 @@ export function LaunchedGamesList() {
       testMode: metaMap.testMode === 'true',
       victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
       playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
-      usbPort: metaMap.usbPort || undefined,
     };
 
     setPlayingGame({ config, uniqid: game.game_uniqid, launchedGameId: game.id });

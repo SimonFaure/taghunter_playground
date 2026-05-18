@@ -1,242 +1,215 @@
-import { useState, useEffect } from 'react';
-import { CreditCard, Download, RefreshCw, AlertCircle, Package, Layers } from 'lucide-react';
-import { getUserDataUpdate, PatternInfo } from '../services/resourceSync';
-import { loadConfig } from '../utils/config';
+import { useCallback, useEffect, useState } from 'react';
+import { CreditCard, RefreshCw, Package, Layers } from 'lucide-react';
+import * as patternStore from '../services/patternStore';
+import { runCycleNow, getState } from '../services/syncOrchestrator';
+import { on } from '../services/syncEvents';
+import { useAuth } from './auth/AuthProvider';
+import { CardsManager } from './cards/CardsManager';
 
-interface Client {
-  id: string;
-  name: string;
-  email: string;
-  url: string;
-}
+// Cards & patterns overview for the currently-authenticated client. Layout
+// mirrors ConfigurationPage: a left sidebar with tab buttons + a main panel
+// that renders the active section. Cards CRUD is handled by CardsManager;
+// patterns are display-only (synced from studio).
 
-interface ClientData {
-  cardsVersion: number;
-  hasOnDemandCards: boolean;
-  defaultPatterns: PatternInfo[];
-  customPatterns: PatternInfo[];
-  billingUpToDate: boolean;
-  licenseType: string;
-}
+type CardsTab = 'cards' | 'patterns';
 
 export default function ClientCardsPage() {
-  const [clients, setClients] = useState<Client[]>([]);
-  const [selectedClient, setSelectedClient] = useState<Client | null>(null);
-  const [clientData, setClientData] = useState<ClientData | null>(null);
+  const { user } = useAuth();
+  const [activeTab, setActiveTab] = useState<CardsTab>('cards');
+  const [defaultPatterns, setDefaultPatterns] = useState<patternStore.PatternRow[]>([]);
+  const [customPatterns, setCustomPatterns] = useState<patternStore.PatternRow[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
 
-  useEffect(() => {
-    loadClients();
-  }, []);
-
-  const loadClients = async () => {
-    try {
-      const clientsData = await (window as any).electron.clients.getAll();
-      setClients(clientsData);
-      if (clientsData.length > 0) {
-        setSelectedClient(clientsData[0]);
-        await loadClientData(clientsData[0].email);
-      }
-    } catch (err) {
-      console.error('Failed to load clients:', err);
-      setError('Failed to load clients');
-    }
-  };
-
-  const loadClientData = async (email: string) => {
+  const refresh = useCallback(async () => {
+    if (!user) return;
     setLoading(true);
-    setError(null);
     try {
-      const apiUrl = 'https://admin.taghunter.fr/backend/api/playground.php';
-      const userData = await getUserDataUpdate(apiUrl, email);
-
-      setClientData({
-        cardsVersion: userData.cards_version,
-        hasOnDemandCards: userData.has_on_demand_cards,
-        defaultPatterns: userData.default_patterns,
-        customPatterns: userData.custom_patterns,
-        billingUpToDate: userData.billing_up_to_date,
-        licenseType: userData.license_type,
-      });
-    } catch (err) {
-      console.error('Failed to load client data:', err);
-      setError('Failed to load client data');
+      const [defaults, customs] = await Promise.all([
+        patternStore.list({ isDefault: true }),
+        patternStore.list({ isDefault: false }),
+      ]);
+      setDefaultPatterns(defaults);
+      setCustomPatterns(customs);
     } finally {
       setLoading(false);
     }
-  };
+  }, [user]);
 
-  const handleClientChange = async (clientId: string) => {
-    const client = clients.find(c => c.id === clientId);
-    if (client) {
-      setSelectedClient(client);
-      await loadClientData(client.email);
-    }
-  };
+  useEffect(() => {
+    void refresh();
+    const offContent = on('content:updated', () => {
+      void refresh();
+    });
+    return () => {
+      offContent();
+    };
+  }, [refresh]);
 
-  const handleRefresh = () => {
-    if (selectedClient) {
-      loadClientData(selectedClient.email);
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      await runCycleNow('manual');
+    } finally {
+      setSyncing(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
-      <div className="container mx-auto px-4 py-8">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white py-8">
+      <div className="container mx-auto px-6">
         <div className="flex items-center justify-between mb-8">
-          <div className="flex items-center space-x-3">
-            <CreditCard className="w-8 h-8 text-slate-700" />
-            <h1 className="text-3xl font-bold text-slate-900">Client Cards & Patterns</h1>
+          <div className="flex items-center gap-3">
+            <CreditCard className="text-blue-400" size={32} />
+            <h1 className="text-3xl font-bold">Cards &amp; Patterns</h1>
           </div>
           <button
-            onClick={handleRefresh}
-            disabled={loading || !selectedClient}
-            className="flex items-center space-x-2 px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            onClick={handleSync}
+            disabled={syncing || getState().cycleInFlight}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
           >
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            <span>Refresh</span>
+            <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
+            <span>Sync now</span>
           </button>
         </div>
 
-        <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
-          <label className="block text-sm font-medium text-slate-700 mb-2">
-            Select Client
-          </label>
-          <select
-            value={selectedClient?.id || ''}
-            onChange={(e) => handleClientChange(e.target.value)}
-            className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent"
-          >
-            {clients.map(client => (
-              <option key={client.id} value={client.id}>
-                {client.name} ({client.email})
-              </option>
-            ))}
-          </select>
+        <div className="flex gap-6">
+          <aside className="w-56 shrink-0">
+            <CardsNav active={activeTab} onChange={setActiveTab} />
+          </aside>
+
+          <main className="flex-1 min-w-0 max-w-4xl">
+            {activeTab === 'cards' && <CardsManager />}
+
+            {activeTab === 'patterns' && (
+              <>
+                {loading ? (
+                  <Section icon={<Package className="text-blue-400" size={24} />} title="Patterns">
+                    <div className="flex items-center justify-center py-10">
+                      <RefreshCw className="w-8 h-8 text-slate-400 animate-spin" />
+                    </div>
+                  </Section>
+                ) : (
+                  <>
+                    <PatternSection
+                      title="Default Patterns"
+                      rows={defaultPatterns}
+                      icon={<Package className="text-blue-400" size={24} />}
+                    />
+                    <PatternSection
+                      title="Custom Patterns"
+                      rows={customPatterns}
+                      icon={<Layers className="text-blue-400" size={24} />}
+                    />
+                  </>
+                )}
+              </>
+            )}
+          </main>
         </div>
+      </div>
+    </div>
+  );
+}
 
-        {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6 flex items-start space-x-3">
-            <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <h3 className="font-medium text-red-900">Error</h3>
-              <p className="text-red-700 text-sm mt-1">{error}</p>
-            </div>
-          </div>
-        )}
+function CardsNav({ active, onChange }: { active: CardsTab; onChange: (tab: CardsTab) => void }) {
+  const items: { tab: CardsTab; label: string; icon: React.ReactNode }[] = [
+    { tab: 'cards', label: 'Cards', icon: <CreditCard size={16} /> },
+    { tab: 'patterns', label: 'Patterns', icon: <Layers size={16} /> },
+  ];
+  return (
+    <nav className="space-y-6 sticky top-24">
+      <div>
+        <div className="text-xs uppercase tracking-wider text-slate-500 px-3 mb-2">Content</div>
+        <div className="space-y-1">
+          {items.map((item) => {
+            const isActive = active === item.tab;
+            return (
+              <button
+                key={item.tab}
+                onClick={() => onChange(item.tab)}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg transition text-left text-sm ${
+                  isActive ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700/60'
+                }`}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </nav>
+  );
+}
 
-        {loading ? (
-          <div className="bg-white rounded-xl shadow-lg p-12 flex flex-col items-center justify-center">
-            <RefreshCw className="w-12 h-12 text-slate-400 animate-spin mb-4" />
-            <p className="text-slate-600">Loading client data...</p>
-          </div>
-        ) : clientData ? (
-          <div className="space-y-6">
-            <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-slate-900 mb-4 flex items-center space-x-2">
-                <CreditCard className="w-6 h-6" />
-                <span>Cards Information</span>
-              </h2>
-              <div className="grid grid-cols-2 gap-6">
-                <div>
-                  <p className="text-sm text-slate-600 mb-1">Cards Version</p>
-                  <p className="text-2xl font-bold text-slate-900">{clientData.cardsVersion}</p>
-                </div>
-                <div>
-                  <p className="text-sm text-slate-600 mb-1">On-Demand Cards</p>
-                  <p className="text-2xl font-bold text-slate-900">
-                    {clientData.hasOnDemandCards ? (
-                      <span className="text-green-600">Yes</span>
-                    ) : (
-                      <span className="text-slate-400">No</span>
+function Section({
+  icon,
+  title,
+  headerExtra,
+  children,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  headerExtra?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="bg-slate-800/50 rounded-lg p-6 mb-6">
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-2">
+          {icon}
+          <h2 className="text-xl font-semibold">{title}</h2>
+        </div>
+        {headerExtra}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function PatternSection({
+  title,
+  rows,
+  icon,
+}: {
+  title: string;
+  rows: patternStore.PatternRow[];
+  icon: React.ReactNode;
+}) {
+  return (
+    <Section
+      icon={icon}
+      title={`${title} (${rows.length})`}
+    >
+      {rows.length === 0 ? (
+        <p className="text-slate-400 italic text-sm">None.</p>
+      ) : (
+        <div className="space-y-3">
+          {rows.map((p) => (
+            <div
+              key={p.pattern_uniqid}
+              className="flex items-center justify-between p-4 rounded-lg border border-slate-700 bg-slate-900/40"
+            >
+              <div className="flex-1">
+                <h3 className="font-semibold text-white">{p.name}</h3>
+                <div className="flex items-center gap-4 mt-1 text-sm text-slate-400 flex-wrap">
+                  <span>Game type: {p.game_type}</span>
+                  <span>
+                    Version: {p.local_version ?? '—'}
+                    {p.local_version !== p.remote_version && (
+                      <span className="text-amber-400 ml-1">(server v{p.remote_version})</span>
                     )}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-sm text-slate-600 mb-1">Billing Status</p>
-                  <p className="text-2xl font-bold">
-                    {clientData.billingUpToDate ? (
-                      <span className="text-green-600">Up to Date</span>
-                    ) : (
-                      <span className="text-red-600">Pending</span>
-                    )}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-sm text-slate-600 mb-1">License Type</p>
-                  <p className="text-2xl font-bold text-slate-900">{clientData.licenseType}</p>
+                  </span>
+                  <span className="font-mono text-xs px-2 py-1 rounded bg-slate-800 text-slate-300">
+                    {p.pattern_uniqid}
+                  </span>
                 </div>
               </div>
             </div>
-
-            <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-slate-900 mb-4 flex items-center space-x-2">
-                <Package className="w-6 h-6" />
-                <span>Default Patterns ({clientData.defaultPatterns.length})</span>
-              </h2>
-              {clientData.defaultPatterns.length === 0 ? (
-                <p className="text-slate-500 italic">No default patterns found</p>
-              ) : (
-                <div className="space-y-3">
-                  {clientData.defaultPatterns.map((pattern, index) => (
-                    <div
-                      key={index}
-                      className="flex items-center justify-between p-4 bg-slate-50 rounded-lg border border-slate-200"
-                    >
-                      <div className="flex-1">
-                        <h3 className="font-semibold text-slate-900">{pattern.name}</h3>
-                        <div className="flex items-center space-x-4 mt-1 text-sm text-slate-600">
-                          <span>Game Type: {pattern.game_type}</span>
-                          <span>Version: {pattern.version}</span>
-                          <span className="font-mono text-xs bg-slate-200 px-2 py-1 rounded">
-                            {pattern.uniqid}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-slate-900 mb-4 flex items-center space-x-2">
-                <Layers className="w-6 h-6" />
-                <span>Custom Patterns ({clientData.customPatterns.length})</span>
-              </h2>
-              {clientData.customPatterns.length === 0 ? (
-                <p className="text-slate-500 italic">No custom patterns found</p>
-              ) : (
-                <div className="space-y-3">
-                  {clientData.customPatterns.map((pattern, index) => (
-                    <div
-                      key={index}
-                      className="flex items-center justify-between p-4 bg-blue-50 rounded-lg border border-blue-200"
-                    >
-                      <div className="flex-1">
-                        <h3 className="font-semibold text-slate-900">{pattern.name}</h3>
-                        <div className="flex items-center space-x-4 mt-1 text-sm text-slate-600">
-                          <span>Game Type: {pattern.game_type}</span>
-                          <span>Version: {pattern.version}</span>
-                          <span className="font-mono text-xs bg-blue-200 px-2 py-1 rounded">
-                            {pattern.uniqid}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        ) : (
-          <div className="bg-white rounded-xl shadow-lg p-12 text-center">
-            <CreditCard className="w-16 h-16 text-slate-300 mx-auto mb-4" />
-            <p className="text-slate-500">Select a client to view their cards and patterns</p>
-          </div>
-        )}
-      </div>
-    </div>
+          ))}
+        </div>
+      )}
+    </Section>
   );
 }

@@ -1,5 +1,5 @@
 import { CheckCircle2 } from 'lucide-react';
-import { CardData } from '../services/usbReader';
+import { CardData } from '../services/sportidentService';
 
 interface CardDetectionAlertProps {
   cardData: CardData | null;

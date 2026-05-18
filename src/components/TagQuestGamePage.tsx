@@ -1,10 +1,32 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { ArrowLeft, Play, Users, Trophy } from 'lucide-react';
 import { GameConfig } from './LaunchGameModal';
-import { usbReaderService, CardData, StationData } from '../services/usbReader';
+import { sportidentService as usbReaderService, CardData, StationData, detectReaderPort } from '../services/sportidentService';
+import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { CardDetectionAlert } from './CardDetectionAlert';
 import { PunchAnimationOverlay } from './PunchAnimationOverlay';
-import { supabase } from '../lib/db';
+import * as scenarioStore from '../services/scenarioStore';
+import * as layoutStore from '../services/layoutStore';
+import * as translationsStore from '../services/translationsStore';
+import {
+  resolveAdminLabelRuntime,
+  type AdminLabelKey,
+  type AdminTranslationsValue,
+} from '../scenarios/tagquest/defaultPreviewLabels';
+import { scenarioAssetUrl } from '../services/contentFs';
+import { resolveFontFamily } from '../fonts/resolveFontFamily';
+import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
+// Bundled fallback (hand-mirror of studio's defaultTagquestLayout.ts). The
+// playground uses this when its SQLite cache is empty, OR when the bundled
+// version is newer than what was synced (transition window after a studio
+// migration). Keep this file in lockstep with the canonical TS source.
+import bundledTagquestLayout from '../scenarios/tagquest/defaultLayout.json';
+import {
+  getLaunchedGameState,
+  getLaunchedGameMeta,
+  recordPunch,
+  updateTeam,
+} from '../services/launchedGames';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { processTagQuestPunch } from '../services/tagquestPunchLogic';
 import type { PunchAnimationData } from '../services/tagquestPunchLogic';
@@ -53,7 +75,20 @@ interface GameData {
   };
   quests?: GameQuest[];
   levels?: Record<string, GameLevel>;
+  game_meta?: TagquestGameMetaRuntime;
+  default_language?: string;
 }
+
+interface TagquestGameMetaRuntime {
+  background_image?: string;
+  malus_image?: string;
+  late_malus_image?: string;
+  custom_template?: string;
+  use_default_template?: boolean;
+  [k: string]: unknown;
+}
+
+const DEFAULT_TAGQUEST_TEMPLATE_URL = '/default_templates/tagquest_template.png';
 
 interface TeamScore {
   id: number;
@@ -65,14 +100,16 @@ interface TeamScore {
   currentLevel?: { level: number; name: string } | null;
 }
 
+type LayoutDim = number | 'auto' | 'fit-content' | 'min-content' | 'max-content';
+
 interface LayoutElement {
   id: string;
   type: 'image' | 'text' | 'container' | 'quest';
   name?: string;
   x?: number;
   y?: number;
-  width?: number;
-  height?: number;
+  width?: LayoutDim;
+  height?: LayoutDim;
   src?: string;
   filename?: string;
   text?: string;
@@ -99,13 +136,33 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const [gameData, setGameData] = useState<GameData | null>(null);
   const [layout, setLayout] = useState<GameLayout | null>(null);
   const [layoutLoading, setLayoutLoading] = useState(true);
+  const [adminTranslations, setAdminTranslations] = useState<AdminTranslationsValue | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const v = await translationsStore.getValue<AdminTranslationsValue>('tagquest_translations');
+        if (active) setAdminTranslations(v);
+      } catch {
+        if (active) setAdminTranslations(null);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
   const [gameStarted, setGameStarted] = useState(true);
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
   const [showCardAlert, setShowCardAlert] = useState(false);
+  // Banner shown when the SportIdent reader isn't plugged in — the game
+  // page autobinds via 'reader:status' once detection flips, so this is
+  // purely informational. Hidden in non-Tauri contexts where the reader
+  // service is unavailable entirely.
+  const detectedReader = useDetectedReaderPort();
   const [teams, setTeams] = useState<TeamScore[]>([]);
   const [gameMessage, setGameMessage] = useState('');
   const [levelUpMessage, setLevelUpMessage] = useState('');
-  const [mediaFiles, setMediaFiles] = useState<Record<string, string>>({});
   const [bgDimensions, setBgDimensions] = useState<{ width: number; height: number } | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [launchedGameInfo, setLaunchedGameInfo] = useState<{ start_time: string | null; duration: number | null } | null>(null);
@@ -120,6 +177,30 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const [animShowUpdated, setAnimShowUpdated] = useState(false);
   const [animDisplayedScore, setAnimDisplayedScore] = useState(0);
   const [animDisplayedCombos, setAnimDisplayedCombos] = useState({ combos6: 0, combos4: 0, combos2: 0 });
+  const visibilityMode = config.visibilityMode ?? 'persist';
+  const visibilityHideDelayMs = Math.max(0, (config.visibilityHideDelaySec ?? 5)) * 1000;
+  // Static combo points read from gameMeta — used between animations when
+  // `punchAnimation?.comboPoints` is null. The same parsing as
+  // `getComboPoints` in tagquestPunchLogic.
+  const staticComboPoints = (() => {
+    const m = gameData?.game_meta as Record<string, unknown> | undefined;
+    const parse = (v: unknown): number => {
+      if (v == null) return 0;
+      if (typeof v === 'number') return v;
+      if (typeof v === 'string') return parseInt(v, 10) || 0;
+      return 0;
+    };
+    return {
+      pts6: parse(m?.combo_6_quests),
+      pts4: parse(m?.combo_4_quests),
+      pts2: parse(m?.combo_2_quests),
+    };
+  })();
+  // For 'hide_after_delay': starts false, flips to true at animation start, flips
+  // back to false after the configured delay following animation 'exit'.
+  // For 'persist': starts false, flips to true on first animation, stays true.
+  const [hudValuesVisible, setHudValuesVisible] = useState(false);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [animDisplayedMalus, setAnimDisplayedMalus] = useState(0);
   const [animDisplayedLateMalus, setAnimDisplayedLateMalus] = useState(0);
   const [lastKnownScore, setLastKnownScore] = useState(0);
@@ -132,7 +213,6 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
   const bgImageRef = useRef<HTMLImageElement>(null);
   const gameDataRef = useRef<GameData | null>(null);
-  const mediaFilesRef = useRef<Record<string, string>>({});
 
   const animSet = (fn: () => void, ms: number) => {
     if (animTimerRef.current) clearTimeout(animTimerRef.current);
@@ -227,6 +307,32 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }
   }, [animPhase]);
 
+  // Visibility-mode driver. Shows HUD values during animations; for
+  // 'hide_after_delay' starts a fade-out timer when animation ends.
+  useEffect(() => {
+    if (animPhase !== 'idle') {
+      if (hideTimerRef.current) {
+        clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = null;
+      }
+      setHudValuesVisible(true);
+      return;
+    }
+    if (visibilityMode === 'persist') return;
+    if (visibilityMode === 'hide_after_delay') {
+      hideTimerRef.current = setTimeout(() => {
+        setHudValuesVisible(false);
+        hideTimerRef.current = null;
+      }, visibilityHideDelayMs);
+    }
+    return () => {
+      if (hideTimerRef.current) {
+        clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = null;
+      }
+    };
+  }, [animPhase, visibilityMode, visibilityHideDelayMs]);
+
   useEffect(() => {
     if (animPhase === 'exit') {
       animSet(async () => {
@@ -243,7 +349,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           setLastKnownMalus(punchAnimation.newMalus ?? 0);
           setLastKnownLateMalus(punchAnimation.newLateMalus ?? 0);
           if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-            await supabase.from('teams').update({ end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore }).eq('id', punchAnimation.teamId);
+            await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
           }
         }
         setAnimPhase('idle');
@@ -279,181 +385,97 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   useEffect(() => {
     const loadGameData = async () => {
       try {
-        const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-        if (isElectron) {
-          const gameDataContent = await (window as any).electron.games.readFile(gameUniqid, 'game-data.json');
-          const data = JSON.parse(gameDataContent);
-          const rawGdj = data?.game_data ?? data;
-          const gdElectron: GameData = {
+        // game-data.json + media files come from the local SQLite/FS store
+        // (download_scenario / download_media); layouts come from layoutStore.
+        // Images resolve via the scenario:// protocol — no disk walk needed
+        // because the Rust handler joins on the row's current local_version
+        // at request time.
+        const scenarioRow = await scenarioStore.get(gameUniqid);
+        const gdjRaw = (await scenarioStore.getGameData(gameUniqid)) as
+          | { game_data?: any }
+          | any
+          | null;
+        if (gdjRaw && scenarioRow) {
+          const rawGdjWeb = gdjRaw.game_data ?? gdjRaw;
+          const quests = rawGdjWeb?.quests || [];
+          const gdWeb: GameData = {
             game: {
               id: gameUniqid,
               uniqid: gameUniqid,
-              type: 'tagquest',
-              title: data.title || data.game?.title || gameUniqid,
+              type: scenarioRow.game_type,
+              title: scenarioRow.title,
             },
-            quests: rawGdj.quests || [],
-            levels: rawGdj.game_meta?.levels ?? rawGdj.levels ?? undefined,
+            quests,
+            levels: rawGdjWeb?.game_meta?.levels ?? rawGdjWeb?.levels ?? undefined,
+            game_meta: (rawGdjWeb?.game_meta as TagquestGameMetaRuntime | undefined) ?? undefined,
           };
-          gameDataRef.current = gdElectron;
-          setGameData(gdElectron);
+          gameDataRef.current = gdWeb;
+          setGameData(gdWeb);
+          // Register the scenario's uploaded custom fonts so a Typography
+          // selection that points at one renders (offline-safe).
+          void registerScenarioFonts(gameUniqid, rawGdjWeb?.game_meta?.custom_fonts);
+        }
 
-          const csvContent = await (window as any).electron.games.readFile(gameUniqid, 'csv/game_media_images.csv');
-          if (csvContent) {
-            const lines = csvContent.split('\n');
-            const headers = lines[0].split(',');
-            const mediaMap: Record<string, string> = {};
-
-            for (let i = 1; i < lines.length; i++) {
-              const line = lines[i].trim();
-              if (!line) continue;
-
-              const values = line.split(',');
-              const id = values[0];
-              const uuid = values[3];
-              const fileName = values[6];
-
-              if (id && uuid && fileName) {
-                const mediaPath = `data/games/${gameUniqid}/media/${uuid}/${fileName}`;
-                mediaMap[id] = mediaPath;
-                mediaMap[fileName] = mediaPath;
-              }
-            }
-
-            setMediaFiles(mediaMap);
-            mediaFilesRef.current = mediaMap;
-            console.log('Loaded media files:', mediaMap);
+        // Layout resolution order:
+        //   1. SQLite (synced from studio MySQL). Take the highest remote_version
+        //      row that has layout_data_json set.
+        //   2. Bundled JSON (hand-mirror of studio's defaultLayout.ts).
+        //   3. Pick whichever has the higher `version` string. Ties go to SQLite
+        //      so a published layout always wins once it's been synced.
+        //
+        // localStorage 'layout_tagquest' is no longer consulted — the bundled
+        // fallback supersedes it.
+        let sqliteLayout: GameLayout | null = null;
+        try {
+          const layouts = await layoutStore.list({ gameType: 'tagquest' });
+          const downloaded = layouts.filter((l) => l.layout_data_json != null);
+          if (downloaded.length > 0) {
+            downloaded.sort((a, b) => b.remote_version - a.remote_version);
+            const parsed = JSON.parse(downloaded[0].layout_data_json!);
+            sqliteLayout = (parsed.config ?? parsed.layout_data ?? parsed) as GameLayout;
           }
+        } catch (err) {
+          console.warn('[TagQuest] failed to read layout from local store:', err);
+        }
 
-          const layoutResult = await (window as any).electron.layouts.readFile('tagquest');
-          if (layoutResult.success) {
-            const layoutData = JSON.parse(layoutResult.content);
-            setLayout(layoutData);
-            console.log('Layout loaded:', layoutData);
-          } else {
-            console.warn('No layout found for tagquest:', layoutResult.error);
+        const bundledLayout = bundledTagquestLayout as unknown as GameLayout;
+
+        // Compare semver-ish version strings. `compareVersions(a, b)` returns
+        // > 0 when a > b, < 0 when a < b, 0 when equal. Missing/unparseable
+        // versions are treated as 0.0.0 so a layout that omits `version`
+        // (legacy) loses to the bundled one.
+        const compareVersions = (a: string | undefined, b: string | undefined): number => {
+          const parts = (s: string | undefined) =>
+            (s ?? '').split('.').map((p) => parseInt(p, 10) || 0);
+          const av = parts(a);
+          const bv = parts(b);
+          const n = Math.max(av.length, bv.length);
+          for (let i = 0; i < n; i++) {
+            const diff = (av[i] ?? 0) - (bv[i] ?? 0);
+            if (diff !== 0) return diff;
           }
+          return 0;
+        };
+
+        let layoutConfig: GameLayout;
+        if (sqliteLayout && compareVersions(sqliteLayout.version, bundledLayout.version) >= 0) {
+          layoutConfig = sqliteLayout;
         } else {
-          const { data: scenarioData, error } = await supabase
-            .from('scenarios')
-            .select('*')
-            .eq('uniqid', gameUniqid)
-            .maybeSingle();
-
-          if (error) {
-            console.error('Error loading scenario:', error);
-            return;
-          }
-
-          if (scenarioData) {
-            let gdj = scenarioData.game_data_json;
-
-            if (!gdj) {
-              const { data: gameDataFile } = await supabase.storage
-                .from('resources')
-                .download(`scenarios/${gameUniqid}/game-data.json`);
-
-              if (gameDataFile) {
-                const text = await gameDataFile.text();
-                gdj = JSON.parse(text);
-              }
-            }
-
-            const rawGdjWeb = gdj?.game_data ?? gdj;
-            const quests = rawGdjWeb?.quests || [];
-            const gdWeb: GameData = {
-              game: {
-                id: scenarioData.id.toString(),
-                uniqid: scenarioData.uniqid,
-                type: scenarioData.game_type,
-                title: scenarioData.title
-              },
-              quests,
-              levels: rawGdjWeb?.game_meta?.levels ?? rawGdjWeb?.levels ?? undefined,
-            };
-            gameDataRef.current = gdWeb;
-            setGameData(gdWeb);
-          }
-
-          const mediaByFilename: Record<string, string> = {};
-
-          const { data: storageMediaFiles } = await supabase.storage
-            .from('resources')
-            .list(`scenarios/${gameUniqid}/media`, { limit: 1000 });
-
-          if (storageMediaFiles) {
-            for (const file of storageMediaFiles) {
-              if (file.name) {
-                const { data: urlData } = supabase.storage
-                  .from('resources')
-                  .getPublicUrl(`scenarios/${gameUniqid}/media/${file.name}`);
-                const url = urlData.publicUrl;
-                const baseName = file.name.startsWith('media/') ? file.name.slice('media/'.length) : file.name;
-                mediaByFilename[baseName] = url;
-                mediaByFilename[`media/${baseName}`] = url;
-              }
-            }
-          }
-
-          setMediaFiles(prev => ({ ...prev, ...mediaByFilename }));
-
-          mediaFilesRef.current = { ...mediaFilesRef.current, ...mediaByFilename };
-          const bgEntry = mediaByFilename['fond-ecran-taille-ok.jpg'] || null;
-
-          let layoutConfig: GameLayout | null = null;
-
-          const { data: storageFiles } = await supabase.storage
-            .from('resources')
-            .list('layouts/tagquest', { limit: 100 });
-
-          if (storageFiles && storageFiles.length > 0) {
-            const jsonFiles = storageFiles
-              .filter(f => f.name.endsWith('.json'))
-              .sort((a, b) => {
-                const vA = parseInt(a.name.match(/(\d+)/)?.[1] ?? '0', 10);
-                const vB = parseInt(b.name.match(/(\d+)/)?.[1] ?? '0', 10);
-                return vB - vA;
-              });
-
-            if (jsonFiles.length > 0) {
-              const { data: fileData } = await supabase.storage
-                .from('resources')
-                .download(`layouts/tagquest/${jsonFiles[0].name}`);
-
-              if (fileData) {
-                const text = await fileData.text();
-                const parsed = JSON.parse(text);
-                layoutConfig = (parsed.config ?? parsed) as GameLayout;
-              }
-            }
-          }
-
-          if (!layoutConfig) {
-            const layoutStr = localStorage.getItem('layout_tagquest');
-            if (layoutStr) {
-              layoutConfig = JSON.parse(layoutStr) as GameLayout;
-            }
-          }
-
-          if (layoutConfig) {
-            const resolvedElements = (layoutConfig.elements || []).map((el: LayoutElement) => {
-              if (el.type === 'image' && el.filename) {
-                const fname = el.filename.split('/').pop() ?? '';
-                const resolved = mediaByFilename[fname];
-                if (resolved) return { ...el, src: resolved };
-              }
-              return el;
-            });
-
-            setLayout({
-              ...layoutConfig,
-              background: bgEntry || layoutConfig.background,
-              elements: resolvedElements
-            });
-          } else {
-            console.warn('No layout found for tagquest');
+          layoutConfig = bundledLayout;
+          if (sqliteLayout) {
+            console.info('[TagQuest] bundled layout v%s supersedes SQLite v%s', bundledLayout.version, sqliteLayout.version);
           }
         }
+
+        // Leave element.filename as-is — sentinel filenames (`@template`,
+        // `@background`, `@malus_image`, `@quest_main_image_N`) are resolved
+        // at render time against the per-scenario gameMeta. Non-sentinel
+        // filenames resolve via `scenarioAssetUrl` in the same place.
+        setLayout({
+          ...layoutConfig,
+          background: layoutConfig.background || '@background',
+          elements: layoutConfig.elements || [],
+        });
       } catch (error) {
         console.error('Error loading game data:', error);
       } finally {
@@ -477,15 +499,14 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
     const startAllTeams = async () => {
       const startTime = Math.floor(Date.now() / 1000);
-      const { error } = await supabase
-        .from('teams')
-        .update({ start_time: startTime, end_time: null })
-        .eq('launched_game_id', launchedGameId);
-
-      if (error) {
-        console.error('[TagQuest] Error starting all teams:', error);
-      } else {
+      try {
+        const state = await getLaunchedGameState(launchedGameId, 0);
+        await Promise.all(
+          state.teams.map((t) => updateTeam(t.id, { start_time: startTime, end_time: null }))
+        );
         console.log('[TagQuest] All teams started at', startTime);
+      } catch (err) {
+        console.error('[TagQuest] Error starting all teams:', err);
       }
     };
 
@@ -496,28 +517,17 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     if (!launchedGameId) return;
 
     const fetchLaunchedGame = async () => {
-      const { data } = await supabase
-        .from('launched_games')
-        .select('start_time, duration')
-        .eq('id', launchedGameId)
-        .maybeSingle();
-
-      if (data) {
-        setLaunchedGameInfo({ start_time: data.start_time, duration: data.duration });
+      try {
+        const state = await getLaunchedGameState(launchedGameId, 0);
+        setLaunchedGameInfo({ start_time: state.start_time, duration: state.duration });
+      } catch (err) {
+        console.error('[TagQuest] fetchLaunchedGame failed:', err);
       }
     };
 
     const fetchMeta = async () => {
-      const { data } = await supabase
-        .from('launched_game_meta')
-        .select('meta_name, meta_value')
-        .eq('launched_game_id', launchedGameId)
-        .in('meta_name', ['victoryType', 'playMode', 'teamsConfig']);
-
-      if (data) {
-        const map: Record<string, string> = {};
-        data.forEach(row => { map[row.meta_name] = row.meta_value || ''; });
-
+      try {
+        const map = await getLaunchedGameMeta(launchedGameId);
         if (map.victoryType === 'score' || map.victoryType === 'speed') {
           setVictoryType(map.victoryType);
         }
@@ -525,10 +535,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           setPlayMode(map.playMode);
         }
         if (map.teamsConfig) {
-          try {
-            setTeamsConfig(JSON.parse(map.teamsConfig));
-          } catch {}
+          try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
+      } catch (err) {
+        console.error('[TagQuest] fetchMeta failed:', err);
       }
     };
 
@@ -571,15 +581,15 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
   const loadTeams = async () => {
     if (!launchedGameId) return;
-
-    const { data, error } = await supabase
-      .from('teams')
-      .select('id, team_name, score, start_time, end_time, key_id')
-      .eq('launched_game_id', launchedGameId);
-
-    if (!error && data) {
-      const withLevels = data.map(t => ({
-        ...t,
+    try {
+      const state = await getLaunchedGameState(launchedGameId, 0);
+      const withLevels = state.teams.map((t) => ({
+        id: t.id,
+        team_name: t.team_name ?? '',
+        score: t.score,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        key_id: t.key_id ?? 0,
         currentLevel: getTeamLevel(t.score ?? 0),
       }));
       const sorted = [...withLevels].sort((a, b) => {
@@ -595,48 +605,34 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         return (b.score ?? 0) - (a.score ?? 0);
       });
       setTeams(sorted);
+    } catch (err) {
+      console.error('[TagQuest] loadTeams failed:', err);
     }
   };
 
   const saveCardData = async (card: CardData) => {
-    if (!supabase || !launchedGameId) {
-      return;
-    }
-
+    if (!launchedGameId) return;
     try {
-      let deviceId = 'web_browser';
-      const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-      if (isElectron) {
-        try {
-          deviceId = await (window as any).electron.getComputerName();
-        } catch (error) {
-          console.error('Error getting computer name:', error);
-        }
-      }
-
       const rawDataJson = JSON.parse(JSON.stringify(card));
-
-      const { error } = await supabase.from('launched_game_raw_data').insert({
-        launched_game_id: launchedGameId,
-        device_id: deviceId,
-        raw_data: rawDataJson,
-      });
-
-      if (error) {
-        console.error('Error saving card data:', error);
-      } else {
-        console.log('✓ Card data saved successfully');
-      }
+      // Server resolves device_id from the JWT (slice 1's auth_tokens.device_id);
+      // no need to send it from the client.
+      await recordPunch(launchedGameId, rawDataJson);
     } catch (error) {
       console.error('Error saving card data:', error);
     }
   };
 
   const resolveMedia = useCallback((key: string): string => {
-    const m = mediaFilesRef.current;
-    return m[key] || m[key.replace(/^media\//, '')] || m[`media/${key}`] || '';
-  }, []);
+    if (!key) return '';
+    return scenarioAssetUrl(gameUniqid, key.replace(/^media\//, ''));
+  }, [gameUniqid]);
+
+  // Scenario-wide font from the Typography section. Empty when no font is set
+  // (falls through to the layout element / page default). When set it
+  // overrides every layout element's own fontFamily — see renderLayoutElement.
+  const scenarioFontFamily = resolveFontFamily(
+    gameData?.game_meta?.font as string | undefined,
+  );
 
   const handleCardPunchLogic = async (card: CardData) => {
     if (!launchedGameId) return;
@@ -659,16 +655,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       errorMessage: result.status !== 'ok' ? result.message : undefined,
     });
 
-    supabase.from('team_punch_responses').insert({
-      launched_game_id: launchedGameId,
-      team_id: result.team_id ?? null,
-      team_name: result.team_name ?? '',
-      chip_id: card.id ?? null,
-      status: result.status,
-      result_json: result as unknown as Record<string, unknown>,
-    }).then(({ error }) => {
-      if (error) console.error('Error saving punch response:', error);
-    });
+    // team_punch_responses (analytics ride-along) is not migrated to studio
+    // MySQL in slice 3 — punch logging already happens via recordPunch +
+    // logApiCall above. If we want a dedicated response audit log later, add
+    // an endpoint then re-enable a write here.
 
     if (result.status === 'ok') {
       if (result.animationData) {
@@ -732,80 +722,156 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   }, []);
 
   useEffect(() => {
-    const initializeUSB = async () => {
-      if (usbReaderService.isElectron() && config.usbPort) {
-        try {
-          console.log('🔌 Initializing USB reader on port:', config.usbPort);
-          const initialized = await usbReaderService.initializePort(config.usbPort);
-          if (initialized) {
-            console.log('✓ USB reader initialized successfully');
-            usbReaderService.setCardDetectedCallback((card: CardData) => {
-              console.log('🏷️  CARD DETECTED:', card);
-              saveCardData(card);
-              setLastCardData(card);
-              setShowCardAlert(true);
-              setTimeout(() => setShowCardAlert(false), 5000);
-            });
+    // Auto-detect the SportIdent reader on start. If the dongle isn't
+    // plugged in yet, the global 'reader:status' event (emitted by
+    // Footer's 10s poll) re-fires this effect and tries again — that's
+    // the hotplug path.
+    let cancelled = false;
 
-            usbReaderService.setCardRemovedCallback(() => {
-              console.log('🏷️  CARD REMOVED');
-              setShowCardAlert(false);
-            });
-          }
-        } catch (error) {
-          console.error('Error initializing USB reader:', error);
+    const initializeUSB = async () => {
+      if (!usbReaderService.isAvailable()) return;
+      const detected = await detectReaderPort();
+      if (cancelled || !detected) return;
+
+      try {
+        console.log('🔌 Initializing USB reader on detected port:', detected.path);
+        const initialized = await usbReaderService.initializePort(detected.path);
+        if (initialized) {
+          console.log('✓ USB reader initialized successfully');
+          usbReaderService.setCardDetectedCallback((card: CardData) => {
+            console.log('🏷️  CARD DETECTED:', card);
+            saveCardData(card);
+            setLastCardData(card);
+            setShowCardAlert(true);
+            setTimeout(() => setShowCardAlert(false), 5000);
+          });
+
+          usbReaderService.setCardRemovedCallback(() => {
+            console.log('🏷️  CARD REMOVED');
+            setShowCardAlert(false);
+          });
+
+          // Phase 1 diagnostic: start the read loop so the SportIdent dongle
+          // on the mother actually surfaces punches. Mirrors MysteryGamePage.
+          // If this causes double-counting with the LAN backend's raw_data
+          // polling in production, revisit the TagQuest USB architecture.
+          console.log('▶️  Starting USB reader...');
+          await usbReaderService.start();
+          console.log('✓ USB reader started - waiting for card data...');
         }
+      } catch (error) {
+        console.error('Error initializing USB reader:', error);
       }
+    };
+
+    const onReaderStatus = () => {
+      void initializeUSB();
     };
 
     if (gameStarted) {
-      initializeUSB();
+      void initializeUSB();
+      window.addEventListener('reader:status', onReaderStatus);
     }
 
     return () => {
-      if (usbReaderService.isElectron()) {
-        usbReaderService.stopReading();
+      cancelled = true;
+      window.removeEventListener('reader:status', onReaderStatus);
+      if (usbReaderService.isAvailable()) {
+        usbReaderService.stop().catch(err => {
+          console.error('Error stopping USB reader:', err);
+        });
       }
     };
-  }, [gameStarted, config.usbPort]);
+  }, [gameStarted]);
 
+  // The HUD lives in a fixed 16:9 "stage" centered in the viewport.
+  // Background image is a separate full-bleed layer underneath that fills
+  // the viewport via objectFit:'cover'. Text/template positions are
+  // percentages of the stage box, never the viewport — so they don't drift
+  // when the viewport aspect ratio is not 16:9 (letterbox/pillarbox).
+  const TEMPLATE_ASPECT = 16 / 9;
   const updateBgDimensions = useCallback(() => {
-    if (bgImageRef.current) {
-      setBgDimensions({
-        width: bgImageRef.current.offsetWidth,
-        height: bgImageRef.current.offsetHeight
-      });
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let width: number;
+    let height: number;
+    if (vw / vh > TEMPLATE_ASPECT) {
+      // Viewport wider than 16:9 — height-limited, pillarbox left/right.
+      height = vh;
+      width = vh * TEMPLATE_ASPECT;
+    } else {
+      // Viewport narrower than 16:9 — width-limited, letterbox top/bottom.
+      width = vw;
+      height = vw / TEMPLATE_ASPECT;
     }
-  }, []);
+    setBgDimensions({ width, height });
+  }, [TEMPLATE_ASPECT]);
 
   useEffect(() => {
-    const observer = new ResizeObserver(updateBgDimensions);
-    if (bgImageRef.current) observer.observe(bgImageRef.current);
+    updateBgDimensions();
     window.addEventListener('resize', updateBgDimensions);
     return () => {
-      observer.disconnect();
       window.removeEventListener('resize', updateBgDimensions);
     };
-  }, [updateBgDimensions, layout]);
+  }, [updateBgDimensions]);
+
+  // Resolve sentinel filenames (`@…`) against per-scenario gameMeta.
+  // Non-sentinel filenames pass through `scenarioAssetUrl` which targets
+  // the scenario:// protocol for the current local_version.
+  const resolveImageFilename = useCallback((filename: string | undefined): string => {
+    if (!filename) return '';
+    if (!filename.startsWith('@')) {
+      return scenarioAssetUrl(gameUniqid, filename);
+    }
+    const meta = gameDataRef.current?.game_meta;
+    if (filename === '@background') {
+      return meta?.background_image ? scenarioAssetUrl(gameUniqid, meta.background_image) : '';
+    }
+    if (filename === '@template' || filename === '@default') {
+      const useDefault = meta?.use_default_template !== false; // default true when missing
+      if (!useDefault && meta?.custom_template) {
+        return scenarioAssetUrl(gameUniqid, meta.custom_template);
+      }
+      return DEFAULT_TAGQUEST_TEMPLATE_URL;
+    }
+    if (filename === '@malus_image') {
+      return meta?.malus_image ? scenarioAssetUrl(gameUniqid, meta.malus_image) : '';
+    }
+    if (filename === '@late_malus_image') {
+      return meta?.late_malus_image ? scenarioAssetUrl(gameUniqid, meta.late_malus_image) : '';
+    }
+    const questMatch = filename.match(/^@quest_main_image_(\d+)$/);
+    if (questMatch) {
+      const idx = parseInt(questMatch[1], 10) - 1;
+      const main = gameDataRef.current?.quests?.[idx]?.main_image;
+      return main ? scenarioAssetUrl(gameUniqid, main) : '';
+    }
+    return '';
+  }, [gameUniqid]);
 
   const renderLayoutElement = (element: LayoutElement, index: number): JSX.Element | JSX.Element[] => {
     if (!bgDimensions) {
       return <div key={`${element.id}-${index}`} />;
     }
 
+    const dimToCss = (
+      v: LayoutDim | undefined,
+      base: number,
+    ): string | undefined => {
+      if (v === undefined) return undefined;
+      if (typeof v === 'string') return v;        // 'auto' | 'fit-content' | 'min-content' | 'max-content'
+      return `${(v / 100) * base}px`;
+    };
     const wrapperStyle: React.CSSProperties = {
       position: 'absolute',
       left: element.x !== undefined ? `${(element.x / 100) * bgDimensions.width}px` : undefined,
       top: element.y !== undefined ? `${(element.y / 100) * bgDimensions.height}px` : undefined,
-      width: element.width !== undefined ? `${(element.width / 100) * bgDimensions.width}px` : undefined,
-      height: element.height !== undefined ? `${(element.height / 100) * bgDimensions.height}px` : undefined,
+      width: dimToCss(element.width, bgDimensions.width),
+      height: dimToCss(element.height, bgDimensions.height),
       ...element.style
     };
 
-    let imageSrc = element.src || element.filename;
-    if (element.type === 'image' && !imageSrc && element.id) {
-      imageSrc = mediaFiles[element.id] || '';
-    }
+    let imageSrc = element.src || resolveImageFilename(element.filename);
 
     const isAnimating = animPhase !== 'idle';
     const activeQuestIndex = punchAnimation?.displayQuest?.index != null ? punchAnimation.displayQuest.index - 1 : -1;
@@ -816,7 +882,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
       const resolveMedia = (key: string | undefined): string => {
         if (!key) return '';
-        return mediaFiles[key] || mediaFiles[key.replace(/^media\//, '')] || mediaFiles[`media/${key}`] || '';
+        return scenarioAssetUrl(gameUniqid, key.replace(/^media\//, ''));
       };
 
       return quests.map((quest, questIndex) => {
@@ -930,8 +996,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 width: '100%',
                 display: 'flex',
                 color: element.color || '#fff',
-                fontFamily: element.fontFamily,
-                fontSize: element.fontSize !== undefined ? `${(element.fontSize / 100) * (element.height !== undefined ? (element.height / 100) * bgDimensions.height : bgDimensions.height)}px` : '1em',
+                fontFamily: scenarioFontFamily || element.fontFamily,
+                fontSize: element.fontSize !== undefined ? `${element.fontSize}px` : '1em',
                 alignItems: 'center',
                 justifyContent: 'center',
                 textAlign: 'center',
@@ -948,10 +1014,29 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }
 
     const elementId = element.id?.toLowerCase() ?? '';
-    const isTitle = elementId.includes('_title') || elementId.includes('_label') || elementId.endsWith('title') || elementId.endsWith('label');
+    // Admin-managed HUD label IDs (resolved against the tagquest_translations row).
+    const ADMIN_LABEL_KEYS: Record<string, AdminLabelKey> = {
+      score_label: 'score',
+      malus_label: 'malus',
+      late_malus_label: 'late_malus',
+      combo_points_label: 'combo_points',
+    };
+    const adminLabelKey: AdminLabelKey | undefined = ADMIN_LABEL_KEYS[elementId];
+    // Note: `isTitle` historically swept up anything ending in `_title`/`_label`.
+    // Exclude the admin-managed labels here so they fall through to their
+    // dedicated text branch below (otherwise they'd render their previewText).
+    const isTitle = !adminLabelKey && (
+      elementId.includes('_title') ||
+      elementId.includes('_label') ||
+      elementId.endsWith('title') ||
+      elementId.endsWith('label')
+    );
     const isQuestPoints = /quest_\d+_points/.test(elementId);
     const isQuestMultiplicator = /quest_\d+_multiplicat/.test(elementId);
-    const isQuestName = /quest_\d+_name/.test(elementId);
+    // Anchored — must NOT match `animation_quest_name`. Per-slot quest names
+    // in the right strip only.
+    const isQuestName = /^quest_\d+_name$/.test(elementId);
+    const isActiveQuestName = elementId === 'animation_quest_name';
     const isCombo6 = !isTitle && !isQuestMultiplicator && (elementId.includes('combo_6') || elementId.includes('combo6'));
     const isCombo4 = !isTitle && !isQuestMultiplicator && (elementId.includes('combo_4') || elementId.includes('combo4'));
     const isCombo2 = !isTitle && !isQuestMultiplicator && (elementId.includes('combo_2') || elementId.includes('combo2'));
@@ -962,7 +1047,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     const isTeamName = elementId === 'team_name_text';
     const isTimer = elementId.includes('timer') || elementId.includes('countdown');
 
-    const elementHeightPx = element.height !== undefined ? (element.height / 100) * bgDimensions.height : bgDimensions.height;
+    // fontSize is a fixed pixel value defined in defaultLayout.ts — no
+    // adaptive scaling. The author tunes it directly against the artwork.
 
     const questIndexForElement = (() => {
       const m = elementId.match(/quest_(\d+)_/);
@@ -973,9 +1059,27 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       details.find(d => d.questIndex === qi);
 
     const isQuestSpecificImage = questIndexForElement >= 0;
-    const imageVisible = isTimer || (isAnimating && (
-      !isQuestSpecificImage || questIndexForElement === activeQuestIndex
-    ));
+    const isQuestIcon = /^quest_\d+_icon$/.test(elementId);
+
+    const valuesShow = isAnimating || hudValuesVisible;
+    let imageVisible: boolean;
+    if (elementId === 'tagquest_template' || elementId === 'background_image') {
+      // Template overlay + background-image elements are always visible.
+      imageVisible = true;
+    } else if (elementId === 'malus_icon') {
+      const m = isAnimating ? animDisplayedMalus : lastKnownMalus;
+      imageVisible = valuesShow && m > 0;
+    } else if (elementId === 'late_malus_icon') {
+      const l = isAnimating ? animDisplayedLateMalus : lastKnownLateMalus;
+      imageVisible = valuesShow && l > 0;
+    } else if (isQuestIcon && questIndexForElement >= 0) {
+      const qd = getQuestDetail(lastKnownQuestDetails, questIndexForElement);
+      imageVisible = valuesShow && !!qd && qd.timesCompleted > 0;
+    } else {
+      imageVisible = isTimer || (isAnimating && (
+        !isQuestSpecificImage || questIndexForElement === activeQuestIndex
+      ));
+    }
 
     switch (element.type) {
       case 'image':
@@ -996,25 +1100,41 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           showElement = true;
           displayText = countdown !== null ? formatTime(countdown) : formatTime(0);
         } else if (isTeamName) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           displayText = punchAnimation?.teamName ?? '';
         } else if (isTotalScore) {
           showElement = true;
           displayText = isAnimating ? animDisplayedScore : lastKnownScore;
+        } else if (adminLabelKey) {
+          // Admin-managed HUD label (score/malus/late_malus/combo_points).
+          // Always visible; resolution language defaults to fr unless the
+          // scenario explicitly carries default_language.
+          showElement = true;
+          const lang = gameData?.default_language || 'fr';
+          displayText = resolveAdminLabelRuntime(adminTranslations, adminLabelKey, lang, lang);
+        } else if (isActiveQuestName) {
+          // Beneath the central grid. Visible only while a punch animation
+          // is playing — matches the grid's own visibility.
+          showElement = isAnimating && activeQuestIndex >= 0;
+          displayText = activeQuestIndex >= 0
+            ? (gameData?.quests?.[activeQuestIndex]?.name ?? '')
+            : '';
         } else if (isQuestName && questIndexForElement >= 0) {
-          showElement = isAnimating && questIndexForElement === activeQuestIndex;
+          // Per-slot quest name in the right strip. Visible iff there is a
+          // backing quest at that slot (mirrors the icon/mult/points logic).
           const quest = gameData?.quests?.[questIndexForElement];
+          showElement = !!quest;
           displayText = quest?.name ?? '';
         } else if (isQuestPoints && questIndexForElement >= 0) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const isActiveQuest = questIndexForElement === activeQuestIndex;
           const details = isAnimating
             ? (animShowUpdated && isActiveQuest ? (punchAnimation?.newQuestDetails ?? []) : (punchAnimation?.prevQuestDetails ?? []))
             : lastKnownQuestDetails;
           const qd = getQuestDetail(details, questIndexForElement);
-          displayText = qd ? `${qd.totalPoints} pts` : '0 pts';
+          displayText = qd ? `${qd.totalPoints}` : '0';
         } else if (isQuestMultiplicator && questIndexForElement >= 0) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const isActiveQuest = questIndexForElement === activeQuestIndex;
           const details = isAnimating
             ? (animShowUpdated && isActiveQuest ? (punchAnimation?.newQuestDetails ?? []) : (punchAnimation?.prevQuestDetails ?? []))
@@ -1022,30 +1142,30 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           const qd = getQuestDetail(details, questIndexForElement);
           displayText = qd ? `x${qd.timesCompleted}` : 'x0';
         } else if (isCombo6) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const combos = isAnimating ? animDisplayedCombos : lastKnownCombos;
-          const cp = punchAnimation?.comboPoints ?? { pts6: 0, pts4: 0, pts2: 0 };
+          const cp = punchAnimation?.comboPoints ?? staticComboPoints;
           displayText = `${combos.combos6 * cp.pts6}`;
         } else if (isCombo4) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const combos = isAnimating ? animDisplayedCombos : lastKnownCombos;
-          const cp = punchAnimation?.comboPoints ?? { pts6: 0, pts4: 0, pts2: 0 };
+          const cp = punchAnimation?.comboPoints ?? staticComboPoints;
           displayText = `${combos.combos4 * cp.pts4}`;
         } else if (isCombo2) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const combos = isAnimating ? animDisplayedCombos : lastKnownCombos;
-          const cp = punchAnimation?.comboPoints ?? { pts6: 0, pts4: 0, pts2: 0 };
+          const cp = punchAnimation?.comboPoints ?? staticComboPoints;
           displayText = `${combos.combos2 * cp.pts2}`;
         } else if (isMultiplicator) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           const combos = isAnimating ? animDisplayedCombos : lastKnownCombos;
           const totalCombos = combos.combos6 + combos.combos4 + combos.combos2;
           displayText = `x${totalCombos}`;
         } else if (isLateMalus) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           displayText = isAnimating ? `-${animDisplayedLateMalus}` : `-${lastKnownLateMalus}`;
         } else if (isMalus) {
-          showElement = isAnimating;
+          showElement = valuesShow;
           displayText = isAnimating ? `-${animDisplayedMalus}` : `-${lastKnownMalus}`;
         } else {
           showElement = true;
@@ -1058,9 +1178,9 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
               style={{
                 width: '100%',
                 height: '100%',
-                fontSize: element.fontSize !== undefined ? `${(element.fontSize / 100) * elementHeightPx}px` : undefined,
+                fontSize: element.fontSize !== undefined ? `${element.fontSize}px` : undefined,
                 color: element.color,
-                fontFamily: element.fontFamily,
+                fontFamily: scenarioFontFamily || element.fontFamily,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -1122,7 +1242,6 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
               <Users className="w-6 h-6" />
               <span className="text-lg">{config.teams?.length || config.numberOfTeams || 0} Teams</span>
             </div>
-            <p className="text-white/60 mb-2">USB Port: {config.usbPort || 'Not configured'}</p>
             <p className="text-white/60">Message Duration: {config.messageDisplayDuration}s</p>
           </div>
 
@@ -1140,6 +1259,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   }
 
   if (layout) {
+    const backgroundUrl = resolveImageFilename(layout.background);
     return (
       <div style={{
         position: 'relative',
@@ -1149,27 +1269,39 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         overflow: 'hidden',
         display: 'flex',
         alignItems: 'center',
-        justifyContent: 'center'
+        justifyContent: 'center',
+        fontFamily: scenarioFontFamily || undefined,
       }}>
-        {layout.background && (
+        {/* Background: full viewport, cover (may crop edges on non-16:9). */}
+        {backgroundUrl && (
           <img
             ref={bgImageRef}
-            src={layout.background}
+            src={backgroundUrl}
             alt="Background"
-            onLoad={updateBgDimensions}
             style={{
               position: 'absolute',
               top: 0,
               left: 0,
               width: '100%',
               height: '100%',
-              objectFit: 'contain',
-              objectPosition: 'center'
+              objectFit: 'cover',
+              objectPosition: 'center',
             }}
           />
         )}
 
-        {bgDimensions && layout.elements?.map((element, index) => renderLayoutElement(element, index))}
+        {/* Stage: the 16:9 template box. All HUD elements position inside this. */}
+        {bgDimensions && (
+          <div
+            style={{
+              position: 'relative',
+              width: `${bgDimensions.width}px`,
+              height: `${bgDimensions.height}px`,
+            }}
+          >
+            {layout.elements?.map((element, index) => renderLayoutElement(element, index))}
+          </div>
+        )}
 
         {gameMessage && (
           <div style={{
@@ -1211,7 +1343,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
               const wasGameOver = punchAnimation.gameOver ?? false;
               const teamName = punchAnimation.teamName ?? '';
               if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-                await supabase.from('teams').update({ end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore }).eq('id', punchAnimation.teamId);
+                await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
               }
               setPunchAnimation(null);
               if (wasGameOver) setGameOverTeamName(teamName);
@@ -1272,7 +1404,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-8">
+    <div
+      className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-8"
+      style={{ fontFamily: scenarioFontFamily || undefined }}
+    >
       <button
         onClick={onBack}
         className="text-white/70 hover:text-white transition-colors flex items-center gap-2 mb-6"
@@ -1287,6 +1422,15 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
             <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode — Max 5 Teams</span>
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          </div>
+        )}
+
+        {usbReaderService.isAvailable() && !detectedReader.isPresent && (
+          <div className="flex items-center justify-center gap-3 mb-6 px-4 py-3 bg-orange-500/20 border border-orange-500/50 rounded-lg">
+            <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
+            <span className="text-orange-300 text-sm">
+              Reader not connected — waiting for SportIdent dongle. The game will autobind when you plug it in.
+            </span>
           </div>
         )}
 
@@ -1413,7 +1557,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
             const wasGameOver = punchAnimation.gameOver ?? false;
             const teamName = punchAnimation.teamName ?? '';
             if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-              await supabase.from('teams').update({ end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore }).eq('id', punchAnimation.teamId);
+              await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
             }
             setPunchAnimation(null);
             if (wasGameOver) setGameOverTeamName(teamName);

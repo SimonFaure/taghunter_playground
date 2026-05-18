@@ -1,0 +1,49 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities granted to the playground main window and the secondary projector window.",
+  "windows": ["main", "projector"],
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-available-monitors",
+    "core:window:allow-primary-monitor",
+    "core:window:allow-close",
+    "core:webview:allow-webview-close",
+    "os:default",
+    "sql:default",
+    "sql:allow-execute",
+    "sql:allow-select",
+    "http:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://studio.taghunter.fr/*" },
+        { "url": "http://studio.taghunter.test/*" },
+        { "url": "http://127.0.0.1:*/*" },
+        { "url": "http://localhost:*/*" },
+        { "url": "http://*.local:*/*" },
+        { "url": "http://192.168.*.*:*/*" },
+        { "url": "http://10.*.*.*:*/*" }
+      ]
+    },
+    "fs:default",
+    "fs:allow-mkdir",
+    "fs:allow-read-text-file",
+    "fs:allow-read-file",
+    "fs:allow-write-text-file",
+    "fs:allow-write-file",
+    "fs:allow-remove",
+    "fs:allow-read-dir",
+    "fs:allow-exists",
+    "fs:allow-rename",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$APPDATA" },
+        { "path": "$APPDATA/**" }
+      ]
+    },
+    "opener:default"
+  ]
+}

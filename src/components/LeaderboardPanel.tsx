@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import { Trophy, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, Minus } from 'lucide-react';
-import { supabase } from '../lib/db';
+import { getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
 import type { GameConfig, Team as ConfigTeam } from './LaunchGameModal';
 
 interface LeaderboardPanelProps {
@@ -108,12 +108,22 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
   }, []);
 
   const fetchTeams = useCallback(async (isInitial: boolean, vt: string) => {
-    const { data, error } = await supabase
-      .from('teams')
-      .select('id, team_number, team_name, score, start_time, end_time, key_id')
-      .eq('launched_game_id', launchedGameId);
-
-    if (error || !data) return;
+    let data: Array<{ id: number; team_number: number; team_name: string; score: number; start_time: number | null; end_time: number | null; key_id: number }> = [];
+    try {
+      const state = await getLaunchedGameState(launchedGameId, 0);
+      data = state.teams.map((t) => ({
+        id: t.id,
+        team_number: t.team_number,
+        team_name: t.team_name ?? '',
+        score: t.score,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        key_id: t.key_id ?? 0,
+      }));
+    } catch (err) {
+      console.error('[LeaderboardPanel] fetchTeams failed:', err);
+      return;
+    }
 
     const ranked = processTeams(data, vt);
 
@@ -163,23 +173,18 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
     let currentVt = config.victoryType || 'score';
 
     const init = async () => {
-      const { data: metaData } = await supabase
-        .from('launched_game_meta')
-        .select('meta_name, meta_value')
-        .eq('launched_game_id', launchedGameId)
-        .in('meta_name', ['playMode', 'victoryType', 'teamsConfig']);
-
-      if (metaData) {
-        const map: Record<string, string> = {};
-        metaData.forEach(row => { map[row.meta_name] = row.meta_value || ''; });
+      try {
+        const map = await getLaunchedGameMeta(launchedGameId);
         if (map.playMode === 'solo' || map.playMode === 'team') setPlayMode(map.playMode);
         if (map.victoryType === 'speed' || map.victoryType === 'score') {
           currentVt = map.victoryType;
           setVictoryType(map.victoryType);
         }
         if (map.teamsConfig) {
-          try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch {}
+          try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
+      } catch (err) {
+        console.error('[LeaderboardPanel] meta load failed:', err);
       }
 
       await fetchTeams(true, currentVt);

@@ -1,7 +1,14 @@
 import { useState, useEffect } from 'react';
 import { X, FlaskConical, Play, CheckCircle, AlertCircle, Loader, Monitor, Image as ImageIcon, CheckSquare, Square } from 'lucide-react';
-import { supabase } from '../lib/db';
-import { loadPatternEnigmas } from '../utils/patterns';
+import * as scenarioStore from '../services/scenarioStore';
+import * as patternStore from '../services/patternStore';
+import {
+  getLaunchedGameState,
+  getLaunchedGameMeta,
+  getLaunchedGameDevices,
+  recordPunch,
+  updateTeam,
+} from '../services/launchedGames';
 
 interface GameTestModalProps {
   gameId: number;
@@ -77,6 +84,8 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
   const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
   const [gameUniqid, setGameUniqid] = useState<string | null>(null);
   const [endChip, setEndChip] = useState(false);
+  // Map of media filename → webview-loadable URL, populated when gameUniqid is set.
+  const [scenarioMediaUrls, setScenarioMediaUrls] = useState<Record<string, string>>({});
 
 
   const totalPercent = testConfig.goodAnswerPercent + testConfig.badAnswerPercent + testConfig.noAnswerPercent;
@@ -86,45 +95,64 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
     detectGameType();
   }, [gameId]);
 
-  const detectGameType = async () => {
-    setLoadingType(true);
-    const { data: launchedGame } = await supabase
-      .from('launched_games')
-      .select('game_type, game_uniqid')
-      .eq('id', gameId)
-      .maybeSingle();
-
-    if (launchedGame) {
-      setGameType(launchedGame.game_type);
-
-      if (launchedGame.game_type?.toLowerCase() === 'tagquest' && launchedGame.game_uniqid) {
-        setGameUniqid(launchedGame.game_uniqid);
-        setLoadingQuests(true);
-        const { data: scenario } = await supabase
-          .from('scenarios')
-          .select('game_data_json')
-          .eq('uniqid', launchedGame.game_uniqid)
-          .maybeSingle();
-
-        if (scenario) {
-          let gdj = scenario.game_data_json;
-
-          if (!gdj) {
-            const { data: gameDataFile } = await supabase.storage
-              .from('resources')
-              .download(`scenarios/${launchedGame.game_uniqid}/game-data.json`);
-
-            if (gameDataFile) {
-              const text = await gameDataFile.text();
-              gdj = JSON.parse(text);
+  // When gameUniqid resolves, walk the scenario's local media dir to build
+  // filename → URL lookups for the quest-image picker thumbnails.
+  useEffect(() => {
+    if (!gameUniqid) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { appDataDir, join } = await import('@tauri-apps/api/path');
+        const { exists, readDir, BaseDirectory } = await import('@tauri-apps/plugin-fs');
+        const { convertFileSrc } = await import('@tauri-apps/api/core');
+        const row = await scenarioStore.get(gameUniqid);
+        if (!row || row.local_version == null) {
+          if (!cancelled) setScenarioMediaUrls({});
+          return;
+        }
+        const versionRel = `media/scenarios/${gameUniqid}/v${row.local_version}`;
+        const root = await appDataDir();
+        const map: Record<string, string> = {};
+        const collect = async (relDir: string): Promise<void> => {
+          if (!(await exists(relDir, { baseDir: BaseDirectory.AppData }))) return;
+          const entries = await readDir(relDir, { baseDir: BaseDirectory.AppData });
+          for (const e of entries) {
+            const childRel = `${relDir}/${e.name}`;
+            if (e.isDirectory) await collect(childRel);
+            else if (e.isFile && e.name) {
+              const abs = await join(root, childRel);
+              const url = convertFileSrc(abs);
+              map[e.name] = url;
+              const tail = childRel.slice(versionRel.length + 1);
+              map[tail] = url;
             }
           }
+        };
+        await collect(versionRel);
+        if (!cancelled) setScenarioMediaUrls(map);
+      } catch (err) {
+        console.warn('[GameTestModal] media URL build failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [gameUniqid]);
 
-          const rawQuests: any[] = gdj?.game_data?.quests || gdj?.quests || gdj?.game_quests || [];
+  const detectGameType = async () => {
+    setLoadingType(true);
+    try {
+      const state = await getLaunchedGameState(gameId, 0);
+      setGameType(state.game_type);
 
+      if (state.game_type?.toLowerCase() === 'tagquest' && state.game_uniqid) {
+        setGameUniqid(state.game_uniqid);
+        setLoadingQuests(true);
+        const gdjRaw = (await scenarioStore.getGameData(state.game_uniqid)) as any;
+        const gdj = gdjRaw?.game_data ?? gdjRaw;
+        if (gdj) {
+          const rawQuests: any[] = gdj?.quests || gdj?.game_quests || [];
           const stripMedia = (name: string) => name.replace(/^media[/\\]/i, '').replace(/^media[/\\]/i, '');
           const mediaImages: Array<{ id: string; file_name: string }> = gdj?.game_media_images || [];
-          const mediaMap = new Map(mediaImages.map(m => [String(m.id), stripMedia(m.file_name)]));
+          const mediaMap = new Map(mediaImages.map((m) => [String(m.id), stripMedia(m.file_name)]));
 
           const parsedQuests: Quest[] = rawQuests.map((q: any, idx: number) => {
             const images: QuestImage[] = [];
@@ -135,31 +163,36 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
             }
             return { index: idx + 1, number: q.number ?? '', text: q.text ?? '', images };
           });
-
           setQuests(parsedQuests);
         }
         setLoadingQuests(false);
       }
+    } catch (err) {
+      console.error('[GameTestModal] detectGameType failed:', err);
+    } finally {
+      setLoadingType(false);
     }
-
-    setLoadingType(false);
   };
 
   const loadDevices = async () => {
     setLoadingDevices(true);
-    const { data, error } = await supabase
-      .from('launched_game_devices')
-      .select('*')
-      .eq('launched_game_id', gameId)
-      .order('last_connexion_attempt', { ascending: false });
-
-    if (!error && data) {
-      setDevices(data);
-      if (data.length > 0) {
-        setTestConfig(prev => ({ ...prev, selectedDeviceId: data[0].device_id }));
+    try {
+      const rows = await getLaunchedGameDevices(gameId);
+      const mapped = rows.map((r) => ({
+        id: r.id,
+        device_id: r.device_label ?? `device-${r.device_id}`,
+        connected: Boolean(r.connected),
+        last_connexion_attempt: r.last_connection_attempt,
+      }));
+      setDevices(mapped as any);
+      if (mapped.length > 0) {
+        setTestConfig((prev) => ({ ...prev, selectedDeviceId: mapped[0].device_id }));
       }
+    } catch (err) {
+      console.error('[GameTestModal] loadDevices failed:', err);
+    } finally {
+      setLoadingDevices(false);
     }
-    setLoadingDevices(false);
   };
 
   const handleChange = (field: keyof TestConfig, value: number | string) => {
@@ -240,47 +273,21 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
     };
   };
 
-  interface PatternItem {
-    item_index: number;
-    assignment_type: string;
-    station_key_number: number;
-  }
+  type PatternItem = patternStore.PatternRoutingItem;
 
   const loadPatternItems = async (patternUniqid: string): Promise<PatternItem[]> => {
-    const fetchPatternJson = async (storagePath: string): Promise<PatternItem[] | null> => {
-      try {
-        const { data: urlData } = supabase.storage.from('resources').getPublicUrl(storagePath);
-        const resp = await fetch(urlData.publicUrl);
-        if (resp.ok) {
-          const json = await resp.json();
-          if (Array.isArray(json?.pattern_data)) return json.pattern_data;
-        }
-      } catch {}
-      return null;
-    };
-
     try {
-      const { getPatternFilesFromStorage } = await import('../utils/patterns');
-      const gameTypeLower = gameType?.toLowerCase() || 'mystery';
-      const storageFiles = await getPatternFilesFromStorage(gameTypeLower);
-      appendLog(`Storage files found: ${storageFiles.map(f => `${f.uniqid}(${f.fileName})`).join(', ') || 'none'}`);
-      const match = storageFiles.find(f => f.uniqid === patternUniqid);
-      if (match) {
-        const items = await fetchPatternJson(match.storagePath);
-        if (items) {
-          appendLog(`Pattern file: ${match.storagePath}`);
-          return items;
-        }
-        appendLog(`JSON parse failed for: ${match.storagePath}`);
+      const routing = await patternStore.getRouting(patternUniqid);
+      if (routing.length > 0) {
+        appendLog(`Pattern loaded from local store: ${patternUniqid}`);
       } else {
-        appendLog(`No file matched uniqid "${patternUniqid}" among: ${storageFiles.map(f => f.uniqid).join(', ')}`);
+        appendLog(`Pattern uniqid not found in local store: ${patternUniqid}`);
       }
+      return routing;
     } catch (e) {
-      appendLog(`Storage scan error: ${e}`);
+      appendLog(`Local pattern store error: ${e}`);
+      return [];
     }
-
-    appendLog(`No pattern items found for uniqid: ${patternUniqid}`);
-    return [];
   };
 
   const buildTagQuestMockCard = (
@@ -337,19 +344,15 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
     appendLog(`Starting test simulation on device: ${deviceLabel}`);
 
     try {
-      const { data: allTeams, error: teamsError } = await supabase
-        .from('teams')
-        .select('id, team_name, key_id, start_time, end_time, score')
-        .eq('launched_game_id', gameId)
-        .order('id', { ascending: true });
-
-      if (teamsError) {
-        appendLog(`Error loading teams: ${teamsError.message}`);
-        setTestRunning(false);
-        return;
-      }
-
-      const teams: TestTeam[] = allTeams || [];
+      const state = await getLaunchedGameState(gameId, 0);
+      const teams: TestTeam[] = state.teams.map((t) => ({
+        id: t.id,
+        team_name: t.team_name ?? '',
+        key_id: t.key_id ?? 0,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        score: t.score,
+      })) as any;
       if (teams.length === 0) {
         appendLog('No teams found. Please create teams before running a test.');
         setTestRunning(false);
@@ -359,44 +362,30 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
       const teamsToTest = teams.slice(0, testConfig.numberOfTeams);
       appendLog(`Simulating ${teamsToTest.length} team(s)`);
 
+      const meta = await getLaunchedGameMeta(gameId);
+
       if (gameType?.toLowerCase() === 'tagquest') {
         appendLog(`Selected ${selectedImages.size} image(s) across ${quests.length} quest(s)`);
-
-        const { data: metaDataTQ } = await supabase
-          .from('launched_game_meta')
-          .select('meta_name, meta_value')
-          .eq('launched_game_id', gameId);
-
-        const metaMapTQ: Record<string, string> = {};
-        metaDataTQ?.forEach(m => { metaMapTQ[m.meta_name] = m.meta_value || ''; });
-        const tqPatternUniqid = metaMapTQ.pattern || '';
-
+        const tqPatternUniqid = meta.pattern || '';
         appendLog(`Loading pattern items: ${tqPatternUniqid}`);
         const tqPatternItems = await loadPatternItems(tqPatternUniqid);
         appendLog(`Loaded ${tqPatternItems.length} pattern item(s)`);
 
         const results: TestResult[] = [];
-
         for (const team of teamsToTest) {
           appendLog(`Processing: ${team.team_name}`);
 
           if (team.start_time || team.end_time) {
-            await supabase.from('teams').update({ start_time: null, end_time: null, score: 0 }).eq('id', team.id);
+            await updateTeam(team.id, { start_time: null, end_time: null, score: 0 });
             appendLog('  Reset previous run');
           }
 
           const startTime = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 1200 + 300);
-          await supabase.from('teams').update({ start_time: startTime }).eq('id', team.id);
+          await updateTeam(team.id, { start_time: startTime });
 
           const mockCard = buildTagQuestMockCard(team.key_id, selectedImages, tqPatternItems, endChip);
-
           appendLog(`Punch: ${JSON.stringify(mockCard)}`);
-
-          await supabase.from('launched_game_raw_data').insert({
-            launched_game_id: gameId,
-            device_id: deviceLabel,
-            raw_data: mockCard,
-          });
+          await recordPunch(gameId, mockCard);
 
           appendLog(`  Card inserted — punch logic will process this card`);
           results.push({
@@ -405,27 +394,17 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
             status: 'success',
             message: `Card sent — check console for punch result`,
           });
-
-          await new Promise(r => setTimeout(r, 150));
+          await new Promise((r) => setTimeout(r, 150));
         }
-
         setTestResults(results);
         appendLog('Simulation complete.');
         return;
       }
 
-      const { data: metaData } = await supabase
-        .from('launched_game_meta')
-        .select('meta_name, meta_value')
-        .eq('launched_game_id', gameId);
-
-      const metaMap: Record<string, string> = {};
-      metaData?.forEach(m => { metaMap[m.meta_name] = m.meta_value || ''; });
-      const patternUniqid = metaMap.pattern || '';
-
+      // Mystery mode below.
+      const patternUniqid = meta.pattern || '';
       appendLog(`Loading pattern: ${patternUniqid}`);
-      const { loadPatternEnigmasByUniqid } = await import('../utils/patterns');
-      const patternEnigmas = await loadPatternEnigmasByUniqid('mystery', patternUniqid);
+      const patternEnigmas = await patternStore.getMysteryEnigmas(patternUniqid);
 
       if (patternEnigmas.length === 0) {
         appendLog('Warning: No pattern enigmas loaded (pattern file may not be available here)');
@@ -433,37 +412,23 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         appendLog(`Loaded ${patternEnigmas.length} enigmas`);
       }
 
-      const { data: launchedGameForScoring } = await supabase
-        .from('launched_games')
-        .select('game_uniqid')
-        .eq('id', gameId)
-        .maybeSingle();
-
       let enigmasForScoring: any[] = [];
-      if (launchedGameForScoring?.game_uniqid) {
-        const { data: scenarioData } = await supabase
-          .from('scenarios')
-          .select('game_data_json')
-          .eq('uniqid', launchedGameForScoring.game_uniqid)
-          .maybeSingle();
-
-        enigmasForScoring =
-          scenarioData?.game_data_json?.game_enigmas ||
-          scenarioData?.game_data_json?.game_data?.game_enigmas || [];
+      if (state.game_uniqid) {
+        const gdj = (await scenarioStore.getGameData(state.game_uniqid)) as any;
+        enigmasForScoring = gdj?.game_enigmas ?? gdj?.game_data?.game_enigmas ?? [];
       }
 
       const results: TestResult[] = [];
-
       for (const team of teamsToTest) {
         appendLog(`Processing: ${team.team_name}`);
 
         if (team.start_time || team.end_time) {
-          await supabase.from('teams').update({ start_time: null, end_time: null, score: 0 }).eq('id', team.id);
+          await updateTeam(team.id, { start_time: null, end_time: null, score: 0 });
           appendLog('  Reset previous run');
         }
 
         const startTime = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 1200 + 300);
-        await supabase.from('teams').update({ start_time: startTime }).eq('id', team.id);
+        await updateTeam(team.id, { start_time: startTime });
 
         const mockCard = buildMockCard(
           team.key_id,
@@ -471,12 +436,7 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
           testConfig.goodAnswerPercent,
           testConfig.badAnswerPercent
         );
-
-        await supabase.from('launched_game_raw_data').insert({
-          launched_game_id: gameId,
-          device_id: deviceLabel,
-          raw_data: mockCard,
-        });
+        await recordPunch(gameId, mockCard);
 
         let totalScore = 0;
         if (enigmasForScoring.length > 0 && patternEnigmas.length > 0) {
@@ -495,15 +455,8 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         }
 
         const endTime = Math.floor(Date.now() / 1000);
-        const { error: endErr } = await supabase
-          .from('teams')
-          .update({ end_time: endTime, score: totalScore })
-          .eq('id', team.id);
-
-        if (endErr) {
-          appendLog(`  Error: ${endErr.message}`);
-          results.push({ teamName: team.team_name, score: 0, status: 'error', message: endErr.message });
-        } else {
+        try {
+          await updateTeam(team.id, { end_time: endTime, score: totalScore });
           const duration = endTime - startTime;
           const mins = Math.floor(duration / 60);
           const secs = duration % 60;
@@ -515,9 +468,11 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
             status: 'success',
             message: `Score: ${totalScore} — Time: ${timeStr}`,
           });
+        } catch (endErr: any) {
+          appendLog(`  Error: ${endErr?.message || endErr}`);
+          results.push({ teamName: team.team_name, score: 0, status: 'error', message: endErr?.message || String(endErr) });
         }
-
-        await new Promise(r => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 150));
       }
 
       setTestResults(results);
@@ -670,9 +625,9 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
                                 const checked = selectedImages.has(img.key);
                                 const isMain = img.label === 'Main';
                                 const safeKey = img.key.replace(/^media[/\\]/i, '').replace(/^media[/\\]/i, '');
-                                const { data: urlData } = supabase.storage
-                                  .from('resources')
-                                  .getPublicUrl(`scenarios/${gameUniqid}/media/${safeKey}`);
+                                // Slice 2: media files come from the local
+                                // SQLite/FS store; resolve to a webview URL.
+                                const imgSrc = scenarioMediaUrls[safeKey] ?? '';
                                 return (
                                   <button
                                     key={img.key}
@@ -685,7 +640,7 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
                                   >
                                     <div className={`w-full bg-slate-800 ${large ? 'flex-1' : ''}`} style={large ? { height: 148 } : { height: 60 }}>
                                       <img
-                                        src={urlData.publicUrl}
+                                        src={imgSrc}
                                         alt={img.label}
                                         className="w-full h-full object-cover"
                                         onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}

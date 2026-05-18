@@ -1,154 +1,229 @@
 import { useState, useEffect, useRef } from 'react';
-import { Settings, ShieldCheck, List, BookOpen, Activity, CreditCard, LayoutGrid as Layout, Map } from 'lucide-react';
+import {
+  Settings,
+  ShieldCheck,
+  CreditCard,
+  Map,
+  Rocket,
+  Database as DatabaseIcon,
+} from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { GameList } from './components/GameList';
-import { ConfigurationPage } from './components/ConfigurationPage';
+import { Footer } from './components/Footer';
+import { ConfigurationPage, type SettingsTab } from './components/ConfigurationPage';
 import { AdminPasswordModal } from './components/AdminPasswordModal';
 import { AdminConfigPage } from './components/AdminConfigPage';
 import { LaunchedGamesList } from './components/LaunchedGamesList';
-import { ApiDocsPage } from './components/ApiDocsPage';
-import { ApiLogsPage } from './components/ApiLogsPage';
 import ClientCardsPage from './components/ClientCardsPage';
-import { LayoutManagement } from './components/LayoutManagement';
-import { PatternsPage } from './components/PatternsPage';
-import { EmailSetupModal } from './components/EmailSetupModal';
-import { OnboardingModal } from './components/OnboardingModal';
-import { SyncLoadingModal, SyncStep } from './components/SyncLoadingModal';
-import { supabase } from './lib/db';
-import { loadConfig, saveConfig } from './utils/config';
-import { DownloadItem } from './types/downloadQueue';
+import { DatabaseInspector } from './components/DatabaseInspector';
+import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
+import { SyncStatusPill } from './components/sync/SyncStatusPill';
+import { SyncFailureBanner } from './components/sync/SyncFailureBanner';
+import { UpdateRequiredOverlay } from './components/update/UpdateRequiredOverlay';
+import { UpdateAvailableNotice } from './components/update/UpdateAvailableNotice';
+import { useAuth } from './components/auth/AuthProvider';
+import { start as startSync, stop as stopSync } from './services/syncOrchestrator';
+import { checkForUpdate, type UpdateStatus } from './services/updateService';
+// Import for side effects: syncLog wires its event listeners on first
+// module load, so it must be referenced before any cycle:* events fire (or
+// it'll miss them when the user isn't on the Settings → Sync tab).
+import './services/syncLog';
+import { pruneStaleVersions, pruneStaleCardsCsv } from './services/contentFs';
+import * as scenarioStore from './services/scenarioStore';
+import { on as onSyncEvent } from './services/syncEvents';
+import {
+  recoverPendingPanic,
+  sendHeartbeat,
+  startDrainer,
+  stopDrainer,
+} from './services/telemetry';
 
-type Page = 'games' | 'launched-games' | 'config' | 'admin-config' | 'api-docs' | 'api-logs' | 'client-cards' | 'layouts' | 'patterns';
+type Page =
+  | 'scenarios'
+  | 'launched'
+  | 'cards'
+  | 'settings'
+  | 'admin-config'
+  | 'database';
 
 function App() {
-  const [currentPage, setCurrentPage] = useState<Page>('games');
+  const auth = useAuth();
+  const [currentPage, setCurrentPage] = useState<Page>('scenarios');
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [showPasswordModal, setShowPasswordModal] = useState(false);
-  const [showEmailSetup, setShowEmailSetup] = useState(false);
-  const [showOnboarding, setShowOnboarding] = useState(false);
-  const [showSyncModal, setShowSyncModal] = useState(false);
-  const [syncSteps, setSyncSteps] = useState<SyncStep[]>([]);
-  const [currentSyncStep, setCurrentSyncStep] = useState<string>('');
-  const [downloadsNeeded, setDownloadsNeeded] = useState<DownloadItem[]>([]);
-  const [userEmail, setUserEmail] = useState<string>('');
   const [pressedKeys, setPressedKeys] = useState<Set<string>>(new Set());
+  // Deep-link target for the settings page. Set by the sync pill / failure
+  // banner when the user clicks them; consumed by ConfigurationPage which
+  // honors it once and is then free to track its own tab state.
+  const [pendingSettingsTab, setPendingSettingsTab] = useState<SettingsTab | undefined>(undefined);
   const processedRef = useRef<boolean>(false);
-  const checkedConfigRef = useRef<boolean>(false);
+  const startedRef = useRef<boolean>(false);
 
+  // App self-update state. `updateGate` is set when the running version is
+  // below the server's hard floor — it blocks the whole app. `optionalUpdate`
+  // is a dismissable notice for a newer-but-not-mandatory version. The ref
+  // mirrors `updateGate` so the orchestrator effect can see it synchronously.
+  const [updateGate, setUpdateGate] = useState<UpdateStatus | null>(null);
+  const [optionalUpdate, setOptionalUpdate] = useState<UpdateStatus | null>(null);
+  const updateGateRef = useRef<boolean>(false);
+
+  // Deep-link into Settings → Updates (from the optional-update notice).
+  const navigateToUpdates = () => {
+    setCurrentPage('settings');
+    setPendingSettingsTab('updates');
+  };
+
+  // Single entry point for "take me to the sync screen" — invoked by both
+  // SyncStatusPill (bottom-right) and SyncFailureBanner (top). Setting the
+  // pendingSettingsTab via a new object (or just to 'sync') triggers the
+  // ConfigurationPage's deep-link effect even if we're already on settings.
+  const navigateToSync = () => {
+    setCurrentPage('settings');
+    setPendingSettingsTab('sync');
+  };
+
+  // First-launch overlay state. Visible while:
+  //   - the local DB has zero scenarios with local_version IS NOT NULL, AND
+  //   - the orchestrator's startup cycle has queued at least one download.
+  // Dismissed when the cycle finishes, when the user clicks "Skip", or when
+  // first-launch detection determines we're not first-launching.
+  const [firstLaunchVisible, setFirstLaunchVisible] = useState(false);
+  // 'pending' = first-launch detected, waiting for the cycle to report work.
+  // 'shown' = overlay rendering. 'done' = past first-launch, never show again.
+  const firstLaunchPhaseRef = useRef<'pending' | 'shown' | 'done'>('done');
+
+  // Launch-time update check. Fires first and runs non-blocking: the app
+  // renders and the orchestrator starts as usual while this resolves. A
+  // hard-floor violation drops in a full-screen blocking overlay and stops
+  // content sync; an optional update shows a dismissable banner. An offline
+  // or errored check resolves silently and the app proceeds.
   useEffect(() => {
-    const checkConfigAndDatabase = async () => {
-      if (checkedConfigRef.current) return;
-      checkedConfigRef.current = true;
-
-      const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-      if (isElectron) {
-        if ((window as any).electron?.db?.connect) {
-          try {
-            await (window as any).electron.db.connect();
-          } catch (error) {
-            console.error('Failed to connect to database on launch:', error);
-          }
-        }
-
-        try {
-          const config = await loadConfig();
-          console.log('[App Launch] Config loaded:', { hasEmail: !!config?.email, email: config?.email });
-
-          if (!config?.email) {
-            console.log('[App Launch] Email missing - showing onboarding');
-            setShowOnboarding(true);
-            return;
-          }
-
-          setUserEmail(config.email);
-
-          // Automatically start sync in background without showing modal
-          console.log('[App Launch] Auto-starting resource sync in background...');
-          const { syncResourcesBeforeScenarios } = await import('./services/syncOrchestrator');
-
-          const initialSteps: SyncStep[] = [
-            { id: 'connectivity', label: 'Checking Internet Connection', status: 'pending' },
-            { id: 'billing', label: 'Fetching Billing Status', status: 'pending' },
-            { id: 'userData', label: 'Fetching User Data', status: 'pending' },
-          ];
-          setSyncSteps(initialSteps);
-
-          const syncResult = await syncResourcesBeforeScenarios((stepId, status, details) => {
-            setCurrentSyncStep(stepId);
-            setSyncSteps(prev =>
-              prev.map(step =>
-                step.id === stepId ? { ...step, status, details } : step
-              )
-            );
-          });
-
-          console.log('[App Launch] Resource sync completed:', syncResult);
-
-          // Only show modal if there are downloads needed
-          if (syncResult.downloadsNeeded.length > 0) {
-            console.log(`[App Launch] ${syncResult.downloadsNeeded.length} resource updates available - showing modal`);
-            setDownloadsNeeded(syncResult.downloadsNeeded);
-            setShowSyncModal(true);
-          } else {
-            console.log('[App Launch] No downloads needed - sync complete');
-          }
-
-          if (syncResult.success) {
-            const syncedConfig = await loadConfig();
-            await saveConfig({
-              ...syncedConfig,
-              lastSuccessfulSync: new Date().toISOString(),
-            });
-          }
-        } catch (error) {
-          console.error('[App Launch] Failed to sync resources:', error);
-          if (error instanceof Error) {
-            console.error('[App Launch] Error details:', error.message, error.stack);
-          }
-        }
-      } else if (!isElectron && supabase) {
-        console.log('=== SUPABASE DATABASE TABLES ===');
-        try {
-          const tableNames = ['configuration', 'game_types', 'launched_games'];
-          console.log('Number of tables:', tableNames.length);
-          console.log('Tables:');
-          tableNames.forEach((table, index) => {
-            console.log(`  ${index + 1}. ${table}`);
-          });
-
-          for (const tableName of tableNames) {
-            const { count, error } = await supabase
-              .from(tableName)
-              .select('*', { count: 'exact', head: true });
-
-            if (!error) {
-              console.log(`  - ${tableName}: ${count} rows`);
-            }
-          }
-        } catch (error) {
-          console.error('Failed to query Supabase:', error);
-        }
-        console.log('=================================');
+    void (async () => {
+      const status = await checkForUpdate();
+      if (status.state === 'required') {
+        updateGateRef.current = true;
+        setUpdateGate(status);
+        stopSync();
+      } else if (status.state === 'optional') {
+        setOptionalUpdate(status);
       }
+    })();
+  }, []);
+
+  // Start the orchestrator once we have an authenticated user. Stop on
+  // logout / unmount. pruneStaleVersions runs first so no in-flight session
+  // can reference a stale dir.
+  useEffect(() => {
+    if (!auth.user || startedRef.current || updateGateRef.current) return;
+    startedRef.current = true;
+
+    let offProgress: (() => void) | null = null;
+    let offFinished: (() => void) | null = null;
+
+    const init = async () => {
+      try {
+        await pruneStaleVersions();
+      } catch (e) {
+        console.error('[App] pruneStaleVersions failed:', e);
+      }
+      try {
+        // One-shot post-Unit-4 cleanup: removes any media/cards/v*.csv files
+        // left over from the pre-row-based card storage. No-op on fresh
+        // installs and idempotent on subsequent boots.
+        await pruneStaleCardsCsv();
+      } catch (e) {
+        console.error('[App] pruneStaleCardsCsv failed:', e);
+      }
+
+      const downloaded = await scenarioStore.count({ downloaded: true });
+      firstLaunchPhaseRef.current = downloaded === 0 ? 'pending' : 'done';
+
+      // Only flip the overlay on once the cycle reports non-zero work, so an
+      // empty manifest on a fresh install doesn't show "0 of 0" briefly.
+      offProgress = onSyncEvent('cycle:progress', (p) => {
+        if (firstLaunchPhaseRef.current === 'pending' && p.total > 0) {
+          firstLaunchPhaseRef.current = 'shown';
+          setFirstLaunchVisible(true);
+        }
+      });
+      offFinished = onSyncEvent('cycle:finished', () => {
+        firstLaunchPhaseRef.current = 'done';
+        offProgress?.();
+        offFinished?.();
+      });
+
+      // A hard-floor result may have landed while init() was awaiting; skip
+      // the cycle so a too-old client never talks to the changed server API.
+      if (updateGateRef.current) return;
+      await startSync(auth.user!);
     };
 
-    checkConfigAndDatabase();
+    void init();
 
+    return () => {
+      offProgress?.();
+      offFinished?.();
+      stopSync();
+      startedRef.current = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth.user]);
+
+  // App-level listener for auth_invalid. SyncFailureBanner also handles this
+  // (it calls onAuthInvalid → auth.refresh), but the banner isn't mounted
+  // while the FirstLaunchProgress overlay is showing — so a first-launch
+  // cycle that hits 401/403 has nobody to ask AuthProvider for a refresh.
+  // Subscribing here makes auth.refresh fire regardless of which overlay
+  // is up. AuthProvider then either re-validates the JWT silently or flips
+  // to LoginScreen, which transparently replaces whatever was rendered.
+  useEffect(() => {
+    const off = onSyncEvent('cycle:failed', (p) => {
+      if (p.reason === 'auth_invalid') {
+        void auth.refresh();
+      }
+    });
+    return off;
+  }, [auth]);
+
+  const dismissFirstLaunch = () => {
+    firstLaunchPhaseRef.current = 'done';
+    setFirstLaunchVisible(false);
+  };
+
+  // Telemetry bootstrap. Runs once per mount:
+  //   1. Recover any Rust panic from the previous session (and enqueue it).
+  //   2. Enqueue a heartbeat — no-op if app_version hasn't changed since last.
+  //   3. Start the periodic drainer (5 min). The drainer politely waits for
+  //      a JWT, so starting it before login is fine.
+  // None of this gates on auth; events sit in the outbox until reachable.
+  useEffect(() => {
+    void recoverPendingPanic();
+    void sendHeartbeat();
+    startDrainer();
+    // Fire-and-forget mDNS browse so the footer's first child-mode ping has a
+    // hot endpoint cache. No-op when paired_mothers is empty. Failure is
+    // silent: the footer's failure-threshold path will run mDNS again if
+    // needed.
+    void invoke('client_refresh_mother_endpoints').catch(() => {});
+    return () => {
+      stopDrainer();
+    };
+  }, []);
+
+  // AMO/AME admin keystroke handlers (unchanged from pre-rewrite).
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      setPressedKeys(prev => new Set(prev).add(e.key.toLowerCase()));
+      setPressedKeys((prev) => new Set(prev).add(e.key.toLowerCase()));
     };
-
     const handleKeyUp = (e: KeyboardEvent) => {
-      setPressedKeys(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(e.key.toLowerCase());
-        return newSet;
+      setPressedKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(e.key.toLowerCase());
+        return next;
       });
     };
-
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
@@ -167,223 +242,84 @@ function App() {
       processedRef.current = true;
       setPressedKeys(new Set());
       setIsAdminMode(false);
-      if (currentPage === 'admin-config') {
-        setCurrentPage('games');
+      if (currentPage === 'admin-config' || currentPage === 'database') {
+        setCurrentPage('scenarios');
       }
     } else if (!hasAMO && !hasAME) {
       processedRef.current = false;
     }
   }, [pressedKeys, isAdminMode, currentPage]);
 
-  const handleAdminSuccess = () => {
-    setIsAdminMode(true);
-  };
+  const handleAdminSuccess = () => setIsAdminMode(true);
 
-  const handleEmailSave = async (email: string) => {
-    try {
-      const config = await loadConfig();
-      await saveConfig({ ...config, email });
-      setUserEmail(email);
-      setShowEmailSetup(false);
-    } catch (error) {
-      console.error('[Email Setup] Failed to save email:', error);
-    }
-  };
+  // Hard floor takes precedence over everything, including first-launch sync:
+  // a too-old client must update before it does anything else.
+  if (updateGate) {
+    return <UpdateRequiredOverlay status={updateGate} />;
+  }
 
-  const handleStartSync = async () => {
-    try {
-      console.log('[App] Starting resource sync...');
-      const { syncResourcesBeforeScenarios } = await import('./services/syncOrchestrator');
-
-      const syncResult = await syncResourcesBeforeScenarios((stepId, status, details) => {
-        setCurrentSyncStep(stepId);
-        setSyncSteps(prev =>
-          prev.map(step =>
-            step.id === stepId ? { ...step, status, details } : step
-          )
-        );
-      });
-
-      console.log('[App] Resource sync completed:', syncResult);
-
-      if (syncResult.downloadsNeeded.length > 0) {
-        console.log(`[App] ${syncResult.downloadsNeeded.length} resource updates available`);
-        setDownloadsNeeded(syncResult.downloadsNeeded);
-      }
-
-      if (syncResult.success) {
-        const config = await loadConfig();
-        await saveConfig({
-          ...config,
-          lastSuccessfulSync: new Date().toISOString(),
-        });
-      }
-    } catch (error) {
-      console.error('[App] Sync failed:', error);
-      if (error instanceof Error) {
-        console.error('[App] Error details:', error.message, error.stack);
-      }
-    }
-  };
-
-  const handleDownloadAll = async () => {
-    try {
-      console.log('[App] Starting download of all resources...');
-      const { downloadResourceItem } = await import('./services/syncOrchestrator');
-
-      for (const item of downloadsNeeded) {
-        console.log(`[App] Downloading: ${item.name}`);
-        await downloadResourceItem(item);
-      }
-
-      console.log('[App] All downloads completed');
-      setDownloadsNeeded([]);
-      setShowSyncModal(false);
-    } catch (error) {
-      console.error('[App] Download failed:', error);
-    }
-  };
-
-  const handleOnboardingComplete = async (settings: {
-    fullscreenOnLaunch: boolean;
-    autoLaunch: boolean;
-    email: string;
-  }) => {
-    try {
-      console.log('[Onboarding] Settings received:', settings);
-      const config = await loadConfig();
-      console.log('[Onboarding] Current config loaded:', config);
-
-      const updatedConfig = {
-        ...config,
-        fullscreenOnLaunch: settings.fullscreenOnLaunch,
-        autoLaunch: settings.autoLaunch,
-        email: settings.email,
-        onboardingCompleted: true,
-      };
-
-      console.log('[Onboarding] Saving updated config:', updatedConfig);
-      await saveConfig(updatedConfig);
-      console.log('[Onboarding] Config saved successfully');
-
-      if ((window as any).electron?.setAutoLaunch) {
-        await (window as any).electron.setAutoLaunch(settings.autoLaunch);
-      }
-
-      setUserEmail(settings.email);
-      setShowOnboarding(false);
-    } catch (error) {
-      console.error('[Onboarding] Failed to save settings:', error);
-    }
-  };
+  if (firstLaunchVisible) {
+    return (
+      <FirstLaunchProgress
+        onSkip={dismissFirstLaunch}
+        onDone={dismissFirstLaunch}
+      />
+    );
+  }
 
   return (
-    <div className={`min-h-screen ${isAdminMode ? 'bg-gradient-to-br from-red-900 via-red-800 to-slate-900' : 'bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900'}`}>
-      <nav className={`backdrop-blur-sm border-b sticky top-0 z-50 ${isAdminMode ? 'bg-red-800/80 border-red-700' : 'bg-slate-800/80 border-slate-700'}`}>
+    <div
+      className={`min-h-screen pb-16 ${
+        isAdminMode
+          ? 'bg-gradient-to-br from-red-900 via-red-800 to-slate-900'
+          : 'bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900'
+      }`}
+    >
+      {optionalUpdate && (
+        <UpdateAvailableNotice
+          status={optionalUpdate}
+          onDismiss={() => setOptionalUpdate(null)}
+          onOpenUpdates={navigateToUpdates}
+        />
+      )}
+
+      <SyncFailureBanner onAuthInvalid={auth.refresh} onViewDetails={navigateToSync} />
+
+      <nav
+        className={`backdrop-blur-sm border-b sticky top-0 z-40 ${
+          isAdminMode ? 'bg-red-800/80 border-red-700' : 'bg-slate-800/80 border-slate-700'
+        }`}
+      >
         <div className="container mx-auto px-6 py-3">
           <div className="flex items-center justify-between">
             <h1 className="text-xl font-bold text-white">Taghunter Playground</h1>
             <div className="flex gap-2">
-              <button
-                onClick={() => setCurrentPage('games')}
-                className={`px-4 py-2 rounded-lg transition ${
-                  currentPage === 'games'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                Games
-              </button>
-              <button
-                onClick={() => setCurrentPage('launched-games')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'launched-games'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <List size={16} />
-                Launched
-              </button>
-              <button
-                onClick={() => setCurrentPage('config')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'config'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Settings size={16} />
-
-              </button>
-              <button
-                onClick={() => setCurrentPage('api-docs')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'api-docs'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <BookOpen size={16} />
-                API Docs
-              </button>
-              <button
-                onClick={() => setCurrentPage('api-logs')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'api-logs'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Activity size={16} />
-                API Logs
-              </button>
-              <button
-                onClick={() => setCurrentPage('client-cards')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'client-cards'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <CreditCard size={16} />
-                Cards
-              </button>
-              <button
-                onClick={() => setCurrentPage('patterns')}
-                className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                  currentPage === 'patterns'
-                    ? isAdminMode ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                    : 'text-slate-300 hover:bg-slate-700'
-                }`}
-              >
+              <NavButton page="scenarios" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
                 <Map size={16} />
-                Patterns
-              </button>
+                Scenarios
+              </NavButton>
+              <NavButton page="launched" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
+                <Rocket size={16} />
+                Launched games
+              </NavButton>
+              <NavButton page="cards" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
+                <CreditCard size={16} />
+                Cards & Patterns
+              </NavButton>
+              <NavButton page="settings" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
+                <Settings size={16} />
+                Settings
+              </NavButton>
               {isAdminMode && (
                 <>
-                  <button
-                    onClick={() => setCurrentPage('layouts')}
-                    className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                      currentPage === 'layouts'
-                        ? 'bg-red-600 text-white'
-                        : 'text-slate-300 hover:bg-slate-700'
-                    }`}
-                  >
-                    <Layout size={16} />
-                    Layouts
-                  </button>
-                  <button
-                    onClick={() => setCurrentPage('admin-config')}
-                    className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
-                      currentPage === 'admin-config'
-                        ? 'bg-red-600 text-white'
-                        : 'text-slate-300 hover:bg-slate-700'
-                    }`}
-                  >
+                  <NavButton page="database" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
+                    <DatabaseIcon size={16} />
+                    Database
+                  </NavButton>
+                  <NavButton page="admin-config" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
                     <ShieldCheck size={16} />
                     Admin Config
-                  </button>
+                  </NavButton>
                 </>
               )}
             </div>
@@ -391,24 +327,12 @@ function App() {
         </div>
       </nav>
 
-      {currentPage === 'games' && <GameList />}
-      {currentPage === 'launched-games' && <LaunchedGamesList />}
-      {currentPage === 'config' && <ConfigurationPage />}
-      {currentPage === 'api-docs' && <ApiDocsPage />}
-      {currentPage === 'client-cards' && <ClientCardsPage />}
-      {currentPage === 'api-logs' && <ApiLogsPage />}
-      {currentPage === 'patterns' && <PatternsPage />}
-      {currentPage === 'layouts' && isAdminMode && <LayoutManagement />}
+      {currentPage === 'scenarios' && <GameList />}
+      {currentPage === 'launched' && <LaunchedGamesList />}
+      {currentPage === 'cards' && <ClientCardsPage />}
+      {currentPage === 'settings' && <ConfigurationPage initialTab={pendingSettingsTab} />}
+      {currentPage === 'database' && isAdminMode && <DatabaseInspector />}
       {currentPage === 'admin-config' && isAdminMode && <AdminConfigPage />}
-
-      {showOnboarding && (
-        <OnboardingModal onComplete={handleOnboardingComplete} />
-      )}
-
-      <EmailSetupModal
-        isOpen={showEmailSetup}
-        onSave={handleEmailSave}
-      />
 
       <AdminPasswordModal
         isOpen={showPasswordModal}
@@ -416,15 +340,35 @@ function App() {
         onSuccess={handleAdminSuccess}
       />
 
-      <SyncLoadingModal
-        isOpen={showSyncModal}
-        steps={syncSteps}
-        currentStep={currentSyncStep}
-        downloadsNeeded={downloadsNeeded}
-        onClose={() => setShowSyncModal(false)}
-        onDownloadAll={handleDownloadAll}
-      />
+      <SyncStatusPill onNavigate={navigateToSync} />
+      <Footer />
     </div>
+  );
+}
+
+interface NavButtonProps {
+  page: Page;
+  current: Page;
+  onClick: (p: Page) => void;
+  admin: boolean;
+  children: React.ReactNode;
+}
+
+function NavButton({ page, current, onClick, admin, children }: NavButtonProps) {
+  const active = current === page;
+  return (
+    <button
+      onClick={() => onClick(page)}
+      className={`px-4 py-2 rounded-lg transition flex items-center gap-2 ${
+        active
+          ? admin
+            ? 'bg-red-600 text-white'
+            : 'bg-blue-600 text-white'
+          : 'text-slate-300 hover:bg-slate-700'
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 

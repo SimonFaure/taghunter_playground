@@ -1,12 +1,79 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { ArrowLeft } from 'lucide-react';
 import { GameConfig } from './LaunchGameModal';
-import { usbReaderService, CardData, StationData } from '../services/usbReader';
+import { sportidentService as siReader, CardData, StationData, detectReaderPort } from '../services/sportidentService';
+import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { CardDetectionAlert } from './CardDetectionAlert';
-import { supabase } from '../lib/db';
-import { loadPatternEnigmasByUniqid, PatternEnigma } from '../utils/patterns';
+import {
+  getLaunchedGameState,
+  recordPunch,
+  updateTeam,
+} from '../services/launchedGames';
+import * as patternStore from '../services/patternStore';
+import * as scenarioStore from '../services/scenarioStore';
+import * as gameTypesStore from '../services/gameTypesStore';
+import { scenarioAssetUrl } from '../services/contentFs';
+import { resolveFontFamily } from '../fonts/resolveFontFamily';
+import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
+import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import '../mystery.css';
+
+interface VideoSource {
+  kind: 'intro' | 'tutorial';
+  videoUrl: string;
+  subtitleLang: string | null;
+  subtitleUrl: string | null;
+}
+
+// Resolve which videos should play on a team's first bip and produce a
+// list of <video> sources for the overlay. Empty list → caller skips the
+// overlay entirely.
+async function resolveFirstBipVideos(
+  config: GameConfig,
+  gameUniqid: string,
+  gameTypeCode: string,
+  rawGameData: unknown,
+): Promise<VideoSource[]> {
+  const lang = config.language || 'en';
+  const sources: VideoSource[] = [];
+
+  // Intro = per-scenario scenario_video. Subtitle file lives in
+  // scenarios/<uniqid>/v<N>/<scenario_video_subtitle_<lang>>.
+  if (config.playIntroOnBip) {
+    const introFilename =
+      (rawGameData as { scenario_video?: unknown } | null)?.scenario_video
+      ?? (rawGameData as { game_meta?: { scenario_video?: unknown } } | null)?.game_meta?.scenario_video
+      ?? (rawGameData as { medias?: { video?: unknown } } | null)?.medias?.video;
+    if (typeof introFilename === 'string' && introFilename.trim().length > 0) {
+      // `medias.video` historically carries a `/media/<uniqid>/...` path; strip
+      // to bare filename for local resolution.
+      const bare = introFilename.split('/').filter(Boolean).pop() ?? introFilename;
+      const url = await scenarioStore.getMediaPath(gameUniqid, bare);
+      if (url) {
+        const subtitleField = `scenario_video_subtitle_${lang}`;
+        const subFilename =
+          (rawGameData as { medias?: { sounds?: Record<string, string> } } | null)?.medias?.sounds?.[subtitleField];
+        let subUrl: string | null = null;
+        if (typeof subFilename === 'string' && subFilename) {
+          subUrl = await scenarioStore.getMediaPath(gameUniqid, subFilename);
+        }
+        sources.push({ kind: 'intro', videoUrl: url, subtitleLang: lang, subtitleUrl: subUrl });
+      }
+    }
+  }
+
+  // Tutorial = game-type-level video, with override-wins resolution.
+  if (config.playTutorialOnBip) {
+    const resolved = await gameTypesStore.resolveTutorialVideoUrl(gameTypeCode);
+    if (resolved) {
+      const subUrl = resolved.subtitleUrls[lang] ?? null;
+      sources.push({ kind: 'tutorial', videoUrl: resolved.videoUrl, subtitleLang: lang, subtitleUrl: subUrl });
+    }
+  }
+
+  return sources;
+}
 
 interface MysteryGamePageProps {
   config: GameConfig;
@@ -27,6 +94,10 @@ interface GameData {
     number_of_enigmas: string;
     font: string;
     font_color?: string;
+    custom_fonts?: Array<{
+      family?: string;
+      faces?: Array<{ filename?: string; weight?: number; style?: string }>;
+    }>;
     score_full_game: string;
     points_units?: string;
     levels: Record<string, { points: string; name: string; description: string }>;
@@ -81,104 +152,54 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
   const [gameMessage, setGameMessage] = useState('');
   const [showLoading, setShowLoading] = useState(false);
   const [audioElements, setAudioElements] = useState<Record<string, HTMLAudioElement>>({});
-  const [mediaFiles, setMediaFiles] = useState<Record<string, string>>({});
+  // First-bip video overlay state. Captures the team to finalize once the
+  // overlay completes so the start_time set + start message fire only after
+  // all videos have played.
+  const [firstBipVideos, setFirstBipVideos] = useState<VideoSource[] | null>(null);
+  const pendingFirstBipFinalizeRef = useRef<(() => Promise<void>) | null>(null);
+  // Banner shown when the SportIdent reader isn't plugged in — the game
+  // page autobinds via 'reader:status' once detection flips.
+  const detectedReader = useDetectedReaderPort();
 
   useEffect(() => {
     const loadGameData = async () => {
       try {
-        const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
+        const raw = (await scenarioStore.getGameData(gameUniqid)) as any;
+        if (!raw) {
+          console.error('No game-data.json on disk for', gameUniqid);
+          return;
+        }
 
-        if (isElectron) {
-          const gameDataContent = await (window as any).electron.games.readFile(gameUniqid, 'game-data.json');
-          let data = JSON.parse(gameDataContent);
-
-          if (data.scenario) {
-            data = {
+        // Disk shape may still ship the legacy {scenario, game_data, ...}
+        // envelope or the flattened {game, game_meta, ...} shape. Normalise.
+        const data: GameData = raw.scenario
+          ? {
               game: {
-                id: data.scenario.id,
-                uniqid: data.scenario.uniqid,
-                type: data.scenario.scenario_type,
-                title: data.game_data?.game_meta?.title || data.scenario.name
+                id: raw.scenario.id,
+                uniqid: raw.scenario.uniqid,
+                type: raw.scenario.scenario_type,
+                title: raw.game_data?.game_meta?.title || raw.scenario.name,
               },
-              game_meta: data.game_data?.game_meta || {},
-              game_enigmas: data.game_data?.game_enigmas || [],
-              game_sounds: data.game_data?.game_sounds || []
-            };
-          }
-
-          setGameData(data);
-          gameDataRef.current = data;
-
-          const mediaFilesMap: Record<string, string> = {};
-          const collectImageIds = (obj: any, ids: Set<string>) => {
-            if (typeof obj === 'string' && /^\d+$/.test(obj)) {
-              ids.add(obj);
-            } else if (typeof obj === 'object' && obj !== null) {
-              Object.values(obj).forEach(val => collectImageIds(val, ids));
+              game_meta: raw.game_data?.game_meta || {},
+              game_enigmas: raw.game_data?.game_enigmas || [],
+              game_sounds: raw.game_data?.game_sounds || [],
             }
-          };
+          : raw;
 
-          const imageIds = new Set<string>();
-          collectImageIds(data.game_meta, imageIds);
-          if (data.game_enigmas) {
-            data.game_enigmas.forEach((enigma: any) => collectImageIds(enigma, imageIds));
-          }
-          if (data.game_sounds) {
-            data.game_sounds.forEach((sound: any) => collectImageIds(sound, imageIds));
-          }
+        setGameData(data);
+        gameDataRef.current = data;
+        // Register the scenario's uploaded custom fonts so a Typography
+        // selection that points at one renders (offline-safe).
+        void registerScenarioFonts(gameUniqid, data.game_meta?.custom_fonts);
 
-          for (const imageId of imageIds) {
-            try {
-              const files = await (window as any).electron.games.listMediaFolder(gameUniqid, imageId);
-              if (files && files.length > 0) {
-                mediaFilesMap[imageId] = files[0];
-              }
-            } catch (err) {
-              console.warn(`Could not load media for ${imageId}:`, err);
-            }
+        if (data.game_sounds) {
+          const loadedAudio: Record<string, HTMLAudioElement> = {};
+          for (const soundData of data.game_sounds) {
+            if (!soundData.sound_id) continue;
+            const audio = new Audio(scenarioAssetUrl(gameUniqid, soundData.sound_id));
+            loadedAudio[soundData.image_number] = audio;
           }
-          setMediaFiles(mediaFilesMap);
-
-          if (data.game_sounds) {
-            const loadedAudio: Record<string, HTMLAudioElement> = {};
-            for (const soundData of data.game_sounds) {
-              const fileName = mediaFilesMap[soundData.sound_id];
-              if (fileName) {
-                const audio = new Audio(`app-file://${gameUniqid}/media/${soundData.sound_id}/${fileName}`);
-                loadedAudio[soundData.image_number] = audio;
-              }
-            }
-            setAudioElements(loadedAudio);
-          }
-        } else {
-          const response = await fetch(`/data/games/${gameUniqid}/game-data.json`);
-          let data = await response.json();
-
-          if (data.scenario) {
-            data = {
-              game: {
-                id: data.scenario.id,
-                uniqid: data.scenario.uniqid,
-                type: data.scenario.scenario_type,
-                title: data.game_data?.game_meta?.title || data.scenario.name
-              },
-              game_meta: data.game_data?.game_meta || {},
-              game_enigmas: data.game_data?.game_enigmas || [],
-              game_sounds: data.game_data?.game_sounds || []
-            };
-          }
-
-          setGameData(data);
-          gameDataRef.current = data;
-
-          if (data.game_sounds) {
-            const loadedAudio: Record<string, HTMLAudioElement> = {};
-            for (const soundData of data.game_sounds) {
-              const audio = new Audio(`/data/games/${gameUniqid}/media/${soundData.sound_id}`);
-              loadedAudio[soundData.image_number] = audio;
-            }
-            setAudioElements(loadedAudio);
-          }
+          setAudioElements(loadedAudio);
         }
       } catch (error) {
         console.error('Error loading game data:', error);
@@ -187,13 +208,6 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
 
     loadGameData();
   }, [gameUniqid]);
-
-  useEffect(() => {
-    const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-    if (isElectron) {
-      (window as any).electron.db.connect().catch(() => {});
-    }
-  }, []);
 
   useEffect(() => {
     if (!gameStarted) return;
@@ -224,8 +238,8 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
   };
 
   const saveCardData = async (card: CardData) => {
-    if (!supabase || !launchedGameId) {
-      console.warn('Cannot save card data: supabase or launchedGameId not available', { supabase: !!supabase, launchedGameId });
+    if (!launchedGameId) {
+      console.warn('Cannot save card data: launchedGameId not available');
       return;
     }
 
@@ -244,45 +258,20 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
         console.error('Game data still not loaded after waiting');
         return;
       }
-      console.log('✓ Game data loaded, proceeding...');
     }
 
-    console.log('Saving card data for launched game:', launchedGameId);
-
     try {
-      let deviceId = 'unknown';
-      if (usbReaderService.isElectron()) {
-        try {
-          const computerName = await (window as any).electron.getComputerName();
-          deviceId = computerName || 'unknown';
-        } catch (error) {
-          console.error('Error getting computer name:', error);
-        }
-      }
-
       const rawDataJson = JSON.parse(JSON.stringify(card));
-
-      const { error } = await supabase.from('launched_game_raw_data').insert({
-        launched_game_id: launchedGameId,
-        device_id: deviceId,
-        raw_data: rawDataJson,
-      });
-
-      if (error) {
-        console.error('Error saving card data:', error);
-      } else {
-        console.log('✓ Card data saved successfully');
-        await handleCardPunchLogic(card);
-      }
+      // Server resolves device_id from the JWT.
+      await recordPunch(launchedGameId, rawDataJson);
+      await handleCardPunchLogic(card);
     } catch (error) {
       console.error('Error saving card data:', error);
     }
   };
 
   const handleCardPunchLogic = async (card: CardData) => {
-    if (!supabase || !launchedGameId) {
-      return;
-    }
+    if (!launchedGameId) return;
 
     const currentGameData = gameDataRef.current;
     if (!currentGameData) {
@@ -291,41 +280,48 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
     }
 
     try {
-      const { data: team, error: teamError } = await supabase
-        .from('teams')
-        .select('*')
-        .eq('launched_game_id', launchedGameId)
-        .eq('key_id', card.id)
-        .maybeSingle();
-
-      if (teamError) {
-        console.error('Error finding team:', teamError);
-        return;
-      }
-
+      // Resolve team via single combined state call.
+      const state = await getLaunchedGameState(launchedGameId, 0);
+      const team = state.teams.find((t) => t.key_id === card.id) ?? null;
       if (!team) {
         console.warn('No team found with card ID:', card.id);
         return;
       }
+      const teamName = team.team_name ?? '';
 
       if (!team.start_time) {
-        const startTime = Math.floor(Date.now() / 1000);
-        const { error: updateError } = await supabase
-          .from('teams')
-          .update({ start_time: startTime })
-          .eq('id', team.id);
+        const finalizeStart = async () => {
+          const startTime = Math.floor(Date.now() / 1000);
+          try {
+            await updateTeam(team.id, { start_time: startTime });
+            console.log('✓ Team started:', teamName);
+            showMessage(`C'est parti! ${teamName}`, config.messageDisplayDuration * 1000);
+            playSound('game_start');
+          } catch (err) {
+            console.error('Error updating team start time:', err);
+          }
+        };
 
-        if (updateError) {
-          console.error('Error updating team start time:', updateError);
-        } else {
-          console.log('✓ Team started:', team.team_name);
-          showMessage(`C'est parti! ${team.team_name}`, config.messageDisplayDuration * 1000);
-          playSound('game_start');
+        // Decide whether to gate the start on the first-bip video overlay.
+        // We only resolve videos here (not at mount) so a launch with both
+        // toggles off skips the whole code path.
+        const wantsVideos = !!(config.playTutorialOnBip || config.playIntroOnBip);
+        if (wantsVideos) {
+          const gameTypeCode = (currentGameData.game?.type || 'mystery').toLowerCase();
+          const rawForResolve = await scenarioStore.getGameData(gameUniqid);
+          const videos = await resolveFirstBipVideos(config, gameUniqid, gameTypeCode, rawForResolve);
+          if (videos.length > 0) {
+            pendingFirstBipFinalizeRef.current = finalizeStart;
+            setFirstBipVideos(videos);
+            return;
+          }
         }
+
+        await finalizeStart();
       } else if (!team.end_time) {
         const endTime = Math.floor(Date.now() / 1000);
 
-        const patternEnigmas = await loadPatternEnigmasByUniqid('mystery', config.pattern);
+        const patternEnigmas = await patternStore.getMysteryEnigmas(config.pattern);
         console.log('Loaded pattern enigmas:', patternEnigmas);
 
         const cardPunchCodes = card.punches.map(p => p.code.toString());
@@ -391,18 +387,15 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
         console.log('=== FINAL SCORE ===');
         console.log('Total Score:', totalScore);
 
-        const { error: updateError } = await supabase
-          .from('teams')
-          .update({
-            end_time: endTime,
-            score: totalScore,
-          })
-          .eq('id', team.id);
-
-        if (updateError) {
-          console.error('Error updating team end time:', updateError);
-        } else {
-          console.log('✓ Team finished:', team.team_name);
+        let updateOk = true;
+        try {
+          await updateTeam(team.id, { end_time: endTime, score: totalScore });
+        } catch (err) {
+          console.error('Error updating team end time:', err);
+          updateOk = false;
+        }
+        if (updateOk) {
+          console.log('✓ Team finished:', teamName);
           console.log('✓ Score:', totalScore);
           const duration = endTime - team.start_time;
 
@@ -469,7 +462,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
             await new Promise(resolve => setTimeout(resolve, parseInt(currentGameData.game_meta.animation_enigma_duration || '1') * 1000));
           }
 
-          showMessage(`Terminé! ${team.team_name} - Score: ${totalScore} - Temps: ${formatTime(duration)}`, config.messageDisplayDuration * 1000);
+          showMessage(`Terminé! ${teamName} - Score: ${totalScore} - Temps: ${formatTime(duration)}`, config.messageDisplayDuration * 1000);
           playSound('game_end');
         }
       } else {
@@ -511,14 +504,24 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
   }, [gameStarted]);
 
   useEffect(() => {
+    let cancelled = false;
+
     const initializeUSB = async () => {
-      if (usbReaderService.isElectron() && config.usbPort) {
-        try {
-          console.log('🔌 Initializing USB reader on port:', config.usbPort);
-          const initialized = await usbReaderService.initializePort(config.usbPort);
-          if (initialized) {
+      if (!siReader.isAvailable()) {
+        console.log('ℹ️  USB not available in this runtime - reader disabled');
+        return;
+      }
+      const detected = await detectReaderPort();
+      if (cancelled || !detected) {
+        if (!detected) console.log('⚠️  No SportIdent reader detected — waiting for hotplug');
+        return;
+      }
+      try {
+        console.log('🔌 Initializing USB reader on detected port:', detected.path);
+        const initialized = await siReader.initializePort(detected.path);
+        if (initialized) {
             console.log('✓ USB reader initialized successfully');
-            usbReaderService.setCardDetectedCallback((card: CardData) => {
+            siReader.setCardDetectedCallback((card: CardData) => {
               console.log('🏷️  CARD DETECTED');
               console.log('  Card ID:', card.id);
               console.log('  Series:', card.series);
@@ -545,12 +548,12 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
               }, 5000);
             });
 
-            usbReaderService.setCardRemovedCallback(() => {
+            siReader.setCardRemovedCallback(() => {
               console.log('🏷️  CARD REMOVED');
               setShowCardAlert(false);
             });
 
-            usbReaderService.setStationsDetectedCallback((detectedStations: StationData[]) => {
+            siReader.setStationsDetectedCallback((detectedStations: StationData[]) => {
               console.log('📡 STATIONS DETECTED');
               console.log('  Number of stations:', detectedStations.length);
               detectedStations.forEach((station, index) => {
@@ -568,34 +571,34 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
             });
 
             console.log('▶️  Starting USB reader...');
-            await usbReaderService.start();
+            await siReader.start();
             console.log('✓ USB reader started - waiting for card data...');
-          } else {
-            console.error('✗ Failed to initialize USB reader');
-          }
-        } catch (error) {
-          console.error('✗ Error starting USB reader:', error);
+        } else {
+          console.error('✗ Failed to initialize USB reader');
         }
-      } else {
-        if (!usbReaderService.isElectron()) {
-          console.log('ℹ️  Not in Electron mode - USB reader disabled');
-        } else if (!config.usbPort) {
-          console.log('⚠️  No USB port configured - USB reader disabled');
-        }
+      } catch (error) {
+        console.error('✗ Error starting USB reader:', error);
       }
     };
 
-    initializeUSB();
+    const onReaderStatus = () => {
+      void initializeUSB();
+    };
+
+    void initializeUSB();
+    window.addEventListener('reader:status', onReaderStatus);
 
     return () => {
+      cancelled = true;
+      window.removeEventListener('reader:status', onReaderStatus);
       console.log('🚪 Leaving game page - cleaning up USB listener...');
-      if (usbReaderService.isElectron()) {
-        usbReaderService.stop().catch(err => {
+      if (siReader.isAvailable()) {
+        siReader.stop().catch(err => {
           console.error('Error stopping USB reader:', err);
         });
       }
     };
-  }, [config.usbPort]);
+  }, []);
 
   const handleNewBip = useCallback((row: { raw_data: any }) => {
     const card = row.raw_data;
@@ -629,25 +632,33 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
     );
   }
 
-  const getImageUrl = (imageId: string) => {
-    if (!imageId || imageId === 'undefined' || imageId === 'null') return '';
-    const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-    if (isElectron) {
-      const fileName = mediaFiles[imageId];
-      if (fileName) {
-        return `app-file://${gameUniqid}/media/${imageId}/${fileName}`;
-      }
-      return `app-file://${gameUniqid}/media/${imageId}`;
-    }
-
-    return '';
+  const getImageUrl = (filename: string) => {
+    if (!filename || filename === 'undefined' || filename === 'null') return '';
+    return scenarioAssetUrl(gameUniqid, filename);
   };
 
   const backgroundImageUrl = getImageUrl(gameData.game_meta.background_image);
 
+  // Scenario-wide font from the Typography section. Applied at the gameplay
+  // page root so all mystery text inherits it.
+  const scenarioFontFamily = resolveFontFamily(gameData.game_meta.font);
+
   return (
-    <div className="game_page_wrapper game_page_wrapper_mystery" style={{ backgroundImage: `url(${backgroundImageUrl})` }}>
+    <div
+      className="game_page_wrapper game_page_wrapper_mystery"
+      style={{ backgroundImage: `url(${backgroundImageUrl})`, fontFamily: scenarioFontFamily || undefined }}
+    >
+      {firstBipVideos && (
+        <FirstBipVideoOverlay
+          videos={firstBipVideos}
+          onComplete={async () => {
+            const finalize = pendingFirstBipFinalizeRef.current;
+            pendingFirstBipFinalizeRef.current = null;
+            setFirstBipVideos(null);
+            if (finalize) await finalize();
+          }}
+        />
+      )}
       <CardDetectionAlert cardData={lastCardData} show={showCardAlert} />
 
       <header className="fixed top-0 left-0 right-0 bg-slate-800/80 backdrop-blur-sm border-b border-slate-700 z-50">
@@ -668,6 +679,14 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
             <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode — Max 5 Teams</span>
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          </div>
+        )}
+        {siReader.isAvailable() && !detectedReader.isPresent && (
+          <div className="flex items-center justify-center gap-3 px-4 py-2 bg-orange-500/20 border-t border-orange-500/40">
+            <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
+            <span className="text-orange-300 text-sm">
+              Reader not connected — waiting for SportIdent dongle. Punches will start landing as soon as you plug it in.
+            </span>
           </div>
         )}
       </header>

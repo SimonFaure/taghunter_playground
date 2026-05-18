@@ -1,6 +1,11 @@
 import { useState, useEffect } from 'react';
 import { X, Award, Zap, Target, Clock, List, ChevronDown, ChevronUp, BarChart2, Radio } from 'lucide-react';
-import { supabase } from '../lib/db';
+import * as scenarioStore from '../services/scenarioStore';
+import {
+  getLaunchedGameState,
+  getRawDataForChip,
+  listCompletedQuests,
+} from '../services/launchedGames';
 
 interface Team {
   id: number;
@@ -148,14 +153,8 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, onClose }: 
   useEffect(() => {
     const loadGameData = async () => {
       try {
-        const { data: urlData } = supabase.storage
-          .from('resources')
-          .getPublicUrl(`scenarios/${gameUniqid}/game-data.json`);
-        const resp = await fetch(urlData.publicUrl);
-        if (resp.ok) {
-          const raw = await resp.json();
-          setGameData(raw?.game_data ?? raw);
-        }
+        const raw = (await scenarioStore.getGameData(gameUniqid)) as any;
+        if (raw) setGameData(raw?.game_data ?? raw);
       } catch {
         // game data not available
       }
@@ -168,36 +167,48 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, onClose }: 
     const load = async (isInitial = false) => {
       if (isInitial) setLoading(true);
 
-      const [questsRes, rawRes, teamRes, responsesRes] = await Promise.all([
-        supabase
-          .from('team_completed_quests')
-          .select('id, quest_number, points_awarded, teammate_chip_id, completed_at')
-          .eq('team_id', team.id)
-          .order('completed_at', { ascending: true }),
-        supabase
-          .from('launched_game_raw_data')
-          .select('id, raw_data, created_at')
-          .eq('launched_game_id', launchedGameId)
-          .eq('raw_data->>id', team.key_id.toString())
-          .order('created_at', { ascending: true }),
-        supabase
-          .from('teams')
-          .select('id, team_name, score, start_time, end_time, key_id')
-          .eq('id', team.id)
-          .maybeSingle(),
-        supabase
-          .from('team_punch_responses')
-          .select('id, chip_id, status, result_json, punched_at')
-          .eq('team_id', team.id)
-          .order('punched_at', { ascending: false }),
-      ]);
-
-      if (questsRes.data) setCompletedQuests(questsRes.data as CompletedQuest[]);
-      if (rawRes.data) setRawDataRecords(rawRes.data as RawDataRecord[]);
-      if (teamRes.data) setCurrentTeam(teamRes.data as typeof team);
-      if (responsesRes.data) setPunchResponses(responsesRes.data as PunchResponse[]);
-
-      if (isInitial) setLoading(false);
+      try {
+        const [questsRows, rawRows, state] = await Promise.all([
+          listCompletedQuests(launchedGameId, team.id),
+          getRawDataForChip(launchedGameId, team.key_id, 50),
+          getLaunchedGameState(launchedGameId, 0),
+        ]);
+        setCompletedQuests(
+          questsRows.map((r) => ({
+            id: r.id,
+            quest_number: r.quest_number,
+            points_awarded: r.points_awarded,
+            teammate_chip_id: r.teammate_chip_id,
+            completed_at: r.created_at,
+          })) as CompletedQuest[]
+        );
+        // raw_data_for_chip returns DESC; this view wants ASC.
+        const rawAsc = [...rawRows].sort((a, b) => a.id - b.id);
+        setRawDataRecords(
+          rawAsc.map((r) => ({
+            id: r.id,
+            raw_data: r.raw_data,
+            created_at: r.created_at,
+          })) as RawDataRecord[]
+        );
+        const refreshed = state.teams.find((t) => t.id === team.id);
+        if (refreshed) {
+          setCurrentTeam({
+            ...team,
+            team_name: refreshed.team_name ?? team.team_name,
+            score: refreshed.score,
+            start_time: refreshed.start_time,
+            end_time: refreshed.end_time,
+            key_id: refreshed.key_id ?? team.key_id,
+          } as typeof team);
+        }
+        // team_punch_responses is not migrated in slice 3; leave empty.
+        setPunchResponses([]);
+      } catch (err) {
+        console.error('[TeamDetailsModal] load failed:', err);
+      } finally {
+        if (isInitial) setLoading(false);
+      }
     };
 
     load(true);
