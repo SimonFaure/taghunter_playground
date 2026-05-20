@@ -6,7 +6,7 @@
 // SportIdent USB driver package.
 
 import { useState } from 'react';
-import { HardDriveDownload, ExternalLink, Loader2 } from 'lucide-react';
+import { HardDriveDownload, ExternalLink, Loader2, ShieldAlert } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
 const DRIVER_URL = 'https://sportident.fr/produit/usb-driver/';
@@ -67,6 +67,63 @@ export function UsbDriverScreen() {
           <span className="text-slate-300">Hardware</span> tab — the reader
           status should turn green.
         </p>
+      </div>
+
+      <div className="bg-slate-800/50 rounded-lg p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <ShieldAlert className="text-blue-400" size={24} />
+          <div>
+            <h2 className="text-xl font-semibold">Why this happens</h2>
+            <p className="text-sm text-slate-400">
+              Memory Integrity and recent Windows 11 feature updates.
+            </p>
+          </div>
+        </div>
+
+        <p className="text-sm text-slate-300 mb-4">
+          Recent Windows 11 feature updates (<span className="text-slate-200 font-medium">24H2</span>,{' '}
+          <span className="text-slate-200 font-medium">25H2</span>) tighten the
+          kernel driver code-integrity policy and turn{' '}
+          <span className="text-slate-200 font-medium">Memory Integrity</span>{' '}
+          (Core Isolation) on by default. Older USB-serial drivers — including
+          the one previously bundled with the SportIdent reader — no longer
+          load under the new policy, so the reader stops being detected. The
+          installer above replaces it with a current signed, HVCI-compatible
+          build —{' '}
+          <span className="text-slate-200 font-medium">
+            you don't need to disable Memory Integrity
+          </span>
+          .
+        </p>
+
+        <div className="text-xs uppercase tracking-wider text-slate-500 mb-2">
+          How to verify on your machine
+        </div>
+        <ul className="text-sm text-slate-300 space-y-2 list-disc pl-5 marker:text-slate-500">
+          <li>
+            Windows Security →{' '}
+            <span className="text-slate-200">Device Security → Core Isolation</span>{' '}
+            — if Memory Integrity is{' '}
+            <span className="text-slate-200 font-medium">On</span>, that's the
+            block.
+          </li>
+          <li>
+            Windows Update →{' '}
+            <span className="text-slate-200">Update history</span> — look for a
+            recent feature update to 24H2 or 25H2.
+          </li>
+          <li>
+            Event Viewer →{' '}
+            <span className="text-slate-200">Windows Logs → System</span>,
+            filter by source{' '}
+            <span className="font-mono text-xs text-slate-200">
+              Microsoft-Windows-CodeIntegrity
+            </span>{' '}
+            — the blocking entry names the exact{' '}
+            <span className="font-mono">.sys</span> file Windows refused to load
+            (for advanced diagnosis).
+          </li>
+        </ul>
       </div>
     </div>
   );
