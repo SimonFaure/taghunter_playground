@@ -13,9 +13,12 @@ import { useAuth } from '../auth/AuthProvider';
 import { isOnline, onConnectivityChange } from '../../services/connectivity';
 
 // Account tab — read-only summary of the signed-in client + the destructive
-// "sign out of this device" action. The everyday logout verb has been
-// reframed as the cold-start PIN lock (see AuthProvider), so reaching this
-// button means the user really does want to release this device.
+// "sign out of this device" action.
+//
+// The everyday "stepping away from the tablet" verb is the nav-bar Lock
+// button (PIN gate, see AuthProvider). "Sign out" actually revokes the
+// device server-side, so reaching this button means the user really does
+// want to release this device.
 //
 // Online-only by design: signing out revokes the device server-side, and
 // without internet the revoke call would no-op while local state still

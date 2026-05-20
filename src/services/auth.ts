@@ -203,9 +203,9 @@ export async function revokeDevice(deviceId: number): Promise<void> {
 }
 
 // "Truly sign out" — the destructive path exposed in Settings → Account.
-// Replaces the old `logout()` verb: everyday "logout" is now a no-op because
-// the cold-start lock + PIN handles same-user-returning. Reach this only when
-// the user explicitly chooses to release this device.
+// Replaces the old `logout()` verb: everyday "stepping away" is the nav-bar
+// "Lock" button (PIN gate), not a sign-out. Reach this only when the user
+// explicitly chooses to release this device.
 //
 // Online-only at the call site (AccountScreen disables its button when
 // connectivity.isOnline() is false). The function itself still tolerates an

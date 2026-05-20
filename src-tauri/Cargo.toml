@@ -48,12 +48,14 @@ windows = { version = "0.58", features = [
     "Networking_NetworkOperators",
 ] }
 
-# Desktop-only: app self-update. The Tauri updater cannot self-install on
-# mobile (Android/iOS go through the app stores), so these are gated to
-# desktop targets and registered behind #[cfg(desktop)] in lib.rs.
+# Desktop-only: app self-update + OS autostart. The Tauri updater cannot
+# self-install on mobile (Android/iOS go through the app stores), and
+# launch-on-boot is a desktop-only concept — so these are gated to desktop
+# targets and registered behind #[cfg(desktop)] in lib.rs.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-autostart = "2"
 
 # Tauri 2 mobile entry-point (compiled in for android/ios targets).
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]

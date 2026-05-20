@@ -79,7 +79,7 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
           </h1>
           <p className="text-slate-400 text-sm">
             {phase === 'choose'
-              ? 'You’ll use this PIN to unlock the app each time it opens. No internet needed.'
+              ? 'You’ll use this PIN to unlock the app after you lock it. No internet needed.'
               : 'Type it once more to make sure it matches.'}
           </p>
           <p className="text-slate-500 text-xs mt-2">Signed in as {user.email}</p>

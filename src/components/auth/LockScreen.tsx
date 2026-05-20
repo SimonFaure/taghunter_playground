@@ -7,8 +7,11 @@ import { isOnline } from '../../services/connectivity';
 import { ApiError } from '../../services/api';
 import type { AuthUser } from '../../services/authStore';
 
-// Cold-start PIN gate. JWT + auth_user are already on disk; this screen
-// never touches the server unless the user explicitly taps "Forgot PIN".
+// Manual-lock PIN gate. Rendered as a full-screen overlay when the user
+// taps "Lock" in the nav bar — the app shell stays mounted and live
+// underneath. It is not a cold-start gate. JWT + auth_user are already on
+// disk; this screen never touches the server unless the user explicitly
+// taps "Forgot PIN".
 //
 // Recovery flow is the existing OTP infra:
 //   1. tap "Forgot PIN" (online only — button disabled when offline),
@@ -164,7 +167,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-500/20 border border-blue-500/40 mb-4">

@@ -36,6 +36,10 @@ function shouldRetry(err: unknown): boolean {
     if (err.status === 429 || err.status >= 500) return true;
     return false;
   }
+  // An intentional abort (cycle teardown / hard cap) must not be retried —
+  // retrying just delays cycle termination. A TimeoutError (a genuine request
+  // stall) is a different DOMException name; it falls through and IS retried.
+  if (err instanceof DOMException && err.name === 'AbortError') return false;
   return true;
 }
 

@@ -140,9 +140,32 @@ export function assetUrl(absPath: string): string {
   return convertFileSrc(absPath);
 }
 
-// `scenario://{uniqid}/{relPath}` resolves on the Rust side to the matching
-// file under media/scenarios/{uniqid}/v{local_version}/{relPath}. Per-request
-// version lookup means callers never need to re-mint URLs after a sync cycle.
+// Custom URI-scheme protocols don't share one URL shape across platforms:
+// Windows (WebView2) and Android serve them over `http(s)://<scheme>.localhost/`
+// — and the scheme is `https` unless `dangerousUseHttpScheme` is set — while
+// macOS/Linux/iOS use the native `<scheme>://` form. Getting this wrong fails
+// the webview fetch: the native form on Windows is ERR_UNKNOWN_URL_SCHEME, and
+// `http://` when Tauri expects `https://` escapes the webview entirely (the
+// request leaves to the network and `*.localhost` 404s on a local web server).
+// `convertFileSrc` already encodes Tauri's exact shape for this platform/build,
+// so probe it once to derive the prefix. `scenario_protocol.rs` accepts both
+// `https://scenario.localhost/<uniqid>/…` and native `scenario://<uniqid>/…`.
+let scenarioUrlPrefixCache: string | null = null;
+function scenarioUrlPrefix(): string {
+  if (scenarioUrlPrefixCache === null) {
+    const probe = convertFileSrc('probe', 'scenario');
+    const httpForm = /^(https?):\/\//.exec(probe);
+    scenarioUrlPrefixCache = httpForm
+      ? `${httpForm[1]}://scenario.localhost/`
+      : 'scenario://';
+  }
+  return scenarioUrlPrefixCache;
+}
+
+// `scenario://{uniqid}/{relPath}` (or `http://scenario.localhost/{uniqid}/...`
+// on Windows/Android) resolves on the Rust side to the matching file under
+// media/scenarios/{uniqid}/v{local_version}/{relPath}. Per-request version
+// lookup means callers never need to re-mint URLs after a sync cycle.
 // Encodes path segments individually so spaces and other reserved chars in
 // filenames round-trip; the protocol handler percent-decodes on receipt.
 //
@@ -161,7 +184,7 @@ export function scenarioAssetUrl(uniqid: string, relPath: string): string {
     .filter((s) => s.length > 0)
     .map(encodeURIComponent)
     .join('/');
-  return `scenario://${encodeURIComponent(uniqid)}/${encoded}`;
+  return `${scenarioUrlPrefix()}${encodeURIComponent(uniqid)}/${encoded}`;
 }
 
 function stripLegacyMediaUrl(input: string): string {

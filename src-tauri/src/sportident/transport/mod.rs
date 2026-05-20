@@ -15,6 +15,10 @@
 //     every call site for no gain.
 
 pub mod desktop;
+// Hardware-free test transport only — referenced exclusively from
+// `#[cfg(test)]` blocks (here and in reader.rs), so gate it to test
+// builds rather than shipping/​warning about it in the release binary.
+#[cfg(test)]
 pub mod mock;
 
 use std::fmt;
@@ -75,6 +79,9 @@ pub trait SerialTransport: Send + Sync + 'static {
     /// `TransportError::NotOpen` and the corresponding `BytesRx` closes.
     async fn close(&self) -> Result<(), TransportError>;
 
+    // Part of the transport surface and exercised by transport tests; no
+    // production caller checks it yet.
+    #[allow(dead_code)]
     fn is_open(&self) -> bool;
 }
 

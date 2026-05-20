@@ -19,52 +19,68 @@ use tauri::http::{Request, Response, StatusCode, Uri};
 use tauri::{AppHandle, Manager};
 
 pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+    let uri_str = request.uri().to_string();
+    eprintln!("[scenario_protocol] -> {uri_str}");
     match resolve(app, &request).await {
-        Ok(resp) => resp,
-        Err(_) => not_found(),
+        Ok(resp) => {
+            eprintln!("[scenario_protocol] 200 {uri_str}");
+            resp
+        }
+        Err(reason) => {
+            eprintln!("[scenario_protocol] 404 {uri_str} -- {reason}");
+            not_found()
+        }
     }
 }
 
-async fn resolve(app: AppHandle, request: &Request<Vec<u8>>) -> Result<Response<Vec<u8>>, ()> {
+async fn resolve(app: AppHandle, request: &Request<Vec<u8>>) -> Result<Response<Vec<u8>>, String> {
     let uri = request.uri();
-    let (uniqid, relpath) = parse_scenario_uri(uri).ok_or(())?;
+    let (uniqid, relpath) =
+        parse_scenario_uri(uri).ok_or_else(|| format!("unparseable URI: {uri}"))?;
     if !is_safe_path(&relpath) {
-        return Err(());
+        return Err(format!("unsafe relpath: {relpath}"));
     }
 
-    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<u8>, String), ()> {
-        let db_dir = app.path().app_data_dir().map_err(|_| ())?;
-        let db_path = db_dir.join("playground.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|_| ())?;
-
-        let local_version: Option<i64> = conn
-            .query_row(
-                "SELECT local_version FROM scenarios WHERE uniqid = ?1",
-                [&uniqid],
-                |row| row.get(0),
+    let bytes =
+        tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
+            let db_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app_data_dir failed: {e}"))?;
+            let db_path = db_dir.join("playground.db");
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
-            .optional()
-            .map_err(|_| ())?
-            .flatten();
-        let version = local_version.ok_or(())?;
+            .map_err(|e| format!("open {} failed: {e}", db_path.display()))?;
 
-        let file_path: PathBuf = db_dir
-            .join("media")
-            .join("scenarios")
-            .join(&uniqid)
-            .join(format!("v{version}"))
-            .join(relpath_to_os(&relpath));
+            let local_version: Option<i64> = conn
+                .query_row(
+                    "SELECT local_version FROM scenarios WHERE uniqid = ?1",
+                    [&uniqid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("query local_version for {uniqid} failed: {e}"))?
+                .flatten();
+            let version = local_version
+                .ok_or_else(|| format!("no local_version for uniqid {uniqid} (NULL or no row)"))?;
 
-        let bytes = std::fs::read(&file_path).map_err(|_| ())?;
-        let mime = mime_for(&file_path).to_string();
-        Ok((bytes, mime))
-    })
-    .await
-    .map_err(|_| ())??;
+            let file_path: PathBuf = db_dir
+                .join("media")
+                .join("scenarios")
+                .join(&uniqid)
+                .join(format!("v{version}"))
+                .join(relpath_to_os(&relpath));
+
+            let bytes = std::fs::read(&file_path)
+                .map_err(|e| format!("read {} failed: {e}", file_path.display()))?;
+            let mime = mime_for(&file_path).to_string();
+            Ok((bytes, mime))
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join error: {e}"))??;
 
     let (body, mime) = bytes;
     Response::builder()
@@ -72,24 +88,31 @@ async fn resolve(app: AppHandle, request: &Request<Vec<u8>>) -> Result<Response<
         .header("Content-Type", mime)
         .header("Access-Control-Allow-Origin", "*")
         .body(body)
-        .map_err(|_| ())
+        .map_err(|e| format!("response build failed: {e}"))
 }
 
 fn not_found() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header("Content-Type", "text/plain")
+        .header("Access-Control-Allow-Origin", "*")
         .body(Vec::new())
         .unwrap()
 }
 
-/// Returns (uniqid, relpath) for both URI shapes Tauri 2 may deliver:
-///   scenario://<uniqid>/<relpath>            (macOS/Linux native)
-///   http://scenario.localhost/<uniqid>/<r>   (Windows webview rewrite)
+/// Returns (uniqid, relpath) for the URI shapes Tauri 2 may deliver.
+///
+/// The webview mints `http(s)://scenario.localhost/<uniqid>/<relpath>` on
+/// Windows/Android and `scenario://…` elsewhere — but Tauri NORMALISES every
+/// custom-protocol request to `scenario://localhost/<uniqid>/<relpath>` before
+/// it reaches this handler (host becomes the literal `localhost`). So:
+///   host == "localhost" / "scenario.localhost"  → uniqid is the 1st path seg
+///   any other host                              → legacy `scenario://<uniqid>/…`
+///                                                  shape (host IS the uniqid)
 fn parse_scenario_uri(uri: &Uri) -> Option<(String, String)> {
     let host = uri.host()?;
     let raw_path = uri.path().trim_start_matches('/');
-    let (uniqid_raw, rest_raw) = if host == "scenario.localhost" {
+    let (uniqid_raw, rest_raw) = if host == "localhost" || host == "scenario.localhost" {
         raw_path.split_once('/')?
     } else {
         (host, raw_path)
@@ -191,6 +214,16 @@ mod tests {
     #[test]
     fn parses_windows_shape() {
         let uri: Uri = "http://scenario.localhost/abc/images/foo.png".parse().unwrap();
+        let (u, r) = parse_scenario_uri(&uri).unwrap();
+        assert_eq!(u, "abc");
+        assert_eq!(r, "images/foo.png");
+    }
+
+    #[test]
+    fn parses_normalised_localhost_shape() {
+        // The shape Tauri actually hands the handler after normalising the
+        // `http://scenario.localhost/…` webview URL.
+        let uri: Uri = "scenario://localhost/abc/images/foo.png".parse().unwrap();
         let (u, r) = parse_scenario_uri(&uri).unwrap();
         assert_eq!(u, "abc");
         assert_eq!(r, "images/foo.png");

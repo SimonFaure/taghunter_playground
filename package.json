@@ -20,7 +20,8 @@
     "ios:build": "tauri ios build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "~2.10.0",
+    "@tauri-apps/plugin-autostart": "^2",
     "@tauri-apps/plugin-fs": "^2",
     "@tauri-apps/plugin-http": "^2",
     "@tauri-apps/plugin-opener": "^2",

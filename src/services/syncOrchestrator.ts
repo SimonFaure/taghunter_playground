@@ -53,6 +53,10 @@ const DEBOUNCE_MS = 60_000;
 const TIMER_MS = 30 * 60 * 1000;
 const FOREGROUND_THRESHOLD_MS = 5 * 60 * 1000;
 const POOL_SIZE = 3;
+// Defense-in-depth wall-clock cap on a single cycle. Per-request timeouts in
+// api.ts should already bound every call; this is the backstop guaranteeing
+// runCycle() always terminates even if a future path forgets a timeout.
+const CYCLE_HARD_CAP_MS = 10 * 60 * 1000;
 
 // ---------- types ----------
 
@@ -235,6 +239,15 @@ async function runCycle(trigger: Trigger): Promise<void> {
   cycleAbort = new AbortController();
   scenarioProgress.clear();
 
+  // Hard cap (see CYCLE_HARD_CAP_MS). Firing aborts the cycle: the pool stops
+  // dispatch, Promise.all resolves, and the cycle ends as a recoverable
+  // failure rather than hanging. Cleared in the finally block below.
+  const thisCycleAbort = cycleAbort;
+  const hardCap = setTimeout(() => {
+    console.warn('[syncOrchestrator] cycle exceeded hard cap, aborting');
+    thisCycleAbort.abort();
+  }, CYCLE_HARD_CAP_MS);
+
   const startedAtIso = new Date().toISOString();
   currentTrigger = trigger;
   currentPhase = null;
@@ -244,6 +257,13 @@ async function runCycle(trigger: Trigger): Promise<void> {
   let total = 0;
   let completed = 0;
   let failed = 0;
+
+  // The terminal event (cycle:finished / cycle:failed) is captured here and
+  // fired from the finally block — AFTER cycleInFlight is cleared — so a
+  // listener that calls getState() inside its handler sees the orchestrator
+  // already idle. Emitting it inline (while still inside this try) left
+  // cycleInFlight=true at notification time, which froze the UI's "Syncing…".
+  let emitTerminal: (() => void) | null = null;
 
   try {
     // Phase 1: push pending local mutations (uploads).
@@ -294,19 +314,21 @@ async function runCycle(trigger: Trigger): Promise<void> {
     }
 
     lastCycleStats = { total, completed, failed };
-    lastCycleFinishedAtIso = new Date().toISOString();
-    emit('cycle:finished', {
-      startedAt: startedAtIso,
-      finishedAt: lastCycleFinishedAtIso,
-      total,
-      completed,
-      failed,
-    });
+    const finishedAt = new Date().toISOString();
+    lastCycleFinishedAtIso = finishedAt;
+    emitTerminal = () =>
+      emit('cycle:finished', {
+        startedAt: startedAtIso,
+        finishedAt,
+        total,
+        completed,
+        failed,
+      });
   } catch (err) {
     lastCycleStats = { total, completed, failed };
     lastCycleFinishedAtIso = new Date().toISOString();
     if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
-      emit('cycle:failed', { reason: 'auth_invalid', recoverable: false });
+      emitTerminal = () => emit('cycle:failed', { reason: 'auth_invalid', recoverable: false });
     } else {
       const detail = buildFailureDetail(err);
       // Log full raw err to console so a developer with devtools open can
@@ -319,19 +341,24 @@ async function runCycle(trigger: Trigger): Promise<void> {
         lastLabel: lastCurrentLabel,
         counters: { total, completed, failed },
       });
-      emit('cycle:failed', {
-        reason: detail.errorType
-          ? `${detail.errorType}: ${detail.serialized}`
-          : detail.serialized,
-        recoverable: true,
-        detail,
-      });
+      emitTerminal = () =>
+        emit('cycle:failed', {
+          reason: detail.errorType
+            ? `${detail.errorType}: ${detail.serialized}`
+            : detail.serialized,
+          recoverable: true,
+          detail,
+        });
     }
   } finally {
+    clearTimeout(hardCap);
     cycleInFlight = false;
     cycleAbort = null;
     currentPhase = null;
     currentTrigger = null;
+    // Orchestrator is idle again — now fire the terminal event so any
+    // getState() call inside a listener observes the consistent idle state.
+    emitTerminal?.();
   }
 }
 
@@ -391,15 +418,13 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   // get here, any outgoing card mutations have been pushed and studio's
   // cards_version reflects this device's writes.
 
-  // Per-attempt 30s timeout, fused with the cycle-wide abort signal. Tauri's
-  // fetch has no default timeout; without this, an unresponsive server (or
-  // local Apache stalling on the .htaccess Authorization rewrite) leaves the
-  // cycle hanging forever and the UI stuck on "Fetching manifest…".
+  // apiCall applies a default 30s per-request timeout internally (see
+  // api.ts DEFAULT_REQUEST_TIMEOUT_MS) — pass only the cycle abort signal.
   const manifest = await withRetry(() =>
     apiCall<ManifestResponse>('playground', 'get_user_data_update', {
       method: 'GET',
       bearer: true,
-      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+      signal,
     })
   );
 

@@ -6,6 +6,8 @@ import {
   Map,
   Rocket,
   Database as DatabaseIcon,
+  Lock,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { GameList } from './components/GameList';
@@ -17,6 +19,7 @@ import { LaunchedGamesList } from './components/LaunchedGamesList';
 import ClientCardsPage from './components/ClientCardsPage';
 import { DatabaseInspector } from './components/DatabaseInspector';
 import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
+import { LogoLaunchScreen } from './components/LogoLaunchScreen';
 import { SyncStatusPill } from './components/sync/SyncStatusPill';
 import { SyncFailureBanner } from './components/sync/SyncFailureBanner';
 import { UpdateRequiredOverlay } from './components/update/UpdateRequiredOverlay';
@@ -37,6 +40,7 @@ import {
   startDrainer,
   stopDrainer,
 } from './services/telemetry';
+import { loadConfig } from './utils/config';
 
 type Page =
   | 'scenarios'
@@ -91,6 +95,47 @@ function App() {
   // 'pending' = first-launch detected, waiting for the cycle to report work.
   // 'shown' = overlay rendering. 'done' = past first-launch, never show again.
   const firstLaunchPhaseRef = useRef<'pending' | 'shown' | 'done'>('done');
+
+  // Logo launch screen. 'loading' until config.json is read, then 'show'
+  // (when logoScreenOnLaunch is set) or 'done'. Shown once per session as
+  // the last gate before the home page — after the update and first-launch
+  // gates. Dismissed by any click/tap/keypress.
+  const [logoPhase, setLogoPhase] = useState<'loading' | 'show' | 'done'>('loading');
+  const [logoCfg, setLogoCfg] = useState<{ bg: string; file: string | null }>({
+    bg: '#000000',
+    file: null,
+  });
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const cfg = await loadConfig();
+        setLogoCfg({
+          bg: cfg.logoScreenBgColor ?? '#000000',
+          file: cfg.logoScreenLogoFile ?? null,
+        });
+        setLogoPhase(cfg.logoScreenOnLaunch ? 'show' : 'done');
+      } catch {
+        setLogoPhase('done');
+      }
+    })();
+  }, []);
+
+  // Manual logo-screen trigger (nav button). Re-reads config so a logo or
+  // background colour changed in Settings this session is reflected without
+  // a restart. The screen itself dismisses on any tap/click/keypress.
+  const showLogoScreen = async () => {
+    try {
+      const cfg = await loadConfig();
+      setLogoCfg({
+        bg: cfg.logoScreenBgColor ?? '#000000',
+        file: cfg.logoScreenLogoFile ?? null,
+      });
+    } catch {
+      /* keep whatever config was loaded at startup */
+    }
+    setLogoPhase('show');
+  };
 
   // Launch-time update check. Fires first and runs non-blocking: the app
   // renders and the orchestrator starts as usual while this resolves. A
@@ -267,6 +312,22 @@ function App() {
     );
   }
 
+  // Last gate before the home page. While config.json is still being read,
+  // render a neutral backdrop so the home page never flashes before the
+  // logo screen has a chance to appear.
+  if (logoPhase === 'loading') {
+    return <div className="min-h-screen bg-slate-900" />;
+  }
+  if (logoPhase === 'show') {
+    return (
+      <LogoLaunchScreen
+        bgColor={logoCfg.bg}
+        logoFile={logoCfg.file}
+        onDismiss={() => setLogoPhase('done')}
+      />
+    );
+  }
+
   return (
     <div
       className={`min-h-screen pb-16 ${
@@ -322,6 +383,27 @@ function App() {
                   </NavButton>
                 </>
               )}
+              {/* Actions, not pages — separated from the page tabs by a
+                  divider. "Logo screen" raises the branded screen on demand;
+                  "Lock" raises the PIN overlay. Both keep the app running
+                  underneath. */}
+              <div className="w-px self-stretch bg-white/10 mx-1" />
+              <button
+                onClick={() => void showLogoScreen()}
+                title="Show the logo screen"
+                className="px-4 py-2 rounded-lg transition flex items-center gap-2 text-slate-300 hover:bg-slate-700"
+              >
+                <ImageIcon size={16} />
+                Logo screen
+              </button>
+              <button
+                onClick={auth.lock}
+                title="Lock the app"
+                className="px-4 py-2 rounded-lg transition flex items-center gap-2 text-slate-300 hover:bg-slate-700"
+              >
+                <Lock size={16} />
+                Lock
+              </button>
             </div>
           </div>
         </div>

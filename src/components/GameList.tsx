@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Clock, Search, Play, Trash2, LogIn } from 'lucide-react';
+import { Clock, Search, Play, Trash2, LogIn, Eye } from 'lucide-react';
 import { Alert } from './Alert';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchGameModal, GameConfig } from './LaunchGameModal';
 import { GamePage } from './GamePage';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
+import { ScenarioDetailsModal } from './ScenarioDetailsModal';
 import { getLocalGameIds } from '../utils/localGames';
 import * as scenarioStore from '../services/scenarioStore';
 import { scenarioAssetUrl } from '../services/contentFs';
@@ -60,6 +61,7 @@ export function GameList() {
   const [scenarioToDelete, setScenarioToDelete] = useState<{ uniqid: string; title: string } | null>(null);
   const [localImages, setLocalImages] = useState<Map<string, string>>(new Map());
   const [activeGames, setActiveGames] = useState<Map<string, { id: number; name: string; game_type: string; duration: number }>>(new Map());
+  const [detailsScenario, setDetailsScenario] = useState<ScenarioWithType | null>(null);
 
   useEffect(() => {
     loadScenarios();
@@ -339,16 +341,23 @@ export function GameList() {
   };
 
   const handleDeleteConfirm = async () => {
-    // Scenario deletion of cloud content isn't a slice-3 concern (deleting a
-    // server-side scenario is an admin-side action). Local-only deletion of
-    // a downloaded scenario isn't useful either since the next sync cycle
-    // would re-download it from the manifest. Surface a hint instead.
-    showAlert(
-      'error',
-      'Deleting scenarios from the playground is not supported. Remove the scenario from the studio admin to push the change.'
-    );
+    const target = scenarioToDelete;
     setDeleteConfirmOpen(false);
     setScenarioToDelete(null);
+    if (!target) return;
+    try {
+      // Local delete: drops the row + downloaded files. Not permanent — the
+      // next sync re-adds the scenario from the manifest and re-downloads it.
+      // Works for any scenario, including ones that never finished
+      // downloading (e.g. a mystery scenario stuck on failed attempts).
+      await scenarioStore.deleteScenario(target.uniqid);
+      await loadScenarios();
+      await loadLocalGames();
+      showAlert('success', `"${target.title}" was deleted. It will be downloaded again on the next sync.`);
+    } catch (err) {
+      console.error('[GameList] failed to delete scenario:', err);
+      showAlert('error', `Could not delete "${target.title}". Please try again.`);
+    }
   };
 
   const handleDeleteCancel = () => {
@@ -357,7 +366,6 @@ export function GameList() {
   };
 
   const renderScenarioCard = (scenario: ScenarioWithType) => {
-    const hasLocal = scenario.uniqid && localGameIds.has(scenario.uniqid);
     const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
     const isAvailableForPurchase = scenario.available_for_purchase;
     const activeGame = scenario.uniqid ? activeGames.get(scenario.uniqid) : undefined;
@@ -400,9 +408,16 @@ export function GameList() {
               <span>{scenario.duration_minutes} minutes</span>
             </div>
             <div className="flex items-center gap-2">
-              {!isAvailableForPurchase && scenario.uniqid && hasLocal && (
+              <button
+                onClick={() => setDetailsScenario(scenario)}
+                className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white rounded-lg transition font-medium text-sm border border-slate-600"
+                title="View scenario details"
+              >
+                <Eye size={16} />
+              </button>
+              {!isAvailableForPurchase && scenario.uniqid && !activeGame && (
                 <button
-                  onClick={() => handleDeleteClick(scenario.uniqid || '', scenario.title)}
+                  onClick={() => handleDeleteClick(scenario.uniqid || '', scenario.title || 'Untitled scenario')}
                   className="flex items-center gap-2 px-3 py-2 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg transition font-medium text-sm border border-red-600/30 hover:border-red-600"
                   title="Delete scenario"
                 >
@@ -598,11 +613,19 @@ export function GameList() {
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
         title="Delete Scenario"
-        message={`Are you sure you want to delete "${scenarioToDelete?.title}"? This action cannot be undone and will permanently remove all scenario files.`}
+        message={`Delete "${scenarioToDelete?.title}" from this playground? Its downloaded files are removed now. It will be downloaded again on the next sync.`}
         confirmText="Delete"
         cancelText="Cancel"
         variant="danger"
       />
+
+      {detailsScenario && (
+        <ScenarioDetailsModal
+          scenario={detailsScenario}
+          thumbnailUrl={(detailsScenario.uniqid && localImages.get(detailsScenario.uniqid)) || null}
+          onClose={() => setDetailsScenario(null)}
+        />
+      )}
     </div>
   );
 }

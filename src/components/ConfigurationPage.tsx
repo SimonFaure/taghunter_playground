@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Settings,
   Usb,
@@ -18,7 +18,10 @@ import {
   Activity,
   AlertCircle,
   Download,
+  Upload,
+  Image as ImageIcon,
 } from 'lucide-react';
+import { enable as enableAutostart, disable as disableAutostart } from '@tauri-apps/plugin-autostart';
 import {
   sportidentService,
   type CardData,
@@ -26,6 +29,14 @@ import {
 } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { loadConfig, saveConfig, AppConfig } from '../utils/config';
+import {
+  extForFile,
+  isSupportedLogoExt,
+  mimeForExt,
+  readLaunchLogoUrl,
+  removeLaunchLogo,
+  writeLaunchLogo,
+} from '../utils/launchLogo';
 import * as cardsRepo from '../services/cardsRepo';
 import { on } from '../services/syncEvents';
 import { runCycleNow } from '../services/syncOrchestrator';
@@ -34,15 +45,27 @@ import { AccountScreen } from './settings/AccountScreen';
 import { SyncStatusScreen } from './settings/SyncStatusScreen';
 import { MyDevicesScreen } from './settings/MyDevicesScreen';
 import { UpdatesScreen } from './settings/UpdatesScreen';
+import { UsbDriverScreen } from './settings/UsbDriverScreen';
 import { ApiDocsPage } from './ApiDocsPage';
 
 const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
   fullscreenOnLaunch: false,
   autoLaunch: false,
+  logoScreenOnLaunch: false,
+  logoScreenBgColor: '#000000',
+  logoScreenLogoFile: null,
 };
 
-export type SettingsTab = 'account' | 'general' | 'hardware' | 'sync' | 'devices' | 'updates' | 'api-docs';
+export type SettingsTab =
+  | 'account'
+  | 'general'
+  | 'hardware'
+  | 'sync'
+  | 'devices'
+  | 'updates'
+  | 'api-docs'
+  | 'usb-driver';
 
 interface ConfigurationPageProps {
   // When the user clicks the sync pill or failure banner, App sets this to
@@ -67,6 +90,16 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
   const [savedConfig, setSavedConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [isSaving, setIsSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  // A logo picked but not yet saved. Held in memory (bytes + a preview
+  // object URL) so cancelling without Save leaves no orphan file in AppData.
+  const [pickedLogo, setPickedLogo] = useState<{
+    bytes: Uint8Array;
+    ext: string;
+    url: string;
+  } | null>(null);
+  // Object URL for the already-saved custom logo file, used in the preview.
+  const [savedLogoUrl, setSavedLogoUrl] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     void loadConfiguration();
@@ -77,6 +110,9 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
       const loaded = await loadConfig();
       setConfig(loaded);
       setSavedConfig(loaded);
+      if (loaded.logoScreenLogoFile) {
+        setSavedLogoUrl(await readLaunchLogoUrl(loaded.logoScreenLogoFile));
+      }
     } catch (err) {
       console.error('Error loading configuration:', err);
     }
@@ -85,8 +121,42 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
   const handleSave = async () => {
     setIsSaving(true);
     try {
-      await saveConfig(config);
-      setSavedConfig(config);
+      let finalConfig = config;
+      if (pickedLogo) {
+        // Persist a freshly picked logo to AppData.
+        const filename = await writeLaunchLogo(
+          pickedLogo.bytes,
+          pickedLogo.ext,
+          savedConfig.logoScreenLogoFile,
+        );
+        finalConfig = { ...config, logoScreenLogoFile: filename };
+      } else if (!config.logoScreenLogoFile && savedConfig.logoScreenLogoFile) {
+        // Logo was removed — delete the previously saved file.
+        await removeLaunchLogo(savedConfig.logoScreenLogoFile);
+      }
+
+      await saveConfig(finalConfig);
+
+      // Sync the OS autostart registration if the toggle changed. There is
+      // no "next launch" for an OS registration, so this applies on Save.
+      if (Boolean(finalConfig.autoLaunch) !== Boolean(savedConfig.autoLaunch)) {
+        try {
+          if (finalConfig.autoLaunch) await enableAutostart();
+          else await disableAutostart();
+        } catch (e) {
+          console.error('Error updating autostart registration:', e);
+        }
+      }
+
+      setConfig(finalConfig);
+      setSavedConfig(finalConfig);
+      // The picked logo is now the saved logo — adopt its preview URL.
+      if (pickedLogo) {
+        setSavedLogoUrl(pickedLogo.url);
+        setPickedLogo(null);
+      } else if (!finalConfig.logoScreenLogoFile) {
+        setSavedLogoUrl(null);
+      }
       setMessage({ type: 'success', text: 'Configuration saved' });
       setTimeout(() => setMessage(null), 3000);
     } catch (err) {
@@ -97,8 +167,47 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
     }
   };
 
-  const dirty = JSON.stringify(config) !== JSON.stringify(savedConfig);
+  const handlePickLogo = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file
+    if (!file) return;
+    const ext = extForFile(file);
+    if (!isSupportedLogoExt(ext)) {
+      setMessage({
+        type: 'error',
+        text: 'Unsupported image format. Use PNG, JPG, SVG, WebP or GIF.',
+      });
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setMessage({ type: 'error', text: 'Logo image is too large (max 5 MB).' });
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const url = URL.createObjectURL(new Blob([bytes], { type: mimeForExt(ext) }));
+      setPickedLogo({ bytes, ext, url });
+      setConfig((c) => ({ ...c, logoScreenLogoFile: `launch-logo.${ext}` }));
+    } catch (err) {
+      console.error('Error reading logo file:', err);
+      setMessage({ type: 'error', text: 'Could not read that image.' });
+    }
+  };
+
+  const handleRemoveLogo = () => {
+    setPickedLogo(null);
+    setConfig((c) => ({ ...c, logoScreenLogoFile: null }));
+  };
+
+  const dirty =
+    JSON.stringify(config) !== JSON.stringify(savedConfig) || pickedLogo !== null;
   const showAppConfigUi = activeTab === 'general' || activeTab === 'hardware';
+  // Preview source: a fresh pick > the saved custom file > bundled fallback.
+  const previewLogoUrl =
+    pickedLogo?.url ??
+    (config.logoScreenLogoFile ? savedLogoUrl : null) ??
+    '/taghunter-logo.png';
+  const hasCustomLogo = pickedLogo !== null || Boolean(config.logoScreenLogoFile);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white py-8">
@@ -148,7 +257,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                 <Section icon={<Monitor className="text-blue-400" size={24} />} title="Display Settings">
                   <Toggle
                     label="Fullscreen on launch"
-                    description="Automatically open the app in fullscreen mode."
+                    description="Open the app in fullscreen when it starts. Press F11 any time to exit or re-enter fullscreen. Takes effect next launch."
                     value={Boolean(config.fullscreenOnLaunch)}
                     onChange={(v) => setConfig({ ...config, fullscreenOnLaunch: v })}
                   />
@@ -160,13 +269,105 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                   />
                 </Section>
 
+                <Section
+                  icon={<ImageIcon className="text-blue-400" size={24} />}
+                  title="Launch logo screen"
+                >
+                  <Toggle
+                    label="Logo screen on launch"
+                    description="Show a branded logo screen instead of the home page when the app starts. Tap anywhere to continue. Takes effect next launch."
+                    value={Boolean(config.logoScreenOnLaunch)}
+                    onChange={(v) => setConfig({ ...config, logoScreenOnLaunch: v })}
+                  />
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                    <div className="space-y-4 p-4 rounded-lg border-2 border-slate-700 bg-slate-700/30">
+                      <div>
+                        <div className="font-semibold mb-1">Logo</div>
+                        <div className="text-sm text-slate-400 mb-2">
+                          PNG, JPG, SVG or WebP. A transparent background works best.
+                          Without a custom logo the TagHunter logo is shown.
+                        </div>
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="image/*"
+                          onChange={handlePickLogo}
+                          className="hidden"
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => fileInputRef.current?.click()}
+                            className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors text-sm"
+                          >
+                            <Upload size={14} />
+                            {hasCustomLogo ? 'Replace logo' : 'Upload logo'}
+                          </button>
+                          {hasCustomLogo && (
+                            <button
+                              onClick={handleRemoveLogo}
+                              className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-sm"
+                            >
+                              <Trash2 size={14} />
+                              Remove
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="font-semibold mb-1">Background color</div>
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="color"
+                            value={config.logoScreenBgColor ?? '#000000'}
+                            onChange={(e) =>
+                              setConfig({ ...config, logoScreenBgColor: e.target.value })
+                            }
+                            className="h-10 w-16 rounded bg-transparent cursor-pointer border border-slate-600"
+                          />
+                          <span className="font-mono text-sm text-slate-400">
+                            {(config.logoScreenBgColor ?? '#000000').toUpperCase()}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="font-semibold mb-1">Preview</div>
+                      <div
+                        className="rounded-lg border border-slate-700 overflow-hidden w-full"
+                        style={{
+                          aspectRatio: '16 / 9',
+                          backgroundColor: config.logoScreenBgColor ?? '#000000',
+                        }}
+                      >
+                        <div className="w-full h-full flex items-center justify-center p-6">
+                          <img
+                            src={previewLogoUrl}
+                            alt=""
+                            className="max-w-[60%] max-h-[60%] object-contain"
+                          />
+                        </div>
+                      </div>
+                      {!hasCustomLogo && (
+                        <div className="text-xs text-slate-500 mt-1">
+                          No custom logo — showing the TagHunter logo.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </Section>
+
                 <SaveBar dirty={dirty} isSaving={isSaving} onSave={handleSave} />
               </>
             )}
 
             {activeTab === 'hardware' && (
               <>
-                <ReaderStatusSection />
+                <ReaderStatusSection
+                  onOpenUsbDriver={() => setActiveTab('usb-driver')}
+                />
                 <CardReaderTestSection />
               </>
             )}
@@ -176,6 +377,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
             {activeTab === 'devices' && <MyDevicesScreen onLoggedOut={auth.refresh} />}
             {activeTab === 'updates' && <UpdatesScreen />}
             {activeTab === 'api-docs' && <ApiDocsPage />}
+            {activeTab === 'usb-driver' && <UsbDriverScreen />}
           </main>
         </div>
       </div>
@@ -325,7 +527,7 @@ interface CardWithReceivedAt {
 // Read-only status block showing the auto-detected reader port. Replaces the
 // old port-picker section: there's no choice to be made — the app filters
 // available ports by VID 10c4 / PID 800a and takes the first match.
-function ReaderStatusSection() {
+function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
   const { port, detail, isPresent, refresh } = useDetectedReaderPort();
   const available = sportidentService.isAvailable();
 
@@ -369,6 +571,13 @@ function ReaderStatusSection() {
             <div className="text-xs text-slate-400 mt-1">
               Plug in your reader. The footer's reader indicator will turn green when it's online.
             </div>
+            <button
+              onClick={onOpenUsbDriver}
+              className="mt-2 inline-flex items-center gap-1.5 text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2"
+            >
+              <Usb size={13} />
+              Driver blocked or missing? Install the SportIdent USB driver
+            </button>
           </div>
         </div>
       )}
@@ -789,6 +998,7 @@ function SettingsNav({ active, onChange }: SettingsNavProps) {
       label: 'Developer',
       items: [
         { tab: 'api-docs', label: 'API docs', icon: <BookOpen size={16} /> },
+        { tab: 'usb-driver', label: 'USB driver', icon: <Usb size={16} /> },
       ],
     },
   ];

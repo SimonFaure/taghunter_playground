@@ -45,6 +45,9 @@ pub fn build_ack() -> Vec<u8> {
 /// Caller passes a (yy, mm, dd, dow, hh, mn, ss) tuple — converting from
 /// a chrono DateTime is the Tauri command's job (step 5), keeping this
 /// module free of date-time deps.
+// Frame builder ready (and unit-tested) ahead of its step-5 caller, the
+// `si_set_station_time` control channel.
+#[allow(dead_code)]
 pub fn build_set_time(yy: u8, mm: u8, dd: u8, dow: u8, hh: u8, mn: u8, ss: u8) -> Vec<u8> {
     build_frame(
         CMD_SET_STATION_TIME,

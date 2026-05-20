@@ -171,15 +171,13 @@ mod tests {
             let secs_in_12h = if pm { time_sec - 12 * 3600 } else { time_sec };
             let code_low = (code & 0xFF) as u8;
             let code_high = ((code >> 8) & 0x03) as u8; // 2-bit high
-            let mut ptd = (code_high << 6) | if pm { 0x01 } else { 0x00 };
+            let ptd = (code_high << 6) | if pm { 0x01 } else { 0x00 };
             // day/week bits left at 0
             buf[off] = ptd as u8;
             // For start/finish (code==0) byte 1 is subsecond, irrelevant here.
             buf[off + 1] = code_low;
             buf[off + 2] = ((secs_in_12h >> 8) & 0xFF) as u8;
             buf[off + 3] = (secs_in_12h & 0xFF) as u8;
-            // silence unused-let-mut warning when only PM is set
-            ptd |= 0;
         };
         if let Some((code, t, pm)) = check {
             write_punch(&mut buf, 8, code, t, pm);

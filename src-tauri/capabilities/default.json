@@ -9,6 +9,8 @@
     "core:window:allow-available-monitors",
     "core:window:allow-primary-monitor",
     "core:window:allow-close",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
     "core:webview:allow-webview-close",
     "os:default",
     "sql:default",
@@ -44,6 +46,7 @@
         { "path": "$APPDATA/**" }
       ]
     },
-    "opener:default"
+    "opener:default",
+    "autostart:default"
   ]
 }

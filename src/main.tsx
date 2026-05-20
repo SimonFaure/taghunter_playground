@@ -1,8 +1,11 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import App from './App.tsx';
 import { AuthProvider, useAuth } from './components/auth/AuthProvider';
+import { FullscreenHint } from './components/FullscreenHint';
 import { captureError } from './services/telemetry';
+import { loadConfig } from './utils/config';
 import { LeaderboardPage } from './components/LeaderboardPage';
 import { readProjectorParamsFromUrl, type ProjectorPayload } from './services/projectorWindow';
 import './index.css';
@@ -55,10 +58,29 @@ registerCatalogFonts();
 
 const projectorParams = readProjectorParamsFromUrl();
 
+// Apply the `fullscreenOnLaunch` preference before the app renders so the
+// LoginScreen comes up fullscreen too. Fire-and-forget: the config read is
+// a fast local file, and a sub-100ms windowed flash is acceptable for a
+// once-per-session kiosk launch. Skipped for the audience-facing projector
+// window, which manages its own sizing.
+if (!projectorParams) {
+  void (async () => {
+    try {
+      const cfg = await loadConfig();
+      if (cfg.fullscreenOnLaunch) {
+        await getCurrentWindow().setFullscreen(true);
+      }
+    } catch (err) {
+      console.error('[main] fullscreen-on-launch failed:', err);
+    }
+  })();
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <AuthProvider>
       {projectorParams ? <ProjectorRoot params={projectorParams} /> : <App />}
     </AuthProvider>
+    {!projectorParams && <FullscreenHint />}
   </StrictMode>
 );

@@ -189,3 +189,18 @@ export async function listPendingDownloads(): Promise<ScenarioRow[]> {
   );
   return rows.map(rowOut);
 }
+
+// Local delete behind the playground's "Delete scenario" button. Removes the
+// scenario row and its on-disk media root.
+//
+// This is intentionally NOT permanent: the scenario stays in the studio
+// manifest, so the next sync cycle's upsertFromManifest re-inserts the row
+// and the orchestrator re-downloads it. Deleting therefore doubles as a
+// "reset" — the re-inserted row starts at failed_attempts = 0, giving a
+// scenario stuck on repeated download failures a clean retry. Works for any
+// scenario regardless of game type or whether it ever finished downloading.
+export async function deleteScenario(uniqid: string): Promise<void> {
+  const db = await getDb();
+  await db.execute('DELETE FROM scenarios WHERE uniqid = $1', [uniqid]);
+  await removeRecursive(scenarioRootDirRel(uniqid));
+}

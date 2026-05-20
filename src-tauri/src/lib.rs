@@ -56,10 +56,16 @@ pub fn run() {
     // Desktop-only: the app self-update stack. tauri-plugin-process supplies
     // the explicit relaunch the user-driven "Restart now" button calls.
     // Mobile updates go through the app stores, so these are not registered.
+    // tauri-plugin-autostart backs the "Launch on startup" preference; it is
+    // desktop-only and the renderer calls enable()/disable() on Save.
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -503,6 +509,31 @@ fn playground_migrations() -> Vec<Migration> {
                 );
 
                 UPDATE schema_meta SET value = '9' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        // Migration 10 is retained for migration-history integrity ONLY.
+        // It shipped in a dev build and was applied to existing databases,
+        // then the feature it backed (a `hidden` soft-delete flag) was
+        // dropped. sqlx records every applied migration and aborts startup
+        // with "migration 10 was previously applied but is missing in the
+        // resolved migrations" if it is removed — so the block must stay, and
+        // its `sql` must stay byte-identical so the sqlx checksum still
+        // matches the recorded one. The `hidden` column is now inert dead
+        // schema that no code reads. Do not delete or edit this block.
+        Migration {
+            version: 10,
+            description: "scenarios.hidden: local soft-delete flag for the playground delete button",
+            sql: r#"
+                -- Local-only soft delete. The playground's "Delete scenario"
+                -- button sets this to 1, which drops the scenario from the
+                -- card list AND from the sync orchestrator's pending-download
+                -- view, so the manifest does not re-download it. The flag is
+                -- never written by upsertFromManifest's ON CONFLICT clause, so
+                -- it survives every subsequent sync cycle.
+                ALTER TABLE scenarios ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+
+                UPDATE schema_meta SET value = '10' WHERE key = 'version';
             "#,
             kind: MigrationKind::Up,
         },

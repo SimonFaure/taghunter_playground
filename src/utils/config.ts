@@ -15,6 +15,13 @@ export interface AppConfig {
   fullscreenOnLaunch?: boolean;
   autoLaunch?: boolean;
   raspberryHost?: string;
+  // Launch logo screen — a branded screen shown instead of the home page
+  // at startup. All three are per-device local prefs. `logoScreenLogoFile`
+  // is the filename of a custom logo copied into AppData (null = use the
+  // bundled TagHunter fallback).
+  logoScreenOnLaunch?: boolean;
+  logoScreenBgColor?: string;
+  logoScreenLogoFile?: string | null;
 }
 
 const CONFIG_REL = 'config.json';
@@ -23,6 +30,9 @@ const DEFAULT_CONFIG: AppConfig = {
   fullscreenOnLaunch: false,
   autoLaunch: false,
   raspberryHost: '192.168.129.250',
+  logoScreenOnLaunch: false,
+  logoScreenBgColor: '#000000',
+  logoScreenLogoFile: null,
 };
 
 export const loadConfig = async (): Promise<AppConfig> => {

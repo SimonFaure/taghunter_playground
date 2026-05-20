@@ -15,8 +15,6 @@ pub mod parser;
 
 use std::fmt;
 
-pub use layout::CardLayout;
-
 /// Subset of SportIdent card families we currently support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CardType {
@@ -59,6 +57,9 @@ impl CardType {
     /// Byte offset (within the assembled readout buffer) at which the
     /// punch array starts. Per-type:
     ///   SI8:136 / SI9:56 / SI10:128 / SI11:128
+    // Convenience accessor — the parser hot path indexes `LAYOUTS` directly;
+    // currently only the layout-consistency test calls this.
+    #[allow(dead_code)]
     pub fn punches_offset(self) -> usize {
         layout::LAYOUTS[self as usize].punches_offset
     }
@@ -66,6 +67,9 @@ impl CardType {
     /// Cap on the `punch_count` byte (data[22]) for this card type.
     /// A real card never reports more than this; if `data[22]` exceeds
     /// it, we treat the readout as corrupt rather than parse garbage.
+    // Convenience accessor — the parser checks `LAYOUTS[..].max_punches`
+    // directly; currently only the layout-consistency test calls this.
+    #[allow(dead_code)]
     pub fn max_punches(self) -> usize {
         layout::LAYOUTS[self as usize].max_punches
     }

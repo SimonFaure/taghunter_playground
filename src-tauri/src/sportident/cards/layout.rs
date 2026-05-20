@@ -3,6 +3,8 @@
 
 /// Bytes per block (128). Hard-coded throughout the SI protocol — every
 /// 0xEF block read returns exactly this many bytes.
+// Kept for protocol completeness; the parser uses the literal 128 inline.
+#[allow(dead_code)]
 pub const BLOCK_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy)]

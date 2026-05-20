@@ -949,7 +949,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 </div>
               )}
               {showSubImages && !showMain && slots.length > 0 && (
-                <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'grid', gridTemplateColumns: slots.length <= 2 ? `repeat(${slots.length}, 1fr)` : 'repeat(2, 1fr)', gap: '4px', zIndex: 1 }}>
+                <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', display: 'grid', gridTemplateColumns: slots.length <= 2 ? `repeat(${slots.length}, 1fr)` : 'repeat(2, 1fr)', gap: 0, zIndex: 1 }}>
                   {slots.map((slot, si) => {
                     const revealed = si < animRevealedSlots;
                     return (
@@ -957,15 +957,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                         key={slot.key}
                         style={{
                           position: 'relative',
-                          borderRadius: '6px',
                           overflow: 'hidden',
-                          border: revealed
-                            ? slot.matched ? '2px solid rgba(74,222,128,0.8)' : '2px solid rgba(248,113,113,0.8)'
-                            : '2px solid rgba(255,255,255,0.08)',
                           background: '#0f172a',
                           opacity: revealed ? 1 : 0.15,
                           transform: revealed ? 'scale(1)' : 'scale(0.92)',
-                          transition: 'opacity 0.35s ease, transform 0.35s ease, border-color 0.3s ease',
+                          transition: 'opacity 0.35s ease, transform 0.35s ease',
                         }}
                       >
                         {slot.src ? (

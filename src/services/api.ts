@@ -6,6 +6,17 @@ const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
   'https://studio.taghunter.fr/backend/api';
 
+// Tauri's HTTP fetch has no default timeout. Without these, a stalled server
+// (notably local Apache hanging on the .htaccess Authorization rewrite) freezes
+// the whole sync cycle: a worker's `await downloadOne()` never settles, so the
+// download pool's Promise.all never resolves and the UI stays stuck on
+// "Syncing…". All sync requests route through apiCall / apiDownloadBytesStream,
+// so centralizing the timeouts here makes the protection structural rather
+// than opt-in per call site.
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000; // apiCall: whole request
+const DOWNLOAD_TTFB_TIMEOUT_MS = 30_000; // stream: connect → response headers
+const DOWNLOAD_STALL_TIMEOUT_MS = 60_000; // stream: max gap between chunks
+
 // LAN override (mother device): when set, requests for endpoints in `endpoints`
 // route to `baseUrl` with `token` as the bearer instead of the studio JWT.
 // This is the bridge that lets services/launchedGames.ts target an in-process
@@ -31,12 +42,36 @@ export class ApiError extends Error {
   }
 }
 
+// Races a promise against a wall-clock deadline. Rejects with a TimeoutError
+// DOMException if the deadline wins. This guards `await`s on Tauri plugin-http
+// promises: aborting an AbortSignal does NOT reliably reject a promise already
+// parked inside an in-flight bridged fetch / stream read, so we cannot depend
+// on the signal alone. The race guarantees the JS promise settles in bounded
+// time regardless. The TimeoutError name matches what AbortSignal.timeout()
+// produces, so it flows through withRetry()/runDownloadPool unchanged.
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new DOMException(`${label} timed out after ${ms}ms`, 'TimeoutError')),
+      ms,
+    );
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
 interface ApiCallOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
   bearer?: boolean | 'optional';
   query?: Record<string, string | number | undefined>;
   signal?: AbortSignal;
+  // Per-request timeout in ms. Defaults to DEFAULT_REQUEST_TIMEOUT_MS. Pass a
+  // number to override, or `null` to disable (rare — e.g. a deliberately
+  // long-running upload/long-poll).
+  timeoutMs?: number | null;
 }
 
 // Single fetch wrapper for studio API calls.
@@ -70,18 +105,37 @@ export async function apiCall<T = unknown>(
     }
   }
 
+  const timeoutMs =
+    options.timeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : options.timeoutMs;
+
+  // Fuse the caller signal + a timeout so the request is aborted at the Rust
+  // layer when either fires. The withDeadline() wrappers below are the actual
+  // guarantee (abort propagation into a stalled Tauri fetch is unreliable);
+  // the fused signal is best-effort cleanup of the underlying socket.
+  const abortSignals: AbortSignal[] = [];
+  if (options.signal) abortSignals.push(options.signal);
+  if (timeoutMs != null) abortSignals.push(AbortSignal.timeout(timeoutMs));
+  const fusedSignal = abortSignals.length > 0 ? AbortSignal.any(abortSignals) : undefined;
+
   const init: Parameters<typeof tauriFetch>[1] = {
     method: options.method ?? 'GET',
     headers,
   };
-  if (options.signal) init.signal = options.signal;
+  if (fusedSignal) init.signal = fusedSignal;
 
   if (options.body !== undefined) {
     init.body = JSON.stringify(options.body);
   }
 
-  const res = await tauriFetch(url, init);
-  const text = await res.text();
+  const label = `${endpoint}?action=${action}`;
+  const res =
+    timeoutMs != null
+      ? await withDeadline(tauriFetch(url, init), timeoutMs, label)
+      : await tauriFetch(url, init);
+  const text =
+    timeoutMs != null
+      ? await withDeadline(res.text(), timeoutMs, `${label} body`)
+      : await res.text();
   let parsed: unknown;
   let parseFailed = false;
   try {
@@ -167,9 +221,17 @@ export interface DownloadProgress {
 export async function apiDownloadBytesStream(
   endpoint: string,
   action: string,
-  options: Omit<ApiCallOptions, 'body' | 'method'> & {
+  options: Omit<ApiCallOptions, 'body' | 'method' | 'timeoutMs'> & {
     signal?: AbortSignal;
     onProgress?: (p: DownloadProgress) => void;
+    // Connect → response-headers timeout (a bounded operation).
+    // Default DOWNLOAD_TTFB_TIMEOUT_MS. `null` disables.
+    ttfbTimeoutMs?: number | null;
+    // Per-chunk IDLE timeout: max gap between body chunks. Reset on every
+    // chunk, so a large file downloading slow-but-steady is never wrongly
+    // aborted — only a genuine mid-stream stall is.
+    // Default DOWNLOAD_STALL_TIMEOUT_MS. `null` disables.
+    stallTimeoutMs?: number | null;
   } = {}
 ): Promise<Uint8Array> {
   const url = buildUrl(endpoint, action, options.query);
@@ -182,9 +244,29 @@ export async function apiDownloadBytesStream(
       throw new ApiError(401, null, 'Missing JWT');
     }
   }
-  const init: Parameters<typeof tauriFetch>[1] = { method: 'GET', headers };
-  if (options.signal) init.signal = options.signal;
-  const res = await tauriFetch(url, init);
+
+  const ttfbMs =
+    options.ttfbTimeoutMs === undefined ? DOWNLOAD_TTFB_TIMEOUT_MS : options.ttfbTimeoutMs;
+  const stallMs =
+    options.stallTimeoutMs === undefined ? DOWNLOAD_STALL_TIMEOUT_MS : options.stallTimeoutMs;
+  const label = `${endpoint}?action=${action}`;
+
+  // Own controller so the stall watchdog can cancel the body stream; fused
+  // with the caller signal and a TTFB timeout for the header phase.
+  const ctrl = new AbortController();
+  const ttfbSignals: AbortSignal[] = [ctrl.signal];
+  if (options.signal) ttfbSignals.push(options.signal);
+  if (ttfbMs != null) ttfbSignals.push(AbortSignal.timeout(ttfbMs));
+
+  const init: Parameters<typeof tauriFetch>[1] = {
+    method: 'GET',
+    headers,
+    signal: AbortSignal.any(ttfbSignals),
+  };
+  const res =
+    ttfbMs != null
+      ? await withDeadline(tauriFetch(url, init), ttfbMs, `${label} TTFB`)
+      : await tauriFetch(url, init);
   if (!res.ok) {
     let body: unknown = null;
     try {
@@ -217,14 +299,30 @@ export async function apiDownloadBytesStream(
   // before the first chunk arrives (large files can have a long TTFB).
   options.onProgress?.({ loaded: 0, total: totalOrNull });
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      loaded += value.byteLength;
-      options.onProgress?.({ loaded, total: totalOrNull });
+  try {
+    for (;;) {
+      // Idle (per-chunk) timeout, not a flat total timeout: a large file
+      // downloading slow-but-steady must not be killed, but no chunk at all
+      // for stallMs means the stream is dead. withDeadline() is what actually
+      // unsticks a parked reader.read() — Tauri's abort propagation into an
+      // in-flight bridged stream read is not reliable.
+      const { done, value } =
+        stallMs != null
+          ? await withDeadline(reader.read(), stallMs, `${label} stream stalled`)
+          : await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        loaded += value.byteLength;
+        options.onProgress?.({ loaded, total: totalOrNull });
+      }
     }
+  } catch (err) {
+    // Best-effort cleanup. NOT awaited — cancel() could itself hang on the
+    // same dead stream; the throw below is what unblocks the caller.
+    try { void reader.cancel(); } catch { /* ignore */ }
+    try { ctrl.abort(); } catch { /* ignore */ }
+    throw err;
   }
 
   // Concatenate. For large files this is the unavoidable JS-heap hit

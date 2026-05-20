@@ -318,7 +318,7 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
                   style={{
                     display: 'grid',
                     gridTemplateColumns: slots.length <= 2 ? `repeat(${slots.length}, 1fr)` : 'repeat(2, 1fr)',
-                    gap: '10px',
+                    gap: 0,
                   }}
                 >
                   {slots.map((slot, i) => {
@@ -328,23 +328,12 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
                         key={slot.key}
                         style={{
                           position: 'relative',
-                          borderRadius: '10px',
                           overflow: 'hidden',
-                          border: revealed
-                            ? slot.matched
-                              ? '2px solid rgba(74,222,128,0.7)'
-                              : '2px solid rgba(248,113,113,0.7)'
-                            : '2px solid rgba(255,255,255,0.08)',
                           background: '#0f172a',
                           aspectRatio: '1',
                           opacity: revealed ? 1 : 0.15,
                           transform: revealed ? 'scale(1)' : 'scale(0.9)',
-                          transition: 'opacity 0.35s ease, transform 0.35s ease, border-color 0.3s ease',
-                          boxShadow: revealed
-                            ? slot.matched
-                              ? '0 0 16px rgba(74,222,128,0.25)'
-                              : '0 0 16px rgba(248,113,113,0.2)'
-                            : 'none',
+                          transition: 'opacity 0.35s ease, transform 0.35s ease',
                         }}
                       >
                         {slot.src ? (

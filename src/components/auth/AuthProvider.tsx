@@ -10,19 +10,21 @@ import { loadJwt } from '../../services/strongholdStore';
 import { getAuthUser } from '../../services/authStore';
 import type { AuthUser } from '../../services/authStore';
 
-// Two locked states intentionally coexist:
-//   - 'pin_locked' is the cold-start PIN gate. JWT + auth_user are intact;
-//     entering the PIN reveals the app. Drives offline relogin.
-//   - 'offline_locked' is the slice-1 grace expiration. JWT may be valid but
-//     we haven't been able to reach the server within `offline_grace_days`,
-//     so we hard-stop until internet returns.
+// The manual lock is a `locked` boolean, NOT an auth state: the user taps
+// "Lock" in the nav bar and LockScreen renders as a full-screen overlay ON
+// TOP of the still-mounted app shell, so sync and any live game keep running
+// underneath. Entering the PIN just hides the overlay again.
+//
+// 'offline_locked' is the slice-1 grace expiration: the JWT may be valid but
+// we haven't reached the server within `offline_grace_days`, so we hard-stop
+// until internet returns.
 // 'needs_pin_setup' covers the post-OTP step where the user picks a PIN
 // before the app shell becomes visible. It also catches the rare
-// "JWT exists but no PIN on disk" case (e.g. mid-onboarding crash).
+// "JWT exists but no PIN on disk" case (e.g. mid-onboarding crash), so an
+// authenticated user always has a PIN for the Lock action to check against.
 type AuthState =
   | { kind: 'loading' }
   | { kind: 'unauthenticated' }
-  | { kind: 'pin_locked'; user: AuthUser }
   | { kind: 'needs_pin_setup'; user: AuthUser }
   | { kind: 'authenticated'; user: AuthUser; offline: boolean }
   | { kind: 'offline_locked'; user: AuthUser };
@@ -32,6 +34,7 @@ interface AuthContextValue {
   offline: boolean;
   refresh: () => Promise<void>;
   signOut: () => Promise<void>;
+  lock: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -48,14 +51,16 @@ interface AuthProviderProps {
 
 export function AuthProvider({ children }: AuthProviderProps) {
   const [state, setState] = useState<AuthState>({ kind: 'loading' });
+  // Manual lock overlay. Kept separate from `state` so the authenticated app
+  // shell stays mounted (sync, timers, live games) while LockScreen covers it.
+  const [locked, setLocked] = useState(false);
 
   // Cold-start gate. Order:
   //   1. No JWT → LoginScreen.
   //   2. JWT but no PIN → SetPinScreen (user finishes onboarding before app).
-  //   3. JWT + PIN → LockScreen (offline-friendly unlock, no server contact).
-  // bootstrap()-against-the-server only runs once the user clears the lock,
-  // so admin-revoked devices still unlock locally and then fall through to
-  // LoginScreen via the 401 path inside refresh().
+  //   3. JWT (+ PIN, or no cached user) → straight to a server bootstrap.
+  // The PIN is no longer a launch gate; it only guards the nav-bar "Lock"
+  // button. A relaunch therefore drops the user straight into the app shell.
   const refresh = useCallback(async () => {
     setState({ kind: 'loading' });
 
@@ -66,17 +71,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     const cachedUser = await getAuthUser();
-    if (cachedUser && (await hasPin())) {
-      setState({ kind: 'pin_locked', user: cachedUser });
-      return;
-    }
-    if (cachedUser) {
+    if (cachedUser && !(await hasPin())) {
+      // Rare: JWT landed but the PIN was never persisted (mid-onboarding
+      // crash). Finish PIN setup so the Lock action always has one to check.
       setState({ kind: 'needs_pin_setup', user: cachedUser });
       return;
     }
 
-    // Token exists but no cached user — fall through to a server bootstrap
-    // to either resurrect the auth_user row or be told the token is dead.
+    // JWT present (with a PIN, or with no cached user) — fall through to a
+    // server bootstrap to refresh auth_state, resurrect the auth_user row,
+    // or be told the token is dead.
     await runServerBootstrap();
   }, []);
 
@@ -84,6 +88,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // auth_state, bump last_seen, and surface 401s as a clean logout.
   const runServerBootstrap = useCallback(async () => {
     setState({ kind: 'loading' });
+    // Any full re-bootstrap supersedes a pending manual lock.
+    setLocked(false);
     const outcome = await bootstrap();
     switch (outcome.kind) {
       case 'no_token':
@@ -118,15 +124,21 @@ export function AuthProvider({ children }: AuthProviderProps) {
     void runServerBootstrap();
   }, [runServerBootstrap]);
 
-  // Called by LockScreen on a correct PIN. JWT + auth_user are already
-  // valid locally; bootstrap when we can to keep last_server_check_at fresh.
+  // Called by the LockScreen overlay on a correct PIN (or a completed
+  // Forgot-PIN reset). The app shell never unmounted — just hide the overlay.
   const handleUnlocked = useCallback(() => {
-    void runServerBootstrap();
-  }, [runServerBootstrap]);
+    setLocked(false);
+  }, []);
 
   const handleSignOut = useCallback(async () => {
     await signOutOfThisDevice();
     setState({ kind: 'unauthenticated' });
+  }, []);
+
+  // Manual lock. Invoked by the nav-bar "Lock" button. Raises the LockScreen
+  // overlay over the still-running app shell; handleUnlocked lowers it again.
+  const lock = useCallback(() => {
+    setLocked(true);
   }, []);
 
   if (state.kind === 'loading') {
@@ -148,10 +160,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return <SetPinScreen user={state.user} onPinSet={handlePinSet} />;
   }
 
-  if (state.kind === 'pin_locked') {
-    return <LockScreen user={state.user} onUnlocked={handleUnlocked} />;
-  }
-
   if (state.kind === 'offline_locked') {
     return <OfflineGraceBanner user={state.user} variant="lock" onRetry={runServerBootstrap} />;
   }
@@ -161,12 +169,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
     offline: state.offline,
     refresh: runServerBootstrap,
     signOut: handleSignOut,
+    lock,
   };
 
+  // The app shell stays mounted while locked — LockScreen overlays it so
+  // sync and any in-progress game keep running behind the PIN gate.
   return (
     <AuthContext.Provider value={ctxValue}>
       {state.offline && <OfflineGraceBanner user={state.user} variant="banner" onRetry={runServerBootstrap} />}
       {children}
+      {locked && <LockScreen user={state.user} onUnlocked={handleUnlocked} />}
     </AuthContext.Provider>
   );
 }
