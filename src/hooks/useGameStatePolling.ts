@@ -1,20 +1,16 @@
-import { useEffect, useRef, useCallback } from 'react';
-import { supabase } from '../lib/db';
+import { useEffect, useRef } from 'react';
+import { getLaunchedGameState, RawPunchRow } from '../services/launchedGames';
 
-interface RawDataRow {
-  id: number;
-  launched_game_id: number;
-  device_id: string;
-  raw_data: any;
-  created_at: string;
-}
+// Polls a single combined `state` endpoint per second that returns ended +
+// teams + new raw_data since the last cursor. Fires onGameEnded,
+// onAllTeamsFinished, onNewBip as state changes.
 
 interface UseGameStatePollingOptions {
   launchedGameId: number | null;
   numberOfTeams: number;
   onGameEnded: () => void;
   onAllTeamsFinished: () => void;
-  onNewBip: (row: RawDataRow) => void;
+  onNewBip: (row: RawPunchRow & { launched_game_id: number }) => void;
   enabled?: boolean;
 }
 
@@ -26,7 +22,7 @@ export function useGameStatePolling({
   onNewBip,
   enabled = true,
 }: UseGameStatePollingOptions) {
-  const lastRawDataIdRef = useRef<number | null>(null);
+  const lastRawIdRef = useRef<number>(0);
   const gameEndedRef = useRef(false);
   const tickRunningRef = useRef(false);
   const onGameEndedRef = useRef(onGameEnded);
@@ -45,63 +41,57 @@ export function useGameStatePolling({
     if (!launchedGameId || !enabled) return;
 
     gameEndedRef.current = false;
-    lastRawDataIdRef.current = null;
+    lastRawIdRef.current = 0;
     tickRunningRef.current = false;
 
+    // Initial state fetch primes the cursor so we don't replay every historical
+    // punch as a "new bip" on first tick.
     const init = async () => {
-      const { data } = await supabase
-        .from('launched_game_raw_data')
-        .select('id')
-        .eq('launched_game_id', launchedGameId)
-        .order('id', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      lastRawDataIdRef.current = data?.id ?? 0;
+      try {
+        const state = await getLaunchedGameState(launchedGameId, 0);
+        lastRawIdRef.current = state.last_raw_id;
+        if (state.ended) {
+          gameEndedRef.current = true;
+          onGameEndedRef.current();
+        }
+      } catch (err) {
+        console.error('[useGameStatePolling] init failed:', err);
+      }
     };
 
     const tick = async () => {
       if (tickRunningRef.current) return;
       const gid = launchedGameIdRef.current;
-      if (!gid || gameEndedRef.current || lastRawDataIdRef.current === null) return;
+      if (!gid || gameEndedRef.current) return;
 
       tickRunningRef.current = true;
       try {
-        const { data: gameRow } = await supabase
-          .from('launched_games')
-          .select('ended')
-          .eq('id', gid)
-          .maybeSingle();
+        const state = await getLaunchedGameState(gid, lastRawIdRef.current);
 
-        if (gameRow?.ended) {
+        if (state.ended) {
           gameEndedRef.current = true;
           onGameEndedRef.current();
           return;
         }
 
-        const { data: teams } = await supabase
-          .from('teams')
-          .select('id, end_time')
-          .eq('launched_game_id', gid);
-
-        if (teams && teams.length >= numberOfTeamsRef.current && teams.every(t => t.end_time !== null)) {
+        const teams = state.teams ?? [];
+        if (teams.length >= numberOfTeamsRef.current && teams.every((t) => t.end_time !== null)) {
           gameEndedRef.current = true;
           onAllTeamsFinishedRef.current();
           return;
         }
 
-        const { data: newRows } = await supabase
-          .from('launched_game_raw_data')
-          .select('*')
-          .eq('launched_game_id', gid)
-          .gt('id', lastRawDataIdRef.current)
-          .order('id', { ascending: true });
-
-        if (newRows && newRows.length > 0) {
-          lastRawDataIdRef.current = newRows[newRows.length - 1].id;
+        const newRows = state.new_raw_data ?? [];
+        if (newRows.length > 0) {
+          lastRawIdRef.current = state.last_raw_id;
           for (const row of newRows) {
-            onNewBipRef.current(row as RawDataRow);
+            onNewBipRef.current({ ...row, launched_game_id: gid });
           }
         }
+      } catch (err) {
+        // Swallow per-tick errors so the interval keeps running. The next
+        // poll will retry. 401/403 propagate via api.ts → AuthProvider.
+        console.error('[useGameStatePolling] tick failed:', err);
       } finally {
         tickRunningRef.current = false;
       }

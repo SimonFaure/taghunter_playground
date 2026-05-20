@@ -1,13 +1,22 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
-import { Trophy, ArrowLeft, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, Minus } from 'lucide-react';
-import { supabase } from '../lib/db';
+import { Trophy, ArrowLeft, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, Minus, MonitorUp, MonitorOff } from 'lucide-react';
+import { getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
 import { GameConfig, Team as ConfigTeam } from './LaunchGameModal';
+import {
+  openProjector,
+  closeProjector,
+  isProjectorOpenFor,
+  closeSelfProjectorWindow,
+} from '../services/projectorWindow';
 
 interface LeaderboardPageProps {
   launchedGameId: number | null;
   config: GameConfig;
   gameName?: string;
   onBack: () => void;
+  /** When true, render as the dedicated projector window — hides back button,
+   *  scales typography for big-screen viewing, and wires Esc to close-self. */
+  projectorMode?: boolean;
 }
 
 interface TeamResult {
@@ -69,12 +78,14 @@ function sortTeams(teams: TeamResult[], victoryType: string): TeamResult[] {
   });
 }
 
-export function LeaderboardPage({ launchedGameId, config, gameName, onBack }: LeaderboardPageProps) {
+export function LeaderboardPage({ launchedGameId, config, gameName, onBack, projectorMode = false }: LeaderboardPageProps) {
   const [teams, setTeams] = useState<RankedTeam[]>([]);
   const [teamsConfig, setTeamsConfig] = useState<ConfigTeam[]>(config.teams || []);
   const [playMode, setPlayMode] = useState<'solo' | 'team'>(config.playMode || 'solo');
   const [loading, setLoading] = useState(true);
   const [visible, setVisible] = useState(false);
+  const [projectorOpen, setProjectorOpen] = useState(false);
+  const [projectorBusy, setProjectorBusy] = useState(false);
 
   const prevRanksRef = useRef<Map<number, number>>(new Map());
   const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -116,13 +127,22 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack }: Le
 
   const fetchTeams = useCallback(async (isInitial = false) => {
     if (!launchedGameId) return;
-
-    const { data, error } = await supabase
-      .from('teams')
-      .select('id, team_number, team_name, score, start_time, end_time, key_id')
-      .eq('launched_game_id', launchedGameId);
-
-    if (error || !data) return;
+    let data: Array<{ id: number; team_number: number; team_name: string; score: number; start_time: number | null; end_time: number | null; key_id: number }> = [];
+    try {
+      const state = await getLaunchedGameState(launchedGameId, 0);
+      data = state.teams.map((t) => ({
+        id: t.id,
+        team_number: t.team_number,
+        team_name: t.team_name ?? '',
+        score: t.score,
+        start_time: t.start_time,
+        end_time: t.end_time,
+        key_id: t.key_id ?? 0,
+      }));
+    } catch (err) {
+      console.error('[LeaderboardPage] fetchTeams failed:', err);
+      return;
+    }
 
     const ranked = processTeams(data);
 
@@ -185,19 +205,14 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack }: Le
   useEffect(() => {
     const loadMeta = async () => {
       if (!launchedGameId) return;
-      const { data: metaData } = await supabase
-        .from('launched_game_meta')
-        .select('meta_name, meta_value')
-        .eq('launched_game_id', launchedGameId)
-        .in('meta_name', ['playMode', 'teamsConfig']);
-
-      if (metaData) {
-        const map: Record<string, string> = {};
-        metaData.forEach(row => { map[row.meta_name] = row.meta_value || ''; });
+      try {
+        const map = await getLaunchedGameMeta(launchedGameId);
         if (map.playMode === 'solo' || map.playMode === 'team') setPlayMode(map.playMode);
         if (map.teamsConfig) {
-          try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch {}
+          try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
+      } catch (err) {
+        console.error('[LeaderboardPage] meta load failed:', err);
       }
     };
 
@@ -212,8 +227,64 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack }: Le
     };
   }, [launchedGameId, fetchTeams]);
 
+  // Esc-to-close inside the projector window. Disabled in the main window
+  // because Esc is reserved for back-button-like navigation upstream.
+  useEffect(() => {
+    if (!projectorMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        void closeSelfProjectorWindow();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [projectorMode]);
+
+  // Refresh the toggle button state on mount and after each toggle action.
+  // Polling keeps the button honest if the projector window is closed
+  // externally (Esc, OS close, app crash) while this modal stays open.
+  useEffect(() => {
+    if (projectorMode || launchedGameId === null) return;
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const open = await isProjectorOpenFor(launchedGameId);
+        if (!cancelled) setProjectorOpen(open);
+      } catch {
+        if (!cancelled) setProjectorOpen(false);
+      }
+    };
+    void check();
+    const id = setInterval(() => void check(), 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [projectorMode, launchedGameId]);
+
+  const handleToggleProjector = useCallback(async () => {
+    if (projectorBusy || launchedGameId === null) return;
+    setProjectorBusy(true);
+    try {
+      if (projectorOpen) {
+        await closeProjector();
+        setProjectorOpen(false);
+      } else {
+        await openProjector({ launchedGameId, gameName, config });
+        setProjectorOpen(true);
+      }
+    } catch (err) {
+      console.error('[LeaderboardPage] projector toggle failed:', err);
+    } finally {
+      setProjectorBusy(false);
+    }
+  }, [projectorBusy, projectorOpen, launchedGameId, gameName, config]);
+
   return (
-    <div className="fixed inset-0 z-[200] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 overflow-auto">
+    <div
+      className="fixed inset-0 z-[200] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 overflow-auto"
+      style={projectorMode ? { zoom: 1.5 } : undefined}
+    >
       <div
         className="min-h-screen flex flex-col"
         style={{
@@ -223,13 +294,32 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack }: Le
         }}
       >
         <header className="flex items-center justify-between px-6 py-5 border-b border-slate-700/60">
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors text-sm font-medium"
-          >
-            <ArrowLeft size={18} />
-            Back
-          </button>
+          <div className="flex items-center gap-3">
+            {!projectorMode && (
+              <button
+                onClick={onBack}
+                className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors text-sm font-medium"
+              >
+                <ArrowLeft size={18} />
+                Back
+              </button>
+            )}
+            {!projectorMode && launchedGameId !== null && (
+              <button
+                onClick={handleToggleProjector}
+                disabled={projectorBusy}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                  projectorOpen
+                    ? 'border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20'
+                    : 'border-slate-600/50 bg-slate-700/40 text-slate-300 hover:bg-slate-700/70 hover:text-white'
+                } ${projectorBusy ? 'opacity-50 cursor-wait' : ''}`}
+                title={projectorOpen ? 'Close the projector window' : 'Open this leaderboard on a second screen'}
+              >
+                {projectorOpen ? <MonitorOff size={14} /> : <MonitorUp size={14} />}
+                {projectorOpen ? 'Close projector' : 'Open on second screen'}
+              </button>
+            )}
+          </div>
 
           <div className="flex items-center gap-3 text-slate-400 text-sm">
             {playMode === 'team' && (

@@ -6,7 +6,13 @@ import { LeaderboardPage } from './LeaderboardPage';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
 import { ConfirmDialog } from './ConfirmDialog';
-import { supabase } from '../lib/db';
+import * as scenarioStore from '../services/scenarioStore';
+import {
+  endLaunchedGame,
+  deleteLaunchedGame,
+  getLaunchedGameState,
+  getLaunchedGameDevices,
+} from '../services/launchedGames';
 import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle } from 'lucide-react';
 
 interface GamePageProps {
@@ -66,56 +72,29 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
   useEffect(() => {
     const loadGameMetadata = async () => {
       try {
-        const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-        if (isElectron) {
-          const gameDataContent = await (window as any).electron.games.readFile(gameUniqid, 'game-data.json');
-          const data = JSON.parse(gameDataContent);
-
-          let type, title;
-          if (data.game && data.game.type) {
-            type = data.game.type;
-            title = data.game.title || 'Unknown Game';
-          } else if (data.scenario) {
-            type = data.scenario.scenario_type;
-            title = data.scenario.title || data.scenario.name;
-          } else {
-            type = 'unknown';
-            title = 'Unknown Game';
+        // Slice 2: scenario metadata + game-data.json come from the local
+        // SQLite/FS store. No remote scenarios endpoint anymore.
+        const gd = (await scenarioStore.getGameData(gameUniqid)) as any;
+        if (gd) {
+          let type: string | undefined;
+          let title: string | undefined;
+          if (gd.game && gd.game.type) {
+            type = gd.game.type;
+            title = gd.game.title || 'Unknown Game';
+          } else if (gd.scenario) {
+            type = gd.scenario.scenario_type;
+            title = gd.scenario.title || gd.scenario.name;
           }
-
-          setGameMetadata({ type, title });
+          if (type && title) {
+            setGameMetadata({ type, title });
+            return;
+          }
+        }
+        const row = await scenarioStore.get(gameUniqid);
+        if (row) {
+          setGameMetadata({ type: row.game_type, title: row.title });
         } else {
-          const { data: scenario, error } = await supabase
-            .from('scenarios')
-            .select('title, game_type')
-            .eq('uniqid', gameUniqid)
-            .maybeSingle();
-
-          if (error || !scenario) {
-            try {
-              const response = await fetch(`/data/games/${gameUniqid}/game-data.json`);
-              const data = await response.json();
-
-              let type, title;
-              if (data.game && data.game.type) {
-                type = data.game.type;
-                title = data.game.title || 'Unknown Game';
-              } else if (data.scenario) {
-                type = data.scenario.scenario_type;
-                title = data.scenario.title || data.scenario.name;
-              } else {
-                type = 'unknown';
-                title = 'Unknown Game';
-              }
-
-              setGameMetadata({ type, title });
-            } catch {
-              setGameMetadata({ type: 'unknown', title: 'Unknown Game' });
-            }
-          } else {
-            setGameMetadata({ type: scenario.game_type, title: scenario.title });
-          }
+          setGameMetadata({ type: 'unknown', title: 'Unknown Game' });
         }
       } catch {
         setGameMetadata({ type: 'unknown', title: 'Unknown Game' });
@@ -140,24 +119,34 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
 
   const loadRankings = async () => {
     if (!launchedGameId) return;
-    const { data } = await supabase
-      .from('teams')
-      .select('*')
-      .eq('launched_game_id', launchedGameId)
-      .order('score', { ascending: false });
-    setRankings(data || []);
-    setShowRankings(true);
+    try {
+      const state = await getLaunchedGameState(launchedGameId, 0);
+      const sorted = [...state.teams]
+        .map((t) => ({ ...t, team_name: t.team_name ?? '' }))
+        .sort((a, b) => b.score - a.score);
+      setRankings(sorted as any);
+      setShowRankings(true);
+    } catch (err) {
+      console.error('[GamePage] loadRankings failed:', err);
+    }
   };
 
   const loadDevices = async () => {
     if (!launchedGameId) return;
-    const { data } = await supabase
-      .from('launched_game_devices')
-      .select('*')
-      .eq('launched_game_id', launchedGameId)
-      .order('last_connexion_attempt', { ascending: false });
-    setDevices(data || []);
-    setShowDevices(true);
+    try {
+      const rows = await getLaunchedGameDevices(launchedGameId);
+      // Map to the legacy Device shape this component renders.
+      const mapped = rows.map((r) => ({
+        id: r.id,
+        device_id: r.device_label ?? `device-${r.device_id}`,
+        connected: Boolean(r.connected),
+        last_connexion_attempt: r.last_connection_attempt,
+      }));
+      setDevices(mapped as any);
+      setShowDevices(true);
+    } catch (err) {
+      console.error('[GamePage] loadDevices failed:', err);
+    }
   };
 
   const handleEndGame = () => {
@@ -169,7 +158,11 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
       confirmText: 'End Game',
       onConfirm: async () => {
         if (!launchedGameId) return;
-        await supabase.from('launched_games').update({ ended: true }).eq('id', launchedGameId);
+        try {
+          await endLaunchedGame(launchedGameId);
+        } catch (err) {
+          console.error('[GamePage] endLaunchedGame failed:', err);
+        }
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         setShowPanel(false);
         onBack();
@@ -186,10 +179,12 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
       confirmText: 'Delete Game',
       onConfirm: async () => {
         if (!launchedGameId) return;
-        await supabase.from('teams').delete().eq('launched_game_id', launchedGameId);
-        await supabase.from('launched_game_devices').delete().eq('launched_game_id', launchedGameId);
-        await supabase.from('launched_game_meta').delete().eq('launched_game_id', launchedGameId);
-        await supabase.from('launched_games').delete().eq('id', launchedGameId);
+        try {
+          // FK ON DELETE CASCADE removes teams + meta + devices + raw_data.
+          await deleteLaunchedGame(launchedGameId);
+        } catch (err) {
+          console.error('[GamePage] deleteLaunchedGame failed:', err);
+        }
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         setShowPanel(false);
         onBack();

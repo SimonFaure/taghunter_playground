@@ -1,102 +1,177 @@
 import { useEffect, useState } from 'react';
-import { Monitor, Usb, Wifi, Database } from 'lucide-react';
-import { usbReaderService } from '../services/usbReader';
+import { Usb, Wifi } from 'lucide-react';
+import { platform } from '@tauri-apps/plugin-os';
+import { isReaderConnected } from '../services/sportidentService';
+import { getDeviceMetadata, type DeviceMetadata } from '../services/device';
+import {
+  useMotherConnection,
+  type MotherConnectionState,
+} from '../services/motherConnection';
+
+const POLL_MS = 10_000;
+
+type ReaderState = 'unknown' | 'ok' | 'bad';
 
 export function Footer() {
-  const [computerName, setComputerName] = useState<string>('Unknown');
-  const [usbConnected, setUsbConnected] = useState<boolean>(false);
-  const [wifiConnected, setWifiConnected] = useState<boolean>(false);
-  const [dbConnected, setDbConnected] = useState<boolean>(false);
-  const [isElectron, setIsElectron] = useState<boolean>(false);
+  const [device, setDevice] = useState<DeviceMetadata | null>(null);
+  const [readerState, setReaderState] = useState<ReaderState>('unknown');
+  // Windows-only for this slice — non-Windows hides the wifi icon entirely.
+  // null while the platform() promise hasn't resolved (one render frame).
+  const [isWindows, setIsWindows] = useState<boolean | null>(null);
+
+  const mother = useMotherConnection();
 
   useEffect(() => {
-    if (window.electron) {
-      window.electron.getComputerName().then(setComputerName);
+    try {
+      setIsWindows(platform() === 'windows');
+    } catch {
+      setIsWindows(false);
     }
-
-    setIsElectron(usbReaderService.isElectron());
   }, []);
 
   useEffect(() => {
-    if (!isElectron) return;
+    let cancelled = false;
+    void (async () => {
+      const meta = await getDeviceMetadata().catch(() => null);
+      if (cancelled) return;
+      if (meta) setDevice(meta);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    const checkUsbConnection = async () => {
-      try {
-        const ports = await usbReaderService.getAvailablePorts();
-        setUsbConnected(ports.length > 0);
-      } catch (error) {
-        setUsbConnected(false);
+  useEffect(() => {
+    let cancelled = false;
+    let lastState: ReaderState = 'unknown';
+    const tick = async () => {
+      const ok = await isReaderConnected().catch(() => false);
+      if (cancelled) return;
+      const next: ReaderState = ok ? 'ok' : 'bad';
+      setReaderState(next);
+      // Emit a global event whenever the polled reader status flips. The
+      // game pages + ConfigurationPage + LaunchGameModal subscribe via
+      // useDetectedReaderPort() and re-run their VID/PID detection so
+      // hotplug propagates without each component running its own poll.
+      if (next !== lastState) {
+        lastState = next;
+        window.dispatchEvent(new CustomEvent('reader:status', { detail: { state: next } }));
       }
     };
-
-    const checkWifiConnection = async () => {
-      try {
-        if (window.electron?.checkWifi) {
-          const result = await window.electron.checkWifi();
-          setWifiConnected(result.isConnected);
-        }
-      } catch (error) {
-        setWifiConnected(false);
-      }
+    void tick();
+    const id = setInterval(() => {
+      void tick();
+    }, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
     };
+  }, []);
 
-    const checkDbConnection = async () => {
-      try {
-        if (window.electron?.db?.connect) {
-          const result = await window.electron.db.connect();
-          console.log('Database connection check:', result);
-          setDbConnected(result.success);
-        }
-      } catch (error) {
-        console.error('Database connection error:', error);
-        setDbConnected(false);
-      }
-    };
-
-    checkUsbConnection();
-    checkWifiConnection();
-    checkDbConnection();
-    const interval = setInterval(() => {
-      checkUsbConnection();
-      checkWifiConnection();
-      checkDbConnection();
-    }, 10000);
-
-    return () => clearInterval(interval);
-  }, [isElectron]);
+  const wifiView = isWindows === true ? motherToView(mother) : null;
 
   return (
-    <footer className="bg-slate-800/80 backdrop-blur-sm border-t border-slate-700 py-4">
+    <footer className="fixed bottom-0 left-0 right-0 z-40 bg-slate-800/90 backdrop-blur-sm border-t border-slate-700 py-3">
       <div className="container mx-auto px-6">
-        <div className="flex items-center justify-center gap-6 text-slate-400 text-sm">
-          <div className="flex items-center gap-2">
-            <Monitor size={16} />
-            <span>Computer: <span className="text-white font-medium">{computerName}</span></span>
+        <div className="flex items-center justify-between gap-6 text-slate-400 text-sm">
+          <div className="flex items-center gap-6">
+            {wifiView && (
+              <Indicator
+                icon={<Wifi size={16} />}
+                label="WiFi"
+                value={wifiView.value}
+                color={wifiView.color}
+                tooltip={wifiView.tooltip}
+              />
+            )}
+            <Indicator
+              icon={<Usb size={16} />}
+              label="Reader"
+              value={readerState === 'ok' ? 'OK' : readerState === 'bad' ? 'KO' : '…'}
+              color={
+                readerState === 'ok'
+                  ? 'text-green-400'
+                  : readerState === 'bad'
+                    ? 'text-red-400'
+                    : 'text-slate-500'
+              }
+            />
           </div>
-          {isElectron && (
-            <>
-              <div className="flex items-center gap-2">
-                <Wifi size={16} className={wifiConnected ? 'text-green-400' : 'text-red-400'} />
-                <span>WiFi: <span className={`font-medium ${wifiConnected ? 'text-green-400' : 'text-red-400'}`}>
-                  {wifiConnected ? 'Connected' : 'Disconnected'}
-                </span></span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Usb size={16} className={usbConnected ? 'text-green-400' : 'text-red-400'} />
-                <span>USB: <span className={`font-medium ${usbConnected ? 'text-green-400' : 'text-red-400'}`}>
-                  {usbConnected ? 'Connected' : 'Disconnected'}
-                </span></span>
-              </div>
-              <div className="flex items-center gap-2">
-                <Database size={16} className={dbConnected ? 'text-green-400' : 'text-red-400'} />
-                <span>DB: <span className={`font-medium ${dbConnected ? 'text-green-400' : 'text-red-400'}`}>
-                  {dbConnected ? 'Connected' : 'Disconnected'}
-                </span></span>
-              </div>
-            </>
-          )}
+          <div className="text-slate-500">
+            {device ? `${device.device_label} · v${device.app_version}` : '…'}
+          </div>
         </div>
       </div>
     </footer>
+  );
+}
+
+interface WifiView {
+  value: string;
+  color: string;
+  tooltip: string;
+}
+
+function motherToView(state: MotherConnectionState): WifiView | null {
+  switch (state.kind) {
+    case 'hidden':
+      return null;
+    case 'checking':
+      return { value: '…', color: 'text-slate-500', tooltip: 'Checking LAN…' };
+    case 'mother_hosting':
+      return {
+        value: 'OK',
+        color: 'text-green-400',
+        tooltip: `Hotspot active, ${state.clientCount} client${state.clientCount === 1 ? '' : 's'}`,
+      };
+    case 'mother_partial':
+      return {
+        value: 'IDLE',
+        color: 'text-slate-400',
+        tooltip: 'Hotspot up, server not started',
+      };
+    case 'mother_idle':
+      return {
+        value: 'IDLE',
+        color: 'text-slate-400',
+        tooltip: 'Mother (hotspot off)',
+      };
+    case 'child_ok':
+      return {
+        value: 'OK',
+        color: 'text-green-400',
+        tooltip: `Connected to ${state.motherLabel ?? 'mother'} (${state.ssid ?? '—'})`,
+      };
+    case 'child_nearby':
+      return {
+        value: 'NEAR',
+        color: 'text-orange-400',
+        tooltip: 'Mother nearby but not responding',
+      };
+    case 'child_offline':
+      return {
+        value: 'KO',
+        color: 'text-red-400',
+        tooltip: 'No mother reachable',
+      };
+  }
+}
+
+interface IndicatorProps {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  color: string;
+  tooltip?: string;
+}
+
+function Indicator({ icon, label, value, color, tooltip }: IndicatorProps) {
+  return (
+    <div className="flex items-center gap-2" title={tooltip}>
+      <span className={color}>{icon}</span>
+      <span>
+        {label}: <span className={`font-medium ${color}`}>{value}</span>
+      </span>
+    </div>
   );
 }

@@ -1,0 +1,62 @@
+[package]
+name = "taghunter-playground"
+version = "1.1.0"
+description = "Tag Hunter Playground"
+authors = ["Tag Hunter"]
+edition = "2021"
+
+[lib]
+name = "taghunter_playground_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-os = "2"
+tauri-plugin-http = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+serialport = "4"
+regex = "1"
+tokio = { version = "1", features = ["time", "process", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util"] }
+axum = "0.8"
+tokio-rusqlite = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+mdns-sd = "0.13"
+rand = "0.8"
+if-addrs = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# SportIdent reader stack (moved from feature-gated to mandatory after the
+# step-7 cutover deleted the legacy JS path).
+tokio-serial = "5"
+async-trait = "0.1"
+bytes = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Networking_Connectivity",
+    "Networking_NetworkOperators",
+] }
+
+# Desktop-only: app self-update + OS autostart. The Tauri updater cannot
+# self-install on mobile (Android/iOS go through the app stores), and
+# launch-on-boot is a desktop-only concept — so these are gated to desktop
+# targets and registered behind #[cfg(desktop)] in lib.rs.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-autostart = "2"
+
+# Tauri 2 mobile entry-point (compiled in for android/ios targets).
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri = { version = "2", features = [] }

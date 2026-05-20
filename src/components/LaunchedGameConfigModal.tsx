@@ -1,6 +1,11 @@
 import { useState, useEffect } from 'react';
 import { Settings, Save, X, Monitor, Eye, EyeOff } from 'lucide-react';
-import { supabase } from '../lib/db';
+import {
+  getLaunchedGameMeta,
+  updateLaunchedGameMeta,
+  getLaunchedGameDevices,
+  getLaunchedGameState,
+} from '../services/launchedGames';
 
 interface LaunchedGameConfigModalProps {
   gameId: number;
@@ -10,7 +15,6 @@ interface LaunchedGameConfigModalProps {
 }
 
 interface MetaField {
-  id: number;
   meta_name: string;
   meta_value: string | null;
 }
@@ -46,59 +50,56 @@ export function LaunchedGameConfigModal({ gameId, gameName, onClose, onSave }: L
 
   const loadMetaFields = async () => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from('launched_game_meta')
-      .select('*')
-      .eq('launched_game_id', gameId);
-
-    if (error) {
-      console.error('Error loading meta fields:', error);
-    } else {
-      const filteredData = (data || []).filter(field => field.meta_name !== 'firstChipIndex');
-      setMetaFields(filteredData);
+    try {
+      const meta = await getLaunchedGameMeta(gameId);
+      const fields: MetaField[] = Object.entries(meta)
+        .filter(([k]) => k !== 'firstChipIndex')
+        .map(([k, v]) => ({ meta_name: k, meta_value: v ?? null }));
+      setMetaFields(fields);
 
       const initialValues: Record<string, string> = {};
-      filteredData.forEach(field => {
-        initialValues[field.meta_name] = field.meta_value || '';
-      });
+      fields.forEach((f) => { initialValues[f.meta_name] = f.meta_value ?? ''; });
       setEditedValues(initialValues);
+    } catch (err) {
+      console.error('Error loading meta fields:', err);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const loadDevices = async () => {
-    const { data, error } = await supabase
-      .from('launched_game_devices')
-      .select('*')
-      .eq('launched_game_id', gameId);
-
-    if (error) {
-      console.error('Error loading devices:', error);
-    } else {
-      setDevices(data || []);
-      await loadRawDataForDevices(data || []);
-    }
-  };
-
-  const loadRawDataForDevices = async (devicesList: Device[]) => {
-    const rawDataMap: Record<string, RawData[]> = {};
-
-    for (const device of devicesList) {
-      const { data, error } = await supabase
-        .from('launched_game_raw_data')
-        .select('*')
-        .eq('launched_game_id', gameId)
-        .eq('device_id', device.device_id)
-        .order('created_at', { ascending: false });
-
-      if (error) {
-        console.error(`Error loading raw data for device ${device.device_id}:`, error);
-      } else {
-        rawDataMap[device.device_id] = data || [];
+    try {
+      const rows = await getLaunchedGameDevices(gameId);
+      const mapped: Device[] = rows.map((r) => ({
+        id: r.id,
+        device_id: r.device_label ?? `device-${r.device_id}`,
+        connected: Boolean(r.connected),
+        last_connexion_attempt: r.last_connection_attempt,
+      }));
+      setDevices(mapped);
+      // Single combined `state` call returns all raw_data; bucket by device_label.
+      const state = await getLaunchedGameState(gameId, 0);
+      const rawDataMap: Record<string, RawData[]> = {};
+      const labelByDeviceId = new Map<number, string>();
+      for (const r of rows) labelByDeviceId.set(r.device_id, r.device_label ?? `device-${r.device_id}`);
+      for (const punch of state.new_raw_data) {
+        const label = labelByDeviceId.get(punch.device_id) ?? `device-${punch.device_id}`;
+        if (!rawDataMap[label]) rawDataMap[label] = [];
+        rawDataMap[label].push({
+          id: punch.id,
+          device_id: label,
+          raw_data: punch.raw_data,
+          created_at: punch.created_at,
+        });
       }
+      // Newest first
+      for (const k of Object.keys(rawDataMap)) {
+        rawDataMap[k].sort((a, b) => b.id - a.id);
+      }
+      setRawData(rawDataMap);
+    } catch (err) {
+      console.error('Error loading devices:', err);
     }
-
-    setRawData(rawDataMap);
   };
 
   const toggleRawData = (deviceId: string) => {
@@ -110,22 +111,23 @@ export function LaunchedGameConfigModal({ gameId, gameName, onClose, onSave }: L
 
   const handleSave = async () => {
     setSaving(true);
-
-    for (const field of metaFields) {
-      const newValue = editedValues[field.meta_name];
-      if (newValue !== field.meta_value) {
-        const { error } = await supabase
-          .from('launched_game_meta')
-          .update({ meta_value: newValue })
-          .eq('id', field.id);
-
-        if (error) {
-          console.error(`Error updating ${field.meta_name}:`, error);
-        }
+    try {
+      // The server's update_meta atomically replaces the whole bag, so we
+      // need the *full* current set, not just the edited fields. Pull fresh
+      // (so we don't clobber firstChipIndex which we filtered out of the UI),
+      // overlay our edits, push.
+      const current = await getLaunchedGameMeta(gameId);
+      const next: Record<string, string> = { ...current };
+      for (const field of metaFields) {
+        const v = editedValues[field.meta_name];
+        if (v !== undefined) next[field.meta_name] = v;
       }
+      await updateLaunchedGameMeta(gameId, next);
+    } catch (err) {
+      console.error('Error saving meta:', err);
+    } finally {
+      setSaving(false);
     }
-
-    setSaving(false);
     onSave();
     onClose();
   };
@@ -194,7 +196,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, onClose, onSave }: L
               const value = editedValues[field.meta_name] || '';
 
               return (
-                <div key={field.id}>
+                <div key={field.meta_name}>
                   <label className="block text-sm font-medium text-slate-300 mb-2">
                     {getFieldLabel(field.meta_name)}
                   </label>

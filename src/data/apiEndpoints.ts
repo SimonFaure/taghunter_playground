@@ -31,7 +31,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_billing_status&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_billing_status&email=user@example.com',
     exampleResponse: `{
   "billing_up_to_date": true,
   "license_type": "premium"
@@ -55,7 +55,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_cards_version&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_cards_version&email=user@example.com',
     exampleResponse: `{
   "version": 5
 }`,
@@ -78,7 +78,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_patterns&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_patterns&email=user@example.com',
     exampleResponse: `{
   "patterns": [
     {
@@ -116,7 +116,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_layouts&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_layouts&email=user@example.com',
     exampleResponse: `{
   "layouts": [
     {
@@ -150,7 +150,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_user_data_update&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_user_data_update&email=user@example.com',
     exampleResponse: `{
   "custom_scenarios": [
     {
@@ -223,40 +223,12 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The unique identifier of the pattern'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=download_pattern&email=user@example.com&pattern_uniqid=pattern_xyz789',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=download_pattern&email=user@example.com&pattern_uniqid=pattern_xyz789',
     exampleResponse: 'CSV file content containing pattern data',
     statusCodes: [
       { code: 200, description: 'Success - Returns pattern file' },
       { code: 400, description: 'Bad Request - Missing required parameters' },
       { code: 404, description: 'Not Found - Pattern does not exist' },
-      { code: 500, description: 'Server Error - Internal server error' }
-    ]
-  },
-  {
-    name: 'Download Cards',
-    method: 'GET',
-    path: '/backend/api/playground.php?action=download_cards',
-    description: 'Downloads the cards database file for a specific version.',
-    parameters: [
-      {
-        name: 'email',
-        type: 'string',
-        required: true,
-        description: 'The email address of the user'
-      },
-      {
-        name: 'version',
-        type: 'number',
-        required: true,
-        description: 'The version number of the cards to download'
-      }
-    ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=download_cards&email=user@example.com&version=3',
-    exampleResponse: 'CSV file content containing cards data',
-    statusCodes: [
-      { code: 200, description: 'Success - Returns cards file' },
-      { code: 400, description: 'Bad Request - Missing required parameters' },
-      { code: 404, description: 'Not Found - Cards version does not exist' },
       { code: 500, description: 'Server Error - Internal server error' }
     ]
   },
@@ -279,7 +251,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The unique identifier of the layout'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=download_layout&email=user@example.com&layout_id=1',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=download_layout&email=user@example.com&layout_id=1',
     exampleResponse: 'JSON file content containing layout configuration',
     statusCodes: [
       { code: 200, description: 'Success - Returns layout file' },
@@ -301,7 +273,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The email address of the user'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_user_scenarios&email=user@example.com',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_user_scenarios&email=user@example.com',
     exampleResponse: `{
   "scenarios": [
     {
@@ -339,7 +311,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The unique identifier of the scenario'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_scenario_game_data&email=user@example.com&uniqid=scenario_674fb123a45e6',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_scenario_game_data&email=user@example.com&uniqid=scenario_674fb123a45e6',
     exampleResponse: `{
   "id": 5,
   "uniqid": "scenario_674fb123a45e6",
@@ -394,7 +366,7 @@ export const apiEndpoints: ApiEndpoint[] = [
         description: 'The name of the media file to download'
       }
     ],
-    exampleRequest: 'GET https://admin.taghunter.fr/backend/api/playground.php?action=get_media&uniqid=scenario_674fb123a45e6&filename=image1.jpg',
+    exampleRequest: 'GET https://studio.taghunter.fr/backend/api/playground.php?action=get_media&uniqid=scenario_674fb123a45e6&filename=image1.jpg',
     exampleResponse: 'Binary file content (image, audio, or video)',
     statusCodes: [
       { code: 200, description: 'Success - Returns the media file' },

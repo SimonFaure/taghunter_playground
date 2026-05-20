@@ -1,6 +1,14 @@
-import { supabase } from '../lib/db';
-import { getPatternFilesFromStorage } from '../utils/patterns';
-import { CardData } from './usbReader';
+import * as patternStore from './patternStore';
+import * as scenarioStore from './scenarioStore';
+import {
+  getLaunchedGameState,
+  getLaunchedGameMeta,
+  getRawDataForChip,
+  listCompletedQuests,
+  recordCompletedQuest,
+  updateTeam,
+} from './launchedGames';
+import { CardData } from './sportidentService';
 import type { Team } from '../components/LaunchGameModal';
 
 interface GameQuest {
@@ -178,38 +186,22 @@ function isCheatDetected(
 }
 
 async function loadPatternItemsFromFile(
-  gameType: string,
+  _gameType: string,
   patternUniqid: string
 ): Promise<PatternItem[]> {
   if (!patternUniqid) return [];
-
   try {
-    const storageFiles = await getPatternFilesFromStorage(gameType);
-    const match = storageFiles.find(f => f.uniqid === patternUniqid);
-    if (!match) {
-      console.warn('[TagQuest] No pattern file found for uniqid:', patternUniqid);
-      return [];
+    // The pattern's JSON is cached inline on the patterns row — decode
+    // the cached pattern_data_json directly.
+    const data = await patternStore.getData(patternUniqid);
+    if (Array.isArray(data)) return data as PatternItem[];
+    if (data && typeof data === 'object' && Array.isArray((data as { pattern_data?: unknown }).pattern_data)) {
+      return (data as { pattern_data: PatternItem[] }).pattern_data;
     }
-
-    const { data: urlData } = supabase.storage
-      .from('resources')
-      .getPublicUrl(match.storagePath);
-
-    const resp = await fetch(urlData.publicUrl);
-    if (!resp.ok) {
-      console.warn('[TagQuest] Failed to fetch pattern file:', match.storagePath);
-      return [];
-    }
-
-    const json = await resp.json();
-    if (Array.isArray(json?.pattern_data)) {
-      return json.pattern_data as PatternItem[];
-    }
-
-    console.warn('[TagQuest] Pattern file missing pattern_data array:', match.storagePath);
+    console.warn('[TagQuest] Local pattern row missing pattern_data array:', patternUniqid);
     return [];
   } catch (err) {
-    console.error('[TagQuest] Error loading pattern items from file:', err);
+    console.error('[TagQuest] Error loading pattern items from local store:', err);
     return [];
   }
 }
@@ -259,30 +251,23 @@ export async function processTagQuestPunch(
   });
 
   try {
-    // Step 1: Resolve team from chip ID
+    // Step 1: Resolve team from chip ID via the single combined `state` call.
+    // We snapshot once here and reuse for everything below; this also lets us
+    // pull game_type / start_time / duration without extra round-trips.
+    const state = await getLaunchedGameState(launchedGameId, 0);
+    const teamsInGame = state.teams;
+    const directTeam = teamsInGame.find((t) => t.key_id === card.id) ?? null;
+
     let resolvedTeamId: number | null = null;
     let teammateChipId: number | null = null;
-
-    const { data: directTeam } = await supabase
-      .from('teams')
-      .select('*')
-      .eq('launched_game_id', launchedGameId)
-      .eq('key_id', card.id)
-      .maybeSingle();
 
     if (directTeam) {
       resolvedTeamId = directTeam.id;
     } else if (playMode === 'team') {
       for (const t of teamsConfig) {
-        const match = t.teammates?.find(mate => mate.chipId === card.id);
+        const match = t.teammates?.find((mate) => mate.chipId === card.id);
         if (match) {
-          const { data: parentTeam } = await supabase
-            .from('teams')
-            .select('*')
-            .eq('launched_game_id', launchedGameId)
-            .eq('key_id', t.chipId)
-            .maybeSingle();
-
+          const parentTeam = teamsInGame.find((tm) => tm.key_id === t.chipId) ?? null;
           if (parentTeam) {
             resolvedTeamId = parentTeam.id;
             teammateChipId = card.id;
@@ -312,19 +297,16 @@ export async function processTagQuestPunch(
       };
     }
 
-    const { data: team } = await supabase
-      .from('teams')
-      .select('*')
-      .eq('id', resolvedTeamId)
-      .maybeSingle();
-
+    const team = teamsInGame.find((t) => t.id === resolvedTeamId) ?? null;
     if (!team) return errorResult('Team record not found');
+
+    const teamName = team.team_name ?? '';
 
     // Step 2: Check if team already finished
     if (team.end_time) {
-      console.log('[TagQuest] Team already finished:', team.team_name);
+      console.log('[TagQuest] Team already finished:', teamName);
       return {
-        team_name: team.team_name,
+        team_name: teamName,
         team_id: team.id,
         teammate_chip_id: teammateChipId,
         completed_quest: null,
@@ -337,25 +319,18 @@ export async function processTagQuestPunch(
         end_station_reached: false,
         game_ended: true,
         status: 'team_already_finished',
-        message: `${team.team_name} has already completed the game`,
+        message: `${teamName} has already completed the game`,
       };
     }
 
     // Step 3: Cheat detection using previous raw data for the same chip
-    const { data: previousRecords } = await supabase
-      .from('launched_game_raw_data')
-      .select('raw_data, created_at')
-      .eq('launched_game_id', launchedGameId)
-      .eq('raw_data->>id', card.id.toString())
-      .order('created_at', { ascending: false })
-      .limit(2);
-
-    if (previousRecords && previousRecords.length >= 2) {
+    const previousRecords = await getRawDataForChip(launchedGameId, card.id, 2);
+    if (previousRecords.length >= 2) {
       const previousCard = previousRecords[1].raw_data as CardData;
       if (isCheatDetected(card.punches, previousCard.punches)) {
-        console.log('[TagQuest] Cheat detected for chip:', card.id, 'team:', team.team_name);
+        console.log('[TagQuest] Cheat detected for chip:', card.id, 'team:', teamName);
         return {
-          team_name: team.team_name,
+          team_name: teamName,
           team_id: team.id,
           teammate_chip_id: teammateChipId,
           completed_quest: null,
@@ -368,48 +343,26 @@ export async function processTagQuestPunch(
           end_station_reached: false,
           game_ended: false,
           status: 'cheat_detected',
-          message: `Cheat detected for ${team.team_name} (chip ${card.id})`,
+          message: `Cheat detected for ${teamName} (chip ${card.id})`,
         };
       }
     }
 
-    // Step 4: Load pattern items from the pattern file in storage
-    const { data: metaRows } = await supabase
-      .from('launched_game_meta')
-      .select('meta_name, meta_value')
-      .eq('launched_game_id', launchedGameId);
-
-    const metaMap: Record<string, string> = {};
-    metaRows?.forEach(m => { metaMap[m.meta_name] = m.meta_value || ''; });
-
+    // Step 4: Load pattern items from the local pattern store
+    const metaMap = await getLaunchedGameMeta(launchedGameId);
     const patternUniqid = metaMap.pattern || '';
-
-    const { data: launchedGameRow } = await supabase
-      .from('launched_games')
-      .select('game_type')
-      .eq('id', launchedGameId)
-      .maybeSingle();
-
-    const gameType = (launchedGameRow?.game_type || 'mystery').toLowerCase();
-
+    const gameType = (state.game_type || 'mystery').toLowerCase();
     const patternItems: PatternItem[] = await loadPatternItemsFromFile(gameType, patternUniqid);
 
-    // Step 5: Load game data for quest definitions
+    // Step 5: Load game data for quest definitions from the local scenario store.
     let gameDataJson: GameDataJson | null = null;
-
     try {
-      const { data: urlData } = supabase.storage
-        .from('resources')
-        .getPublicUrl(`scenarios/${gameUniqid}/game-data.json`);
-      const resp = await fetch(urlData.publicUrl);
-      if (resp.ok) {
-        const raw = await resp.json();
-        gameDataJson = raw?.game_data ?? raw;
-      } else {
-        console.warn('[TagQuest] Could not fetch game-data.json from storage, status:', resp.status);
+      const raw = (await scenarioStore.getGameData(gameUniqid)) as { game_data?: GameDataJson } | GameDataJson | null;
+      if (raw) {
+        gameDataJson = (raw as { game_data?: GameDataJson }).game_data ?? (raw as GameDataJson);
       }
     } catch (err) {
-      console.warn('[TagQuest] Error fetching game-data.json from storage:', err);
+      console.warn('[TagQuest] Error fetching game-data.json from local store:', err);
     }
 
     const quests = gameDataJson ? getQuests(gameDataJson) : [];
@@ -422,12 +375,8 @@ export async function processTagQuestPunch(
 
     // Step 6: Load already-scored quests for this team
     // quest_number stores the 1-based item_index (= array index + 1)
-    const { data: completedQuests } = await supabase
-      .from('team_completed_quests')
-      .select('quest_number, points_awarded')
-      .eq('team_id', team.id);
-
-    const completedQuestNumbers = new Set((completedQuests || []).map(r => Number(r.quest_number)));
+    const completedQuests = await listCompletedQuests(launchedGameId, team.id);
+    const completedQuestNumbers = new Set(completedQuests.map((r) => Number(r.quest_number)));
 
     // Step 7: Sanitize - remove already-scored quest punches from working set
     // In score mode, quests can be completed multiple times so we never strip them out.
@@ -486,17 +435,11 @@ export async function processTagQuestPunch(
       qp => qp.matchedSlots === qp.totalSlots && qp.totalSlots > 0
     );
 
-    // Step 10: Late malus calculation
+    // Step 10: Late malus calculation (using game metadata from `state` above).
     let malusApplied = 0;
-    const { data: launchedGame } = await supabase
-      .from('launched_games')
-      .select('start_time, duration')
-      .eq('id', launchedGameId)
-      .maybeSingle();
-
-    if (launchedGame && lateMalusPoints > 0) {
-      const startMs = new Date(launchedGame.start_time).getTime();
-      const durationMs = (launchedGame.duration ?? 0) * 60 * 1000;
+    if (state.start_time && lateMalusPoints > 0) {
+      const startMs = new Date(state.start_time).getTime();
+      const durationMs = (state.duration ?? 0) * 60 * 1000;
       const deadline = startMs + durationMs;
       const now = Date.now();
       if (now > deadline) {
@@ -517,7 +460,7 @@ export async function processTagQuestPunch(
     };
 
     const beforeCompletionMap = buildCompletionMap(
-      (completedQuests || []).map(r => ({ quest_number: String(r.quest_number) }))
+      completedQuests.map((r) => ({ quest_number: String(r.quest_number) }))
     );
     const beforeCombos = computeCombos(beforeCompletionMap);
 
@@ -526,35 +469,21 @@ export async function processTagQuestPunch(
       const rawPts = qp.quest.points ?? 0;
       const pts = typeof rawPts === 'string' ? parseInt(rawPts, 10) || 0 : rawPts;
 
-      const row = {
-        launched_game_id: launchedGameId,
-        team_id: team.id,
-        teammate_chip_id: teammateChipId ?? card.id,
-        quest_id: null,
-        quest_number: String(itemIndex),
-        points_awarded: pts,
-      };
-
       // In speed mode, skip if already completed (guards against rare race conditions)
       if (!isScoreMode && completedQuestNumbers.has(itemIndex)) continue;
 
-      let insertedRows: { id: number }[] | null = null;
-      if (isScoreMode) {
-        const { data } = await supabase
-          .from('team_completed_quests')
-          .insert(row)
-          .select('id');
-        insertedRows = data;
-      } else {
-        const { data } = await supabase
-          .from('team_completed_quests')
-          .upsert(row, { onConflict: 'team_id,quest_number', ignoreDuplicates: true })
-          .select('id');
-        insertedRows = data;
-      }
-      const actuallyInserted = insertedRows !== null && insertedRows.length > 0;
+      const res = await recordCompletedQuest({
+        launched_game_id: launchedGameId,
+        team_id: team.id,
+        teammate_chip_id: teammateChipId ?? card.id,
+        quest_number: String(itemIndex),
+        points_awarded: pts,
+        // Score mode allows duplicates (re-completing a quest scores again).
+        // Speed mode is unique-per-quest; the server enforces idempotency.
+        allow_duplicates: isScoreMode,
+      });
 
-      if (actuallyInserted && !newCompletedQuest) {
+      if (res.inserted && !newCompletedQuest) {
         newCompletedQuest = {
           index: itemIndex,
           name: qp.quest.name,
@@ -565,12 +494,8 @@ export async function processTagQuestPunch(
 
     // Recompute score from scratch based on all completed quests (existing + new)
     // This guarantees the score is always consistent with team_completed_quests
-    const { data: allCompletedRows } = await supabase
-      .from('team_completed_quests')
-      .select('quest_number, points_awarded')
-      .eq('team_id', team.id);
-
-    const allCompleted = allCompletedRows ?? [];
+    const allCompletedRows = await listCompletedQuests(launchedGameId, team.id);
+    const allCompleted = allCompletedRows;
     const totalQuestPoints = allCompleted.reduce((sum, r) => sum + (r.points_awarded ?? 0), 0);
 
     const afterCompletionMap = buildCompletionMap(
@@ -582,7 +507,7 @@ export async function processTagQuestPunch(
       afterCombos.combos4 * pts4 +
       afterCombos.combos2 * pts2;
 
-    const prevTotalQuestPoints = (completedQuests || []).reduce((sum, r) => sum + (r.points_awarded ?? 0), 0);
+    const prevTotalQuestPoints = completedQuests.reduce((sum, r) => sum + (r.points_awarded ?? 0), 0);
     const prevTotalComboBonus =
       beforeCombos.combos6 * pts6 +
       beforeCombos.combos4 * pts4 +
@@ -622,10 +547,10 @@ export async function processTagQuestPunch(
       endTimeToCommit = Math.floor(toMs(card.end!.time) / 1000);
       gameEnded = true;
       if (scoreDelta !== 0 || completedNow.length > 0) {
-        await supabase.from('teams').update({ score: newScore }).eq('id', team.id);
+        await updateTeam(team.id, { score: newScore });
       }
     } else if (scoreDelta !== 0 || completedNow.length > 0) {
-      await supabase.from('teams').update({ score: newScore }).eq('id', team.id);
+      await updateTeam(team.id, { score: newScore });
     }
 
     // Step 14: Best partial quest (if no complete quest this round)
@@ -659,11 +584,11 @@ export async function processTagQuestPunch(
     };
 
     const prevQuestDetails = buildQuestDetails(
-      (completedQuests || []).map(r => ({ quest_number: String(r.quest_number), points_awarded: r.points_awarded ?? 0 }))
+      completedQuests.map((r) => ({ quest_number: String(r.quest_number), points_awarded: r.points_awarded ?? 0 }))
     );
 
     const newQuestDetails = buildQuestDetails(
-      (allCompletedRows ?? []).map(r => ({ quest_number: String(r.quest_number), points_awarded: r.points_awarded ?? 0 }))
+      allCompletedRows.map((r) => ({ quest_number: String(r.quest_number), points_awarded: r.points_awarded ?? 0 }))
     );
 
     // Determine which quest to display (completed or best partial)
@@ -698,7 +623,7 @@ export async function processTagQuestPunch(
       const rawPts = quest.points ?? 0;
       const pts = typeof rawPts === 'string' ? parseInt(rawPts, 10) || 0 : rawPts;
 
-      const timesCompleted = (allCompletedRows ?? []).filter(r => r.quest_number === String(targetItemIndex)).length;
+      const timesCompleted = allCompletedRows.filter((r) => r.quest_number === String(targetItemIndex)).length;
 
       displayQuest = {
         index: targetItemIndex,
@@ -708,14 +633,14 @@ export async function processTagQuestPunch(
         slots,
         complete: newCompletedQuest?.index === targetItemIndex,
         timesCompleted,
-        totalPointsForQuest: (allCompletedRows ?? [])
-          .filter(r => r.quest_number === String(targetItemIndex))
+        totalPointsForQuest: allCompletedRows
+          .filter((r) => r.quest_number === String(targetItemIndex))
           .reduce((s, r) => s + (r.points_awarded ?? 0), 0),
       };
     }
 
     const animationData: PunchAnimationData = {
-      teamName: team.team_name,
+      teamName: teamName,
       prevScore: prevScore,
       prevCombos: beforeCombos,
       prevQuestDetails,
@@ -734,7 +659,7 @@ export async function processTagQuestPunch(
     };
 
     const result: PunchResult = {
-      team_name: team.team_name,
+      team_name: teamName,
       team_id: team.id,
       teammate_chip_id: teammateChipId,
       completed_quest: newCompletedQuest,

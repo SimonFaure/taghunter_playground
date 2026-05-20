@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Trophy, X, Calendar, Gamepad2, ChevronRight, ChevronDown } from 'lucide-react';
-import { supabase } from '../lib/db';
+import * as scenarioStore from '../services/scenarioStore';
+import { listActiveLaunchedGames } from '../services/launchedGames';
 
 export type TimeRange = 'day' | 'week' | 'month' | 'trimester' | 'year' | 'all';
 
@@ -58,43 +59,41 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
 
   useEffect(() => {
     const loadScenarios = async () => {
-      const { data } = await supabase
-        .from('scenarios')
-        .select('uniqid, title')
-        .order('title');
-      if (data) {
-        const opts = data.map(s => ({ uniqid: s.uniqid, title: s.title }));
+      try {
+        const rows = await scenarioStore.list();
+        const opts = rows
+          .map((r) => ({ uniqid: r.uniqid, title: r.title }))
+          .sort((a, b) => a.title.localeCompare(b.title));
         setScenarios(opts);
         if (opts.length > 0) setSelectedScenario(opts[0]);
+      } catch (err) {
+        console.error('[RankingsModal] loadScenarios failed:', err);
+      } finally {
+        setLoadingScenarios(false);
       }
-      setLoadingScenarios(false);
     };
 
     const loadActiveGames = async () => {
-      const { data } = await supabase
-        .from('launched_games')
-        .select('id, name, game_uniqid')
-        .eq('ended', false)
-        .order('created_at', { ascending: false });
-
-      if (data && data.length > 0) {
-        const uniqids = [...new Set(data.map(g => g.game_uniqid))];
-        const { data: scenData } = await supabase
-          .from('scenarios')
-          .select('uniqid, title')
-          .in('uniqid', uniqids);
-
-        const scenMap: Record<string, string> = {};
-        scenData?.forEach(s => { scenMap[s.uniqid] = s.title; });
-
-        setActiveGames(data.map(g => ({
-          id: g.id,
-          name: g.name,
-          game_uniqid: g.game_uniqid,
-          scenarioTitle: scenMap[g.game_uniqid] || g.game_uniqid,
-        })));
+      try {
+        const games = await listActiveLaunchedGames();
+        if (games.length > 0) {
+          const titleByUniqid = new Map<string, string>();
+          for (const uniq of new Set(games.map((g) => g.game_uniqid))) {
+            const row = await scenarioStore.get(uniq);
+            if (row) titleByUniqid.set(uniq, row.title);
+          }
+          setActiveGames(games.map((g) => ({
+            id: g.id,
+            name: g.name,
+            game_uniqid: g.game_uniqid,
+            scenarioTitle: titleByUniqid.get(g.game_uniqid) ?? g.game_uniqid,
+          })));
+        }
+      } catch (err) {
+        console.error('[RankingsModal] loadActiveGames failed:', err);
+      } finally {
+        setLoadingActive(false);
       }
-      setLoadingActive(false);
     };
 
     loadScenarios();

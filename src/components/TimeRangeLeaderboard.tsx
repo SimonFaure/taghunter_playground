@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Trophy, ArrowLeft, Clock, Medal, Calendar, Zap, Star, Users } from 'lucide-react';
-import { supabase } from '../lib/db';
+import {
+  listLaunchedGames,
+  getLaunchedGameMeta,
+  getLaunchedGameState,
+} from '../services/launchedGames';
 import type { TimeRange, ScenarioOption } from './RankingsModal';
 
 interface TimeRangeLeaderboardProps {
@@ -100,67 +104,67 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
 
       const rangeStart = getTimeRangeStart(timeRange);
 
-      let query = supabase
-        .from('launched_games')
-        .select('id, name, created_at')
-        .eq('game_uniqid', scenario.uniqid);
-
-      if (rangeStart) {
-        query = query.gte('created_at', rangeStart.toISOString());
-      }
-
-      const { data: launchedGames, error: lgErr } = await query;
-      if (lgErr || !launchedGames || launchedGames.length === 0) {
+      // Cross-game leaderboard: client-side aggregation. Pull all this client's
+      // launched_games, filter to the scenario + time range, then for each
+      // matching game fetch teams and meta. With most venues running tens of
+      // games, the round-trip cost is acceptable for a manual leaderboard view.
+      let allGames;
+      try {
+        allGames = await listLaunchedGames();
+      } catch (err) {
+        console.error('[TimeRangeLeaderboard] listLaunchedGames failed:', err);
         setTeams([]);
         setLoading(false);
         setTimeout(() => setVisible(true), 50);
         return;
       }
 
-      const gameIds = launchedGames.map(g => g.id);
-      const gameInfoMap: Record<number, { name: string; created_at: string }> = {};
-      launchedGames.forEach(g => { gameInfoMap[g.id] = { name: g.name, created_at: g.created_at }; });
-
-      const [teamsRes, metaRes] = await Promise.all([
-        supabase
-          .from('teams')
-          .select('id, team_name, score, start_time, end_time, launched_game_id')
-          .in('launched_game_id', gameIds),
-        supabase
-          .from('launched_game_meta')
-          .select('launched_game_id, meta_name, meta_value')
-          .in('launched_game_id', gameIds)
-          .in('meta_name', ['victoryType', 'playMode']),
-      ]);
-
-      if (metaRes.data) {
-        const vt = metaRes.data.find(m => m.meta_name === 'victoryType');
-        if (vt?.meta_value === 'speed' || vt?.meta_value === 'score') setVictoryType(vt.meta_value);
-        const pm = metaRes.data.find(m => m.meta_name === 'playMode');
-        if (pm?.meta_value === 'solo' || pm?.meta_value === 'team') setPlayMode(pm.meta_value);
-      }
-
-      if (!teamsRes.data || teamsRes.data.length === 0) {
-        setTeams([]);
-        setLoading(false);
-        setTimeout(() => setVisible(true), 50);
-        return;
-      }
-
-      const entries: TeamEntry[] = teamsRes.data.map(t => {
-        const gameInfo = gameInfoMap[t.launched_game_id];
-        const duration = t.start_time && t.end_time ? t.end_time - t.start_time : null;
-        return {
-          key: `${t.launched_game_id}-${t.id}`,
-          team_name: t.team_name,
-          score: t.score ?? 0,
-          duration,
-          launched_game_name: gameInfo?.name ?? '',
-          game_date: gameInfo?.created_at ?? '',
-        };
+      const cutoffMs = rangeStart ? rangeStart.getTime() : 0;
+      const launchedGames = allGames.filter((g) => {
+        if (g.game_uniqid !== scenario.uniqid) return false;
+        if (cutoffMs > 0 && g.created_at) {
+          if (new Date(g.created_at).getTime() < cutoffMs) return false;
+        }
+        return true;
       });
 
-      const resolvedVictoryType = metaRes.data?.find(m => m.meta_name === 'victoryType')?.meta_value ?? 'score';
+      if (launchedGames.length === 0) {
+        setTeams([]);
+        setLoading(false);
+        setTimeout(() => setVisible(true), 50);
+        return;
+      }
+
+      const entries: TeamEntry[] = [];
+      let resolvedVictoryType: 'speed' | 'score' = 'score';
+      for (const game of launchedGames) {
+        try {
+          const [state, meta] = await Promise.all([
+            getLaunchedGameState(game.id, 0),
+            getLaunchedGameMeta(game.id),
+          ]);
+          if (meta.victoryType === 'speed' || meta.victoryType === 'score') {
+            resolvedVictoryType = meta.victoryType;
+            setVictoryType(meta.victoryType);
+          }
+          if (meta.playMode === 'solo' || meta.playMode === 'team') {
+            setPlayMode(meta.playMode);
+          }
+          for (const t of state.teams) {
+            const duration = t.start_time && t.end_time ? t.end_time - t.start_time : null;
+            entries.push({
+              key: `${game.id}-${t.id}`,
+              team_name: t.team_name ?? '',
+              score: t.score ?? 0,
+              duration,
+              launched_game_name: game.name,
+              game_date: game.created_at ?? '',
+            });
+          }
+        } catch (err) {
+          console.warn('[TimeRangeLeaderboard] game fetch failed:', game.id, err);
+        }
+      }
 
       let sorted = entries;
       if (resolvedVictoryType === 'speed') {

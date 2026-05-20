@@ -1,0 +1,78 @@
+{
+  "_doc": [
+    "Bundled fallback copy of the canonical Tagquest layout. Loaded by",
+    "TagQuestGamePage.tsx when the SQLite-cached layout is older than this",
+    "version, missing, or unavailable (fresh install, offline, LAN-paired",
+    "device without studio reachability).",
+    "",
+    "CANONICAL SOURCE: studio-taghunter/src/scenarios/bodies/tagquest/defaultLayout.ts",
+    "ALSO MIRRORED IN:  studio-taghunter/backend/database/tagquest_default_layout_migration.sql",
+    "Keep all three in sync when changing positions, ids, or fontSize values."
+  ],
+  "version": "3.0",
+  "background": "@background",
+  "elements": [
+    { "id": "tagquest_template", "type": "image", "name": "Tagquest Template (overlay)", "filename": "@template", "x": 0, "y": 0, "width": 100, "height": 100 },
+
+    { "id": "animation_quest_image", "type": "image", "name": "Quest Pieces Grid", "x": 32, "y": 18, "width": 40, "height": 60, "fontSize": 8, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "animation_quest_name", "type": "text", "name": "Active Quest Name", "previewText": "Quest 1", "x": 32, "y": 78.5, "width": 40, "height": 4, "fontSize": 18, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "timer", "type": "text", "name": "Timer", "previewText": "00:00:00", "x": 2.5, "y": 5.6, "width": 19, "height": 8, "fontSize": 44, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "team_name_text", "type": "text", "name": "Team Name", "previewText": "TEAM 1", "x": 34, "y": 4, "width": 36, "height": 6, "fontSize": 37, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "score_label", "type": "text", "name": "Score Label", "previewText": "SCORE", "x": 79, "y": 1.2, "width": 17, "height": 3, "fontSize": 12, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "score", "type": "text", "name": "Score", "previewText": "0", "x": 86, "y": 5, "width": 9, "height": 6, "fontSize": 41, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "malus_label", "type": "text", "name": "Malus Label", "previewText": "MALUS", "x": 4, "y": 25.3, "width": 16, "height": 3, "fontSize": 12, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "malus_icon", "type": "image", "name": "Malus Icon", "filename": "@malus_image", "x": 5.6, "y": 29, "width": "auto", "height": 5.8 },
+    { "id": "malus_multiplicator", "type": "text", "name": "Malus Multiplicator", "previewText": "x0", "x": 10.2, "y": 29, "width": 3.4, "height": 5.8, "fontSize": 21.21, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "malus_points", "type": "text", "name": "Malus Points", "previewText": "0", "x": 15.1, "y": 29, "width": 3.4, "height": 5.8, "fontSize": 21.21, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "late_malus_label", "type": "text", "name": "Late Malus Label", "previewText": "LATE MALUS", "x": 4, "y": 50.1, "width": 16, "height": 3, "fontSize": 12, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "late_malus_icon", "type": "image", "name": "Late Malus Icon", "filename": "@late_malus_image", "x": 5.5, "y": 53.8, "width": "auto", "height": 5.8 },
+    { "id": "late_malus_multiplicator", "type": "text", "name": "Late Malus Multiplicator", "previewText": "x0", "x": 10.2, "y": 53.8, "width": 3.4, "height": 5.8, "fontSize": 20.21, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "late_malus_points", "type": "text", "name": "Late Malus Points", "previewText": "0", "x": 15.1, "y": 53.8, "width": 3.4, "height": 5.8, "fontSize": 20.21, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "combo_points_label", "type": "text", "name": "Combo Points Label", "previewText": "COMBO POINTS", "x": 2, "y": 74, "width": 22, "height": 3, "fontSize": 12, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_6_title", "type": "text", "name": "Combo 6 Title", "previewText": "COMBO 6", "x": 3.6, "y": 77.6, "width": 5, "height": 4, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_6_multiplicator", "type": "text", "name": "Combo 6 Multiplicator", "previewText": "x0", "x": 3.6, "y": 80.8, "width": 5, "height": 7, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_6_points", "type": "text", "name": "Combo 6 Points", "previewText": "0", "x": 3.6, "y": 87.9, "width": 5, "height": 7, "fontSize": 31, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "combo_4_title", "type": "text", "name": "Combo 4 Title", "previewText": "COMBO 4", "x": 7.5, "y": 77.6, "width": 9, "height": 4, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_4_multiplicator", "type": "text", "name": "Combo 4 Multiplicator", "previewText": "x0", "x": 7.5, "y": 80.8, "width": 9, "height": 7, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_4_points", "type": "text", "name": "Combo 4 Points", "previewText": "0", "x": 7.5, "y": 87.9, "width": 9, "height": 7, "fontSize": 31, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "combo_2_title", "type": "text", "name": "Combo 2 Title", "previewText": "COMBO 2", "x": 13.4, "y": 77.6, "width": 9, "height": 4, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_2_multiplicator", "type": "text", "name": "Combo 2 Multiplicator", "previewText": "x0", "x": 13.4, "y": 80.8, "width": 9, "height": 7, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "combo_2_points", "type": "text", "name": "Combo 2 Points", "previewText": "0", "x": 13.4, "y": 87.9, "width": 9, "height": 7, "fontSize": 31, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_1_name", "type": "text", "name": "Quest 1 Name", "previewText": "Quest 1", "x": 79, "y": 21.4, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_1_icon", "type": "image", "name": "Quest 1 Icon", "filename": "@quest_main_image_1", "x": 83.8, "y": 24.4, "width": 3.6, "height": 6 },
+    { "id": "quest_1_multiplicator", "type": "text", "name": "Quest 1 Multiplicator", "previewText": "x0", "x": 88.9, "y": 24.4, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_1_points", "type": "text", "name": "Quest 1 Points", "previewText": "0", "x": 94, "y": 24.4, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_2_name", "type": "text", "name": "Quest 2 Name", "previewText": "Quest 2", "x": 79, "y": 34.55, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_2_icon", "type": "image", "name": "Quest 2 Icon", "filename": "@quest_main_image_2", "x": 83.8, "y": 37.55, "width": 3.6, "height": 6 },
+    { "id": "quest_2_multiplicator", "type": "text", "name": "Quest 2 Multiplicator", "previewText": "x0", "x": 88.9, "y": 37.55, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_2_points", "type": "text", "name": "Quest 2 Points", "previewText": "0", "x": 94, "y": 37.55, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_3_name", "type": "text", "name": "Quest 3 Name", "previewText": "Quest 3", "x": 79, "y": 47.7, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_3_icon", "type": "image", "name": "Quest 3 Icon", "filename": "@quest_main_image_3", "x": 83.8, "y": 50.7, "width": 3.6, "height": 6 },
+    { "id": "quest_3_multiplicator", "type": "text", "name": "Quest 3 Multiplicator", "previewText": "x0", "x": 88.9, "y": 50.7, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_3_points", "type": "text", "name": "Quest 3 Points", "previewText": "0", "x": 94, "y": 50.7, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_4_name", "type": "text", "name": "Quest 4 Name", "previewText": "Quest 4", "x": 79, "y": 60.85, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_4_icon", "type": "image", "name": "Quest 4 Icon", "filename": "@quest_main_image_4", "x": 83.8, "y": 63.85, "width": 3.6, "height": 6 },
+    { "id": "quest_4_multiplicator", "type": "text", "name": "Quest 4 Multiplicator", "previewText": "x0", "x": 88.9, "y": 63.85, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_4_points", "type": "text", "name": "Quest 4 Points", "previewText": "0", "x": 94, "y": 63.85, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_5_name", "type": "text", "name": "Quest 5 Name", "previewText": "Quest 5", "x": 79, "y": 74, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_5_icon", "type": "image", "name": "Quest 5 Icon", "filename": "@quest_main_image_5", "x": 83.8, "y": 77, "width": 3.6, "height": 6 },
+    { "id": "quest_5_multiplicator", "type": "text", "name": "Quest 5 Multiplicator", "previewText": "x0", "x": 88.9, "y": 77, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_5_points", "type": "text", "name": "Quest 5 Points", "previewText": "0", "x": 94, "y": 77, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+
+    { "id": "quest_6_name", "type": "text", "name": "Quest 6 Name", "previewText": "Quest 6", "x": 79, "y": 87.15, "width": 21, "height": 2.8, "fontSize": 11, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_6_icon", "type": "image", "name": "Quest 6 Icon", "filename": "@quest_main_image_6", "x": 83.8, "y": 90.15, "width": 3.6, "height": 6 },
+    { "id": "quest_6_multiplicator", "type": "text", "name": "Quest 6 Multiplicator", "previewText": "x0", "x": 88.9, "y": 90.15, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" },
+    { "id": "quest_6_points", "type": "text", "name": "Quest 6 Points", "previewText": "0", "x": 94, "y": 90.15, "width": 3.6, "height": 6, "fontSize": 25, "fontFamily": "Arial Black, Arial, sans-serif", "color": "#000000ff" }
+  ]
+}

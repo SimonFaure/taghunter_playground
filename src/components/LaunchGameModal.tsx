@@ -1,10 +1,80 @@
 import { useState, useEffect } from 'react';
 import { X, ChevronRight, ChevronLeft } from 'lucide-react';
-import { getPatternOptions, getPatternFilesFromStorage, getDefaultPatternId, PatternOption } from '../utils/patterns';
-import { usbReaderService, USBPort } from '../services/usbReader';
-import { supabase } from '../lib/db';
-import { ConfirmDialog } from './ConfirmDialog';
 import type { SiPuce } from '../types/database';
+import * as cardsStore from '../services/cardsStore';
+import * as cardsRepo from '../services/cardsRepo';
+import * as patternStore from '../services/patternStore';
+import * as scenarioStore from '../services/scenarioStore';
+import * as gameTypesStore from '../services/gameTypesStore';
+import * as clientPreferencesStore from '../services/clientPreferencesStore';
+import { listActiveLaunchedGames, getLaunchedGameState } from '../services/launchedGames';
+import { useAuth } from './auth/AuthProvider';
+
+const LANG_NAMES: Record<string, string> = {
+  en: 'English', fr: 'Français', es: 'Español', de: 'Deutsch', it: 'Italiano',
+  pt: 'Português', nl: 'Nederlands', pl: 'Polski', ru: 'Русский',
+  ja: '日本語', zh: '中文', ar: 'العربية',
+};
+
+// Walk a `Localized<>` map shape — `{ en: '...', fr: '...' }` — looking for
+// every language key that has at least one non-empty value across the whole
+// gameMeta. Used to populate the launch language picker so we only offer
+// languages the scenario actually has translations for.
+function collectScenarioLanguages(value: unknown, found: Set<string>): void {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const v of value) collectScenarioLanguages(v, found);
+    return;
+  }
+  const obj = value as Record<string, unknown>;
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.length === 2 && typeof v === 'string' && v.trim().length > 0 && /^[a-z]{2}$/.test(k)) {
+      found.add(k);
+    } else {
+      collectScenarioLanguages(v, found);
+    }
+  }
+}
+
+function extractDefaultLanguage(rawGameData: unknown): string | null {
+  if (!rawGameData || typeof rawGameData !== 'object') return null;
+  const root = rawGameData as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.default_language,
+    (root.scenario as { default_language?: unknown } | undefined)?.default_language,
+    (root.game_data as { default_language?: unknown } | undefined)?.default_language,
+    (root.game_meta as { default_language?: unknown } | undefined)?.default_language,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.length === 2) return c;
+  }
+  return null;
+}
+
+interface PatternOption {
+  slug: string;
+  name: string;
+  uniqid: string;
+}
+
+// The on-disk game-data.json may be the raw `game_data` blob or a legacy
+// envelope with `{scenario, game_data}` siblings — depending on which sync
+// generation wrote it. Probe known paths for `default_pattern_id`.
+function extractDefaultPatternId(rawGameData: unknown): string | null {
+  if (!rawGameData || typeof rawGameData !== 'object') return null;
+  const root = rawGameData as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.default_pattern_id,
+    (root.scenario as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
+    (root.game_data as { scenario?: { default_pattern_id?: unknown }; default_pattern_id?: unknown } | undefined)?.scenario?.default_pattern_id,
+    (root.game_data as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
+    (root.game_meta as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return null;
+}
 
 interface LaunchGameModalProps {
   isOpen: boolean;
@@ -14,6 +84,8 @@ interface LaunchGameModalProps {
   gameTypeName: string;
   onLaunch: (config: GameConfig) => void;
 }
+
+export type TagquestVisibilityMode = 'persist' | 'hide_after_delay';
 
 export interface GameConfig {
   name: string;
@@ -30,8 +102,17 @@ export interface GameConfig {
   playMode?: 'solo' | 'team';
   teammatesPerTeam?: number;
   testMode?: boolean;
-  usbPort?: string;
   teams?: Team[];
+  /** Tagquest HUD value visibility — persists by default. */
+  visibilityMode?: TagquestVisibilityMode;
+  /** Seconds before HUD values fade out after an animation completes (used when visibilityMode === 'hide_after_delay'). */
+  visibilityHideDelaySec?: number;
+  /** Selected language code from the launch picker (drives translations + video subtitles). */
+  language?: string;
+  /** Play tutorial video on each team's first bip (mystery/tracks only). Off if no video exists. */
+  playTutorialOnBip?: boolean;
+  /** Play intro video (per-scenario scenario_video) on each team's first bip. Off if scenario has none. */
+  playIntroOnBip?: boolean;
 }
 
 export interface Teammate {
@@ -48,6 +129,8 @@ export interface Team {
 }
 
 export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTypeName, onLaunch }: LaunchGameModalProps) {
+  const { user } = useAuth();
+
   const getDefaultName = () => {
     const now = new Date();
     const date = now.toLocaleDateString('fr-FR');
@@ -70,75 +153,89 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
     playMode: 'team',
     teammatesPerTeam: 2,
     testMode: false,
-    usbPort: '',
+    visibilityMode: 'persist',
+    visibilityHideDelaySec: 5,
   });
   const [patternFolders, setPatternFolders] = useState<PatternOption[]>([]);
   const [defaultPattern, setDefaultPattern] = useState<string>('');
-  const [usbPorts, setUsbPorts] = useState<USBPort[]>([]);
-  const [savedUsbPort, setSavedUsbPort] = useState<string>('');
   const [step, setStep] = useState<1 | 2>(1);
+  const [scenarioLanguages, setScenarioLanguages] = useState<string[]>([]);
+  const [scenarioDefaultLang, setScenarioDefaultLang] = useState<string>('en');
+  const [gameTypeRow, setGameTypeRow] = useState<gameTypesStore.GameTypeRow | null>(null);
+  const [hasTutorialVideo, setHasTutorialVideo] = useState(false);
+  const [hasIntroVideo, setHasIntroVideo] = useState(false);
+  const [prefTutorialDefault, setPrefTutorialDefault] = useState(false);
+  const [prefIntroDefault, setPrefIntroDefault] = useState(false);
   const [teams, setTeams] = useState<Team[]>([]);
   const [availableChips, setAvailableChips] = useState<SiPuce[]>([]);
   const [onDemandChips, setOnDemandChips] = useState<SiPuce[]>([]);
   const [hasOnDemandCards, setHasOnDemandCards] = useState(false);
   const [useOnDemandCards, setUseOnDemandCards] = useState(false);
   const [usedChipIds, setUsedChipIds] = useState<Set<number>>(new Set());
-  const [showUsbAlert, setShowUsbAlert] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
       if (!gameTypeName || !gameUniqid) return;
 
-      const [options, storageFiles, defaultPatternId] = await Promise.all([
-        getPatternOptions(gameTypeName),
-        getPatternFilesFromStorage(gameTypeName),
-        getDefaultPatternId(gameUniqid),
+      const gameTypeLc = gameTypeName.toLowerCase();
+      const [rows, rawGameData] = await Promise.all([
+        patternStore.list({ gameType: gameTypeLc }),
+        scenarioStore.getGameData(gameUniqid),
       ]);
 
+      const options: PatternOption[] = rows.map(r => ({
+        slug: r.pattern_slug ?? r.pattern_uniqid,
+        name: r.name || r.pattern_slug || r.pattern_uniqid,
+        uniqid: r.pattern_uniqid,
+      }));
       setPatternFolders(options);
 
+      const defaultPatternId = extractDefaultPatternId(rawGameData);
       let resolvedPattern = '';
-
-      if (defaultPatternId) {
-        const match = storageFiles.find(f => f.uniqid === defaultPatternId);
-        if (match) {
-          resolvedPattern = match.uniqid;
-        }
+      if (defaultPatternId && options.some(o => o.uniqid === defaultPatternId)) {
+        resolvedPattern = defaultPatternId;
       }
-
       if (!resolvedPattern) {
         resolvedPattern = options[0]?.uniqid || '';
       }
-
       setDefaultPattern(resolvedPattern);
 
-      if (usbReaderService.isElectron()) {
-        try {
-          const ports = await usbReaderService.getAvailablePorts();
-          setUsbPorts(ports);
-        } catch (error) {
-          console.error('Error loading USB ports:', error);
-        }
+      // Discover languages the scenario has translations for. Default to the
+      // scenario's declared default_language; fall back to 'en' if neither
+      // exists. Empty set means no localization — picker stays hidden.
+      const langs = new Set<string>();
+      collectScenarioLanguages(rawGameData, langs);
+      const sortedLangs = Array.from(langs).sort();
+      setScenarioLanguages(sortedLangs);
+      const defaultLang = extractDefaultLanguage(rawGameData) || sortedLangs[0] || 'en';
+      setScenarioDefaultLang(defaultLang);
+
+      // Resolve game-type capabilities + whether tutorial/intro videos are
+      // actually available locally so we know whether to render each toggle.
+      const gameTypeLcLocal = gameTypeName.toLowerCase();
+      const gt = await gameTypesStore.getGameType(gameTypeLcLocal);
+      setGameTypeRow(gt);
+      const resolvedTutorial = await gameTypesStore.resolveTutorialVideoUrl(gameTypeLcLocal);
+      setHasTutorialVideo(!!gt?.supports_tutorial_video && resolvedTutorial !== null);
+
+      // Intro video = per-scenario scenario_video. Probe game-data for either
+      // a top-level `scenario_video` (post-Stage-3) or legacy `medias.video`.
+      const introCandidate =
+        (rawGameData as { scenario_video?: unknown } | null)?.scenario_video
+        ?? ((rawGameData as { game_meta?: { scenario_video?: unknown } } | null)?.game_meta?.scenario_video)
+        ?? ((rawGameData as { medias?: { video?: unknown } } | null)?.medias?.video);
+      const hasIntro = typeof introCandidate === 'string' && introCandidate.trim().length > 0;
+      setHasIntroVideo(!!gt?.supports_intro_video && hasIntro);
+
+      // Pre-fill the toggles from the client's saved preferences.
+      if (user?.client_id) {
+        const pref = await clientPreferencesStore.getGamePref(user.client_id, gameTypeLcLocal);
+        setPrefTutorialDefault(!!pref.play_tutorial_default);
+        setPrefIntroDefault(!!pref.play_intro_default);
       }
     };
     loadData();
-  }, [gameTypeName, gameUniqid]);
-
-  useEffect(() => {
-    const loadSavedPort = async () => {
-      try {
-        const { loadConfig } = await import('../utils/config');
-        const config = await loadConfig();
-        setSavedUsbPort(config.usbPort);
-      } catch (error) {
-        console.error('Error loading saved USB port:', error);
-      }
-    };
-
-    if (isOpen && usbReaderService.isElectron()) {
-      loadSavedPort();
-    }
-  }, [isOpen]);
+  }, [gameTypeName, gameUniqid, user?.client_id]);
 
   useEffect(() => {
     if (isOpen) {
@@ -157,12 +254,16 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
         playMode: 'team',
         teammatesPerTeam: 2,
         testMode: false,
-        usbPort: savedUsbPort,
+        visibilityMode: 'persist',
+        visibilityHideDelaySec: 5,
+        language: scenarioDefaultLang,
+        playTutorialOnBip: hasTutorialVideo && prefTutorialDefault,
+        playIntroOnBip: hasIntroVideo && prefIntroDefault,
       });
       setStep(1);
       setTeams([]);
     }
-  }, [isOpen, defaultPattern, savedUsbPort]);
+  }, [isOpen, defaultPattern, scenarioDefaultLang, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault]);
 
   const allChips = useOnDemandCards
     ? [...availableChips, ...onDemandChips]
@@ -178,103 +279,87 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
     ? Math.max(0, allChips.length - totalChipsNeeded)
     : undefined;
 
-  const parseChipsCsv = (text: string): SiPuce[] => {
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) return [];
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-    const idIdx = headers.indexOf('id');
-    const numIdx = headers.indexOf('key_number');
-    const nameIdx = headers.indexOf('key_name');
-    const colorIdx = headers.indexOf('color');
-    const chips: SiPuce[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const vals = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-      const id = parseInt(vals[idIdx]);
-      const key_number = parseInt(vals[numIdx]);
-      const key_name = vals[nameIdx] || '';
-      if (isNaN(id) || isNaN(key_number)) continue;
-      chips.push({ id, key_number, key_name, color: colorIdx !== -1 ? vals[colorIdx] || null : null, created_at: '', updated_at: '' });
-    }
-    return chips.sort((a, b) => a.key_number - b.key_number);
-  };
-
   useEffect(() => {
+    if (!isOpen || !user) return;
+
+    // Chip roster comes from the local `cards` table (synced from studio's
+    // client_cards) plus optional on-demand JSON. Pending-write rows show
+    // up here too so the operator can assign a freshly-registered card to
+    // a team in the same launch session.
     const loadChips = async () => {
-      if (!supabase) return;
-
-      const { data: files, error: listError } = await supabase.storage
-        .from('resources')
-        .list('cards', { limit: 100 });
-
-      if (listError || !files) return;
-
-      const csvFiles = files.filter(f => f.name && f.name.endsWith('.csv') && f.name !== '.emptyFolderPlaceholder');
-
-      const regularFile = csvFiles.find(f => !f.name.startsWith('on_demand_'));
-      const onDemandFile = csvFiles.find(f => f.name.startsWith('on_demand_'));
-
-      if (regularFile) {
-        const { data: blob } = await supabase.storage.from('resources').download(`cards/${regularFile.name}`);
-        if (blob) {
-          const chips = parseChipsCsv(await blob.text());
-          setAvailableChips(chips);
-        }
+      try {
+        const rows = await cardsRepo.list();
+        setAvailableChips(
+          rows.map((r) => ({
+            id: r.id,
+            key_number: r.key_number,
+            key_name: r.key_name,
+            color: r.color,
+            created_at: '',
+            updated_at: '',
+          }))
+        );
+      } catch (err) {
+        console.error('[LaunchGameModal] failed to read cards table:', err);
+        setAvailableChips([]);
       }
 
-      if (onDemandFile) {
-        const { data: blob } = await supabase.storage.from('resources').download(`cards/${onDemandFile.name}`);
-        if (blob) {
-          const chips = parseChipsCsv(await blob.text());
-          setOnDemandChips(chips);
+      try {
+        const onDemandJson = await cardsStore.getOnDemandCardsJson();
+        const cards = (onDemandJson as { cards?: Array<{ id?: number; key_number: number; key_name: string; color?: string | null }> } | null)?.cards;
+        if (cards && cards.length > 0) {
+          const mapped: SiPuce[] = cards.map((c) => ({
+            id: c.id ?? c.key_number,
+            key_number: c.key_number,
+            key_name: c.key_name,
+            color: c.color ?? null,
+            created_at: '',
+            updated_at: '',
+          }));
+          setOnDemandChips(mapped.sort((a, b) => a.key_number - b.key_number));
           setHasOnDemandCards(true);
+        } else {
+          setOnDemandChips([]);
+          setHasOnDemandCards(false);
         }
-      } else {
-        setHasOnDemandCards(false);
+      } catch (err) {
+        console.error('[LaunchGameModal] failed to read on-demand cards:', err);
         setOnDemandChips([]);
+        setHasOnDemandCards(false);
       }
     };
 
+    // Used chips: enumerate active games' teams.key_id so the user can't
+    // re-assign a chip already in play. With per-client scoping this only
+    // sees the current client's active games.
     const loadUsedChips = async () => {
-      if (!supabase) {
-        console.error('Supabase client not initialized');
-        return;
-      }
-
-      const { data, error } = await supabase
-        .from('launched_games')
-        .select('id')
-        .eq('ended', false);
-
-      if (error) {
-        console.error('Error loading launched games:', error);
-        return;
-      }
-
-      const launchedGameIds = data?.map(g => g.id) || [];
-
-      if (launchedGameIds.length > 0) {
-        const { data: teamsData, error: teamsError } = await supabase
-          .from('teams')
-          .select('key_id')
-          .in('launched_game_id', launchedGameIds);
-
-        if (teamsError) {
-          console.error('Error loading teams:', teamsError);
+      try {
+        const active = await listActiveLaunchedGames();
+        if (active.length === 0) {
+          setUsedChipIds(new Set());
           return;
         }
-
-        const usedIds = new Set(teamsData?.map(t => t.key_id) || []);
-        setUsedChipIds(usedIds);
-      } else {
+        const used = new Set<number>();
+        for (const game of active) {
+          try {
+            const state = await getLaunchedGameState(game.id, 0);
+            for (const t of state.teams ?? []) {
+              if (t.key_id !== null && t.key_id !== undefined) used.add(t.key_id);
+            }
+          } catch (err) {
+            console.warn('[LaunchGameModal] state fetch failed for', game.id, err);
+          }
+        }
+        setUsedChipIds(used);
+      } catch (err) {
+        console.error('[LaunchGameModal] loadUsedChips failed:', err);
         setUsedChipIds(new Set());
       }
     };
 
-    if (isOpen) {
-      loadChips();
-      loadUsedChips();
-    }
-  }, [isOpen]);
+    loadChips();
+    loadUsedChips();
+  }, [isOpen, user]);
 
   const handleNextStep = () => {
     const startIndex = config.firstChipIndex;
@@ -387,11 +472,9 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       return;
     }
 
-    if (usbReaderService.isElectron() && !config.usbPort) {
-      setShowUsbAlert(true);
-      return;
-    }
-
+    // Reader-not-detected is no longer a launch gate. The game pages
+    // surface a banner if the dongle is missing and auto-bind via the
+    // 'reader:status' event once it's plugged in.
     const finalConfig = {
       ...config,
       name: config.name.trim() || getDefaultName(),
@@ -513,28 +596,6 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               </select>
             </div>
 
-            {usbReaderService.isElectron() && (
-              <div className="space-y-2">
-                <label htmlFor="usbPort" className="block text-sm font-medium text-slate-300">
-                  USB Port {savedUsbPort && <span className="text-green-400 text-xs">(Saved)</span>}
-                </label>
-                <select
-                  id="usbPort"
-                  value={config.usbPort}
-                  onChange={(e) => setConfig({ ...config, usbPort: e.target.value })}
-                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                >
-                  <option value="">No USB Port (Testing Mode)</option>
-                  {usbPorts.map((port) => (
-                    <option key={port.path} value={port.path}>
-                      {port.path} {port.manufacturer ? `- ${port.manufacturer}` : ''}
-                      {savedUsbPort === port.path ? ' (Saved)' : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
             <div className="space-y-2">
               <label htmlFor="duration" className="block text-sm font-medium text-slate-300">
                 Duration (minutes)
@@ -580,6 +641,59 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               />
             </div>
           </div>
+
+          {scenarioLanguages.length > 0 && (
+            <div className="space-y-2">
+              <label htmlFor="language" className="block text-sm font-medium text-slate-300">
+                Language
+              </label>
+              <select
+                id="language"
+                value={config.language || scenarioDefaultLang}
+                onChange={(e) => setConfig({ ...config, language: e.target.value })}
+                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                {scenarioLanguages.map((lang) => (
+                  <option key={lang} value={lang}>
+                    {LANG_NAMES[lang] || lang} ({lang})
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-slate-500">
+                Selects in-game text translations and video subtitle track.
+              </p>
+            </div>
+          )}
+
+          {(hasTutorialVideo || hasIntroVideo) && (
+            <div className="space-y-3 p-4 bg-slate-800/50 rounded-lg">
+              <div className="text-sm font-medium text-slate-300">First-bip videos</div>
+              {hasTutorialVideo && (
+                <label className="flex items-center gap-3 text-sm text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={!!config.playTutorialOnBip}
+                    onChange={(e) => setConfig({ ...config, playTutorialOnBip: e.target.checked })}
+                  />
+                  Play Taghunter tutorial video on each team's first bip
+                </label>
+              )}
+              {hasIntroVideo && (
+                <label className="flex items-center gap-3 text-sm text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={!!config.playIntroOnBip}
+                    onChange={(e) => setConfig({ ...config, playIntroOnBip: e.target.checked })}
+                  />
+                  Play scenario intro video on each team's first bip
+                </label>
+              )}
+              <p className="text-xs text-slate-500">
+                Both videos play in order (intro first, then tutorial) before the team's timer starts.
+                Returning teams (already started) skip the videos.
+              </p>
+            </div>
+          )}
 
           {isTagQuest && (
             <>
@@ -775,6 +889,58 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               </div>
             )}
 
+            <div className="pt-1 border-t border-slate-700/60 space-y-2">
+              <label className="block text-sm font-medium text-slate-300">
+                HUD values display
+              </label>
+              <div className="space-y-2">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="visibilityMode"
+                    value="persist"
+                    checked={(config.visibilityMode ?? 'persist') === 'persist'}
+                    onChange={() => setConfig({ ...config, visibilityMode: 'persist' })}
+                    className="mt-1 w-4 h-4 bg-slate-700 border-slate-600 text-blue-600 focus:ring-2 focus:ring-blue-500"
+                  />
+                  <span className="text-sm text-slate-300">
+                    Persist until next punch
+                    <span className="ml-1 text-xs text-slate-400">— values stay visible after each punch animation</span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="visibilityMode"
+                    value="hide_after_delay"
+                    checked={config.visibilityMode === 'hide_after_delay'}
+                    onChange={() => setConfig({ ...config, visibilityMode: 'hide_after_delay' })}
+                    className="mt-1 w-4 h-4 bg-slate-700 border-slate-600 text-blue-600 focus:ring-2 focus:ring-blue-500"
+                  />
+                  <span className="text-sm text-slate-300">
+                    Hide after
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={config.visibilityHideDelaySec ?? 5}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          visibilityHideDelaySec: Math.max(1, parseInt(e.target.value) || 5),
+                        })
+                      }
+                      onClick={(e) => e.stopPropagation()}
+                      disabled={config.visibilityMode !== 'hide_after_delay'}
+                      className="mx-1 w-14 px-2 py-0.5 text-sm bg-slate-800 border border-slate-700 rounded text-white disabled:opacity-50"
+                    />
+                    seconds
+                    <span className="ml-1 text-xs text-slate-400">— values fade out after the animation completes</span>
+                  </span>
+                </label>
+              </div>
+            </div>
+
             <div className="flex items-center gap-3 pt-1 border-t border-slate-700/60">
               <input
                 type="checkbox"
@@ -955,16 +1121,6 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
           )}
         </form>
       </div>
-
-      <ConfirmDialog
-        isOpen={showUsbAlert}
-        onConfirm={() => setShowUsbAlert(false)}
-        onCancel={() => setShowUsbAlert(false)}
-        title="USB Port Required"
-        message="Please select a USB port to launch the game in Electron mode. You can select a port from the USB Port dropdown above."
-        variant="warning"
-        confirmText="OK"
-      />
     </div>
   );
 }

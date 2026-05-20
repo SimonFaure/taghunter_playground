@@ -1,14 +1,21 @@
 import { useEffect, useState } from 'react';
-import { Clock, Search, Upload, Play, Trash2, LogIn } from 'lucide-react';
-import { Footer } from './Footer';
+import { Clock, Search, Play, Trash2, LogIn, Eye } from 'lucide-react';
 import { Alert } from './Alert';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchGameModal, GameConfig } from './LaunchGameModal';
 import { GamePage } from './GamePage';
-import { validateAndExtractZip } from '../utils/zipHandler';
+import { ScenarioThumbnail } from './ScenarioThumbnail';
+import { ScenarioDetailsModal } from './ScenarioDetailsModal';
 import { getLocalGameIds } from '../utils/localGames';
-import { supabase } from '../lib/db';
-import { usbReaderService } from '../services/usbReader';
+import * as scenarioStore from '../services/scenarioStore';
+import { scenarioAssetUrl } from '../services/contentFs';
+import { on as onSyncEvent } from '../services/syncEvents';
+import { setGameActive } from '../services/activeSession';
+import {
+  createLaunchedGame,
+  listActiveLaunchedGames,
+  getLaunchedGameMeta,
+} from '../services/launchedGames';
 import gamesData from '../../data/games.json';
 
 interface GameType {
@@ -24,7 +31,6 @@ interface Scenario {
   description: string;
   difficulty: string | null;
   duration_minutes: number;
-  image_url: string;
   uniqid?: string;
   available_for_purchase?: boolean;
 }
@@ -46,22 +52,40 @@ export function GameList() {
   const [selectedGameType, setSelectedGameType] = useState<string>('all');
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>('all');
   const [showOnlyLaunchable, setShowOnlyLaunchable] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
   const [alert, setAlert] = useState<AlertState>({ show: false, type: 'success', message: '' });
   const [localGameIds, setLocalGameIds] = useState<Set<string>>(new Set());
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
   const [selectedGame, setSelectedGame] = useState<{ uniqid: string; title: string; gameTypeName: string } | null>(null);
-  const [launchedGame, setLaunchedGame] = useState<{ config: GameConfig; uniqid: string } | null>(null);
+  const [launchedGame, setLaunchedGame] = useState<{ config: GameConfig; uniqid: string; launchedGameId: number | null } | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [scenarioToDelete, setScenarioToDelete] = useState<{ uniqid: string; title: string } | null>(null);
   const [localImages, setLocalImages] = useState<Map<string, string>>(new Map());
   const [activeGames, setActiveGames] = useState<Map<string, { id: number; name: string; game_type: string; duration: number }>>(new Map());
+  const [detailsScenario, setDetailsScenario] = useState<ScenarioWithType | null>(null);
 
   useEffect(() => {
     loadScenarios();
     loadLocalGames();
     loadActiveGames();
+
+    // Refresh when the orchestrator downloads or removes content.
+    const offContent = onSyncEvent('content:updated', (p) => {
+      if (p.kind === 'scenarios') {
+        loadScenarios();
+        loadLocalGames();
+      }
+    });
+    return () => {
+      offContent();
+    };
   }, []);
+
+  // Mirror "a game is running" into the module-level signal the update flow
+  // reads before relaunching to apply an update (services/activeSession.ts).
+  useEffect(() => {
+    setGameActive(launchedGame !== null);
+    return () => setGameActive(false);
+  }, [launchedGame]);
 
   const loadLocalGames = async () => {
     const ids = await getLocalGameIds();
@@ -70,28 +94,30 @@ export function GameList() {
   };
 
   const loadActiveGames = async () => {
-    if (!supabase) return;
-    const { data, error } = await supabase
-      .from('launched_games')
-      .select('id, game_uniqid, name, game_type, duration')
-      .eq('ended', false);
-    if (error || !data) return;
-    const map = new Map<string, { id: number; name: string; game_type: string; duration: number }>();
-    data.forEach(g => { if (g.game_uniqid) map.set(g.game_uniqid, { id: g.id, name: g.name, game_type: g.game_type, duration: g.duration }); });
-    setActiveGames(map);
+    try {
+      const games = await listActiveLaunchedGames();
+      const map = new Map<string, { id: number; name: string; game_type: string; duration: number }>();
+      for (const g of games) {
+        if (g.game_uniqid) {
+          map.set(g.game_uniqid, { id: g.id, name: g.name, game_type: g.game_type, duration: g.duration });
+        }
+      }
+      setActiveGames(map);
+    } catch (err) {
+      console.error('[GameList] loadActiveGames failed:', err);
+    }
   };
 
   const handleJoinGame = async (uniqid: string) => {
     const active = activeGames.get(uniqid);
-    if (!active || !supabase) return;
+    if (!active) return;
 
-    const { data: metaRows } = await supabase
-      .from('launched_game_meta')
-      .select('meta_name, meta_value')
-      .eq('launched_game_id', active.id);
-
-    const meta: Record<string, string> = {};
-    (metaRows || []).forEach(r => { meta[r.meta_name] = r.meta_value; });
+    let meta: Record<string, string> = {};
+    try {
+      meta = await getLaunchedGameMeta(active.id);
+    } catch (err) {
+      console.error('[GameList] failed to load meta for join:', err);
+    }
 
     const config: GameConfig = {
       name: active.name,
@@ -108,54 +134,93 @@ export function GameList() {
       playMode: (meta.playMode as GameConfig['playMode']) ?? undefined,
       teammatesPerTeam: meta.teammatesPerTeam ? parseInt(meta.teammatesPerTeam) : undefined,
       testMode: meta.testMode === 'true' ? true : undefined,
-      usbPort: meta.usbPort ?? undefined,
       teams: meta.teamsConfig ? JSON.parse(meta.teamsConfig) : undefined,
     };
 
     setLaunchedGame({ config, uniqid, launchedGameId: active.id });
   };
 
+  // Load thumbnail URLs from the local SQLite/FS store. Resolves
+  // game-data.json's `game_media_images.game_visual` (or background_image) for
+  // each downloaded scenario and turns it into a webview-loadable URL.
+  // The orchestrator writes the API's `game_data` payload to disk unwrapped,
+  // so the map sits at the root (not under a `.game_data` key).
   const loadLocalImages = async (gameIds: string[]) => {
-    const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-    if (!isElectron) return;
-
     const imageMap = new Map<string, string>();
-
     for (const uniqid of gameIds) {
       try {
-        const result = await (window as any).electron.scenarios.getImage(uniqid);
-        if (result.success && result.data) {
-          imageMap.set(uniqid, result.data);
-        }
-      } catch (error) {
-        console.error(`Error loading image for ${uniqid}:`, error);
+        const gameData = await scenarioStore.getGameData(uniqid);
+        const mediaImages =
+          (gameData as { game_media_images?: { game_visual?: string; background_image?: string } } | null)
+            ?.game_media_images;
+        const raw = mediaImages?.game_visual ?? mediaImages?.background_image;
+        if (!raw) continue;
+        const fileName = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
+        // Resolve to a `scenario://` URL — the custom protocol is the only one
+        // the webview can actually load (the asset protocol / convertFileSrc
+        // is not enabled in tauri.conf.json). The Rust handler resolves the
+        // file against the scenario's current local_version per request.
+        const url = scenarioAssetUrl(uniqid, fileName);
+        if (url) imageMap.set(uniqid, url);
+      } catch (err) {
+        console.warn(`[GameList] image lookup failed for ${uniqid}:`, err);
       }
     }
-
     setLocalImages(imageMap);
   };
 
   const loadScenarios = async () => {
     try {
-      let scenariosData;
+      const rows = await scenarioStore.list();
+      const gameTypeByName = new Map(gamesData.game_types.map((gt) => [gt.name.toLowerCase(), gt]));
 
-      const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
+      const scenariosWithTypes: ScenarioWithType[] = await Promise.all(
+        rows.map(async (row) => {
+          // Pull richer metadata from game-data.json if the scenario is downloaded.
+          let description = '';
+          let difficulty: string | null = 'medium';
+          let durationMinutes = 60;
+          if (row.local_version !== null) {
+            try {
+              const gd = (await scenarioStore.getGameData(row.uniqid)) as
+                | {
+                    game?: { description?: string; difficulty?: string; duration_minutes?: number };
+                    scenario?: { description?: string };
+                    game_meta?: { scenario?: string };
+                    description?: string;
+                    difficulty?: string;
+                    duration_minutes?: number;
+                  }
+                | null;
+              description =
+                gd?.game_meta?.scenario ?? gd?.scenario?.description ?? gd?.description ?? gd?.game?.description ?? '';
+              difficulty = gd?.difficulty ?? gd?.game?.difficulty ?? 'medium';
+              durationMinutes = gd?.duration_minutes ?? gd?.game?.duration_minutes ?? 60;
+            } catch (err) {
+              console.warn(`[GameList] game-data.json read failed for ${row.uniqid}:`, err);
+            }
+          }
 
-      if (isElectron && (window as any).electron?.scenarios?.load) {
-        await (window as any).electron.scenarios.refresh();
-        scenariosData = await (window as any).electron.scenarios.load();
-        console.log('Loaded scenarios from local folder:', scenariosData);
-      } else {
-        scenariosData = await loadScenariosFromSupabase();
-        console.log('Loaded scenarios from Supabase:', scenariosData);
-      }
+          const matchedType =
+            gameTypeByName.get(row.game_type.toLowerCase()) ?? {
+              id: row.game_type,
+              name: row.game_type.charAt(0).toUpperCase() + row.game_type.slice(1),
+              description: '',
+            };
 
-      const gameTypesMap = new Map(scenariosData.game_types.map(gt => [gt.id, gt]));
-
-      const scenariosWithTypes = scenariosData.scenarios.map(scenario => ({
-        ...scenario,
-        game_type: gameTypesMap.get(scenario.game_type_id)!
-      }));
+          return {
+            id: row.uniqid,
+            game_type_id: matchedType.id,
+            title: row.title,
+            description,
+            difficulty,
+            duration_minutes: durationMinutes,
+            uniqid: row.uniqid,
+            available_for_purchase: false,
+            game_type: matchedType,
+          };
+        })
+      );
 
       setScenarios(scenariosWithTypes);
     } catch (error) {
@@ -163,127 +228,6 @@ export function GameList() {
     } finally {
       setLoading(false);
     }
-  };
-
-  const loadScenariosFromSupabase = async () => {
-    const { data: storageFolders, error: storageError } = await supabase.storage
-      .from('resources')
-      .list('scenarios', { limit: 1000 });
-
-    if (storageError || !storageFolders || storageFolders.length === 0) {
-      return gamesData;
-    }
-
-    const gameTypeMap = new Map();
-    const scenariosList = [];
-
-    for (const folder of storageFolders) {
-      if (!folder.name) continue;
-      const uniqid = folder.name;
-
-      const { data: fileData, error: fileError } = await supabase.storage
-        .from('resources')
-        .download(`scenarios/${uniqid}/game-data.json`);
-
-      if (fileError || !fileData) continue;
-
-      let gameData: any;
-      try {
-        const text = await fileData.text();
-        gameData = JSON.parse(text);
-      } catch {
-        continue;
-      }
-
-      const title = gameData?.game?.title || gameData?.scenario?.title || gameData?.title || 'Unknown';
-      const description = gameData?.game_meta?.scenario || gameData?.scenario?.description || gameData?.description || '';
-      const game_type = gameData?.game?.type || gameData?.scenario?.game_type || gameData?.game_type || 'mystery';
-      const difficulty = gameData?.difficulty || gameData?.game?.difficulty || 'medium';
-      const duration_minutes = gameData?.duration_minutes || gameData?.game?.duration_minutes || 60;
-
-      if (!gameTypeMap.has(game_type)) {
-        gameTypeMap.set(game_type, {
-          id: game_type,
-          name: game_type.charAt(0).toUpperCase() + game_type.slice(1),
-          description: `${game_type} game type`
-        });
-      }
-
-      const imageUrl = await getScenarioImageFromStorage(uniqid, gameData);
-
-      scenariosList.push({
-        id: uniqid,
-        game_type_id: game_type,
-        title,
-        description,
-        difficulty,
-        duration_minutes,
-        image_url: imageUrl || '/placeholder-image.jpg',
-        uniqid,
-        available_for_purchase: false
-      });
-    }
-
-    const combinedScenarios = [...scenariosList, ...gamesData.scenarios];
-    const gameTypes = Array.from(gameTypeMap.values());
-    const combinedGameTypes = [...gameTypes, ...gamesData.game_types];
-    const uniqueGameTypes = Array.from(
-      new Map(combinedGameTypes.map(gt => [gt.id, gt])).values()
-    );
-
-    return {
-      game_types: uniqueGameTypes,
-      scenarios: combinedScenarios
-    };
-  };
-
-  const getScenarioImageUrl = async (uniqid: string): Promise<string | null> => {
-    const { data: scenarioMedia, error: mediaError } = await supabase
-      .from('scenario_media')
-      .select('filename, data')
-      .eq('scenario_uniqid', uniqid)
-      .eq('media_type', 'image')
-      .like('filename', '%game_instructions_image%')
-      .maybeSingle();
-
-    if (scenarioMedia && scenarioMedia.data) {
-      return `data:image/png;base64,${scenarioMedia.data}`;
-    }
-
-    const { data: anyImage } = await supabase
-      .from('scenario_media')
-      .select('filename, data')
-      .eq('scenario_uniqid', uniqid)
-      .eq('media_type', 'image')
-      .limit(1)
-      .maybeSingle();
-
-    if (anyImage && anyImage.data) {
-      return `data:image/png;base64,${anyImage.data}`;
-    }
-
-    return null;
-  };
-
-  const getScenarioImageFromStorage = async (uniqid: string, gameData: any): Promise<string | null> => {
-    const mediaImages = gameData?.game_data?.game_media_images;
-    const rawFileName: string | undefined = mediaImages?.game_visual || mediaImages?.background_image;
-
-    console.log(`[GameList][${uniqid}] game_media_images:`, mediaImages);
-    console.log(`[GameList][${uniqid}] game_visual file:`, rawFileName);
-
-    if (rawFileName) {
-      const fileName = rawFileName.startsWith('media/') ? rawFileName.slice('media/'.length) : rawFileName;
-      console.log(`[GameList][${uniqid}] resolved storage path: scenarios/${uniqid}/media/${fileName}`);
-      const { data } = supabase.storage
-        .from('resources')
-        .getPublicUrl(`scenarios/${uniqid}/media/${fileName}`);
-      console.log(`[GameList][${uniqid}] public URL:`, data.publicUrl);
-      return data.publicUrl;
-    }
-
-    console.warn(`[GameList][${uniqid}] No game_visual or background_image found`);
-    return null;
   };
 
   const filteredScenarios = scenarios
@@ -321,18 +265,6 @@ export function GameList() {
     }
   };
 
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-  };
-
   const showAlert = (type: 'success' | 'error', message: string) => {
     setAlert({ show: true, type, message });
   };
@@ -341,182 +273,57 @@ export function GameList() {
     setAlert({ ...alert, show: false });
   };
 
-  const handleDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-
-    const files = Array.from(e.dataTransfer.files);
-    const zipFile = files.find(f => f.name.endsWith('.zip'));
-
-    if (!zipFile) {
-      showAlert('error', 'Please drop a ZIP file.');
-      return;
-    }
-
-    const result = await validateAndExtractZip(zipFile);
-
-    if (!result.success) {
-      showAlert('error', result.message || 'Failed to import scenario.');
-      return;
-    }
-
-    showAlert('success', `Successfully imported game scenario: ${result.uniqid}`);
-    await loadScenarios();
-    await loadLocalGames();
-  };
-
-  const handleClick = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.zip';
-    input.onchange = async (e: Event) => {
-      const target = e.target as HTMLInputElement;
-      const file = target.files?.[0];
-      if (!file) return;
-
-      const result = await validateAndExtractZip(file);
-
-      if (!result.success) {
-        showAlert('error', result.message || 'Failed to import scenario.');
-        return;
-      }
-
-      showAlert('success', `Successfully imported game scenario: ${result.uniqid}`);
-      await loadScenarios();
-      await loadLocalGames();
-    };
-    input.click();
-  };
-
   const handleLaunchGame = (uniqid: string, title: string, gameTypeName: string) => {
     setSelectedGame({ uniqid, title, gameTypeName });
     setLaunchModalOpen(true);
   };
 
   const handleGameLaunch = async (config: GameConfig) => {
-    console.log('Launching game with config:', selectedGame, config);
-
     let launchedGameId: number | null = null;
 
-    if (supabase && selectedGame) {
+    if (selectedGame) {
+      // Build the meta KV bag. Pattern is stored as a string (the pattern's
+      // identifier), but the server's teams.pattern column expects an int —
+      // it represents the pattern *index*, set per team below.
+      const meta: Record<string, string | number | boolean | null> = {
+        firstChipIndex: config.firstChipIndex.toString(),
+        pattern: config.pattern,
+        messageDisplayDuration: config.messageDisplayDuration.toString(),
+        enigmaImageDisplayDuration: config.enigmaImageDisplayDuration.toString(),
+        colorblindMode: config.colorblindMode.toString(),
+        autoResetTeam: config.autoResetTeam.toString(),
+        delayBeforeReset: config.delayBeforeReset.toString(),
+      };
+      if (config.victoryType) meta.victoryType = config.victoryType;
+      if (config.testMode) meta.testMode = 'true';
+      if (config.playMode) meta.playMode = config.playMode;
+      if (config.teammatesPerTeam !== undefined) meta.teammatesPerTeam = config.teammatesPerTeam.toString();
+      if (config.teams && config.teams.length > 0) meta.teamsConfig = JSON.stringify(config.teams);
+
+      const teamRows = (config.teams ?? []).map((team, index) => ({
+        team_number: index + 1,
+        team_name: team.name,
+        // Store 0 for now; teams.pattern is the team-specific pattern index,
+        // which the gameplay engine assigns at runtime. Most code paths just
+        // read the global config.pattern from meta anyway.
+        pattern: 0,
+        key_id: team.chipId,
+      }));
+
       try {
-        const { data: launchedGame, error } = await supabase.from('launched_games').insert({
+        const res = await createLaunchedGame({
           game_uniqid: selectedGame.uniqid,
           name: config.name,
           number_of_teams: config.numberOfTeams,
           game_type: selectedGame.gameTypeName,
-          start_time: new Date().toISOString(),
           duration: config.duration,
           started: false,
-          ended: false,
-        }).select().single();
-
-        if (error) {
-          console.error('Error inserting launched game:', error);
-        } else if (launchedGame) {
-          console.log('Successfully saved launched game to database');
-          launchedGameId = launchedGame.id;
-
-          const metaEntries = [
-            { meta_name: 'firstChipIndex', meta_value: config.firstChipIndex.toString() },
-            { meta_name: 'pattern', meta_value: config.pattern },
-            { meta_name: 'messageDisplayDuration', meta_value: config.messageDisplayDuration.toString() },
-            { meta_name: 'enigmaImageDisplayDuration', meta_value: config.enigmaImageDisplayDuration.toString() },
-            { meta_name: 'colorblindMode', meta_value: config.colorblindMode.toString() },
-            { meta_name: 'autoResetTeam', meta_value: config.autoResetTeam.toString() },
-            { meta_name: 'delayBeforeReset', meta_value: config.delayBeforeReset.toString() },
-          ];
-
-          if (config.victoryType) {
-            metaEntries.push({ meta_name: 'victoryType', meta_value: config.victoryType });
-          }
-
-          if (config.usbPort) {
-            metaEntries.push({ meta_name: 'usbPort', meta_value: config.usbPort });
-          }
-
-          if (config.testMode) {
-            metaEntries.push({ meta_name: 'testMode', meta_value: 'true' });
-          }
-
-          if (config.playMode) {
-            metaEntries.push({ meta_name: 'playMode', meta_value: config.playMode });
-          }
-
-          if (config.teammatesPerTeam !== undefined) {
-            metaEntries.push({ meta_name: 'teammatesPerTeam', meta_value: config.teammatesPerTeam.toString() });
-          }
-
-          if (config.teams && config.teams.length > 0) {
-            metaEntries.push({ meta_name: 'teamsConfig', meta_value: JSON.stringify(config.teams) });
-          }
-
-          const metaData = metaEntries.map(entry => ({
-            ...entry,
-            launched_game_id: launchedGame.id,
-          }));
-
-          const { error: metaError } = await supabase.from('launched_game_meta').insert(metaData);
-
-          if (metaError) {
-            console.error('Error inserting launched game meta:', metaError);
-          } else {
-            console.log('Successfully saved launched game meta to database');
-          }
-
-          let deviceId = 'bolt';
-
-          if (usbReaderService.isElectron()) {
-            try {
-              const computerName = await (window as any).electron.getComputerName();
-              deviceId = computerName || 'unknown';
-            } catch (error) {
-              console.error('Error getting computer name:', error);
-              deviceId = 'electron-unknown';
-            }
-          }
-
-          const { error: deviceError } = await supabase.from('launched_game_devices').insert({
-            launched_game_id: launchedGame.id,
-            device_id: deviceId,
-            connected: true,
-            last_connexion_attempt: new Date().toISOString(),
-          });
-
-          if (deviceError) {
-            console.error('Error inserting device:', deviceError);
-          } else {
-            console.log('Successfully saved device to database');
-          }
-
-          console.log('Config teams:', config.teams);
-          if (config.teams && config.teams.length > 0) {
-            const teamsData = config.teams.map((team, index) => ({
-              launched_game_id: launchedGame.id,
-              team_number: index + 1,
-              team_name: team.name,
-              pattern: config.pattern || '',
-              score: 0,
-              key_id: team.chipId,
-            }));
-
-            console.log('Teams data to insert:', teamsData);
-            const { data: insertedTeams, error: teamsError } = await supabase.from('teams').insert(teamsData);
-
-            if (teamsError) {
-              console.error('Error inserting teams:', teamsError);
-              console.error('Full error details:', JSON.stringify(teamsError, null, 2));
-            } else {
-              console.log('Successfully saved teams to database');
-              console.log('Inserted teams response:', insertedTeams);
-            }
-          } else {
-            console.log('No teams to insert or teams array is empty');
-          }
-        }
+          meta,
+          teams: teamRows,
+        });
+        launchedGameId = res.id;
       } catch (error) {
-        console.error('Error saving launched game:', error);
+        console.error('Error creating launched game:', error);
       }
     }
 
@@ -534,56 +341,23 @@ export function GameList() {
   };
 
   const handleDeleteConfirm = async () => {
-    if (!scenarioToDelete) return;
-
-    const isElectron = typeof window !== 'undefined' && (window as any).electron?.isElectron;
-
-    if (isElectron && (window as any).electron?.scenarios?.delete) {
-      try {
-        const result = await (window as any).electron.scenarios.delete(scenarioToDelete.uniqid);
-        if (result.success) {
-          showAlert('success', `Successfully deleted scenario: ${scenarioToDelete.title}`);
-          await loadScenarios();
-          await loadLocalGames();
-        } else {
-          showAlert('error', `Failed to delete scenario: ${result.error}`);
-        }
-      } catch (error) {
-        console.error('Error deleting scenario:', error);
-        showAlert('error', 'Failed to delete scenario');
-      }
-    } else if (!isElectron) {
-      try {
-        const { data: storageFiles } = await supabase.storage
-          .from('game-media')
-          .list(scenarioToDelete.uniqid, { limit: 1000 });
-
-        if (storageFiles && storageFiles.length > 0) {
-          const filePaths = storageFiles.map(f => `${scenarioToDelete.uniqid}/${f.name}`);
-          await supabase.storage.from('game-media').remove(filePaths);
-        }
-
-        const { error } = await supabase
-          .from('scenarios')
-          .delete()
-          .eq('uniqid', scenarioToDelete.uniqid);
-
-        if (error) {
-          console.error('Error deleting scenario:', error);
-          showAlert('error', `Failed to delete scenario: ${error.message}`);
-        } else {
-          showAlert('success', `Successfully deleted scenario: ${scenarioToDelete.title}`);
-          await loadScenarios();
-          await loadLocalGames();
-        }
-      } catch (error) {
-        console.error('Error deleting scenario:', error);
-        showAlert('error', 'Failed to delete scenario');
-      }
-    }
-
+    const target = scenarioToDelete;
     setDeleteConfirmOpen(false);
     setScenarioToDelete(null);
+    if (!target) return;
+    try {
+      // Local delete: drops the row + downloaded files. Not permanent — the
+      // next sync re-adds the scenario from the manifest and re-downloads it.
+      // Works for any scenario, including ones that never finished
+      // downloading (e.g. a mystery scenario stuck on failed attempts).
+      await scenarioStore.deleteScenario(target.uniqid);
+      await loadScenarios();
+      await loadLocalGames();
+      showAlert('success', `"${target.title}" was deleted. It will be downloaded again on the next sync.`);
+    } catch (err) {
+      console.error('[GameList] failed to delete scenario:', err);
+      showAlert('error', `Could not delete "${target.title}". Please try again.`);
+    }
   };
 
   const handleDeleteCancel = () => {
@@ -592,9 +366,7 @@ export function GameList() {
   };
 
   const renderScenarioCard = (scenario: ScenarioWithType) => {
-    const hasLocal = scenario.uniqid && localGameIds.has(scenario.uniqid);
-    const localImageUrl = scenario.uniqid ? localImages.get(scenario.uniqid) : null;
-    const displayImageUrl = localImageUrl || scenario.image_url;
+    const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
     const isAvailableForPurchase = scenario.available_for_purchase;
     const activeGame = scenario.uniqid ? activeGames.get(scenario.uniqid) : undefined;
 
@@ -603,20 +375,18 @@ export function GameList() {
         key={scenario.id}
         className="bg-slate-800 rounded-xl shadow-xl overflow-hidden border border-slate-700 hover:border-slate-600 transition group"
       >
-        {displayImageUrl && (
-          <div className="w-full h-48 overflow-hidden bg-slate-700 relative">
-            <img
-              src={displayImageUrl}
-              alt={scenario.title}
-              className="w-full h-full object-cover group-hover:scale-110 transition duration-300"
-            />
-            {isAvailableForPurchase && (
-              <div className="absolute top-3 right-3 bg-amber-500/90 backdrop-blur-sm px-3 py-1 rounded-full text-xs font-bold text-white shadow-lg">
-                Available for Purchase
-              </div>
-            )}
-          </div>
-        )}
+        <div className="w-full h-48 overflow-hidden bg-slate-700 relative">
+          <ScenarioThumbnail
+            imageUrl={localImageUrl}
+            gameTypeName={scenario.game_type.name}
+            title={scenario.title}
+          />
+          {isAvailableForPurchase && (
+            <div className="absolute top-3 right-3 bg-amber-500/90 backdrop-blur-sm px-3 py-1 rounded-full text-xs font-bold text-white shadow-lg">
+              Available for Purchase
+            </div>
+          )}
+        </div>
         <div className="p-6">
           <div className="flex items-start justify-between mb-3">
             <span className="text-blue-400 text-sm font-semibold">
@@ -627,7 +397,7 @@ export function GameList() {
             </span>
           </div>
           <h3 className="text-xl font-bold text-white mb-2 group-hover:text-blue-400 transition">
-            {scenario.title}
+            {scenario.title || 'Untitled scenario'}
           </h3>
           <p className="text-slate-400 text-sm mb-4 line-clamp-2">
             {scenario.description}
@@ -638,9 +408,16 @@ export function GameList() {
               <span>{scenario.duration_minutes} minutes</span>
             </div>
             <div className="flex items-center gap-2">
-              {!isAvailableForPurchase && scenario.uniqid && hasLocal && (
+              <button
+                onClick={() => setDetailsScenario(scenario)}
+                className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white rounded-lg transition font-medium text-sm border border-slate-600"
+                title="View scenario details"
+              >
+                <Eye size={16} />
+              </button>
+              {!isAvailableForPurchase && scenario.uniqid && !activeGame && (
                 <button
-                  onClick={() => handleDeleteClick(scenario.uniqid || '', scenario.title)}
+                  onClick={() => handleDeleteClick(scenario.uniqid || '', scenario.title || 'Untitled scenario')}
                   className="flex items-center gap-2 px-3 py-2 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg transition font-medium text-sm border border-red-600/30 hover:border-red-600"
                   title="Delete scenario"
                 >
@@ -666,7 +443,7 @@ export function GameList() {
               ) : null}
               {isAvailableForPurchase && (
                 <a
-                  href="https://admin.taghunter.fr"
+                  href="https://studio.taghunter.fr"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition font-medium text-sm"
@@ -794,29 +571,6 @@ export function GameList() {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
               {purchasedScenarios.map(renderScenarioCard)}
-              <button
-                onClick={handleClick}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                className={`bg-slate-800 rounded-xl shadow-xl overflow-hidden border transition group cursor-pointer flex flex-col items-center justify-center min-h-[300px] p-6 ${
-                  isDragging ? 'border-blue-400 bg-blue-900/20' : 'border-slate-700 hover:border-blue-500'
-                }`}
-              >
-                <div className={`w-16 h-16 rounded-full flex items-center justify-center mb-4 transition ${
-                  isDragging ? 'bg-blue-600/40' : 'bg-blue-600/20 group-hover:bg-blue-600/30'
-                }`}>
-                  <Upload className={`transition ${
-                    isDragging ? 'text-blue-300' : 'text-blue-400 group-hover:text-blue-300'
-                  }`} size={32} />
-                </div>
-                <h3 className="text-xl font-bold text-white mb-2 group-hover:text-blue-400 transition">
-                  Import Scenario
-                </h3>
-                <p className="text-slate-400 text-sm text-center">
-                  {isDragging ? 'Drop ZIP file here' : 'Drag and drop a ZIP file or click to browse'}
-                </p>
-              </button>
             </div>
           </>
         )}
@@ -845,8 +599,6 @@ export function GameList() {
         )}
       </main>
 
-      <Footer />
-
       <LaunchGameModal
         isOpen={launchModalOpen}
         onClose={() => setLaunchModalOpen(false)}
@@ -861,11 +613,19 @@ export function GameList() {
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
         title="Delete Scenario"
-        message={`Are you sure you want to delete "${scenarioToDelete?.title}"? This action cannot be undone and will permanently remove all scenario files.`}
+        message={`Delete "${scenarioToDelete?.title}" from this playground? Its downloaded files are removed now. It will be downloaded again on the next sync.`}
         confirmText="Delete"
         cancelText="Cancel"
         variant="danger"
       />
+
+      {detailsScenario && (
+        <ScenarioDetailsModal
+          scenario={detailsScenario}
+          thumbnailUrl={(detailsScenario.uniqid && localImages.get(detailsScenario.uniqid)) || null}
+          onClose={() => setDetailsScenario(null)}
+        />
+      )}
     </div>
   );
 }
