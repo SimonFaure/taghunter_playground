@@ -7,13 +7,14 @@ import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
 import { ConfirmDialog } from './ConfirmDialog';
 import { GameDevicesModal } from './GameDevicesModal';
+import { VideoControlModal } from './VideoControlModal';
 import * as scenarioStore from '../services/scenarioStore';
 import {
   endLaunchedGame,
   deleteLaunchedGame,
   getLaunchedGameState,
 } from '../services/launchedGames';
-import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle } from 'lucide-react';
+import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle, Film } from 'lucide-react';
 
 interface GamePageProps {
   config: GameConfig;
@@ -51,6 +52,7 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
   const [postAnimExitDelayMs, setPostAnimExitDelayMs] = useState(0);
   const [showRankings, setShowRankings] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
+  const [showVideoControl, setShowVideoControl] = useState(false);
   const [rankings, setRankings] = useState<Team[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
@@ -272,6 +274,13 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
                     Devices
                   </button>
                   <button
+                    onClick={() => { setShowPanel(false); setShowVideoControl(true); }}
+                    className="flex items-center justify-center gap-2 px-4 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition"
+                  >
+                    <Film size={16} />
+                    Play Video
+                  </button>
+                  <button
                     onClick={() => { setShowPanel(false); handleEndGame(); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition"
                   >
@@ -384,6 +393,15 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
           gameLanguage={config.language ?? 'fr'}
           isMother={true}
           onClose={() => setShowDevices(false)}
+        />
+      )}
+
+      {showVideoControl && gameMetadata && (
+        <VideoControlModal
+          gameUniqid={gameUniqid}
+          gameType={gameMetadata.type}
+          gameLanguage={config.language ?? 'fr'}
+          onClose={() => setShowVideoControl(false)}
         />
       )}
 

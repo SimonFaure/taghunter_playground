@@ -227,6 +227,54 @@ pub async fn mother_server_status(
     })
 }
 
+/// Returns the running server's full info (port + self peer_secret + mother_uuid),
+/// or None when the server isn't running. Lets the renderer pick up an already-
+/// running server across React re-mounts without restarting it (and without
+/// caching the secret in JS).
+#[tauri::command]
+pub async fn mother_get_server_info(
+    app: AppHandle,
+    state: tauri::State<'_, MotherServerState>,
+) -> Result<Option<MotherServerInfo>, String> {
+    let port = {
+        let guard = state.inner.lock().await;
+        match &*guard {
+            Some(r) => r.port,
+            None => return Ok(None),
+        }
+    };
+    // Read self peer fields from the local DB. Cheaper than a heap-cached
+    // copy and keeps a single source of truth (the paired_devices row).
+    let db_path = resolve_db_path(&app)?;
+    let conn = DbConnection::open(db_path.clone())
+        .await
+        .map_err(|e| format!("open sqlite ({}): {e}", db_path.display()))?;
+    let info = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<MotherServerInfo> {
+            let mother_uuid: String = c.query_row(
+                "SELECT value FROM schema_meta WHERE key = 'mother_device_uuid'",
+                [],
+                |r| r.get(0),
+            )?;
+            let (peer_id, peer_secret) = c.query_row(
+                "SELECT id, peer_secret FROM paired_devices
+                  WHERE peer_uuid = ? AND is_self = 1",
+                params![mother_uuid],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            Ok(MotherServerInfo {
+                port,
+                bound_addr: format!("127.0.0.1:{port}"),
+                mother_device_uuid: mother_uuid,
+                mother_peer_secret: peer_secret,
+                mother_peer_id: peer_id,
+            })
+        })
+        .await
+        .map_err(|e| format!("read self peer: {e}"))?;
+    Ok(Some(info))
+}
+
 fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()

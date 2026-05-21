@@ -1,0 +1,24 @@
+/* Mystery in-game renderer — scoped blur + button hover swap.
+   Mirrors `studio-taghunter/src/scenarios/preview/mystery-preview.css` so the
+   playground and the studio preview share visual behaviour. */
+
+.mystery-game-scope .mystery-game-blur {
+  filter: blur(1.2rem);
+  transition: filter 0.4s ease;
+}
+
+.mystery-game-scope .mystery-game-instructions-button {
+  cursor: pointer;
+}
+.mystery-game-scope .mystery-game-button-default,
+.mystery-game-scope .mystery-game-button-hover {
+  transition: opacity 0.2s ease;
+}
+.mystery-game-scope .mystery-game-instructions-button:hover
+  .mystery-game-button-default {
+  opacity: 0;
+}
+.mystery-game-scope .mystery-game-instructions-button:hover
+  .mystery-game-button-hover {
+  opacity: 1 !important;
+}

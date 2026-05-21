@@ -993,7 +993,9 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 display: 'flex',
                 color: element.color || '#fff',
                 fontFamily: scenarioFontFamily || element.fontFamily,
-                fontSize: element.fontSize !== undefined ? `${element.fontSize}px` : '1em',
+                fontSize: element.fontSize !== undefined
+                  ? `${element.fontSize * (bgDimensions.width / 1920)}px`
+                  : '1em',
                 alignItems: 'center',
                 justifyContent: 'center',
                 textAlign: 'center',
@@ -1174,7 +1176,12 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
               style={{
                 width: '100%',
                 height: '100%',
-                fontSize: element.fontSize !== undefined ? `${element.fontSize}px` : undefined,
+                // fontSize in defaultLayout.json is authored against a 1920-wide
+                // canonical stage. Scale to the actual stage so the text keeps
+                // its proportion against the template artwork at any size.
+                fontSize: element.fontSize !== undefined
+                  ? `${element.fontSize * (bgDimensions.width / 1920)}px`
+                  : undefined,
                 color: element.color,
                 fontFamily: scenarioFontFamily || element.fontFamily,
                 display: 'flex',

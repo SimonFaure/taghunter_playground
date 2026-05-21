@@ -19,6 +19,8 @@ import { LaunchedGamesList } from './components/LaunchedGamesList';
 import { OperatorVideoOverlay } from './components/OperatorVideoOverlay';
 import { listen } from '@tauri-apps/api/event';
 import { emitPendingJoin } from './services/pendingJoinStore';
+import { ensureMotherServer } from './services/lanMotherBoot';
+import { getDeviceMetadata } from './services/device';
 import ClientCardsPage from './components/ClientCardsPage';
 import { DatabaseInspector } from './components/DatabaseInspector';
 import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
@@ -245,6 +247,24 @@ function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auth.user]);
+
+  // Boot the mother's local axum server once auth is resolved, and install a
+  // permanent LAN override so all `launched_games` traffic routes locally
+  // instead of to studio. This is what makes the new Devices-modal endpoints
+  // (`list_paired_with_status`, push commands, etc.) reachable. Idempotent:
+  // re-mounts pick up the running server via `mother_get_server_info`.
+  useEffect(() => {
+    if (!auth.user?.client_id) return;
+    let cancelled = false;
+    void (async () => {
+      const meta = await getDeviceMetadata().catch(() => null);
+      if (cancelled) return;
+      await ensureMotherServer(auth.user!.client_id, meta?.device_label ?? undefined);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [auth.user?.client_id]);
 
   // App-level listener for auth_invalid. SyncFailureBanner also handles this
   // (it calls onAuthInvalid → auth.refresh), but the banner isn't mounted

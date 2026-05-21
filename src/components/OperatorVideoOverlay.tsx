@@ -9,6 +9,7 @@ import { listen } from '@tauri-apps/api/event';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { resolveVideosByKind, type VideoSource } from '../services/videoResolution';
 import { getLaunchedGameState } from '../services/launchedGames';
+import { onLocalVideoCommand } from '../services/localVideoStore';
 
 interface LanCommand {
   id: number;
@@ -77,6 +78,34 @@ export function OperatorVideoOverlay() {
       if (unlistenFn) unlistenFn();
     };
   }, []);
+
+  // Local-trigger path: the in-game panel's "Play Video" button skips the
+  // pending_commands queue and emits directly on `localVideoStore`. Same
+  // overlay state machine — preempts and stops work identically.
+  useEffect(() => {
+    return onLocalVideoCommand({
+      onPlay: (resolved) => {
+        if (resolved.length > 0) setVideos(resolved);
+      },
+      onStop: () => setVideos(null),
+    });
+  }, []);
+
+  // Escape-to-quit: only active when the overlay is mounted, and only for
+  // operator-driven playback. The player-facing first-bip flow keeps its
+  // 4-tap admin gesture (rendered by FirstBipVideoOverlay) because the
+  // listener below lives on the operator-overlay wrapper, not the renderer.
+  useEffect(() => {
+    if (!videos) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setVideos(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [videos]);
 
   if (!videos) return null;
 

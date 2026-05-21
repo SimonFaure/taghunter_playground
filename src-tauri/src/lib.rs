@@ -76,6 +76,7 @@ pub fn run() {
             lan_server::mother_start_local_server,
             lan_server::mother_stop_local_server,
             lan_server::mother_server_status,
+            lan_server::mother_get_server_info,
             lan_server::mother_list_pending_pair_requests,
             lan_server::mother_approve_pair_request,
             lan_server::mother_deny_pair_request,

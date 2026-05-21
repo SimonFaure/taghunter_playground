@@ -108,34 +108,49 @@ export async function apiCall<T = unknown>(
   const timeoutMs =
     options.timeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : options.timeoutMs;
 
-  // Fuse the caller signal + a timeout so the request is aborted at the Rust
-  // layer when either fires. The withDeadline() wrappers below are the actual
-  // guarantee (abort propagation into a stalled Tauri fetch is unreliable);
-  // the fused signal is best-effort cleanup of the underlying socket.
-  const abortSignals: AbortSignal[] = [];
+  // Fuse the caller signal + our own clearable timeout controller so the
+  // request is aborted at the Rust layer when either fires. We do NOT use
+  // AbortSignal.timeout() here: plugin-http leaks abort listeners on the
+  // signal we hand it (they're attached in `start(controller)` and on the
+  // outer fetch's `signal.addEventListener('abort', ...)` and never removed).
+  // When the timeout fires LATER, after the body was already fully read and
+  // its rid closed Rust-side, dropBody() re-invokes `fetch_cancel_body` on
+  // the closed rid → "The resource id N is invalid" uncaught rejection.
+  // The clearable timeout below is reset in `finally`, so on natural
+  // completion the controller never aborts and the leaked listeners are
+  // silent. withDeadline() below remains the authoritative timeout.
+  const timeoutCtrl = new AbortController();
+  const timeoutHandle =
+    timeoutMs != null ? setTimeout(() => timeoutCtrl.abort(), timeoutMs) : null;
+  const abortSignals: AbortSignal[] = [timeoutCtrl.signal];
   if (options.signal) abortSignals.push(options.signal);
-  if (timeoutMs != null) abortSignals.push(AbortSignal.timeout(timeoutMs));
-  const fusedSignal = abortSignals.length > 0 ? AbortSignal.any(abortSignals) : undefined;
+  const fusedSignal = AbortSignal.any(abortSignals);
 
   const init: Parameters<typeof tauriFetch>[1] = {
     method: options.method ?? 'GET',
     headers,
+    signal: fusedSignal,
   };
-  if (fusedSignal) init.signal = fusedSignal;
 
   if (options.body !== undefined) {
     init.body = JSON.stringify(options.body);
   }
 
   const label = `${endpoint}?action=${action}`;
-  const res =
-    timeoutMs != null
-      ? await withDeadline(tauriFetch(url, init), timeoutMs, label)
-      : await tauriFetch(url, init);
-  const text =
-    timeoutMs != null
-      ? await withDeadline(res.text(), timeoutMs, `${label} body`)
-      : await res.text();
+  let res: Awaited<ReturnType<typeof tauriFetch>>;
+  let text: string;
+  try {
+    res =
+      timeoutMs != null
+        ? await withDeadline(tauriFetch(url, init), timeoutMs, label)
+        : await tauriFetch(url, init);
+    text =
+      timeoutMs != null
+        ? await withDeadline(res.text(), timeoutMs, `${label} body`)
+        : await res.text();
+  } finally {
+    if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+  }
   let parsed: unknown;
   let parseFailed = false;
   try {
@@ -252,21 +267,33 @@ export async function apiDownloadBytesStream(
   const label = `${endpoint}?action=${action}`;
 
   // Own controller so the stall watchdog can cancel the body stream; fused
-  // with the caller signal and a TTFB timeout for the header phase.
+  // with the caller signal and a CLEARABLE TTFB timeout for the header phase.
+  // We do NOT use AbortSignal.timeout(): plugin-http leaks abort listeners
+  // on `init.signal` (one calls fetch_cancel(REQUEST rid), one calls
+  // dropBody(BODY rid)). After natural completion the body rid is already
+  // closed Rust-side, so a delayed dropBody → "The resource id N is invalid"
+  // uncaught rejection. clearTimeout in `finally` prevents the controller
+  // from firing on success; withDeadline below remains the real timeout.
   const ctrl = new AbortController();
+  const ttfbHandle =
+    ttfbMs != null ? setTimeout(() => ctrl.abort(), ttfbMs) : null;
   const ttfbSignals: AbortSignal[] = [ctrl.signal];
   if (options.signal) ttfbSignals.push(options.signal);
-  if (ttfbMs != null) ttfbSignals.push(AbortSignal.timeout(ttfbMs));
 
   const init: Parameters<typeof tauriFetch>[1] = {
     method: 'GET',
     headers,
     signal: AbortSignal.any(ttfbSignals),
   };
-  const res =
-    ttfbMs != null
-      ? await withDeadline(tauriFetch(url, init), ttfbMs, `${label} TTFB`)
-      : await tauriFetch(url, init);
+  let res;
+  try {
+    res =
+      ttfbMs != null
+        ? await withDeadline(tauriFetch(url, init), ttfbMs, `${label} TTFB`)
+        : await tauriFetch(url, init);
+  } finally {
+    if (ttfbHandle !== null) clearTimeout(ttfbHandle);
+  }
   if (!res.ok) {
     let body: unknown = null;
     try {
@@ -320,8 +347,12 @@ export async function apiDownloadBytesStream(
   } catch (err) {
     // Best-effort cleanup. NOT awaited — cancel() could itself hang on the
     // same dead stream; the throw below is what unblocks the caller.
+    // reader.cancel() triggers plugin-http's stream cancel callback which
+    // already calls fetch_cancel_body for us. We deliberately do NOT also
+    // ctrl.abort() — firing the fused signal here would invoke plugin-http's
+    // leaked abort listener for a second dropBody on the now-closed body rid
+    // → "The resource id N is invalid" uncaught rejection.
     try { void reader.cancel(); } catch { /* ignore */ }
-    try { ctrl.abort(); } catch { /* ignore */ }
     throw err;
   }
 

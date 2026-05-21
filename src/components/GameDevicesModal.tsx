@@ -279,22 +279,28 @@ export function GameDevicesModal({
         {/* Section A — In this game */}
         <section className="mb-6">
           <SectionHeader title="In this game" count={buckets.in_game.length} dotClass="bg-green-500" />
-          {isMother && inGameSelectableCount > 0 && (
-            <div className="flex items-center gap-3 mb-3 px-1">
-              <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                  checked={
-                    selectedForVideo.size > 0 &&
-                    buckets.in_game
-                      .filter((r) => !r.is_self)
-                      .every((r) => selectedForVideo.has(r.id))
-                  }
-                  onChange={toggleSelectAll}
-                />
-                Select all
-              </label>
+          {isMother && buckets.in_game.length > 0 && (
+            <div className="flex items-center gap-3 mb-3 px-1 flex-wrap">
+              {inGameSelectableCount > 0 ? (
+                <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                    checked={
+                      selectedForVideo.size > 0 &&
+                      buckets.in_game
+                        .filter((r) => !r.is_self)
+                        .every((r) => selectedForVideo.has(r.id))
+                    }
+                    onChange={toggleSelectAll}
+                  />
+                  Select all
+                </label>
+              ) : (
+                <span className="text-xs text-slate-500 italic">
+                  Add a paired satellite to this game to play videos on it.
+                </span>
+              )}
               <div className="flex-1" />
               <span className="text-xs text-slate-400">
                 {selectedForVideo.size} selected
@@ -303,6 +309,13 @@ export function GameDevicesModal({
                 <button
                   className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg text-sm flex items-center gap-1.5"
                   disabled={selectedForVideo.size === 0}
+                  title={
+                    inGameSelectableCount === 0
+                      ? 'No satellites in this game yet'
+                      : selectedForVideo.size === 0
+                        ? 'Tick at least one device below'
+                        : 'Pick a video to play on selected devices'
+                  }
                   onClick={() => setPlayMenuOpen((v) => !v)}
                 >
                   <Play size={14} />
@@ -332,6 +345,11 @@ export function GameDevicesModal({
               <button
                 className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg text-sm flex items-center gap-1.5"
                 disabled={selectedForVideo.size === 0}
+                title={
+                  selectedForVideo.size === 0
+                    ? 'Tick at least one device below'
+                    : 'Stop video on selected devices'
+                }
                 onClick={onStopVideo}
               >
                 <StopCircle size={14} />

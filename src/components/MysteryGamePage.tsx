@@ -17,6 +17,7 @@ import { resolveFontFamily } from '../fonts/resolveFontFamily';
 import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
+import { MysteryGameRenderer, type MysteryScreen } from './MysteryGameRenderer';
 import '../mystery.css';
 
 interface VideoSource {
@@ -146,6 +147,14 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
   const [score, setScore] = useState(0);
   const [time, setTime] = useState(0);
   const [completedEnigmas, setCompletedEnigmas] = useState<Set<number>>(new Set());
+  // Reveal-animation overlay colours keyed by `enigma.number`. The end-of-
+  // game tally walks each enigma, sets a colour here for instant feedback,
+  // then adds the enigma to `completedEnigmas` to unblur the image.
+  const [enigmaStatusColors, setEnigmaStatusColors] = useState<Record<string, string>>({});
+  // Which enigma to feature in the centre column. Defaults to the first
+  // uncompleted enigma; the reveal animation overrides it to walk through
+  // every enigma as it tallies the score.
+  const [revealEnigmaNumber, setRevealEnigmaNumber] = useState<string | null>(null);
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
   const [stations, setStations] = useState<StationData[]>([]);
   const [showCardAlert, setShowCardAlert] = useState(false);
@@ -420,46 +429,39 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
             const gameEnigma = currentGameData.game_enigmas.find(ge => ge.number === enigmaResult.enigma_id);
             if (!gameEnigma) continue;
 
-            const enigmaContainer = document.querySelector(`#enigma_container_${enigmaResult.enigma_id}`);
-            const recapContainer = document.querySelector(`#enigmas_recap_enigma_container_${enigmaResult.enigma_id} .enigma_answer_image`);
-
-            if (enigmaContainer) {
-              let backgroundColor = '';
-              switch (enigmaResult.result) {
-                case 'correct':
-                  backgroundColor = 'rgba(0, 255, 0, 0.3)';
-                  playSound('enigma_success');
-                  break;
-                case 'incorrect':
-                  backgroundColor = 'rgba(255, 0, 0, 0.3)';
-                  playSound('enigma_error');
-                  break;
-                case 'no_answer':
-                  backgroundColor = 'rgba(128, 128, 128, 0.3)';
-                  playSound('enigma_no_answer');
-                  break;
-                case 'both_answers':
-                  backgroundColor = 'rgba(255, 165, 0, 0.3)';
-                  playSound('enigma_error');
-                  break;
-              }
-
-              (enigmaContainer as HTMLElement).style.backgroundColor = backgroundColor;
+            let backgroundColor = '';
+            switch (enigmaResult.result) {
+              case 'correct':
+                backgroundColor = 'rgba(0, 255, 0, 0.3)';
+                playSound('enigma_success');
+                break;
+              case 'incorrect':
+                backgroundColor = 'rgba(255, 0, 0, 0.3)';
+                playSound('enigma_error');
+                break;
+              case 'no_answer':
+                backgroundColor = 'rgba(128, 128, 128, 0.3)';
+                playSound('enigma_no_answer');
+                break;
+              case 'both_answers':
+                backgroundColor = 'rgba(255, 165, 0, 0.3)';
+                playSound('enigma_error');
+                break;
             }
 
-            if (recapContainer) {
-              recapContainer.classList.remove('blur');
-            }
+            setRevealEnigmaNumber(enigmaResult.enigma_id);
+            setEnigmaStatusColors(prev => ({ ...prev, [enigmaResult.enigma_id]: backgroundColor }));
+            setCompletedEnigmas(prev => {
+              const next = new Set(prev);
+              next.add(parseInt(enigmaResult.enigma_id, 10));
+              return next;
+            });
 
             currentScore += enigmaResult.points;
             setScore(currentScore);
 
-            const scoreElement = document.querySelector('#game_score_container_score');
-            if (scoreElement) {
-              scoreElement.textContent = currentScore.toString();
-            }
-
-            await new Promise(resolve => setTimeout(resolve, parseInt(currentGameData.game_meta.animation_enigma_duration || '1') * 1000));
+            const animationDuration = (currentGameData.game_meta as unknown as { animation_enigma_duration?: string }).animation_enigma_duration;
+            await new Promise(resolve => setTimeout(resolve, parseInt(animationDuration || '1') * 1000));
           }
 
           showMessage(`Terminé! ${teamName} - Score: ${totalScore} - Temps: ${formatTime(duration)}`, config.messageDisplayDuration * 1000);
@@ -637,16 +639,59 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
     return scenarioAssetUrl(gameUniqid, filename);
   };
 
-  const backgroundImageUrl = getImageUrl(gameData.game_meta.background_image);
-
-  // Scenario-wide font from the Typography section. Applied at the gameplay
-  // page root so all mystery text inherits it.
+  // Scenario-wide font from the Typography section. Applied at the renderer
+  // root so all mystery text inherits it.
   const scenarioFontFamily = resolveFontFamily(gameData.game_meta.font);
+
+  // Which screen the renderer shows. `gameStarted` defaults to true so the
+  // instructions branch is currently dead-code; kept wired so the start
+  // button can be re-enabled later by flipping the initial state.
+  const screen: MysteryScreen = !gameStarted
+    ? 'instructions'
+    : gameEnded
+      ? 'endgame'
+      : 'ingame';
+
+  // Centre column focuses the next uncompleted enigma; during the end-of-game
+  // reveal animation, `revealEnigmaNumber` overrides it so the centre walks
+  // through every enigma as the tally runs.
+  const selectedEnigmaIndex = (() => {
+    if (revealEnigmaNumber) {
+      const idx = gameData.game_enigmas.findIndex(e => e.number === revealEnigmaNumber);
+      if (idx >= 0) return idx;
+    }
+    const firstUncompleted = gameData.game_enigmas.findIndex(
+      e => !completedEnigmas.has(parseInt(e.number, 10)),
+    );
+    return firstUncompleted >= 0 ? firstUncompleted : 0;
+  })();
+
+  const scoreFullGameNum = parseFloat(gameData.game_meta.score_full_game) || 100;
+  const gaugePercent = (score / scoreFullGameNum) * 100;
+
+  const finalScoreText = gameData.game_meta.points_units === 'percentage'
+    ? `${Math.round(score)}%`
+    : `${Math.round(score)} / ${gameData.game_meta.score_full_game}`;
+
+  // Highest level whose points threshold is ≤ current score — drives the
+  // endgame screen's level name + description.
+  const reachedLevel = (() => {
+    let best: { name: string; description: string } | null = null;
+    let bestPts = -Infinity;
+    for (const lvl of Object.values(gameData.game_meta.levels ?? {})) {
+      const pts = parseFloat(lvl?.points ?? '0') || 0;
+      if (pts <= score && pts > bestPts) {
+        best = { name: lvl?.name ?? '', description: lvl?.description ?? '' };
+        bestPts = pts;
+      }
+    }
+    return best;
+  })();
 
   return (
     <div
       className="game_page_wrapper game_page_wrapper_mystery"
-      style={{ backgroundImage: `url(${backgroundImageUrl})`, fontFamily: scenarioFontFamily || undefined }}
+      style={{ fontFamily: scenarioFontFamily || undefined, position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}
     >
       {firstBipVideos && (
         <FirstBipVideoOverlay
@@ -691,159 +736,25 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
         )}
       </header>
 
-      {!gameStarted && (
-        <div className="game_instructions_wrapper">
-          <div
-            className="mystery_game_instructions_container"
-            style={{ backgroundImage: `url(${getImageUrl(gameData.game_meta.game_instructions_image)})` }}
-          >
-            <div id="game_instructions_button_image_container" onClick={handleStartGame}>
-              <div className="game_instructions_button" id="game_instructions_button_image">
-                <img src={getImageUrl(gameData.game_meta.game_instructions_button_image)} alt="start" />
-              </div>
-              <div className="game_instructions_button" id="game_instructions_button_hover_image">
-                <img src={getImageUrl(gameData.game_meta.game_instructions_button_hover_image)} alt="start-hover" />
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className="enigmas_wrapper" style={{ opacity: gameStarted ? 1 : 0 }}>
-        <div className="left_column_mystery">
-          <div className="time_background_image">
-            <img src={getImageUrl(gameData.game_meta.time_background_image)} alt="timer" />
-            <div id="time_background_image_text">{formatTime(time)}</div>
-          </div>
-
-          <div className="team_score_container">
-            <img src={getImageUrl(gameData.game_meta.score_background_image)} alt="score" />
-            <div className="team_score_container_text">
-              <span id="game_score_container_score">{score}</span>
-              {gameData.game_meta.points_units === 'percentage' ? (
-                <span id="game_score_container_percentage">%</span>
-              ) : (
-                <>/<span id="game_score_container_game_complete_score">{gameData.game_meta.score_full_game}</span></>
-              )}
-            </div>
-            <div id="floating_enigma_score"></div>
-          </div>
-
-          <div id="game_overscore" className="team_bonus_wrapper">
-            <div className="team_bonus_container team_bonus_container_empty">
-              <img src={getImageUrl(gameData.game_meta.enigmas_header_image)} alt="bonus-empty" />
-            </div>
-          </div>
-        </div>
-
-        <div id="enigmas_grid_wrapper">
-          <div className="enigmas_subwrapper">
-            <div className="enigma_container" id="time_full_container">
-              <div>Your time </div>
-              <div id="time_full_container_detail">{formatTime(time)}</div>
-            </div>
-
-            {gameData.game_enigmas.map((enigma) => (
-              <div key={enigma.id} className="enigma_wrapper">
-                <div className="enigma_container" id={`enigma_container_${enigma.number}`}>
-                  <div className="enigma_subcontainer enigma_texts_container">
-                    <div className="enigma_text">{enigma.text}</div>
-                    <div className="enigma_answer">
-                      <div className="enigma_answer_image">
-                        <div className="enigma_answer_image_background"></div>
-                        <img
-                          src={getImageUrl(enigma.good_answer_image)}
-                          alt={enigma.text}
-                          className={completedEnigmas.has(parseInt(enigma.number)) ? '' : 'blur'}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div id="right_column_mystery" className="right_column_mystery">
-          <div id="mystery_team_name_container" className="mystery_team_name_container">
-            <img src={getImageUrl(gameData.game_meta.team_name_background_image)} alt="team" />
-            <div className="mystery_team_name_container_text">{config.name}</div>
-          </div>
-
-          <div id="artefacts_container" className="artefacts_container">
-            <img src={getImageUrl(gameData.game_meta.enigmas_header_image)} alt="ingredients" />
-          </div>
-
-          <div className="team_enigmas_recap_container">
-            {gameData.game_enigmas.map((enigma) => (
-              <div
-                key={enigma.id}
-                className="enigmas_recap_enigma_container"
-                id={`enigmas_recap_enigma_container_${enigma.number}`}
-              >
-                <div className="enigmas_recap_enigma_subcontainer">
-                  <div className="enigma_answer">
-                    <div className="enigma_answer_image_background">
-                      <div className={`enigma_answer_image ${completedEnigmas.has(parseInt(enigma.number)) ? 'no_blur' : 'blur'}`}>
-                        <img src={getImageUrl(enigma.good_answer_image)} alt={enigma.text} />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className="progress_bar_container">
-        <div id="progression_wrapper">
-          <div className="progress_bar">
-            <div id="progress_bar_gauge_with_back">
-              <img src={getImageUrl(gameData.game_meta.levels_gauge_image)} alt="gauge" />
-            </div>
-            <div id="progress_bar_content">
-              <div
-                id="progress_bar_content_inside"
-                style={{
-                  background: gameData.game_meta.gauge_filling,
-                  width: `${score}%`
-                }}
-              ></div>
-            </div>
-
-            {Object.entries(gameData.game_meta.levels).map(([key, level]) => {
-              const stepNumber = parseInt(key);
-              const isEven = stepNumber % 2 === 0;
-              const isFirst = stepNumber === 1;
-              const isLast = stepNumber === Object.keys(gameData.game_meta.levels).length;
-              const shouldShowIcon = stepNumber === 1 || stepNumber === 10 || stepNumber === 20 || stepNumber === 30 || stepNumber === 40 || stepNumber === 50;
-
-              if (!shouldShowIcon) return null;
-
-              return (
-                <div
-                  key={key}
-                  className={`step ${isFirst ? 'first_step' : ''} ${isLast ? 'last_step' : ''}`}
-                  id={`step_container_${stepNumber}`}
-                >
-                  <div className="step-progress"></div>
-                  <div className={`icon-wrapper ${!isFirst && !isLast ? 'icon-wrapper-end' : ''} ${isLast ? 'icon-wrapper-last' : ''}`}>
-                    <div id={`step_${stepNumber}`} className={`${isEven ? 'even_image' : ''} step_checkmark`}>
-                      <img src={getImageUrl(gameData.game_meta.levels_gauge_level_icon_image)} alt="level-icon" />
-                    </div>
-                    <div className={`${isEven ? 'level_line_even' : ''} level_line`}></div>
-                  </div>
-                  <div className={`${isEven ? 'step_even' : 'step_odd'} step-text step-text-end step_level_hidden`}>
-                    {level.name}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      </div>
+      <MysteryGameRenderer
+        gameMeta={gameData.game_meta}
+        enigmas={gameData.game_enigmas}
+        resolveMediaUrl={getImageUrl}
+        screen={screen}
+        timerText={formatTime(time)}
+        score={score}
+        teamName={config.name}
+        completedEnigmas={completedEnigmas}
+        enigmaStatusColors={enigmaStatusColors}
+        selectedEnigmaIndex={selectedEnigmaIndex}
+        gaugePercent={gaugePercent}
+        onStartGame={handleStartGame}
+        onRestart={() => window.location.reload()}
+        finalScoreText={finalScoreText}
+        endLevelName={reachedLevel?.name}
+        endLevelDescription={reachedLevel?.description}
+        fontFamily={scenarioFontFamily || undefined}
+      />
 
       {gameMessage && (
         <div id="game_message_container" className="active">
@@ -861,39 +772,6 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onBack, on
             ) : (
               <div className="spinner"></div>
             )}
-          </div>
-        </div>
-      )}
-
-      {gameEnded && (
-        <div id="final_score_container" className="active">
-          <div id="final_score_container_data">
-            <div>
-              Your final score: <br />
-              <span id="final_score_score">{score}</span>
-              {gameData.game_meta.points_units === 'percentage' ? (
-                <span>%</span>
-              ) : (
-                <>/<span id="final_score_complete_score">{gameData.game_meta.score_full_game}</span></>
-              )}
-            </div>
-            <div id="final_score_level_container"></div>
-            <div className="get_bip_survival">
-              <div id="reload_page" className="game_instructions_summary" onClick={() => window.location.reload()}>
-                {gameData.game_meta.game_refresh_button_image && gameData.game_meta.game_refresh_button_hover_image ? (
-                  <div id="refresh_button_container">
-                    <div className="refresh_button" id="game_instructions_button_image">
-                      <img src={getImageUrl(gameData.game_meta.game_refresh_button_image)} alt="refresh" />
-                    </div>
-                    <div className="refresh_button hide" id="game_refresh_button_hover_image">
-                      <img src={getImageUrl(gameData.game_meta.game_refresh_button_hover_image)} alt="refresh-hover" />
-                    </div>
-                  </div>
-                ) : (
-                  <span>Restart Game</span>
-                )}
-              </div>
-            </div>
           </div>
         </div>
       )}

@@ -69,20 +69,21 @@ export function FirstBipVideoOverlay({ videos, onComplete }: FirstBipVideoOverla
     handleEnded();
   };
 
-  // Reload the video element when index changes so the new src + subtitle
-  // track mount cleanly. Without this, swapping just `src` on the existing
-  // element keeps the previous <track> in the DOM and Chromium sometimes
-  // refuses to render the new subtitles.
+  // The `key` prop on the <video> element remounts it whenever the source
+  // changes, so we get a fresh element with a fresh <source>/<track> on
+  // every index advance — no manual load() needed. Calling load() here
+  // would abort the autoPlay attribute's already-in-flight play() promise
+  // and surface as a noisy AbortError.
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
-    el.load();
     void el.play().catch((err) => {
-      // Autoplay can be blocked even in a Tauri webview if the user hasn't
-      // interacted yet. The team just scanned a tag, so input is fresh —
-      // most blocks come from missed user-gesture inheritance after a
-      // route transition. Show a play-through icon as a fallback.
-      console.warn('[FirstBipVideoOverlay] autoplay rejected:', err);
+      const name = (err as Error | null)?.name;
+      // AbortError: typically a stale promise from a previous remount —
+      // benign. NotAllowedError: browser blocked autoplay without a user
+      // gesture — also nothing we can do here.
+      if (name === 'AbortError' || name === 'NotAllowedError') return;
+      console.warn('[FirstBipVideoOverlay] play rejected:', err);
     });
   }, [index]);
 
