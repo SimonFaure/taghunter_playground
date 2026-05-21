@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Query, Request, State};
@@ -59,6 +59,16 @@ pub struct MotherServerState {
 #[derive(Default)]
 pub struct MotherEndpointCache {
     inner: Mutex<HashMap<String, SocketAddr>>,
+}
+
+/// Client-side: the satellite's current SportIdent reader-attached state.
+/// Updated by JS (`Footer.tsx`'s 10s polling tick → `client_set_reader_presence`)
+/// and read by `client_ping_mother` so the mother sees a fresh `has_reader`
+/// in the next ping body. We don't model "which reader" — the modal just
+/// needs the boolean for the row badge.
+#[derive(Default)]
+pub struct ReaderPresence {
+    inner: Mutex<bool>,
 }
 
 struct Running {
@@ -134,6 +144,8 @@ pub async fn mother_start_local_server(
         db: Arc::new(conn),
         client_id,
         mother_uuid: self_pair.mother_device_uuid.clone(),
+        self_peer_id: self_pair.peer_id,
+        last_bump: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app_router = build_router(app_state);
@@ -306,6 +318,15 @@ struct AppState {
     /// Stable identity of this mother device. Returned by /ping.php so the
     /// child can verify it's still talking to the same machine it paired with.
     mother_uuid: String,
+    /// `paired_devices.id` of the mother's own self-row. Cached here so the
+    /// authorization check on queue_command (only self may push commands) is
+    /// a single integer comparison instead of a SQL roundtrip per call.
+    self_peer_id: i64,
+    /// Debounce map for `bump_presence` — peer_id → last write Instant. The
+    /// 5s window keeps the row from churning under the satellite's 1s state
+    /// polling, while the 25s online window in `list_paired_with_status`
+    /// still reads a fresh enough timestamp.
+    last_bump: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 fn build_router(state: AppState) -> Router {
@@ -326,6 +347,15 @@ struct ActionQuery {
 // ─── auth ────────────────────────────────────────────────────────────────────
 
 async fn resolve_peer(state: &AppState, headers: &HeaderMap) -> Result<i64, Response> {
+    let id = resolve_peer_for_ping(state, headers).await?;
+    bump_presence(state, id, None).await;
+    Ok(id)
+}
+
+/// Same lookup as `resolve_peer` but does NOT touch last_seen_at. Used by the
+/// /ping.php handler so we can wrap the bump in `bump_presence` once we've
+/// also parsed the body (and folded `has_reader` into the same UPDATE).
+async fn resolve_peer_for_ping(state: &AppState, headers: &HeaderMap) -> Result<i64, Response> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -346,25 +376,114 @@ async fn resolve_peer(state: &AppState, headers: &HeaderMap) -> Result<i64, Resp
         })
         .await
         .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    match peer_id {
-        Some(id) => {
-            // Best-effort: bump last_seen_at; failures don't block the request.
-            let id_for_update = id;
-            let db = state.db.clone();
-            tokio::spawn(async move {
-                let _ = db
-                    .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-                        c.execute(
-                            "UPDATE paired_devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            params![id_for_update],
-                        )?;
-                        Ok(())
-                    })
-                    .await;
-            });
-            Ok(id)
+    peer_id.ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Unauthorized"))
+}
+
+/// Best-effort presence bump, debounced to once per 5s per peer. Folds in
+/// `has_reader` when the satellite reports it, so the reader badge in the
+/// devices modal stays within ~10s of the truth (the satellite pings at 10s
+/// cadence). Failures are swallowed — presence is observability, not the
+/// critical path.
+async fn bump_presence(state: &AppState, peer_id: i64, has_reader: Option<bool>) {
+    {
+        let mut guard = state.last_bump.lock().await;
+        let now = Instant::now();
+        // If we don't have reader news AND we bumped recently, skip the write.
+        // A reader-status report always writes through so plug/unplug surfaces
+        // promptly even if the last bump was <5s ago.
+        if has_reader.is_none() {
+            if let Some(prev) = guard.get(&peer_id) {
+                if now.duration_since(*prev) < Duration::from_secs(5) {
+                    return;
+                }
+            }
         }
-        None => Err(error(StatusCode::UNAUTHORIZED, "Unauthorized")),
+        guard.insert(peer_id, now);
+    }
+
+    let db = state.db.clone();
+    let has_reader_i64: Option<i64> = has_reader.map(|b| if b { 1 } else { 0 });
+    tokio::spawn(async move {
+        let _ = db
+            .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE paired_devices
+                        SET last_seen_at = CURRENT_TIMESTAMP,
+                            has_reader = COALESCE(?1, has_reader),
+                            reader_last_seen_at = CASE
+                                WHEN ?1 = 1 THEN CURRENT_TIMESTAMP
+                                ELSE reader_last_seen_at
+                            END
+                      WHERE id = ?2",
+                    params![has_reader_i64, peer_id],
+                )?;
+                Ok(())
+            })
+            .await;
+    });
+}
+
+/// Drain (with delivery-stamp side-effect) the open commands queued for this
+/// peer, opportunistically pruning long-dead rows on the way in. Returns the
+/// payloads ready to be embedded in the /ping.php response; the satellite is
+/// expected to POST `ack_command` once it has acted on each.
+///
+/// TTLs: undelivered rows > 15min are dropped (the operator can re-issue);
+/// acked rows > 1h are dropped (kept briefly for at-least-once audit).
+async fn pickup_pending_commands(state: &AppState, peer_id: i64) -> Vec<Value> {
+    let result = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String, String)>> {
+            // Prune first so the SELECT doesn't surface stale work.
+            c.execute(
+                "DELETE FROM pending_commands
+                  WHERE (acked_at IS NOT NULL AND acked_at < datetime('now','-1 hour'))
+                     OR (acked_at IS NULL    AND created_at < datetime('now','-15 minutes'))",
+                [],
+            )?;
+
+            let mut stmt = c.prepare(
+                "SELECT id, kind, payload_json
+                   FROM pending_commands
+                  WHERE target_device_id = ?
+                    AND acked_at IS NULL
+                  ORDER BY id ASC
+                  LIMIT 32",
+            )?;
+            let rows: Vec<(i64, String, String)> = stmt
+                .query_map(params![peer_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            if !rows.is_empty() {
+                let placeholders = vec!["?"; rows.len()].join(",");
+                let sql = format!(
+                    "UPDATE pending_commands
+                        SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)
+                      WHERE id IN ({placeholders})"
+                );
+                let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+                c.execute(&sql, params_from_iter(ids.iter()))?;
+            }
+
+            Ok(rows)
+        })
+        .await;
+
+    match result {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, kind, payload_json)| {
+                let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+                json!({ "id": id, "kind": kind, "payload": payload })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -412,6 +531,11 @@ async fn dispatch_launched_games(
         ("POST", "delete_game") => delete_game(&state, body).await,
         ("POST", "register_device") => register_device(&state, peer_id, body).await,
         ("GET", "get_devices") => get_devices(&state, &q.rest).await,
+        ("GET", "list_paired_with_status") => list_paired_with_status(&state, &q.rest).await,
+        ("GET", "list_paired_for_launch") => list_paired_for_launch(&state).await,
+        ("POST", "queue_command") => queue_command(&state, peer_id, body).await,
+        ("POST", "queue_command_bulk") => queue_command_bulk(&state, peer_id, body).await,
+        ("POST", "ack_command") => ack_command(&state, peer_id, body).await,
         ("GET", "list_completed_quests") => list_completed_quests(&state, &q.rest).await,
         ("POST", "record_completed_quest") => record_completed_quest(&state, body).await,
         ("", _) | (_, "") => Err(ApiErr::bad("action is required")),
@@ -464,20 +588,46 @@ async fn dispatch_pair(
     }
 }
 
-// Lightweight health/identity check polled by the child's footer every 10s.
-// Authenticated with the peer's bearer secret so an unrecognized device gets
-// 401 (drives the child's RED state) instead of a misleading OK. Does NOT bump
-// paired_devices.last_seen_at — that would churn the row at the poll cadence.
+// Lightweight health/identity + push channel polled by the child's footer
+// every 10s. Authenticated with the peer's bearer secret so an unrecognized
+// device gets 401 (drives the child's RED state) instead of a misleading OK.
+//
+// Accepts both GET (legacy clients) and POST. POST body is optional and may
+// carry `{ has_reader: bool }` so the satellite reports whether a SportIdent
+// dongle is currently attached. The response always includes `mother_uuid`;
+// any pending join_game/play_video/stop_video commands queued for this peer
+// are returned in `commands: [...]` and the satellite is expected to POST
+// `ack_command` per id once it has acted.
 async fn dispatch_ping(
     State(state): State<AppState>,
     headers: HeaderMap,
+    request: Request<Body>,
 ) -> Response {
-    if let Err(resp) = verify_peer_secret(&state, &headers).await {
-        return resp;
-    }
-    json_ok(json!({ "mother_uuid": state.mother_uuid }))
+    let peer_id = match resolve_peer_for_ping(&state, &headers).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024)
+        .await
+        .unwrap_or_default();
+    let body: Value = if body_bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
+    };
+    let has_reader = body.get("has_reader").and_then(|v| v.as_bool());
+
+    bump_presence(&state, peer_id, has_reader).await;
+    let commands = pickup_pending_commands(&state, peer_id).await;
+
+    json_ok(json!({
+        "mother_uuid": state.mother_uuid,
+        "commands": commands,
+    }))
 }
 
+#[allow(dead_code)]
 async fn verify_peer_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let token = headers
         .get(header::AUTHORIZATION)
@@ -670,6 +820,13 @@ async fn create(state: &AppState, peer_id: i64, body: Value) -> Result<Value, Ap
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let client_id = state.client_id;
+    // `include_self` lets the launch-wizard skip the mother as a participating
+    // device — e.g. for a server-only mother that runs the game without
+    // having a screen scanning cards. Default true keeps legacy behaviour.
+    let include_self = body
+        .get("include_self")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let start_time = if started {
         Some(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string())
     } else {
@@ -757,13 +914,19 @@ async fn create(state: &AppState, peer_id: i64, body: Value) -> Result<Value, Ap
             }
 
             // Register the creating peer (the launching mother in slice B's
-            // single-device case) into launched_game_devices.
-            tx.execute(
-                "INSERT INTO lg_launched_game_devices
-                   (launched_game_id, device_id, connected) VALUES (?, ?, 1)",
-                params![launched_game_id, peer_id],
-            )?;
-            let device_row_id = Some(tx.last_insert_rowid());
+            // single-device case) into launched_game_devices. Skipped when the
+            // operator explicitly unchecked the mother on the launch wizard's
+            // device step — in that mode the mother just hosts the server.
+            let device_row_id = if include_self {
+                tx.execute(
+                    "INSERT INTO lg_launched_game_devices
+                       (launched_game_id, device_id, connected) VALUES (?, ?, 1)",
+                    params![launched_game_id, peer_id],
+                )?;
+                Some(tx.last_insert_rowid())
+            } else {
+                None
+            };
 
             tx.commit()?;
             Ok((launched_game_id, device_row_id, false))
@@ -1344,6 +1507,326 @@ async fn get_devices(
         })
         .await?;
     Ok(json!({ "devices": devices }))
+}
+
+// Three-bucket view of paired devices for the in-game Devices modal:
+// (A) currently in this launched_game, (B) paired & online & not in game,
+// (C) paired & offline & not in game. "Online" is `last_seen_at` within 25s.
+// Self is included in (A) when it's a participating device; otherwise the
+// caller can hide it. The modal sorts (C) by `last_seen_at` desc and labels
+// staleness — that's a client concern; we just return raw timestamps.
+async fn list_paired_with_status(
+    state: &AppState,
+    rest: &HashMap<String, String>,
+) -> Result<Value, ApiErr> {
+    let launched_game_id = parse_i64(rest, "launched_game_id")?;
+    require_game_owned(state, launched_game_id).await?;
+    let rows = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String, Option<String>, i64, Option<String>, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, i64)>> {
+            let mut stmt = c.prepare(
+                "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
+                        pd.last_seen_at, pd.has_reader, pd.reader_last_seen_at,
+                        lgd.id AS lgd_id, lgd.connected, lgd.last_connection_attempt,
+                        CASE WHEN pd.last_seen_at IS NOT NULL
+                               AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
+                             THEN 1 ELSE 0 END AS online
+                   FROM paired_devices pd
+                   LEFT JOIN lg_launched_game_devices lgd
+                     ON lgd.device_id = pd.id AND lgd.launched_game_id = ?
+                 ORDER BY pd.is_self DESC, online DESC, pd.last_seen_at DESC",
+            )?;
+            let rows = stmt.query_map(params![launched_game_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, i64>(10)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+
+    let mut in_game = Vec::new();
+    let mut available_online = Vec::new();
+    let mut offline = Vec::new();
+    for (
+        id,
+        peer_label,
+        peer_os,
+        is_self,
+        last_seen_at,
+        has_reader,
+        reader_last_seen_at,
+        lgd_id,
+        _connected,
+        _last_conn_attempt,
+        online,
+    ) in rows
+    {
+        let row = json!({
+            "id": id,
+            "device_label": peer_label,
+            "peer_os": peer_os,
+            "is_self": is_self == 1,
+            "has_reader": has_reader == 1,
+            "reader_last_seen_at": reader_last_seen_at,
+            "online": online == 1,
+            "last_seen_at": last_seen_at,
+            "lgd_id": lgd_id,
+        });
+        if lgd_id.is_some() {
+            in_game.push(row);
+        } else if online == 1 {
+            available_online.push(row);
+        } else {
+            offline.push(row);
+        }
+    }
+    Ok(json!({
+        "in_game": in_game,
+        "available_online": available_online,
+        "offline": offline,
+    }))
+}
+
+// Same shape as a single `list_paired_with_status` row, but without a launched
+// game to anchor against — used by the launch-wizard's step 3 to render the
+// device picker BEFORE the game has been created. `lgd_id` is always null.
+async fn list_paired_for_launch(state: &AppState) -> Result<Value, ApiErr> {
+    let rows = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+            let mut stmt = c.prepare(
+                "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
+                        pd.last_seen_at, pd.has_reader, pd.reader_last_seen_at,
+                        CASE WHEN pd.last_seen_at IS NOT NULL
+                               AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
+                             THEN 1 ELSE 0 END AS online
+                   FROM paired_devices pd
+                 ORDER BY pd.is_self DESC, online DESC, pd.last_seen_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "device_label": r.get::<_, String>(1)?,
+                    "peer_os": r.get::<_, Option<String>>(2)?,
+                    "is_self": r.get::<_, i64>(3)? == 1,
+                    "last_seen_at": r.get::<_, Option<String>>(4)?,
+                    "has_reader": r.get::<_, i64>(5)? == 1,
+                    "reader_last_seen_at": r.get::<_, Option<String>>(6)?,
+                    "online": r.get::<_, i64>(7)? == 1,
+                    "lgd_id": Value::Null,
+                }))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(json!({ "devices": rows }))
+}
+
+/// Mother-only push queue. Three command kinds today:
+/// - `join_game`     — payload `{launched_game_id}` — target satellite is
+///                     expected to register_device + navigate to GamePage.
+/// - `play_video`    — payload `{launched_game_id, kinds[], language}` — the
+///                     target plays the named videos (intro/tutorial) on top
+///                     of whatever it was showing; preempts any in-flight
+///                     `play_video` for the same (target, game).
+/// - `stop_video`    — payload `{}` — unmount any operator overlay.
+///
+/// Authorization: only the mother's self-peer may queue (`peer_id == self_peer_id`).
+/// Targets are validated per-kind: `play_video`/`stop_video` require the target
+/// to be currently in `lg_launched_game_devices` for the payload's game;
+/// `join_game` requires the target NOT to be in it (409 otherwise).
+async fn queue_command(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
+    if peer_id != state.self_peer_id {
+        return Err(ApiErr::status(
+            StatusCode::FORBIDDEN,
+            "Only the mother may queue commands",
+        ));
+    }
+    let target_device_id = json_i64(&body, "target_device_id")?;
+    let kind = json_str(&body, "kind")?.to_string();
+    let payload = body.get("payload").cloned().unwrap_or(Value::Null);
+    let id = queue_command_inner(state, target_device_id, &kind, payload).await?;
+    Ok(json!({ "command_id": id }))
+}
+
+/// Batch convenience used by the launch wizard (`join_game` for N satellites)
+/// and the in-game modal's video action bar (`play_video`/`stop_video` for N
+/// targets). Per-target failures are returned alongside successes so the
+/// caller can render partial-success UI without aborting the whole batch.
+async fn queue_command_bulk(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
+    if peer_id != state.self_peer_id {
+        return Err(ApiErr::status(
+            StatusCode::FORBIDDEN,
+            "Only the mother may queue commands",
+        ));
+    }
+    let kind = json_str(&body, "kind")?.to_string();
+    let payload = body.get("payload").cloned().unwrap_or(Value::Null);
+    let targets: Vec<i64> = body
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect())
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Err(ApiErr::bad("targets is required (non-empty array)"));
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    for target_device_id in targets {
+        match queue_command_inner(state, target_device_id, &kind, payload.clone()).await {
+            Ok(id) => results.push(json!({
+                "target_device_id": target_device_id,
+                "command_id": id,
+            })),
+            Err(e) => results.push(json!({
+                "target_device_id": target_device_id,
+                "error": e.message,
+                "status": e.status.as_u16(),
+            })),
+        }
+    }
+    Ok(json!({ "results": results }))
+}
+
+/// Validates the command and inserts it. Factored out so both `queue_command`
+/// and `queue_command_bulk` enforce identical semantics — including the
+/// `play_video` preempt rule that auto-acks a previous in-flight `play_video`
+/// for the same (target, game) before inserting the new one.
+async fn queue_command_inner(
+    state: &AppState,
+    target_device_id: i64,
+    kind: &str,
+    payload: Value,
+) -> Result<i64, ApiErr> {
+    if target_device_id == state.self_peer_id {
+        return Err(ApiErr::bad("Cannot queue a command targeting self"));
+    }
+    let launched_game_id = payload
+        .get("launched_game_id")
+        .and_then(|v| v.as_i64());
+    let kind_owned = kind.to_string();
+
+    // Per-kind validation.
+    match kind {
+        "join_game" => {
+            let gid = launched_game_id
+                .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
+            require_game_owned(state, gid).await?;
+            let already: Option<i64> = state
+                .db
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+                    Ok(c.query_row(
+                        "SELECT id FROM lg_launched_game_devices
+                          WHERE launched_game_id = ? AND device_id = ?",
+                        params![gid, target_device_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+                })
+                .await?;
+            if already.is_some() {
+                return Err(ApiErr::status(
+                    StatusCode::CONFLICT,
+                    "already_in_game",
+                ));
+            }
+        }
+        "play_video" | "stop_video" => {
+            let gid = launched_game_id
+                .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
+            require_game_owned(state, gid).await?;
+            let registered: Option<i64> = state
+                .db
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+                    Ok(c.query_row(
+                        "SELECT id FROM lg_launched_game_devices
+                          WHERE launched_game_id = ? AND device_id = ?",
+                        params![gid, target_device_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+                })
+                .await?;
+            if registered.is_none() {
+                return Err(ApiErr::status(
+                    StatusCode::CONFLICT,
+                    "target_not_in_game",
+                ));
+            }
+        }
+        _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
+    }
+
+    let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    let kind_for_insert = kind_owned.clone();
+    let preempt_gid = if kind == "play_video" {
+        launched_game_id
+    } else {
+        None
+    };
+
+    let new_id = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
+            // Preempt: when queuing a play_video, ack any prior unacked
+            // play_video for the same (target, game) so only the newest
+            // command reaches the satellite. We match on JSON substring of
+            // launched_game_id — payloads we emit are normalized.
+            if let Some(gid) = preempt_gid {
+                let needle = format!("\"launched_game_id\":{gid}");
+                let alt_needle = format!("\"launched_game_id\": {gid}");
+                c.execute(
+                    "UPDATE pending_commands
+                        SET acked_at = CURRENT_TIMESTAMP
+                      WHERE target_device_id = ?
+                        AND kind = 'play_video'
+                        AND acked_at IS NULL
+                        AND (payload_json LIKE '%' || ?1 || '%'
+                             OR payload_json LIKE '%' || ?2 || '%')",
+                    params![target_device_id, needle, alt_needle],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO pending_commands (target_device_id, kind, payload_json)
+                 VALUES (?, ?, ?)",
+                params![target_device_id, kind_for_insert, payload_str],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await?;
+    Ok(new_id)
+}
+
+/// Satellite-side confirmation that a command was acted upon. Only the target
+/// device may ack its own command. Idempotent: re-acking is a no-op.
+async fn ack_command(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
+    let command_id = json_i64(&body, "command_id")?;
+    let updated = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<usize> {
+            Ok(c.execute(
+                "UPDATE pending_commands
+                    SET acked_at = CURRENT_TIMESTAMP
+                  WHERE id = ? AND target_device_id = ?",
+                params![command_id, peer_id],
+            )?)
+        })
+        .await?;
+    if updated == 0 {
+        return Err(ApiErr::not_found("Command not found or not owned by caller"));
+    }
+    Ok(json!({ "ok": true }))
 }
 
 async fn list_completed_quests(
@@ -2115,10 +2598,18 @@ pub enum PingErr {
 
 // Ping a single paired mother by uuid. The renderer's footer hook iterates
 // paired_mothers (last_seen_at DESC) and stops on the first Ok(()).
+//
+// Now also: (1) reports the satellite's reader-attached state to the mother,
+// piggybacked in the POST body, so the mother's devices modal shows a fresh
+// reader badge per peer; (2) drains any pending commands the mother has
+// queued for this peer (join_game, play_video, stop_video), emits each as a
+// Tauri event `taghunter://lan-command`, and best-effort acks them so the
+// mother's modal stops spinning the corresponding row.
 #[tauri::command]
 pub async fn client_ping_mother(
     app: AppHandle,
     cache: tauri::State<'_, MotherEndpointCache>,
+    reader_presence: tauri::State<'_, ReaderPresence>,
     mother_uuid: String,
 ) -> Result<(), PingErr> {
     let secret: Option<String> = {
@@ -2149,16 +2640,19 @@ pub async fn client_ping_mother(
         return Err(PingErr::NotCached);
     };
 
+    let has_reader = *reader_presence.inner.lock().await;
+
     let url = format!("http://{addr}/ping.php");
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
         .connect_timeout(Duration::from_millis(700))
         .build()
         .map_err(|e| PingErr::Network { message: e.to_string() })?;
 
     let resp = client
-        .get(&url)
+        .post(&url)
         .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .json(&serde_json::json!({ "has_reader": has_reader }))
         .send()
         .await
         .map_err(|e| PingErr::Network { message: e.to_string() })?;
@@ -2188,6 +2682,51 @@ pub async fn client_ping_mother(
         guard.remove(&mother_uuid);
         return Err(PingErr::WrongUuid { got });
     }
+
+    // Drain & dispatch pending commands. We emit before acking so a crash
+    // mid-emit doesn't lose the work (the mother's 15-min TTL will re-issue).
+    if let Some(commands) = body.get("commands").and_then(|v| v.as_array()) {
+        use tauri::Emitter;
+        for cmd in commands {
+            let _ = app.emit("taghunter://lan-command", cmd.clone());
+            if let Some(id) = cmd.get("id").and_then(|v| v.as_i64()) {
+                let ack_addr = addr;
+                let ack_secret = secret.clone();
+                tokio::spawn(async move {
+                    let ack_client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(2))
+                        .connect_timeout(Duration::from_millis(700))
+                        .build();
+                    if let Ok(ack_client) = ack_client {
+                        let ack_url = format!(
+                            "http://{ack_addr}/launched_games.php?action=ack_command"
+                        );
+                        let _ = ack_client
+                            .post(&ack_url)
+                            .header(header::AUTHORIZATION, format!("Bearer {ack_secret}"))
+                            .json(&serde_json::json!({ "command_id": id }))
+                            .send()
+                            .await;
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Renderer-driven setter: the JS-side `sportidentService` poll in the Footer
+/// reports whether a SI dongle is currently attached. We cache the boolean
+/// in-process and let `client_ping_mother` ship it on the next ping. The
+/// mother stores it on `paired_devices.has_reader` so its devices modal can
+/// render a reader badge per peer without per-poll DB writes.
+#[tauri::command]
+pub async fn client_set_reader_presence(
+    presence: tauri::State<'_, ReaderPresence>,
+    has_reader: bool,
+) -> Result<(), String> {
+    let mut guard = presence.inner.lock().await;
+    *guard = has_reader;
     Ok(())
 }
 

@@ -38,7 +38,8 @@
     ],
     "category": "Game",
     "shortDescription": "Tag Hunter game scenario player",
-    "longDescription": "Browse, download and run Tag Hunter game scenarios. Connects to studio.taghunter.fr for content sync."
+    "longDescription": "Browse, download and run Tag Hunter game scenarios. Connects to studio.taghunter.fr for content sync.",
+    "resources": ["resources/silabser-drivers/**/*"]
   },
   "plugins": {
     "updater": {

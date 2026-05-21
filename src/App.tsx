@@ -16,6 +16,9 @@ import { ConfigurationPage, type SettingsTab } from './components/ConfigurationP
 import { AdminPasswordModal } from './components/AdminPasswordModal';
 import { AdminConfigPage } from './components/AdminConfigPage';
 import { LaunchedGamesList } from './components/LaunchedGamesList';
+import { OperatorVideoOverlay } from './components/OperatorVideoOverlay';
+import { listen } from '@tauri-apps/api/event';
+import { emitPendingJoin } from './services/pendingJoinStore';
 import ClientCardsPage from './components/ClientCardsPage';
 import { DatabaseInspector } from './components/DatabaseInspector';
 import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
@@ -76,6 +79,35 @@ function App() {
     setCurrentPage('settings');
     setPendingSettingsTab('updates');
   };
+
+  // Listen for mother-issued LAN commands relayed by `client_ping_mother`.
+  // join_game lands here at the App level because it controls navigation;
+  // play_video / stop_video are handled by <OperatorVideoOverlay> directly.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFn: (() => void) | null = null;
+    void (async () => {
+      const unlisten = await listen<{
+        id: number;
+        kind: 'join_game' | 'play_video' | 'stop_video';
+        payload: { launched_game_id?: number };
+      }>('taghunter://lan-command', (event) => {
+        if (cancelled) return;
+        const cmd = event.payload;
+        if (cmd.kind !== 'join_game') return;
+        const gid = cmd.payload.launched_game_id;
+        if (typeof gid !== 'number') return;
+        setCurrentPage('launched');
+        emitPendingJoin(gid);
+      });
+      if (cancelled) unlisten();
+      else unlistenFn = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
 
   // Single entry point for "take me to the sync screen" — invoked by both
   // SyncStatusPill (bottom-right) and SyncFailureBanner (top). Setting the
@@ -424,6 +456,7 @@ function App() {
 
       <SyncStatusPill onNavigate={navigateToSync} />
       <Footer />
+      <OperatorVideoOverlay />
     </div>
   );
 }

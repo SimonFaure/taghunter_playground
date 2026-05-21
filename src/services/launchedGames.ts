@@ -89,6 +89,11 @@ export interface CreateLaunchedGameInput {
   // create a duplicate row. Callers that don't pass one get a fresh UUID per
   // call, which only helps if the entire call (incl. all retries) shares it.
   idempotency_key?: string;
+  // When false, the mother (the calling peer) is NOT auto-inserted into
+  // lg_launched_game_devices. Lets the operator launch a game where the
+  // mother just hosts the server but doesn't participate as a scanning
+  // station. Default true.
+  include_self?: boolean;
 }
 
 // ---------- public API ----------
@@ -272,6 +277,105 @@ export async function getLaunchedGameDevices(id: number): Promise<LaunchedGameDe
     })
   );
   return res.devices;
+}
+
+// ---------- bucketed devices view + push-channel APIs ----------
+
+// One row in the three-bucket Devices modal AND the launch wizard's step 3.
+// Both surfaces share the shape so the modal can reuse the same row-renderer.
+export interface PairedDeviceStatusRow {
+  id: number; // paired_devices.id, used as device_id everywhere
+  device_label: string;
+  peer_os: string | null;
+  is_self: boolean;
+  has_reader: boolean;
+  reader_last_seen_at: string | null;
+  online: boolean;
+  last_seen_at: string | null;
+  // Non-null when the device is currently in the launched_game we asked
+  // about; null in the launch-wizard's pre-create view.
+  lgd_id: number | null;
+}
+
+export interface ListPairedWithStatusResp {
+  in_game: PairedDeviceStatusRow[];
+  available_online: PairedDeviceStatusRow[];
+  offline: PairedDeviceStatusRow[];
+}
+
+export async function listPairedWithStatus(
+  launchedGameId: number
+): Promise<ListPairedWithStatusResp> {
+  return withRetry(() =>
+    apiCall<ListPairedWithStatusResp>('launched_games', 'list_paired_with_status', {
+      method: 'GET',
+      bearer: true,
+      query: { launched_game_id: launchedGameId },
+    })
+  );
+}
+
+export async function listPairedDevicesForLaunch(): Promise<PairedDeviceStatusRow[]> {
+  const res = await withRetry(() =>
+    apiCall<{ devices: PairedDeviceStatusRow[] }>(
+      'launched_games',
+      'list_paired_for_launch',
+      { method: 'GET', bearer: true }
+    )
+  );
+  return res.devices;
+}
+
+export interface QueueCommandResult {
+  target_device_id: number;
+  command_id?: number;
+  error?: string;
+  status?: number;
+}
+
+export interface QueueCommandBulkResp {
+  results: QueueCommandResult[];
+}
+
+async function queueCommandBulk(
+  targets: number[],
+  kind: 'join_game' | 'play_video' | 'stop_video',
+  payload: Record<string, unknown>
+): Promise<QueueCommandBulkResp> {
+  return withRetry(() =>
+    apiCall<QueueCommandBulkResp>('launched_games', 'queue_command_bulk', {
+      method: 'POST',
+      bearer: true,
+      body: { targets, kind, payload },
+    })
+  );
+}
+
+export async function queueJoinGameCommandBulk(
+  targets: number[],
+  launchedGameId: number
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'join_game', { launched_game_id: launchedGameId });
+}
+
+export async function queuePlayVideoBulk(
+  targets: number[],
+  launchedGameId: number,
+  kinds: Array<'intro' | 'tutorial'>,
+  language: string
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'play_video', {
+    launched_game_id: launchedGameId,
+    kinds,
+    language,
+  });
+}
+
+export async function queueStopVideoBulk(
+  targets: number[],
+  launchedGameId: number
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'stop_video', { launched_game_id: launchedGameId });
 }
 
 // ---------- team_completed_quests (tagquest scoring) ----------

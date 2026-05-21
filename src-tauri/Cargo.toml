@@ -46,6 +46,15 @@ windows = { version = "0.58", features = [
     "Foundation_Collections",
     "Networking_Connectivity",
     "Networking_NetworkOperators",
+    # cp210x_driver: SetupDi* device enumeration + ShellExecuteExW UAC-elevated
+    # pnputil for the SportIdent reader driver install flow.
+    # ShellExecuteExW lives under Win32_UI_Shell, not Win32_System_ShellAPI
+    # (the latter is not a windows-rs feature flag).
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell",
 ] }
 
 # Desktop-only: app self-update + OS autostart. The Tauri updater cannot

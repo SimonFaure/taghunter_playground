@@ -15,8 +15,10 @@ import {
   updateTeam,
   addTeamToLaunchedGame,
   listCompletedQuests,
-  getLaunchedGameDevices,
+  registerDeviceForGame,
 } from '../services/launchedGames';
+import { GameDevicesModal } from './GameDevicesModal';
+import { onPendingJoin } from '../services/pendingJoinStore';
 import { ApiError } from '../services/api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
@@ -60,13 +62,6 @@ interface Team {
   currentLevel?: { level: number; name: string } | null;
 }
 
-interface Device {
-  id: number;
-  device_id: string;
-  connected: boolean;
-  last_connexion_attempt: string;
-}
-
 export function LaunchedGamesList() {
   const { user } = useAuth();
   const [games, setGames] = useState<LaunchedGame[]>([]);
@@ -89,7 +84,6 @@ export function LaunchedGamesList() {
   const [teamSortBy, setTeamSortBy] = useState<'ranking' | 'name'>('ranking');
   const [minimizedTeams, setMinimizedTeams] = useState<Set<number>>(new Set());
   const [showDevices, setShowDevices] = useState<number | null>(null);
-  const [devices, setDevices] = useState<Device[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -613,23 +607,10 @@ export function LaunchedGamesList() {
     setShowRankings(gameId);
   };
 
-  const handleShowDevices = async (gameId: number) => {
-    try {
-      const rows = await getLaunchedGameDevices(gameId);
-      // The Device type expected by this component uses string device_id +
-      // last_connexion_attempt; the new server returns int device_id +
-      // last_connection_attempt. Map for compatibility.
-      const mapped: Device[] = rows.map((r) => ({
-        id: r.id,
-        device_id: r.device_label ?? `device-${r.device_id}`,
-        connected: Boolean(r.connected),
-        last_connexion_attempt: r.last_connection_attempt,
-      }));
-      setDevices(mapped);
-      setShowDevices(gameId);
-    } catch (err) {
-      console.error('Error loading devices:', err);
-    }
+  const handleShowDevices = (gameId: number) => {
+    // The shared <GameDevicesModal> handles its own fetch + 2s polling. We
+    // just open it pointed at the right launched_game.
+    setShowDevices(gameId);
   };
 
   const handlePlayGame = async (game: LaunchedGame) => {
@@ -658,6 +639,55 @@ export function LaunchedGamesList() {
 
     setPlayingGame({ config, uniqid: game.game_uniqid, launchedGameId: game.id });
   };
+
+  // Drive into a launched game by id alone — used by the mother → satellite
+  // join_game push. Looks the game up in the cached list (refetching if not
+  // present), registers the satellite with the mother, then mounts GamePage.
+  const playGameById = async (launchedGameId: number) => {
+    let game = games.find(g => g.id === launchedGameId);
+    if (!game) {
+      // The active list may be stale (e.g. mother created the game seconds ago).
+      try {
+        const fresh = await listLaunchedGames({ ended: false });
+        // Normalize to the local LaunchedGame shape (boolean ended, defaulted
+        // number_of_teams) — same as the initial loadGames() path.
+        const normalized: LaunchedGame[] = fresh.map((g) => ({
+          id: g.id,
+          game_uniqid: g.game_uniqid,
+          name: g.name,
+          number_of_teams: g.number_of_teams ?? 0,
+          game_type: g.game_type,
+          ended: Boolean(g.ended),
+          created_at: g.created_at ?? '',
+        }));
+        setGames(normalized);
+        game = normalized.find(g => g.id === launchedGameId);
+      } catch (err) {
+        console.error('[LaunchedGamesList] playGameById refresh failed:', err);
+        return;
+      }
+    }
+    if (!game) {
+      console.warn('[LaunchedGamesList] playGameById: launched_game not found', launchedGameId);
+      return;
+    }
+    // Register the satellite as a participating device BEFORE entering
+    // GamePage, so the mother's modal sees the row migrate B → A on its
+    // next 2s poll without waiting for the satellite to take any action.
+    try {
+      await registerDeviceForGame(launchedGameId);
+    } catch (err) {
+      console.warn('[LaunchedGamesList] registerDeviceForGame failed:', err);
+    }
+    await handlePlayGame(game);
+  };
+
+  useEffect(() => {
+    return onPendingJoin((launchedGameId) => {
+      void playGameById(launchedGameId);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [games]);
 
   const getFilteredAndSortedTeams = () => {
     let filtered = teams;
@@ -1317,59 +1347,12 @@ export function LaunchedGamesList() {
       )}
 
       {showDevices !== null && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowDevices(null)}>
-          <div className="bg-slate-800 border-2 border-slate-700 rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-2xl font-bold text-white flex items-center gap-2">
-                <Monitor size={24} className="text-purple-500" />
-                Game Devices
-              </h3>
-              <button
-                onClick={() => setShowDevices(null)}
-                className="text-slate-400 hover:text-white transition"
-                title="Close"
-              >
-                ✕
-              </button>
-            </div>
-
-            {devices.length === 0 ? (
-              <p className="text-slate-400 text-center py-8">No devices have connected to this game yet.</p>
-            ) : (
-              <div className="space-y-3">
-                {devices.map((device) => (
-                  <div
-                    key={device.id}
-                    className="p-4 rounded-lg border-2 bg-slate-800 border-slate-700"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Monitor size={20} className={device.connected ? 'text-green-500' : 'text-slate-500'} />
-                        <div>
-                          <div className="text-white font-semibold text-lg">
-                            {device.device_id}
-                          </div>
-                          <p className="text-sm text-slate-400">
-                            Last attempt: {formatDate(device.last_connexion_attempt)}
-                          </p>
-                        </div>
-                      </div>
-                      <div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                          device.connected
-                            ? 'bg-green-900/30 text-green-400 border border-green-700'
-                            : 'bg-slate-700 text-slate-300 border border-slate-600'
-                        }`}>
-                          {device.connected ? 'Connected' : 'Disconnected'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+        <GameDevicesModal
+          launchedGameId={showDevices}
+          gameLanguage="fr"
+          isMother={true}
+          onClose={() => setShowDevices(null)}
+        />
       )}
 
       {showRankings !== null && (

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Clock, Search, Play, Trash2, LogIn, Eye } from 'lucide-react';
 import { Alert } from './Alert';
 import { ConfirmDialog } from './ConfirmDialog';
-import { LaunchGameModal, GameConfig } from './LaunchGameModal';
+import { LaunchGameModal, GameConfig, LaunchDeviceSelection } from './LaunchGameModal';
 import { GamePage } from './GamePage';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
 import { ScenarioDetailsModal } from './ScenarioDetailsModal';
@@ -15,6 +15,7 @@ import {
   createLaunchedGame,
   listActiveLaunchedGames,
   getLaunchedGameMeta,
+  queueJoinGameCommandBulk,
 } from '../services/launchedGames';
 import gamesData from '../../data/games.json';
 
@@ -278,7 +279,10 @@ export function GameList() {
     setLaunchModalOpen(true);
   };
 
-  const handleGameLaunch = async (config: GameConfig) => {
+  const handleGameLaunch = async (
+    config: GameConfig,
+    deviceSelection: LaunchDeviceSelection
+  ) => {
     let launchedGameId: number | null = null;
 
     if (selectedGame) {
@@ -320,8 +324,20 @@ export function GameList() {
           started: false,
           meta,
           teams: teamRows,
+          include_self: deviceSelection.include_self,
         });
         launchedGameId = res.id;
+        // Fan out join_game to every pre-selected satellite. Server validates
+        // each target individually; we don't await/inspect per-target results
+        // here because the in-game Devices modal surfaces them anyway as the
+        // rows migrate from bucket B → bucket A on the next 2s poll.
+        if (deviceSelection.satellite_targets.length > 0 && launchedGameId !== null) {
+          try {
+            await queueJoinGameCommandBulk(deviceSelection.satellite_targets, launchedGameId);
+          } catch (err) {
+            console.error('[GameList] queueJoinGameCommandBulk failed:', err);
+          }
+        }
       } catch (error) {
         console.error('Error creating launched game:', error);
       }

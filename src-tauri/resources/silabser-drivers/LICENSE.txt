@@ -1,0 +1,56 @@
+SportIdent reader driver bundle — placeholder
+==============================================
+
+This folder is BUNDLED INSIDE THE PLAYGROUND APP at build time (see
+src-tauri/tauri.conf.json "bundle.resources"). At runtime the elevated
+install command points pnputil at silabser.inf inside this folder.
+
+The driver files themselves are NOT committed to source control:
+
+    silabser.inf
+    silabser.sys
+    silabser.cat
+    arm64/
+    x64/
+    x86/
+
+To prepare the bundle, do this ONCE per release (or whenever Silicon Labs
+ships a new build, or Microsoft's Vulnerable Driver Blocklist bumps to
+cover the currently-bundled version):
+
+1. Go to silabs.com → search "CP210x VCP Drivers".
+2. Download the CP210x **Universal Windows Driver** package — NOT the
+   "Windows 7/8/10" legacy package. The version inside silabser.inf must
+   be 10.x or 11.x; the legacy 6.7.x build is the one Microsoft's
+   blocklist refuses.
+3. Unzip the package directly into this folder so silabser.inf sits next
+   to this LICENSE.txt.
+4. Below, record the package version + acquisition date + the
+   redistribution clause from the Silicon Labs Software License Agreement
+   that ships inside the zip.
+
+Why we bundle: the SportIdent USB driver page distributes the legacy
+6.7.x build, which Windows 11 (24H2/25H2) refuses to load with Code 39
+"application control policy blocked this file". The Universal driver is
+the post-CVE signed build that passes the policy. Operators in the field
+shouldn't have to navigate silabs.com's download maze; the playground
+installs the known-good build with one click + UAC.
+
+------------------------------------------------------------------------
+Bundle provenance (fill in when refreshing):
+------------------------------------------------------------------------
+
+  Package:            CP210x Universal Windows Driver
+  Version (.inf):     <fill in, e.g. 11.5.0.417>
+  Driver Date:        <fill in, e.g. 2025-12-10>
+  Downloaded from:    https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers
+  Downloaded on:      <fill in YYYY-MM-DD>
+  Verified by:        <name>
+
+------------------------------------------------------------------------
+Silicon Labs Software License Agreement — redistribution clause:
+------------------------------------------------------------------------
+
+  <paste the relevant excerpt from the EULA that ships inside the
+   Universal driver zip. Verify it permits OEM/integrator redistribution
+   alongside the playground installer.>

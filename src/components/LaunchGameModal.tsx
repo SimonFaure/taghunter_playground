@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, ChevronRight, ChevronLeft } from 'lucide-react';
+import { X, ChevronRight, ChevronLeft, Usb } from 'lucide-react';
 import type { SiPuce } from '../types/database';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -7,8 +7,20 @@ import * as patternStore from '../services/patternStore';
 import * as scenarioStore from '../services/scenarioStore';
 import * as gameTypesStore from '../services/gameTypesStore';
 import * as clientPreferencesStore from '../services/clientPreferencesStore';
-import { listActiveLaunchedGames, getLaunchedGameState } from '../services/launchedGames';
+import {
+  listActiveLaunchedGames,
+  getLaunchedGameState,
+  listPairedDevicesForLaunch,
+  type PairedDeviceStatusRow,
+} from '../services/launchedGames';
 import { useAuth } from './auth/AuthProvider';
+
+export interface LaunchDeviceSelection {
+  /** Whether to register the mother itself as a participating device. */
+  include_self: boolean;
+  /** paired_devices.id of every non-self peer to send a join_game command to. */
+  satellite_targets: number[];
+}
 
 const LANG_NAMES: Record<string, string> = {
   en: 'English', fr: 'Français', es: 'Español', de: 'Deutsch', it: 'Italiano',
@@ -82,7 +94,7 @@ interface LaunchGameModalProps {
   gameTitle: string;
   gameUniqid: string;
   gameTypeName: string;
-  onLaunch: (config: GameConfig) => void;
+  onLaunch: (config: GameConfig, deviceSelection: LaunchDeviceSelection) => void;
 }
 
 export type TagquestVisibilityMode = 'persist' | 'hide_after_delay';
@@ -158,7 +170,14 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
   });
   const [patternFolders, setPatternFolders] = useState<PatternOption[]>([]);
   const [defaultPattern, setDefaultPattern] = useState<string>('');
-  const [step, setStep] = useState<1 | 2>(1);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  // Step-3 state — the paired-device picker. Loaded lazily when the user
+  // advances to step 3; reset on modal close so a fresh open doesn't show
+  // stale online indicators.
+  const [pairedDevices, setPairedDevices] = useState<PairedDeviceStatusRow[]>([]);
+  const [pairedLoading, setPairedLoading] = useState(false);
+  const [selectedDeviceIds, setSelectedDeviceIds] = useState<Set<number>>(new Set());
+  const [motherChecked, setMotherChecked] = useState(true);
   const [scenarioLanguages, setScenarioLanguages] = useState<string[]>([]);
   const [scenarioDefaultLang, setScenarioDefaultLang] = useState<string>('en');
   const [gameTypeRow, setGameTypeRow] = useState<gameTypesStore.GameTypeRow | null>(null);
@@ -262,6 +281,9 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       });
       setStep(1);
       setTeams([]);
+      setPairedDevices([]);
+      setSelectedDeviceIds(new Set());
+      setMotherChecked(true);
     }
   }, [isOpen, defaultPattern, scenarioDefaultLang, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault]);
 
@@ -472,6 +494,29 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       return;
     }
 
+    if (step === 2) {
+      // Advance to the device picker. Lazy-fetch the paired list and
+      // pre-check the mother + every currently-online satellite. Offline
+      // peers are visible but unchecked — the operator can opt to queue a
+      // join_game command that will wake them up when they reconnect
+      // (15-minute TTL on the pending_commands row).
+      setStep(3);
+      setPairedLoading(true);
+      try {
+        const rows = await listPairedDevicesForLaunch();
+        setPairedDevices(rows);
+        setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online).map(r => r.id)));
+        setMotherChecked(true);
+      } catch (err) {
+        console.error('[LaunchGameModal] failed to load paired devices:', err);
+        setPairedDevices([]);
+      } finally {
+        setPairedLoading(false);
+      }
+      return;
+    }
+
+    // step === 3: actually launch.
     // Reader-not-detected is no longer a launch gate. The game pages
     // surface a banner if the dongle is missing and auto-bind via the
     // 'reader:status' event once it's plugged in.
@@ -480,8 +525,11 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       name: config.name.trim() || getDefaultName(),
       teams,
     };
-
-    onLaunch(finalConfig);
+    const satellite_targets = Array.from(selectedDeviceIds);
+    onLaunch(finalConfig, {
+      include_self: motherChecked,
+      satellite_targets,
+    });
   };
 
   if (!isOpen) return null;
@@ -1111,9 +1159,148 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
                   </button>
                   <button
                     type="submit"
-                    className="px-6 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition font-medium"
+                    className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium flex items-center gap-2"
                   >
-                    Launch Game
+                    Next
+                    <ChevronRight size={20} />
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <div>
+                <h3 className="text-lg font-semibold text-white mb-1">
+                  Devices to launch on
+                </h3>
+                <p className="text-sm text-slate-400 mb-4">
+                  Pick which paired devices should run this game. Online devices
+                  join within ~10s; offline devices receive the launch when they
+                  reconnect (within 15 minutes).
+                </p>
+                {pairedLoading ? (
+                  <p className="text-slate-400 text-sm">Loading paired devices…</p>
+                ) : (
+                  <div className="space-y-2">
+                    {/* Mother row — always rendered, defaults checked, but
+                        unchecking is allowed so the operator can launch a
+                        "server-only" mother that doesn't participate. */}
+                    <label className="flex items-center gap-3 p-3 bg-slate-800 border border-slate-700 rounded-lg cursor-pointer hover:bg-slate-700/50">
+                      <input
+                        type="checkbox"
+                        checked={motherChecked}
+                        onChange={(e) => setMotherChecked(e.target.checked)}
+                        className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="flex-1 text-white font-medium">
+                        This device <span className="text-xs text-slate-500">(mother)</span>
+                      </span>
+                      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-400">
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                        online
+                      </span>
+                      {!motherChecked && (
+                        <span className="text-xs text-amber-400 italic">
+                          will host the game without participating
+                        </span>
+                      )}
+                    </label>
+
+                    {/* Paired (non-self) devices */}
+                    {pairedDevices.filter(d => !d.is_self).length === 0 ? (
+                      <p className="text-sm text-slate-500 italic px-1 mt-2">
+                        No other paired devices.
+                      </p>
+                    ) : (
+                      pairedDevices
+                        .filter(d => !d.is_self)
+                        .map(device => {
+                          const checked = selectedDeviceIds.has(device.id);
+                          return (
+                            <label
+                              key={device.id}
+                              className={`flex items-center gap-3 p-3 bg-slate-800 border rounded-lg cursor-pointer hover:bg-slate-700/50 ${
+                                device.online ? 'border-slate-700' : 'border-slate-700/50 opacity-70'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  setSelectedDeviceIds(prev => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(device.id);
+                                    else next.delete(device.id);
+                                    return next;
+                                  });
+                                }}
+                                className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="text-white font-medium truncate">
+                                  {device.device_label}
+                                </div>
+                                {device.peer_os && (
+                                  <div className="text-xs text-slate-500 truncate">{device.peer_os}</div>
+                                )}
+                              </div>
+                              <span
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${
+                                  device.has_reader
+                                    ? 'bg-green-500/10 text-green-400'
+                                    : 'bg-slate-700/50 text-slate-500'
+                                }`}
+                              >
+                                <Usb size={12} />
+                                {device.has_reader ? 'reader' : 'no reader'}
+                              </span>
+                              <span
+                                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs ${
+                                  device.online
+                                    ? 'bg-green-500/10 text-green-400'
+                                    : 'bg-slate-700/50 text-slate-500'
+                                }`}
+                              >
+                                <span
+                                  className={`w-1.5 h-1.5 rounded-full ${
+                                    device.online ? 'bg-green-500' : 'bg-slate-500'
+                                  }`}
+                                />
+                                {device.online ? 'online' : 'offline'}
+                              </span>
+                            </label>
+                          );
+                        })
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-700">
+                <button
+                  type="button"
+                  onClick={() => setStep(2)}
+                  className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium flex items-center gap-2"
+                >
+                  <ChevronLeft size={20} />
+                  Back
+                </button>
+                <div className="flex items-center gap-4">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!motherChecked && selectedDeviceIds.size === 0}
+                    className="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg transition font-medium"
+                  >
+                    Launch on {(motherChecked ? 1 : 0) + selectedDeviceIds.size} device{(motherChecked ? 1 : 0) + selectedDeviceIds.size === 1 ? '' : 's'}
                   </button>
                 </div>
               </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Usb, Wifi } from 'lucide-react';
 import { platform } from '@tauri-apps/plugin-os';
+import { invoke } from '@tauri-apps/api/core';
 import { isReaderConnected } from '../services/sportidentService';
 import { getDeviceMetadata, type DeviceMetadata } from '../services/device';
 import {
@@ -49,6 +50,11 @@ export function Footer() {
       if (cancelled) return;
       const next: ReaderState = ok ? 'ok' : 'bad';
       setReaderState(next);
+      // Push the same boolean into the Rust-side ReaderPresence so the next
+      // /ping.php tick reports it to the mother. The mother surfaces it as a
+      // per-row reader badge in the Devices modal so the operator can pick
+      // a launch target without physical inspection.
+      void invoke('client_set_reader_presence', { hasReader: ok }).catch(() => {});
       // Emit a global event whenever the polled reader status flips. The
       // game pages + ConfigurationPage + LaunchGameModal subscribe via
       // useDetectedReaderPort() and re-run their VID/PID detection so

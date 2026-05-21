@@ -17,8 +17,10 @@ import {
   Trash2,
   Activity,
   AlertCircle,
+  AlertTriangle,
   Download,
   Upload,
+  HardDriveDownload,
   Image as ImageIcon,
 } from 'lucide-react';
 import { enable as enableAutostart, disable as disableAutostart } from '@tauri-apps/plugin-autostart';
@@ -28,6 +30,7 @@ import {
   type StationData,
 } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
+import { useDriverState } from '../services/useDriverState';
 import { loadConfig, saveConfig, AppConfig } from '../utils/config';
 import {
   extForFile,
@@ -529,7 +532,16 @@ interface CardWithReceivedAt {
 // available ports by VID 10c4 / PID 800a and takes the first match.
 function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
   const { port, detail, isPresent, refresh } = useDetectedReaderPort();
+  const { state: driverState, recheck: recheckDriver } = useDriverState();
   const available = sportidentService.isAvailable();
+
+  // The Refresh button refreshes both the port enumeration AND the driver-
+  // state probe so a fresh plug or driver swap reflects immediately, not on
+  // the next Footer poll tick.
+  const refreshAll = () => {
+    refresh();
+    recheckDriver();
+  };
 
   return (
     <Section
@@ -537,7 +549,7 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
       title="Reader"
       headerExtra={
         <button
-          onClick={refresh}
+          onClick={refreshAll}
           disabled={!available}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
         >
@@ -561,6 +573,44 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
           </div>
           <div className="text-xs text-slate-500 mt-1 ml-7">
             Detected by USB VID/PID. The app auto-binds at game start.
+          </div>
+        </div>
+      ) : driverState.kind === 'blocked_by_policy' ? (
+        // SetupDi saw a CP210x device with CM problem code 39/40 — the
+        // Vulnerable Driver Blocklist or HVCI refused silabser.sys. The
+        // hardware is plugged in; the driver just isn't loading.
+        <div className="rounded-lg border-2 border-red-500/50 bg-red-500/10 px-4 py-3">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="text-red-400 flex-shrink-0 mt-0.5" size={18} />
+            <div className="flex-1 min-w-0">
+              <div className="text-red-300 font-medium">
+                We see a SportIdent reader, but Windows blocked its driver
+              </div>
+              <div className="text-xs text-slate-400 mt-1">
+                The Vulnerable Driver Blocklist is refusing the legacy
+                silabser.sys. Install the signed Universal driver to fix
+                it — no Memory Integrity change needed.
+              </div>
+              <div className="mt-2 flex items-center gap-3 flex-wrap">
+                <button
+                  disabled
+                  title="Coming in the next build"
+                  className="inline-flex items-center gap-2 px-3 py-1.5 bg-red-600/60 rounded font-medium text-white text-sm opacity-60 cursor-not-allowed"
+                >
+                  <HardDriveDownload size={14} />
+                  Install signed driver
+                  <span className="text-xs uppercase tracking-wider opacity-80">
+                    (coming soon)
+                  </span>
+                </button>
+                <button
+                  onClick={onOpenUsbDriver}
+                  className="inline-flex items-center gap-1.5 text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2"
+                >
+                  Learn more
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : (

@@ -9,6 +9,7 @@
 
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod cp210x_driver;
 mod hotspot;
 mod lan_server;
 mod scenario_protocol;
@@ -43,6 +44,7 @@ pub fn run() {
         })
         .manage(lan_server::MotherServerState::default())
         .manage(lan_server::MotherEndpointCache::default())
+        .manage(lan_server::ReaderPresence::default())
         .manage(sportident::SportIdentState::default())
         .setup(|app| {
         // Install the Rust panic hook now that an AppHandle exists, so
@@ -87,6 +89,7 @@ pub fn run() {
             lan_server::client_discover_mothers,
             lan_server::client_refresh_mother_endpoints,
             lan_server::client_ping_mother,
+            lan_server::client_set_reader_presence,
             lan_server::client_describe_local_role,
             hotspot::mother_start_hotspot,
             hotspot::mother_stop_hotspot,
@@ -97,6 +100,8 @@ pub fn run() {
             sportident::si_send_beep,
             sportident::si_set_station_time,
             sportident::si_read_station_config,
+            cp210x_driver::check_cp210x_driver_state,
+            cp210x_driver::install_cp210x_driver,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -534,6 +539,29 @@ fn playground_migrations() -> Vec<Migration> {
                 ALTER TABLE scenarios ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 
                 UPDATE schema_meta SET value = '10' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 11,
+            description: "device push-channel: reader presence + pending_commands queue",
+            sql: r#"
+                ALTER TABLE paired_devices ADD COLUMN has_reader INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE paired_devices ADD COLUMN reader_last_seen_at TEXT NULL;
+
+                CREATE TABLE IF NOT EXISTS pending_commands (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_device_id INTEGER NOT NULL REFERENCES paired_devices(id) ON DELETE CASCADE,
+                    kind             TEXT NOT NULL,
+                    payload_json     TEXT NOT NULL,
+                    created_at       TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    delivered_at     TEXT NULL,
+                    acked_at         TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_commands_target_open
+                    ON pending_commands(target_device_id, acked_at);
+
+                UPDATE schema_meta SET value = '11' WHERE key = 'version';
             "#,
             kind: MigrationKind::Up,
         },

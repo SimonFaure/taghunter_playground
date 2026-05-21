@@ -6,12 +6,12 @@ import { LeaderboardPage } from './LeaderboardPage';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
 import { ConfirmDialog } from './ConfirmDialog';
+import { GameDevicesModal } from './GameDevicesModal';
 import * as scenarioStore from '../services/scenarioStore';
 import {
   endLaunchedGame,
   deleteLaunchedGame,
   getLaunchedGameState,
-  getLaunchedGameDevices,
 } from '../services/launchedGames';
 import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle } from 'lucide-react';
 
@@ -37,13 +37,6 @@ interface Team {
   key_id: number;
 }
 
-interface Device {
-  id: number;
-  device_id: string;
-  connected: boolean;
-  last_connexion_attempt: string;
-}
-
 export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePageProps) {
   const [gameMetadata, setGameMetadata] = useState<GameMetadata | null>(null);
   const [loading, setLoading] = useState(true);
@@ -59,7 +52,6 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
   const [showRankings, setShowRankings] = useState(false);
   const [showDevices, setShowDevices] = useState(false);
   const [rankings, setRankings] = useState<Team[]>([]);
-  const [devices, setDevices] = useState<Device[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -131,22 +123,11 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     }
   };
 
-  const loadDevices = async () => {
+  const loadDevices = () => {
+    // The shared <GameDevicesModal> fetches its own data and polls every 2s
+    // while open. We just toggle the visibility flag here.
     if (!launchedGameId) return;
-    try {
-      const rows = await getLaunchedGameDevices(launchedGameId);
-      // Map to the legacy Device shape this component renders.
-      const mapped = rows.map((r) => ({
-        id: r.id,
-        device_id: r.device_label ?? `device-${r.device_id}`,
-        connected: Boolean(r.connected),
-        last_connexion_attempt: r.last_connection_attempt,
-      }));
-      setDevices(mapped as any);
-      setShowDevices(true);
-    } catch (err) {
-      console.error('[GamePage] loadDevices failed:', err);
-    }
+    setShowDevices(true);
   };
 
   const handleEndGame = () => {
@@ -397,44 +378,13 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
         </div>
       )}
 
-      {showDevices && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[130] p-4" onClick={() => setShowDevices(false)}>
-          <div className="bg-slate-800 border-2 border-slate-700 rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-2xl font-bold text-white flex items-center gap-2">
-                <Monitor size={24} className="text-blue-400" />
-                Devices
-              </h3>
-              <button onClick={() => setShowDevices(false)} className="text-slate-400 hover:text-white transition">
-                <X size={20} />
-              </button>
-            </div>
-            {devices.length === 0 ? (
-              <p className="text-slate-400 text-center py-8">No devices connected yet.</p>
-            ) : (
-              <div className="space-y-3">
-                {devices.map(device => (
-                  <div key={device.id} className="p-4 rounded-lg border-2 bg-slate-800 border-slate-700">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Monitor size={20} className={device.connected ? 'text-green-500' : 'text-slate-500'} />
-                        <div>
-                          <div className="text-white font-semibold">{device.device_id}</div>
-                          <p className="text-sm text-slate-400">Last attempt: {new Date(device.last_connexion_attempt).toLocaleString()}</p>
-                        </div>
-                      </div>
-                      <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                        device.connected ? 'bg-green-900/30 text-green-400 border border-green-700' : 'bg-slate-700 text-slate-300 border border-slate-600'
-                      }`}>
-                        {device.connected ? 'Connected' : 'Disconnected'}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+      {showDevices && launchedGameId && (
+        <GameDevicesModal
+          launchedGameId={launchedGameId}
+          gameLanguage={config.language ?? 'fr'}
+          isMother={true}
+          onClose={() => setShowDevices(false)}
+        />
       )}
 
       <ConfirmDialog
