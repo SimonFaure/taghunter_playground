@@ -8,6 +8,10 @@
 //     so the same crash within a 5-min window collapses to one row.
 //   - launch:    light per-game-launch stat (future feature; the wire shape
 //     and outbox handling are wired now so the future call site is a one-liner).
+//   - game_summary: per-game played-stats summary computed from the mother's
+//     local lg_* tables once a game ends (teams/players that actually played).
+//     Server upserts on summary_uuid (last-write-wins); see
+//     project_playground_statistics_to_studio.
 //
 // Delivery is invisible and non-blocking: enqueue is synchronous from the
 // caller's perspective (SQLite write), the drainer runs on a 5-min interval
@@ -35,7 +39,26 @@ const META_LAST_HEARTBEAT_VERSION = 'telemetry_last_heartbeat_app_version';
 
 // ─── public surface ──────────────────────────────────────────────────────────
 
-export type TelemetryEventType = 'heartbeat' | 'error' | 'launch';
+export type TelemetryEventType =
+  | 'heartbeat'
+  | 'error'
+  | 'launch'
+  | 'game_summary'
+  | 'recovery_code_used';
+
+/** Wire shape of a game_summary event payload (matches the mother's
+ * sync_summaries rows and the studio game_summaries ingest branch). */
+export interface GameSummaryPayload {
+  summary_uuid: string;
+  name: string | null;
+  game_type: string;
+  scenario_uniqid: string | null;
+  /** UTC "YYYY-MM-DD HH:MM:SS" — start_time, falling back to created_at. */
+  played_at: string | null;
+  teams_launched: number | null;
+  teams_played: number;
+  players_played: number;
+}
 
 export interface ErrorContext {
   /** Free-form structured context. JSON-serialized, scrubbed for PII. */
@@ -116,6 +139,41 @@ export async function captureLaunch(launch: {
     await enqueue('launch', launch);
   } catch (err) {
     console.warn('[telemetry] captureLaunch failed:', err);
+  }
+}
+
+/**
+ * Enqueue a per-game statistics summary. The payload is computed mother-side
+ * (sync_summaries) and pushed here; the studio upserts on summary_uuid, so
+ * re-emitting an updated summary is safe (last-write-wins). Best-effort.
+ */
+export async function captureGameSummary(summary: GameSummaryPayload): Promise<void> {
+  try {
+    await enqueue('game_summary', summary);
+  } catch (err) {
+    console.warn('[telemetry] captureGameSummary failed:', err);
+  }
+}
+
+/**
+ * Report that an offline recovery code was consumed on this device, so studio
+ * can show the pool's used/unused status. Best-effort and version-gated server
+ * side (a report against a since-regenerated pool is ignored). The device label
+ * is attached here so studio can show which device used it.
+ */
+export async function captureRecoveryCodeUsed(used: {
+  code_index: number;
+  pool_version: number;
+}): Promise<void> {
+  try {
+    const meta = await getDeviceMetadata().catch(() => null);
+    await enqueue('recovery_code_used', {
+      code_index: used.code_index,
+      pool_version: used.pool_version,
+      device_label: meta?.device_label ?? null,
+    });
+  } catch (err) {
+    console.warn('[telemetry] captureRecoveryCodeUsed failed:', err);
   }
 }
 

@@ -139,8 +139,13 @@ export function LaunchedGameConfigModal({ gameId, gameName, onClose, onSave }: L
       messageDisplayDuration: 'Message Display Duration (seconds)',
       enigmaImageDisplayDuration: 'Enigma Image Display Duration (seconds)',
       colorblindMode: 'Colorblind Mode',
-      autoResetTeam: 'Auto Reset Team',
+      autoResetTeam: 'Auto-reset page',
       delayBeforeReset: 'Delay Before Reset (seconds)',
+      revealResultsOnInput: 'Use Enter/click to reveal results',
+      autoRegisterTeam: 'Auto register team',
+      reuseCards: 'Reuse cards',
+      selfRegisterTeam: 'Self-register team names',
+      reuseDelayMinutes: 'Reuse delay (minutes)',
       victoryType: 'Victory Type',
     };
     return labels[metaName] || metaName;
@@ -148,11 +153,14 @@ export function LaunchedGameConfigModal({ gameId, gameName, onClose, onSave }: L
 
   const getFieldType = (metaName: string): 'text' | 'number' | 'checkbox' | 'victoryType' => {
     if (metaName === 'victoryType') return 'victoryType';
-    if (metaName === 'colorblindMode' || metaName === 'autoResetTeam') {
+    if (metaName === 'colorblindMode' || metaName === 'autoResetTeam' ||
+        metaName === 'autoRegisterTeam' || metaName === 'reuseCards' ||
+        metaName === 'selfRegisterTeam' || metaName === 'revealResultsOnInput') {
       return 'checkbox';
     }
     if (metaName === 'duration' || metaName === 'messageDisplayDuration' ||
-        metaName === 'enigmaImageDisplayDuration' || metaName === 'delayBeforeReset') {
+        metaName === 'enigmaImageDisplayDuration' || metaName === 'delayBeforeReset' ||
+        metaName === 'reuseDelayMinutes') {
       return 'number';
     }
     return 'text';

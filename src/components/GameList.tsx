@@ -1,13 +1,26 @@
 import { useEffect, useState } from 'react';
-import { Clock, Search, Play, Trash2, LogIn, Eye } from 'lucide-react';
+import { Clock, Search, Play, Trash2, LogIn, Eye, Zap, ChevronDown } from 'lucide-react';
 import { Alert } from './Alert';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchGameModal, GameConfig, LaunchDeviceSelection } from './LaunchGameModal';
+import { LaunchConfigModal } from './LaunchConfigModal';
 import { GamePage } from './GamePage';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
 import { ScenarioDetailsModal } from './ScenarioDetailsModal';
 import { getLocalGameIds } from '../utils/localGames';
 import * as scenarioStore from '../services/scenarioStore';
+import * as patternStore from '../services/patternStore';
+import * as cardsRepo from '../services/cardsRepo';
+import * as launchConfigsStore from '../services/launchConfigsStore';
+import type { LaunchConfigRow } from '../services/launchConfigsStore';
+import {
+  validateForHeadless,
+  buildRoster,
+  resolveDefaultDeviceSelection,
+  extractTracksOptions,
+  EMPTY_TRACKS_OPTIONS,
+  type PatternOption,
+} from '../services/launchResolve';
 import { scenarioAssetUrl } from '../services/contentFs';
 import { on as onSyncEvent } from '../services/syncEvents';
 import { setGameActive } from '../services/activeSession';
@@ -15,8 +28,10 @@ import {
   createLaunchedGame,
   listActiveLaunchedGames,
   getLaunchedGameMeta,
+  getLaunchedGameState,
   queueJoinGameCommandBulk,
 } from '../services/launchedGames';
+import { useAuth } from './auth/AuthProvider';
 import gamesData from '../../data/games.json';
 
 interface GameType {
@@ -46,7 +61,14 @@ interface AlertState {
   message: string;
 }
 
+interface LaunchTarget {
+  uniqid: string;
+  title: string;
+  gameTypeName: string;
+}
+
 export function GameList() {
+  const { user } = useAuth();
   const [scenarios, setScenarios] = useState<ScenarioWithType[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -56,18 +78,26 @@ export function GameList() {
   const [alert, setAlert] = useState<AlertState>({ show: false, type: 'success', message: '' });
   const [localGameIds, setLocalGameIds] = useState<Set<string>>(new Set());
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
-  const [selectedGame, setSelectedGame] = useState<{ uniqid: string; title: string; gameTypeName: string } | null>(null);
+  const [selectedGame, setSelectedGame] = useState<LaunchTarget | null>(null);
   const [launchedGame, setLaunchedGame] = useState<{ config: GameConfig; uniqid: string; launchedGameId: number | null } | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [scenarioToDelete, setScenarioToDelete] = useState<{ uniqid: string; title: string } | null>(null);
   const [localImages, setLocalImages] = useState<Map<string, string>>(new Map());
   const [activeGames, setActiveGames] = useState<Map<string, { id: number; name: string; game_type: string; duration: number }>>(new Map());
   const [detailsScenario, setDetailsScenario] = useState<ScenarioWithType | null>(null);
+  // Saved launch configs (local-only). Counts drive the Quick Launch button;
+  // the modal is the unified picker + manager.
+  const [configCounts, setConfigCounts] = useState<Map<string, number>>(new Map());
+  const [configModal, setConfigModal] = useState<{ scenario: LaunchTarget; configs: LaunchConfigRow[] } | null>(null);
+  // Pre-fill payload for the launch wizard: set when Editing a config or when a
+  // headless launch hit critical drift and falls back to the full screen.
+  const [prefill, setPrefill] = useState<{ config: Partial<GameConfig>; name?: string; notice?: string } | null>(null);
 
   useEffect(() => {
     loadScenarios();
     loadLocalGames();
     loadActiveGames();
+    loadConfigCounts();
 
     // Refresh when the orchestrator downloads or removes content.
     const offContent = onSyncEvent('content:updated', (p) => {
@@ -79,7 +109,19 @@ export function GameList() {
     return () => {
       offContent();
     };
-  }, []);
+  }, [user?.client_id]);
+
+  const loadConfigCounts = async () => {
+    if (!user?.client_id) {
+      setConfigCounts(new Map());
+      return;
+    }
+    try {
+      setConfigCounts(await launchConfigsStore.countsByScenario(user.client_id));
+    } catch (err) {
+      console.error('[GameList] loadConfigCounts failed:', err);
+    }
+  };
 
   // Mirror "a game is running" into the module-level signal the update flow
   // reads before relaunching to apply an update (services/activeSession.ts).
@@ -127,10 +169,19 @@ export function GameList() {
       pattern: meta.pattern ?? '',
       duration: active.duration,
       messageDisplayDuration: parseInt(meta.messageDisplayDuration ?? '5'),
-      enigmaImageDisplayDuration: parseInt(meta.enigmaImageDisplayDuration ?? '5'),
+      enigmaImageDisplayDuration: parseInt(meta.enigmaImageDisplayDuration ?? '1'),
       colorblindMode: meta.colorblindMode === 'true',
       autoResetTeam: meta.autoResetTeam === 'true',
       delayBeforeReset: parseInt(meta.delayBeforeReset ?? '3'),
+      revealResultsOnInput: meta.revealResultsOnInput !== 'false',
+      autoRegisterTeam: meta.autoRegisterTeam === 'true',
+      reuseCards: meta.reuseCards === 'true',
+      selfRegisterTeam: meta.selfRegisterTeam === 'true',
+      reuseDelayMinutes: parseInt(meta.reuseDelayMinutes ?? '5'),
+      useNamePool: meta.useNamePool === 'true',
+      namePoolAudience: (meta.namePoolAudience as GameConfig['namePoolAudience']) ?? undefined,
+      language: meta.language ?? undefined,
+      visibilityHideDelaySec: parseInt(meta.visibilityHideDelaySec ?? '10'),
       victoryType: (meta.victoryType as GameConfig['victoryType']) ?? undefined,
       playMode: (meta.playMode as GameConfig['playMode']) ?? undefined,
       teammatesPerTeam: meta.teammatesPerTeam ? parseInt(meta.teammatesPerTeam) : undefined,
@@ -275,76 +326,250 @@ export function GameList() {
   };
 
   const handleLaunchGame = (uniqid: string, title: string, gameTypeName: string) => {
+    setPrefill(null);
     setSelectedGame({ uniqid, title, gameTypeName });
     setLaunchModalOpen(true);
   };
 
-  const handleGameLaunch = async (
+  // Core launch: create the launched_game, fan out join_game, navigate to the
+  // GamePage. Used by both the wizard (via handleGameLaunch) and the headless
+  // Quick Launch path (via headlessLaunch), so the game target is explicit
+  // rather than read from `selectedGame`.
+  const launchGame = async (
+    game: LaunchTarget,
     config: GameConfig,
     deviceSelection: LaunchDeviceSelection
   ) => {
     let launchedGameId: number | null = null;
 
-    if (selectedGame) {
-      // Build the meta KV bag. Pattern is stored as a string (the pattern's
-      // identifier), but the server's teams.pattern column expects an int —
-      // it represents the pattern *index*, set per team below.
-      const meta: Record<string, string | number | boolean | null> = {
-        firstChipIndex: config.firstChipIndex.toString(),
-        pattern: config.pattern,
-        messageDisplayDuration: config.messageDisplayDuration.toString(),
-        enigmaImageDisplayDuration: config.enigmaImageDisplayDuration.toString(),
-        colorblindMode: config.colorblindMode.toString(),
-        autoResetTeam: config.autoResetTeam.toString(),
-        delayBeforeReset: config.delayBeforeReset.toString(),
-      };
-      if (config.victoryType) meta.victoryType = config.victoryType;
-      if (config.testMode) meta.testMode = 'true';
-      if (config.playMode) meta.playMode = config.playMode;
-      if (config.teammatesPerTeam !== undefined) meta.teammatesPerTeam = config.teammatesPerTeam.toString();
-      if (config.teams && config.teams.length > 0) meta.teamsConfig = JSON.stringify(config.teams);
+    // Build the meta KV bag. Pattern is stored as a string (the pattern's
+    // identifier), but the server's teams.pattern column expects an int —
+    // it represents the pattern *index*, set per team below.
+    const meta: Record<string, string | number | boolean | null> = {
+      firstChipIndex: config.firstChipIndex.toString(),
+      pattern: config.pattern,
+      messageDisplayDuration: config.messageDisplayDuration.toString(),
+      enigmaImageDisplayDuration: config.enigmaImageDisplayDuration.toString(),
+      colorblindMode: config.colorblindMode.toString(),
+      autoResetTeam: config.autoResetTeam.toString(),
+      delayBeforeReset: config.delayBeforeReset.toString(),
+      revealResultsOnInput: (config.revealResultsOnInput ?? true) ? 'true' : 'false',
+      autoRegisterTeam: config.autoRegisterTeam ? 'true' : 'false',
+      reuseCards: config.reuseCards ? 'true' : 'false',
+      selfRegisterTeam: config.selfRegisterTeam ? 'true' : 'false',
+      reuseDelayMinutes: (config.reuseDelayMinutes ?? 5).toString(),
+      useNamePool: config.useNamePool ? 'true' : 'false',
+      visibilityHideDelaySec: (config.visibilityHideDelaySec ?? 10).toString(),
+    };
+    // Name-pool draw needs audience + language server-side (cloud PHP / LAN
+    // Rust read these from meta). language was previously meta-less.
+    if (config.namePoolAudience) meta.namePoolAudience = config.namePoolAudience;
+    if (config.language) meta.language = config.language;
+    if (config.victoryType) meta.victoryType = config.victoryType;
+    if (config.testMode) meta.testMode = 'true';
+    if (config.playMode) meta.playMode = config.playMode;
+    if (config.teammatesPerTeam !== undefined) meta.teammatesPerTeam = config.teammatesPerTeam.toString();
+    if (config.teams && config.teams.length > 0) meta.teamsConfig = JSON.stringify(config.teams);
+    // Tracks launch selections — persisted to launched_games.meta so they
+    // survive reload and reach satellites. Consumed by the tracks runtime
+    // (Slice C). Time is carried by the top-level `duration` field below;
+    // language flows via the in-memory config like mystery/tagquest.
+    if (config.route) meta.route = config.route;
+    // Enabled route set → lets the Add Team form offer a per-team route override.
+    if (config.tracksRoutes && config.tracksRoutes.length > 0) {
+      meta.tracks_routes = config.tracksRoutes.join(',');
+    }
+    if (config.displayMode) meta.displayMode = config.displayMode;
+    if (config.trackPlayMode) meta.trackPlayMode = config.trackPlayMode;
+    if (config.scoreType) meta.scoreType = config.scoreType;
+    if (config.malusPerMinute !== undefined) meta.malusPerMinute = config.malusPerMinute.toString();
 
-      const teamRows = (config.teams ?? []).map((team, index) => ({
-        team_number: index + 1,
-        team_name: team.name,
-        // Store 0 for now; teams.pattern is the team-specific pattern index,
-        // which the gameplay engine assigns at runtime. Most code paths just
-        // read the global config.pattern from meta anyway.
-        pattern: 0,
-        key_id: team.chipId,
-      }));
+    const teamRows = (config.teams ?? []).map((team, index) => ({
+      team_number: index + 1,
+      team_name: team.name,
+      // Store 0 for now; teams.pattern is the team-specific pattern index,
+      // which the gameplay engine assigns at runtime. Most code paths just
+      // read the global config.pattern from meta anyway.
+      pattern: 0,
+      key_id: team.chipId,
+    }));
 
-      try {
-        const res = await createLaunchedGame({
-          game_uniqid: selectedGame.uniqid,
-          name: config.name,
-          number_of_teams: config.numberOfTeams,
-          game_type: selectedGame.gameTypeName,
-          duration: config.duration,
-          started: false,
-          meta,
-          teams: teamRows,
-          include_self: deviceSelection.include_self,
-        });
-        launchedGameId = res.id;
-        // Fan out join_game to every pre-selected satellite. Server validates
-        // each target individually; we don't await/inspect per-target results
-        // here because the in-game Devices modal surfaces them anyway as the
-        // rows migrate from bucket B → bucket A on the next 2s poll.
-        if (deviceSelection.satellite_targets.length > 0 && launchedGameId !== null) {
-          try {
-            await queueJoinGameCommandBulk(deviceSelection.satellite_targets, launchedGameId);
-          } catch (err) {
-            console.error('[GameList] queueJoinGameCommandBulk failed:', err);
-          }
+    try {
+      const res = await createLaunchedGame({
+        game_uniqid: game.uniqid,
+        name: config.name,
+        // Auto-register builds no roster; the server's create guard rejects
+        // <= 0, so send a placeholder. The all-teams-finished auto-end is
+        // disabled at runtime (disableAllFinishedEnd), so this is inert.
+        number_of_teams: config.autoRegisterTeam || config.selfRegisterTeam ? 1 : config.numberOfTeams,
+        game_type: game.gameTypeName,
+        duration: config.duration,
+        started: false,
+        meta,
+        teams: teamRows,
+        include_self: deviceSelection.include_self,
+      });
+      launchedGameId = res.id;
+      // Fan out join_game to every pre-selected satellite. Server validates
+      // each target individually; we don't await/inspect per-target results
+      // here because the in-game Devices modal surfaces them anyway as the
+      // rows migrate from bucket B → bucket A on the next 2s poll.
+      if (deviceSelection.satellite_targets.length > 0 && launchedGameId !== null) {
+        try {
+          await queueJoinGameCommandBulk(deviceSelection.satellite_targets, launchedGameId);
+        } catch (err) {
+          console.error('[GameList] queueJoinGameCommandBulk failed:', err);
         }
-      } catch (error) {
-        console.error('Error creating launched game:', error);
       }
+    } catch (error) {
+      console.error('Error creating launched game:', error);
     }
 
-    setLaunchedGame({ config, uniqid: selectedGame?.uniqid || '', launchedGameId });
+    setLaunchedGame({ config, uniqid: game.uniqid, launchedGameId });
     setLaunchModalOpen(false);
+  };
+
+  // Wizard launch — the modal's onLaunch. Targets the scenario the modal was
+  // opened for.
+  const handleGameLaunch = async (
+    config: GameConfig,
+    deviceSelection: LaunchDeviceSelection
+  ) => {
+    if (!selectedGame) return;
+    await launchGame(selectedGame, config, deviceSelection);
+  };
+
+  // ---- Quick Launch + saved-config orchestration ----
+
+  // Chips already assigned to a team in any active game — can't be reused.
+  const collectUsedChipIds = async (): Promise<Set<number>> => {
+    const used = new Set<number>();
+    try {
+      const active = await listActiveLaunchedGames();
+      for (const g of active) {
+        try {
+          const state = await getLaunchedGameState(g.id, 0);
+          for (const t of state.teams ?? []) {
+            if (t.key_id !== null && t.key_id !== undefined) used.add(t.key_id);
+          }
+        } catch (err) {
+          console.warn('[GameList] state fetch failed for', g.id, err);
+        }
+      }
+    } catch (err) {
+      console.error('[GameList] collectUsedChipIds failed:', err);
+    }
+    return used;
+  };
+
+  const frenchStamp = (): string => {
+    const now = new Date();
+    const date = now.toLocaleDateString('fr-FR');
+    const time = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    return `${date} ${time}`;
+  };
+
+  // Open the launch wizard pre-filled with a saved config (Edit, or a headless
+  // launch that hit critical drift). Does not launch.
+  const openPrefilledWizard = (
+    scenario: LaunchTarget,
+    config: Partial<GameConfig>,
+    name?: string,
+    notice?: string
+  ) => {
+    setConfigModal(null);
+    setSelectedGame(scenario);
+    setPrefill({ config, name, notice });
+    setLaunchModalOpen(true);
+  };
+
+  // Headless launch: validate the saved config against the current world; on
+  // critical drift fall back to the pre-filled wizard, otherwise build the
+  // roster + default device selection and launch straight into the GamePage.
+  const headlessLaunch = async (scenario: LaunchTarget, cfgRow: LaunchConfigRow) => {
+    const gameTypeLc = scenario.gameTypeName.toLowerCase();
+    try {
+      const [patternRows, rawGameData, cardRows, scenarioRow, used] = await Promise.all([
+        patternStore.list({ gameType: gameTypeLc }),
+        scenarioStore.getGameData(scenario.uniqid),
+        cardsRepo.list(),
+        scenarioStore.get(scenario.uniqid),
+        collectUsedChipIds(),
+      ]);
+
+      const patterns: PatternOption[] = patternRows.map((r) => ({
+        slug: r.pattern_slug ?? r.pattern_uniqid,
+        name: r.name || r.pattern_slug || r.pattern_uniqid,
+        uniqid: r.pattern_uniqid,
+      }));
+      const tracksOptions = gameTypeLc === 'tracks' ? extractTracksOptions(rawGameData) : EMPTY_TRACKS_OPTIONS;
+      const freeChips = cardRows.filter((c) => !used.has(c.id));
+      const scenarioDownloaded = !!scenarioRow && scenarioRow.local_version !== null;
+
+      const { ok, critical, resolved } = validateForHeadless(cfgRow.config, {
+        patterns,
+        freeChips,
+        tracksOptions,
+        scenarioDownloaded,
+        gameTypeName: scenario.gameTypeName,
+      });
+
+      if (!ok) {
+        openPrefilledWizard(scenario, cfgRow.config, cfgRow.name, critical.join(' '));
+        return;
+      }
+
+      const teams = resolved.autoRegisterTeam || resolved.selfRegisterTeam ? [] : buildRoster(resolved, freeChips, scenario.gameTypeName);
+      const deviceSelection = await resolveDefaultDeviceSelection();
+      setConfigModal(null);
+      await launchGame(scenario, { ...resolved, name: `${cfgRow.name} — ${frenchStamp()}`, teams }, deviceSelection);
+    } catch (err) {
+      console.error('[GameList] headlessLaunch failed:', err);
+      // Last-resort fallback: open the pre-filled wizard so the operator can
+      // launch manually rather than silently doing nothing.
+      openPrefilledWizard(scenario, cfgRow.config, cfgRow.name, 'Could not prepare a quick launch — please review and launch.');
+    }
+  };
+
+  const openConfigModal = async (scenario: LaunchTarget) => {
+    if (!user?.client_id) return;
+    try {
+      const configs = await launchConfigsStore.listForScenario(user.client_id, scenario.uniqid);
+      setConfigModal({ scenario, configs });
+    } catch (err) {
+      console.error('[GameList] openConfigModal failed:', err);
+    }
+  };
+
+  // Main split-button action: 1 config → headless; >1 → open the picker.
+  const handleQuickLaunch = async (scenario: LaunchTarget) => {
+    if (!user?.client_id) return;
+    try {
+      const configs = await launchConfigsStore.listForScenario(user.client_id, scenario.uniqid);
+      if (configs.length === 1) {
+        await headlessLaunch(scenario, configs[0]);
+      } else if (configs.length > 1) {
+        setConfigModal({ scenario, configs });
+      }
+    } catch (err) {
+      console.error('[GameList] handleQuickLaunch failed:', err);
+    }
+  };
+
+  const handleDeleteConfig = async (cfg: LaunchConfigRow) => {
+    if (!user?.client_id) return;
+    try {
+      await launchConfigsStore.deleteConfig(user.client_id, cfg.id);
+      await loadConfigCounts();
+      // Refresh the open modal's list (and close it if it emptied).
+      if (configModal) {
+        const configs = await launchConfigsStore.listForScenario(user.client_id, configModal.scenario.uniqid);
+        if (configs.length === 0) setConfigModal(null);
+        else setConfigModal({ scenario: configModal.scenario, configs });
+      }
+    } catch (err) {
+      console.error('[GameList] handleDeleteConfig failed:', err);
+    }
   };
 
   const handleBackToList = () => {
@@ -385,6 +610,12 @@ export function GameList() {
     const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
     const isAvailableForPurchase = scenario.available_for_purchase;
     const activeGame = scenario.uniqid ? activeGames.get(scenario.uniqid) : undefined;
+    const configCount = scenario.uniqid ? (configCounts.get(scenario.uniqid) ?? 0) : 0;
+    const launchTarget: LaunchTarget = {
+      uniqid: scenario.uniqid || '',
+      title: scenario.title,
+      gameTypeName: scenario.game_type.name,
+    };
 
     return (
       <div
@@ -450,12 +681,37 @@ export function GameList() {
                   <span>Join</span>
                 </button>
               ) : !isAvailableForPurchase && scenario.uniqid && (localGameIds.size === 0 || localGameIds.has(scenario.uniqid)) ? (
-                <button
-                  onClick={() => handleLaunchGame(scenario.uniqid || '', scenario.title, scenario.game_type.name)}
-                  className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition font-medium text-sm"
-                >
-                  <Play size={16} />
-                </button>
+                <>
+                  <button
+                    onClick={() => handleLaunchGame(scenario.uniqid || '', scenario.title, scenario.game_type.name)}
+                    className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition font-medium text-sm"
+                    title="Launch (full options)"
+                  >
+                    <Play size={16} />
+                  </button>
+                  {/* Quick Launch split button — only when this scenario has
+                      saved configs. Main: 1 config → headless, >1 → picker.
+                      Caret: always opens the picker/manage modal. */}
+                  {configCount > 0 && (
+                    <div className="flex items-stretch rounded-lg overflow-hidden">
+                      <button
+                        onClick={() => void handleQuickLaunch(launchTarget)}
+                        className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white transition font-medium text-sm"
+                        title="Quick launch from a saved configuration"
+                      >
+                        <Zap size={16} />
+                        Quick
+                      </button>
+                      <button
+                        onClick={() => void openConfigModal(launchTarget)}
+                        className="px-2 py-2 bg-blue-700 hover:bg-blue-600 text-white transition border-l border-blue-500/40"
+                        title="Manage saved configurations"
+                      >
+                        <ChevronDown size={16} />
+                      </button>
+                    </div>
+                  )}
+                </>
               ) : null}
               {isAvailableForPurchase && (
                 <a
@@ -617,12 +873,34 @@ export function GameList() {
 
       <LaunchGameModal
         isOpen={launchModalOpen}
-        onClose={() => setLaunchModalOpen(false)}
+        onClose={() => {
+          setLaunchModalOpen(false);
+          setPrefill(null);
+        }}
         gameTitle={selectedGame?.title || ''}
         gameUniqid={selectedGame?.uniqid || ''}
         gameTypeName={selectedGame?.gameTypeName || ''}
         onLaunch={handleGameLaunch}
+        prefillConfig={prefill?.config}
+        prefillConfigName={prefill?.name}
+        noticeText={prefill?.notice}
+        onConfigSaved={(name) => {
+          void loadConfigCounts();
+          showAlert('success', `Configuration “${name}” saved.`);
+        }}
       />
+
+      {configModal && (
+        <LaunchConfigModal
+          isOpen={true}
+          onClose={() => setConfigModal(null)}
+          scenario={configModal.scenario}
+          configs={configModal.configs}
+          onLaunch={(cfg) => void headlessLaunch(configModal.scenario, cfg)}
+          onEdit={(cfg) => openPrefilledWizard(configModal.scenario, cfg.config, cfg.name)}
+          onDelete={(cfg) => void handleDeleteConfig(cfg)}
+        />
+      )}
 
       <ConfirmDialog
         isOpen={deleteConfirmOpen}

@@ -16,3 +16,81 @@
 .animate-slide-in {
   animation: slide-in 0.3s ease-out;
 }
+
+/* ───────────────────────────────────────────────────────────────────────────
+   Logo-screen ambient animation (see utils/logoEffect.ts).
+   The glow colour is supplied per-instance as the --logo-glow custom property
+   on the wrapper, so one keyframe set serves any operator-chosen colour. The
+   glow uses drop-shadow, which follows the logo's alpha silhouette.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+@keyframes logo-glow-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 4px var(--logo-glow)) drop-shadow(0 0 8px var(--logo-glow));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px var(--logo-glow)) drop-shadow(0 0 26px var(--logo-glow));
+  }
+}
+
+@keyframes logo-glow-pulse-scale {
+  0%,
+  100% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 4px var(--logo-glow)) drop-shadow(0 0 8px var(--logo-glow));
+  }
+  50% {
+    transform: scale(1.035);
+    filter: drop-shadow(0 0 12px var(--logo-glow)) drop-shadow(0 0 26px var(--logo-glow));
+  }
+}
+
+.logo-anim-pulse {
+  animation: logo-glow-pulse 3s ease-in-out infinite;
+  will-change: filter;
+}
+
+.logo-anim-pulse-scale {
+  animation: logo-glow-pulse-scale 3s ease-in-out infinite;
+  will-change: filter, transform;
+}
+
+.logo-anim-static {
+  filter: drop-shadow(0 0 8px var(--logo-glow)) drop-shadow(0 0 18px var(--logo-glow));
+}
+
+/* Shimmer sweep: a moving diagonal sheen clipped to the logo silhouette by a
+   mask-image of the logo. Sized to the logo box (mask contain + centre) so it
+   lines up with the object-contain <img> it overlays. Tinted by --logo-glow,
+   blended onto the logo so it reads as a highlight passing across. */
+@keyframes logo-shimmer-sweep {
+  0% {
+    background-position: 160% 0;
+  }
+  55%,
+  100% {
+    background-position: -60% 0;
+  }
+}
+
+.logo-shimmer {
+  background-image: linear-gradient(
+    115deg,
+    transparent 42%,
+    var(--logo-glow) 50%,
+    transparent 58%
+  );
+  background-repeat: no-repeat;
+  background-size: 250% 100%;
+  background-position: 160% 0;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  mix-blend-mode: screen;
+  opacity: 0.85;
+  animation: logo-shimmer-sweep 3.5s ease-in-out infinite;
+}

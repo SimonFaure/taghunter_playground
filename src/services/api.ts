@@ -28,12 +28,51 @@ interface LanOverride {
 }
 let lanOverride: LanOverride | null = null;
 
+// Endpoints that are ALWAYS served by the in-process mother (never studio).
+// A call to one of these before the override is installed must wait for it
+// rather than fall through to studio — studio has no mother-local launched
+// game, so it answers 404. See waitForLanOverride below.
+const LOCAL_ONLY_ENDPOINTS: ReadonlySet<string> = new Set(['launched_games']);
+const LAN_READY_TIMEOUT_MS = 4000;
+
+// A gate that resolves when the override is installed. The mother boot in
+// App.tsx is fire-and-forget after auth, so a launched_games call (e.g. the
+// in-game state poll) can fire during the boot/webview-reload window before
+// the override exists. Waiters on this promise unblock the moment
+// setLanOverride() installs a non-null override.
+let lanReadyResolve: (() => void) | null = null;
+let lanReadyPromise: Promise<void> = new Promise<void>((res) => {
+  lanReadyResolve = res;
+});
+
 export function setLanOverride(o: LanOverride | null): void {
   lanOverride = o;
+  if (o) {
+    lanReadyResolve?.();
+  } else {
+    // Re-arm the gate so future callers block until it's re-installed.
+    lanReadyPromise = new Promise<void>((res) => {
+      lanReadyResolve = res;
+    });
+  }
 }
 
 export function getLanOverride(): LanOverride | null {
   return lanOverride;
+}
+
+// Wait up to `timeoutMs` for the LAN override to be installed. Resolves
+// immediately if it's already set. On timeout it resolves anyway (the caller
+// then proceeds to studio) so a genuinely-absent mother never hangs forever.
+function waitForLanOverride(timeoutMs: number): Promise<void> {
+  if (lanOverride) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((res) => {
+    timer = setTimeout(res, timeoutMs);
+  });
+  return Promise.race([lanReadyPromise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 export class ApiError extends Error {
@@ -84,6 +123,12 @@ export async function apiCall<T = unknown>(
   action: string,
   options: ApiCallOptions = {}
 ): Promise<T> {
+  // For mother-local endpoints, give the override a moment to install before
+  // routing — otherwise a boot/reload race sends the request to studio, which
+  // 404s for a launched game that only exists in the mother's local SQLite.
+  if (lanOverride == null && LOCAL_ONLY_ENDPOINTS.has(endpoint)) {
+    await waitForLanOverride(LAN_READY_TIMEOUT_MS);
+  }
   const lanRoute = lanOverride && lanOverride.endpoints.has(endpoint) ? lanOverride : null;
   const url = lanRoute
     ? buildUrlWithBase(lanRoute.baseUrl, endpoint, action, options.query)

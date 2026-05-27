@@ -35,6 +35,13 @@ pub enum DriverState {
     /// (driver blocked). On modern Windows 11 this almost always means the
     /// Vulnerable Driver Blocklist refused the .sys file.
     BlockedByPolicy,
+    /// Device present, CM problem code 28 (CM_PROB_FAILED_INSTALL — "the
+    /// drivers for this device are not installed") or 18 (CM_PROB_REINSTALL).
+    /// The reader is physically plugged in but Windows has never bound a
+    /// working driver to it, so it sits under "Other devices". Distinct from
+    /// BlockedByPolicy: there a driver exists but the kernel refused to load
+    /// it; here there is simply no driver to load — installing one fixes it.
+    DriverNotInstalled,
     /// Device present, CM problem code is something else (uninitialized,
     /// disabled, resource conflict, etc.). Surfaced so the UI can render
     /// the code and point the operator at Event Viewer.
@@ -136,6 +143,13 @@ mod windows_impl {
                             // group it under the same UI bucket so the same
                             // Install Driver action fires.
                             39 | 40 => DriverState::BlockedByPolicy,
+                            // CM_PROB_FAILED_INSTALL (28) is "the drivers for
+                            // this device are not installed" — a CP210x that
+                            // never had a driver bound, sitting under "Other
+                            // devices". CM_PROB_REINSTALL (18) is the same
+                            // remedy from the operator's side (install the
+                            // driver), so group them.
+                            28 | 18 => DriverState::DriverNotInstalled,
                             code => DriverState::OtherError { code },
                         }
                     }

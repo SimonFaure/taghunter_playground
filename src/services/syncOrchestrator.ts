@@ -27,6 +27,7 @@ import {
   ensureDir,
   scenarioVersionDirRel,
   onDemandCardsFileRel,
+  teamNamesFileRel,
   writeJson,
   writeBinary,
   writeText,
@@ -35,6 +36,8 @@ import * as scenarioStore from './scenarioStore';
 import * as patternStore from './patternStore';
 import * as layoutStore from './layoutStore';
 import * as cardsStore from './cardsStore';
+import * as namePoolsStore from './namePoolsStore';
+import * as recoveryCodesStore from './recoveryCodesStore';
 import * as translationsStore from './translationsStore';
 import * as gameTypesStore from './gameTypesStore';
 import * as clientPreferencesStore from './clientPreferencesStore';
@@ -69,6 +72,8 @@ interface ManifestResponse {
   custom_patterns: Array<{ pattern_uniqid: string; name: string; version: number; game_type: string }>;
   cards_version: number | null;
   has_on_demand_cards: boolean;
+  team_names_version?: number;
+  recovery_codes_version?: number;
   layouts: Array<{ id: number; version: number; game_type: string }>;
   translations?: Array<{ key: string; value: unknown; version: number }>;
   game_types?: gameTypesStore.GameTypeManifestRow[];
@@ -93,6 +98,8 @@ interface PatternDownloadResponse {
 type WorkItem =
   | { kind: 'cards'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'on_demand'; priority: 1; clientId: number; label: string }
+  | { kind: 'team_names'; priority: 1; clientId: number; remoteVersion: number; label: string }
+  | { kind: 'recovery_codes'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'pattern'; priority: 2; uniqid: string; remoteVersion: number; label: string }
   | { kind: 'layout'; priority: 3; id: number; remoteVersion: number; label: string }
   | { kind: 'scenario_meta'; priority: 4; uniqid: string; remoteVersion: number; label: string }
@@ -496,6 +503,16 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     has_on_demand_cards: manifest.has_on_demand_cards,
   });
 
+  // Team-name pools (single-row state, incremental version compare).
+  await namePoolsStore.upsertFromManifest(clientId, {
+    team_names_version: manifest.team_names_version ?? null,
+  });
+
+  // Offline PIN-recovery codes (single-row state, incremental version compare).
+  await recoveryCodesStore.upsertFromManifest(clientId, {
+    recovery_codes_version: manifest.recovery_codes_version ?? null,
+  });
+
   // Build the work list from each store's pending-downloads view.
   const work: WorkItem[] = [];
 
@@ -513,6 +530,30 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   }
   if (manifest.has_on_demand_cards) {
     work.push({ kind: 'on_demand', priority: 1, clientId, label: 'On-demand cards' });
+  }
+  if (await namePoolsStore.needsTeamNamesDownload(clientId)) {
+    const row = await namePoolsStore.get(clientId);
+    if (row && row.remote_version !== null) {
+      work.push({
+        kind: 'team_names',
+        priority: 1,
+        clientId,
+        remoteVersion: row.remote_version,
+        label: `Team names v${row.remote_version}`,
+      });
+    }
+  }
+  if (await recoveryCodesStore.needsRecoveryCodesDownload(clientId)) {
+    const row = await recoveryCodesStore.getState(clientId);
+    if (row && row.remote_version !== null) {
+      work.push({
+        kind: 'recovery_codes',
+        priority: 1,
+        clientId,
+        remoteVersion: row.remote_version,
+        label: `Recovery codes v${row.remote_version}`,
+      });
+    }
   }
 
   for (const p of await patternStore.listPendingDownloads()) {
@@ -708,6 +749,12 @@ async function markFailed(item: WorkItem): Promise<void> {
     case 'on_demand':
       await cardsStore.incrementFailedAttempts(item.clientId);
       break;
+    case 'team_names':
+      await namePoolsStore.incrementFailedAttempts(item.clientId);
+      break;
+    case 'recovery_codes':
+      await recoveryCodesStore.incrementFailedAttempts(item.clientId);
+      break;
     case 'pattern':
       await patternStore.incrementFailedAttempts(item.uniqid);
       break;
@@ -747,6 +794,10 @@ async function downloadOne(item: WorkItem, signal: AbortSignal): Promise<Downloa
       return downloadCards(item, signal);
     case 'on_demand':
       return downloadOnDemand(item, signal);
+    case 'team_names':
+      return downloadTeamNames(item, signal);
+    case 'recovery_codes':
+      return downloadRecoveryCodes(item, signal);
     case 'pattern':
       return downloadPattern(item, signal);
     case 'layout':
@@ -803,6 +854,67 @@ async function downloadOnDemand(
   await writeText(onDemandCardsFileRel(), new TextDecoder().decode(bytes));
   await cardsStore.markOnDemandFetched(item.clientId);
   emit('content:updated', { kind: 'on_demand_cards', ids: [item.clientId] });
+  return { enqueued: null, bytes: bytes.byteLength };
+}
+
+// Team-name pools: download the merged (global ∪ client) names JSON and write
+// it where the LAN mother (Rust) reads it at team creation. Version-gated like
+// cards (only runs when remote_version changed).
+async function downloadTeamNames(
+  item: Extract<WorkItem, { kind: 'team_names' }>,
+  signal: AbortSignal
+): Promise<DownloadOutcome> {
+  const bytes = await withRetry(() =>
+    apiDownloadBytesStream('playground', 'get_team_names', {
+      bearer: true,
+      signal,
+      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+    })
+  );
+  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+  await ensureDir('media/name_pools');
+  await writeText(teamNamesFileRel(), new TextDecoder().decode(bytes));
+  await namePoolsStore.markDownloaded(item.clientId, item.remoteVersion);
+  emit('content:updated', { kind: 'team_names', ids: [item.clientId] });
+  return { enqueued: null, bytes: bytes.byteLength };
+}
+
+// Offline PIN-recovery codes: download the client's plaintext pool and hash it
+// into the local recovery_codes table (replaceRecoveryPool resets used flags).
+// Version-gated like team names — only runs when the admin regenerated. Unlike
+// team names, this is NOT written to disk: the codes go straight into SQLite as
+// salted hashes (the plaintext exists only in transit).
+async function downloadRecoveryCodes(
+  item: Extract<WorkItem, { kind: 'recovery_codes' }>,
+  signal: AbortSignal
+): Promise<DownloadOutcome> {
+  const bytes = await withRetry(() =>
+    apiDownloadBytesStream('playground', 'get_recovery_codes', {
+      bearer: true,
+      signal,
+      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+    })
+  );
+  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+
+  let codes: string[] = [];
+  let version = item.remoteVersion;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+      version?: number;
+      codes?: unknown;
+    };
+    if (Array.isArray(parsed.codes)) {
+      codes = parsed.codes.filter((c): c is string => typeof c === 'string');
+    }
+    if (typeof parsed.version === 'number') version = parsed.version;
+  } catch (err) {
+    console.error('[sync] recovery codes parse failed:', err);
+  }
+
+  await recoveryCodesStore.replaceRecoveryPool(codes, version);
+  await recoveryCodesStore.markDownloaded(item.clientId, version);
+  emit('content:updated', { kind: 'recovery_codes', ids: [item.clientId] });
   return { enqueued: null, bytes: bytes.byteLength };
 }
 

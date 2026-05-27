@@ -656,31 +656,9 @@
     width: 100px;
 }
 
-/* Game Message Container */
-#game_message_container {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 9999;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.3s ease;
-}
-
-#game_message_container.active {
-    opacity: 1;
-}
-
-.game_message_text {
-    background: rgba(0, 0, 0, 0.9);
-    color: white;
-    padding: 30px 50px;
-    border-radius: 15px;
-    font-size: 24px;
-    text-align: center;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-}
+/* In-game status messages now render via the shared <GameMessageOverlay>
+   component (full-screen type-coloured wash). The old #game_message_container
+   / .game_message_text rules were retired with that change. */
 
 /* Game Loading Overlay */
 #game_loading_wrapper {

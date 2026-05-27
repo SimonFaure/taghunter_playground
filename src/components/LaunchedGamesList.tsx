@@ -1,23 +1,30 @@
 import { useState, useEffect } from 'react';
-import { Play, Trash2, Users, Save, Clock, CheckCircle, Flag, Trophy, Gamepad2, Search, ArrowUpDown, Import as SortAsc, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, UserPlus, PlusCircle, X, BarChart2, RefreshCw, ExternalLink } from 'lucide-react';
+import { Play, Trash2, Users, Save, Clock, CheckCircle, Flag, Trophy, Gamepad2, Search, ArrowUpDown, Import as SortAsc, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, UserPlus, PlusCircle, X, BarChart2, RefreshCw, ExternalLink, Database, Archive, Dices } from 'lucide-react';
 import { GamePage } from './GamePage';
 import { useAuth } from './auth/AuthProvider';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
 import * as scenarioStore from '../services/scenarioStore';
+import * as namePoolsStore from '../services/namePoolsStore';
 import {
   listLaunchedGames,
   getLaunchedGameMeta,
   updateLaunchedGameMeta,
+  mergeLaunchedGameMeta,
   getLaunchedGameState,
   endLaunchedGame,
   deleteLaunchedGame,
+  archiveLaunchedGame,
+  listArchivedSummaries,
+  type GameSummaryRow,
   updateTeam,
   addTeamToLaunchedGame,
+  deleteTeam,
   listCompletedQuests,
   registerDeviceForGame,
 } from '../services/launchedGames';
 import { GameDevicesModal } from './GameDevicesModal';
+import { RawDataModal } from './RawDataModal';
 import { onPendingJoin } from '../services/pendingJoinStore';
 import { ApiError } from '../services/api';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -33,6 +40,15 @@ import type { ScenarioOption, TimeRange, ActiveGameOption } from './RankingsModa
 import type { GameConfig, Team as ConfigTeam, Teammate } from './LaunchGameModal';
 import type { SiPuce } from '../types/database';
 
+// Tracks route keys → operator-facing labels (Add Team per-team route override).
+const TRACKS_ROUTE_LABELS: Record<string, string> = {
+  default: 'Default (all checkpoints)',
+  first_half: 'First half',
+  last_half: 'Last half',
+  odd: 'Odd checkpoints',
+  even: 'Even checkpoints',
+};
+
 interface LaunchedGame {
   id: number;
   game_uniqid: string;
@@ -41,6 +57,7 @@ interface LaunchedGame {
   game_type: string;
   ended: boolean;
   created_at: string;
+  is_test: boolean;
 }
 
 interface GameData {
@@ -62,7 +79,35 @@ interface Team {
   currentLevel?: { level: number; name: string } | null;
 }
 
-export function LaunchedGamesList() {
+// Game-type → display label + pill colors for the launched-game card badge.
+// launched_games stores game_type capitalised ('TagQuest'); we key off the
+// lowercase slug so either casing (and the scenario gameDataMap fallback) works.
+const GAME_TYPE_BADGE: Record<string, { label: string; className: string }> = {
+  tagquest: { label: 'TagQuest', className: 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300' },
+  mystery: { label: 'Mystery', className: 'bg-purple-500/15 border-purple-500/40 text-purple-300' },
+  tracks: { label: 'Tracks', className: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300' },
+};
+
+function gameTypeBadge(raw: string): { label: string; className: string } {
+  const key = (raw || '').toLowerCase();
+  return (
+    GAME_TYPE_BADGE[key] ?? {
+      label: raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : 'Unknown',
+      className: 'bg-slate-600/40 border-slate-500/50 text-slate-300',
+    }
+  );
+}
+
+// Fold a scenario's game_public onto the canonical name-pool audience trio
+// (mirrors LaunchGameModal's normalizeGamePublic / studio src/types/audience.ts).
+function normalizeAudience(raw: unknown): string {
+  const v = String(raw ?? '').toLowerCase();
+  if (['adults', 'adult', 'adultes', 'teens', 'ado'].includes(v)) return 'ado_adultes';
+  if (v === 'mini_kids' || v === 'ado_adultes') return v;
+  return 'kids';
+}
+
+export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boolean }) {
   const { user } = useAuth();
   const [games, setGames] = useState<LaunchedGame[]>([]);
   const [selectedGameId, setSelectedGameId] = useState<number | null>(null);
@@ -84,6 +129,7 @@ export function LaunchedGamesList() {
   const [teamSortBy, setTeamSortBy] = useState<'ranking' | 'name'>('ranking');
   const [minimizedTeams, setMinimizedTeams] = useState<Set<number>>(new Set());
   const [showDevices, setShowDevices] = useState<number | null>(null);
+  const [showRawData, setShowRawData] = useState<{ id: number; name: string } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -107,13 +153,25 @@ export function LaunchedGamesList() {
   const [selectedGameTeamsConfig, setSelectedGameTeamsConfig] = useState<ConfigTeam[]>([]);
   const [allChips, setAllChips] = useState<SiPuce[]>([]);
   const [addTeammateState, setAddTeammateState] = useState<{ teamId: number; chipId: number | null; name: string } | null>(null);
-  const [addTeamState, setAddTeamState] = useState<{ name: string; chipId: number | null } | null>(null);
+  const [addTeamState, setAddTeamState] = useState<{ name: string; chipId: number | null; route?: string } | null>(null);
+  // Tracks: enabled route set + launch default route (from launch meta), so the
+  // Add Team form can offer a per-team route override (manual assignment only).
+  const [tracksRouteOptions, setTracksRouteOptions] = useState<string[]>([]);
+  const [tracksDefaultRoute, setTracksDefaultRoute] = useState<string>('default');
+  // Name-pool draw context for the manual "Random name" button: the scenario's
+  // audience + language (from launch meta) and the resolved candidate names.
+  const [nameDrawAudience, setNameDrawAudience] = useState<string>('kids');
+  const [nameDrawLang, setNameDrawLang] = useState<string>('en');
+  const [namePoolNames, setNamePoolNames] = useState<string[]>([]);
   const [savingTeammate, setSavingTeammate] = useState(false);
   const [savingTeam, setSavingTeam] = useState(false);
-  const [teamDetails, setTeamDetails] = useState<{ team: Team; gameUniqid: string } | null>(null);
+  const [teamDetails, setTeamDetails] = useState<{ team: Team; gameUniqid: string; gameType: string } | null>(null);
   const [showRankingsModal, setShowRankingsModal] = useState(false);
   const [timeRangePage, setTimeRangePage] = useState<{ scenario: ScenarioOption; timeRange: TimeRange } | null>(null);
   const [activeGamesPage, setActiveGamesPage] = useState<ActiveGameOption[] | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivedSummaries, setArchivedSummaries] = useState<GameSummaryRow[]>([]);
+  const [archivedLoading, setArchivedLoading] = useState(false);
 
   useEffect(() => {
     loadGames();
@@ -161,18 +219,54 @@ export function LaunchedGamesList() {
       setMinimizedTeams(new Set());
       setSelectedGamePlayMode(null);
       setSelectedGameTeamsConfig([]);
+      setNameDrawAudience('kids');
+      setNameDrawLang('en');
+      setTracksRouteOptions([]);
+      setTracksDefaultRoute('default');
       getLaunchedGameMeta(selectedGameId)
-        .then((map) => {
+        .then(async (map) => {
           if (map.playMode === 'solo' || map.playMode === 'team') {
             setSelectedGamePlayMode(map.playMode);
           }
+          // Tracks per-team route options (persisted at launch).
+          if (map.tracks_routes) {
+            setTracksRouteOptions(map.tracks_routes.split(',').map((s) => s.trim()).filter(Boolean));
+          }
+          if (map.route) setTracksDefaultRoute(map.route);
           if (map.teamsConfig) {
             try { setSelectedGameTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
           }
+          // Name-pool draw context. namePoolAudience + language are persisted by
+          // the launch modal; for older games predating that, fall back to the
+          // scenario's game_meta.game_public (language falls back in the store).
+          let audienceRaw: unknown = map.namePoolAudience;
+          const lang = map.language;
+          if (!audienceRaw) {
+            const game = games.find((g) => g.id === selectedGameId);
+            if (game) {
+              try {
+                const gd = (await scenarioStore.getGameData(game.game_uniqid)) as any;
+                audienceRaw = (gd?.game_data?.game_meta ?? gd?.game_meta)?.game_public;
+              } catch { /* swallow — defaults to 'kids' */ }
+            }
+          }
+          setNameDrawAudience(normalizeAudience(audienceRaw));
+          setNameDrawLang((lang || 'en').toLowerCase());
         })
         .catch((err) => console.error('[LaunchedGamesList] meta load failed:', err));
     }
   }, [selectedGameId]);
+
+  // Resolve the candidate names for the current audience/language so the
+  // "Random name" button can draw instantly (and stay disabled when empty).
+  useEffect(() => {
+    let cancelled = false;
+    namePoolsStore
+      .listPoolNames(nameDrawAudience, nameDrawLang)
+      .then((names) => { if (!cancelled) setNamePoolNames(names); })
+      .catch(() => { if (!cancelled) setNamePoolNames([]); });
+    return () => { cancelled = true; };
+  }, [nameDrawAudience, nameDrawLang]);
 
   const loadGames = async () => {
     setLoading(true);
@@ -187,6 +281,7 @@ export function LaunchedGamesList() {
         game_type: g.game_type,
         ended: Boolean(g.ended),
         created_at: g.created_at ?? '',
+        is_test: Boolean(g.is_test),
       }));
       setGames(normalized);
     } catch (err) {
@@ -405,6 +500,50 @@ export function LaunchedGamesList() {
     });
   };
 
+  const handleArchiveGame = async (gameId: number) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Archive Game',
+      message: 'Archiving keeps only this game’s statistics summary and permanently deletes its detailed data (teams, punches, devices, configuration). The summary stays available in the Archived view and in Studio. Continue?',
+      variant: 'warning',
+      confirmText: 'Archive Game',
+      onConfirm: () => {
+        setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
+        const snapshot = games;
+        setGames((prev) => prev.filter((g) => g.id !== gameId));
+        if (selectedGameId === gameId) {
+          setSelectedGameId(null);
+          setTeams([]);
+        }
+        (async () => {
+          try {
+            await archiveLaunchedGame(gameId);
+          } catch (err) {
+            if (err instanceof ApiError && err.status === 404) {
+              return;
+            }
+            console.error('Error archiving game:', err);
+            setGames(snapshot);
+            alert('Failed to archive game');
+          }
+        })();
+      },
+    });
+  };
+
+  const openArchived = async () => {
+    setShowArchived(true);
+    setArchivedLoading(true);
+    try {
+      setArchivedSummaries(await listArchivedSummaries());
+    } catch (err) {
+      console.error('[LaunchedGamesList] failed to load archived summaries:', err);
+      setArchivedSummaries([]);
+    } finally {
+      setArchivedLoading(false);
+    }
+  };
+
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);
     return date.toLocaleString();
@@ -478,6 +617,15 @@ export function LaunchedGamesList() {
     setRenameValue('');
   };
 
+  // All chips on a team (leader + teammates) from the launch config — the
+  // Team Details punch tab needs them all, since in team mode members punch
+  // with their own chip, not the leader's key_id.
+  const chipIdsForTeam = (t: Team): number[] => {
+    const cfg = selectedGameTeamsConfig.find(c => c.chipId === t.key_id || c.name === t.team_name);
+    const ids = cfg ? [cfg.chipId, ...(cfg.teammates ?? []).map(m => m.chipId)] : [t.key_id];
+    return [...new Set(ids.filter((x): x is number => x != null))];
+  };
+
   const getUsedChipIds = (): Set<number> => {
     const used = new Set<number>();
     selectedGameTeamsConfig.forEach(t => {
@@ -486,6 +634,46 @@ export function LaunchedGamesList() {
     });
     teams.forEach(t => used.add(t.key_id));
     return used;
+  };
+
+  // The first card not already assigned to a team/teammate — used to preselect
+  // a chip (and seed the name from its key_name) when opening an add form.
+  const firstFreeChip = (): SiPuce | undefined => {
+    const used = getUsedChipIds();
+    return allChips.find(c => !used.has(c.id));
+  };
+
+  // Names already in use across teams + teammates, so the random draw can avoid
+  // handing out a duplicate.
+  const usedNames = (): string[] => {
+    const names = teams.map(t => t.team_name);
+    selectedGameTeamsConfig.forEach(t => {
+      names.push(t.name);
+      t.teammates?.forEach(m => names.push(m.name));
+    });
+    return names.filter(Boolean);
+  };
+
+  // Draw a random pooled name, preferring one not already used. Returns null
+  // when the pool has no names for the scenario's audience/language.
+  const pickRandomName = (): string | null => {
+    if (namePoolNames.length === 0) return null;
+    const used = new Set(usedNames().map(n => n.trim().toLowerCase()));
+    const free = namePoolNames.filter(n => !used.has(n.trim().toLowerCase()));
+    const pool = free.length > 0 ? free : namePoolNames;
+    return pool[Math.floor(Math.random() * pool.length)] ?? null;
+  };
+
+  // Open the add-team form with the first free chip preselected and its name
+  // seeded from the card (per the launched-game team/player creation UX).
+  const openAddTeam = () => {
+    const chip = firstFreeChip();
+    setAddTeamState({ chipId: chip?.id ?? null, name: chip?.key_name ?? '', route: tracksDefaultRoute });
+  };
+
+  const openAddTeammate = (teamId: number) => {
+    const chip = firstFreeChip();
+    setAddTeammateState({ teamId, chipId: chip?.id ?? null, name: chip?.key_name ?? '' });
   };
 
   const persistTeamsConfig = async (updated: ConfigTeam[]) => {
@@ -534,14 +722,20 @@ export function LaunchedGamesList() {
 
     const nextTeamNumber = (teams.length > 0 ? Math.max(...teams.map(t => t.team_number)) : 0) + 1;
 
+    const chosenRoute = addTeamState.route;
     try {
-      await addTeamToLaunchedGame({
+      const { id: newTeamId } = await addTeamToLaunchedGame({
         launched_game_id: selectedGameId,
         team_number: nextTeamNumber,
         team_name: addTeamState.name.trim(),
         pattern: 0,
         key_id: chip.id,
       });
+      // Persist a per-team route override only when it differs from the launch
+      // default (the runtime falls back to the default when no override exists).
+      if (chosenRoute && chosenRoute !== tracksDefaultRoute && tracksRouteOptions.length > 1) {
+        await mergeLaunchedGameMeta(selectedGameId, { [`route:${newTeamId}`]: chosenRoute });
+      }
     } catch (err) {
       console.error('Error adding team:', err);
       setSavingTeam(false);
@@ -560,6 +754,54 @@ export function LaunchedGamesList() {
     await loadTeams(selectedGameId);
     setAddTeamState(null);
     setSavingTeam(false);
+  };
+
+  // Remove one (non-leader) teammate from a team. Teammates live only in
+  // meta.teamsConfig, so this is a config edit — no DB team row involved.
+  const handleRemoveTeammate = (teamId: number, teammateChipId: number, teammateName: string) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Remove Teammate',
+      message: `Remove "${teammateName}" from this team?`,
+      variant: 'warning',
+      confirmText: 'Remove',
+      onConfirm: async () => {
+        setConfirmDialog(d => ({ ...d, isOpen: false }));
+        const t = teams.find(tm => tm.id === teamId);
+        const updated = selectedGameTeamsConfig.map(ct => {
+          if (ct.chipId === t?.key_id || ct.name === t?.team_name) {
+            return { ...ct, teammates: (ct.teammates ?? []).filter(m => m.chipId !== teammateChipId) };
+          }
+          return ct;
+        });
+        await persistTeamsConfig(updated);
+      },
+    });
+  };
+
+  // Remove a whole team: deletes the DB team row + its completions, then drops
+  // it from the launch roster (meta.teamsConfig).
+  const handleRemoveTeam = (team: Team) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Remove Team',
+      message: `Remove "${team.team_name}" from this game? Its completions will be permanently deleted. This cannot be undone.`,
+      variant: 'danger',
+      confirmText: 'Remove Team',
+      onConfirm: async () => {
+        setConfirmDialog(d => ({ ...d, isOpen: false }));
+        try {
+          await deleteTeam(team.id);
+          const updated = selectedGameTeamsConfig.filter(
+            ct => !(ct.chipId === team.key_id || ct.name === team.team_name)
+          );
+          await persistTeamsConfig(updated);
+        } catch (err) {
+          console.error('[LaunchedGamesList] removeTeam failed:', err);
+        }
+        if (selectedGameId !== null) loadTeams(selectedGameId);
+      },
+    });
   };
 
   const handleShowRankings = async (gameId: number, gameName: string) => {
@@ -592,10 +834,14 @@ export function LaunchedGamesList() {
       pattern: metaMap.pattern || '',
       duration: parseInt(metaMap.duration || '0'),
       messageDisplayDuration: parseInt(metaMap.messageDisplayDuration || '5'),
-      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '5'),
+      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '1'),
       colorblindMode: metaMap.colorblindMode === 'true',
       autoResetTeam: metaMap.autoResetTeam === 'true',
       delayBeforeReset: parseInt(metaMap.delayBeforeReset || '2'),
+      autoRegisterTeam: metaMap.autoRegisterTeam === 'true',
+      reuseCards: metaMap.reuseCards === 'true',
+      selfRegisterTeam: metaMap.selfRegisterTeam === 'true',
+      reuseDelayMinutes: parseInt(metaMap.reuseDelayMinutes || '5'),
       testMode: metaMap.testMode === 'true',
       victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
       playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
@@ -628,10 +874,16 @@ export function LaunchedGamesList() {
       pattern: metaMap.pattern || '',
       duration: parseInt(metaMap.duration || '0'),
       messageDisplayDuration: parseInt(metaMap.messageDisplayDuration || '5'),
-      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '5'),
+      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '1'),
       colorblindMode: metaMap.colorblindMode === 'true',
       autoResetTeam: metaMap.autoResetTeam === 'true',
       delayBeforeReset: parseInt(metaMap.delayBeforeReset || '2'),
+      revealResultsOnInput: metaMap.revealResultsOnInput !== 'false',
+      autoRegisterTeam: metaMap.autoRegisterTeam === 'true',
+      reuseCards: metaMap.reuseCards === 'true',
+      selfRegisterTeam: metaMap.selfRegisterTeam === 'true',
+      reuseDelayMinutes: parseInt(metaMap.reuseDelayMinutes || '5'),
+      visibilityHideDelaySec: parseInt(metaMap.visibilityHideDelaySec || '10'),
       testMode: metaMap.testMode === 'true',
       victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
       playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
@@ -752,13 +1004,22 @@ export function LaunchedGamesList() {
     <div className="container mx-auto px-6 py-8">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-3xl font-bold text-white">Launched Games</h2>
-        <button
-          onClick={() => setShowRankingsModal(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-yellow-500/15 hover:bg-yellow-500/25 border border-yellow-500/30 hover:border-yellow-400/50 text-yellow-400 font-semibold text-sm rounded-xl transition-all"
-        >
-          <Trophy size={16} />
-          Rankings
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowRankingsModal(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-yellow-500/15 hover:bg-yellow-500/25 border border-yellow-500/30 hover:border-yellow-400/50 text-yellow-400 font-semibold text-sm rounded-xl transition-all"
+          >
+            <Trophy size={16} />
+            Rankings
+          </button>
+          <button
+            onClick={() => void openArchived()}
+            className="flex items-center gap-2 px-4 py-2 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 hover:border-indigo-400/50 text-indigo-300 font-semibold text-sm rounded-xl transition-all"
+          >
+            <Archive size={16} />
+            Archived
+          </button>
+        </div>
       </div>
 
       {games.length === 0 ? (
@@ -768,7 +1029,9 @@ export function LaunchedGamesList() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="space-y-4">
-            {games.map((game) => (
+            {games.map((game) => {
+              const typeBadge = gameTypeBadge(game.game_type || gameDataMap[game.game_uniqid]?.game?.type || '');
+              return (
               <div
                 key={game.id}
                 className={`p-6 rounded-lg border-2 transition cursor-pointer ${
@@ -789,6 +1052,12 @@ export function LaunchedGamesList() {
                     <p className="text-sm text-slate-400">Game ID: {game.id}</p>
                   </div>
                   <div className="flex items-center gap-2">
+                    <span
+                      className={`px-3 py-1 rounded-full text-xs font-semibold border ${typeBadge.className}`}
+                      title="Game type"
+                    >
+                      {typeBadge.label}
+                    </span>
                     {game.ended ? (
                       <span className="px-3 py-1 bg-slate-700 text-slate-300 rounded-full text-xs font-semibold flex items-center gap-1">
                         <StopCircle size={12} />
@@ -852,6 +1121,18 @@ export function LaunchedGamesList() {
                   >
                     <Trophy size={18} />
                   </button>
+                  {game.ended && !game.is_test && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleArchiveGame(game.id);
+                      }}
+                      className="p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition"
+                      title="Archive (keep summary, delete game data)"
+                    >
+                      <Archive size={18} />
+                    </button>
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -861,6 +1142,16 @@ export function LaunchedGamesList() {
                     title="Devices"
                   >
                     <Monitor size={18} />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowRawData({ id: game.id, name: game.name });
+                    }}
+                    className="p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition"
+                    title="Raw Data"
+                  >
+                    <Database size={18} />
                   </button>
                   {!game.ended && (
                     <button
@@ -874,19 +1165,22 @@ export function LaunchedGamesList() {
                       <StopCircle size={18} />
                     </button>
                   )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteGame(game.id);
-                    }}
-                    className="p-2 bg-red-600 hover:bg-red-500 text-white rounded-lg transition"
-                    title="Delete"
-                  >
-                    <Trash2 size={18} />
-                  </button>
+                  {(game.is_test || isAdminMode) && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteGame(game.id);
+                      }}
+                      className="p-2 bg-red-600 hover:bg-red-500 text-white rounded-lg transition"
+                      title={game.is_test ? 'Delete test game' : 'Delete (admin)'}
+                    >
+                      <Trash2 size={18} />
+                    </button>
+                  )}
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <div>
@@ -987,8 +1281,12 @@ export function LaunchedGamesList() {
                         const isMinimized = minimizedTeams.has(team.id);
                         const ranking = index + 1;
                         const selectedGame = games.find(g => g.id === selectedGameId);
-                        const isTagQuest = selectedGame?.game_type === 'tagquest' ||
-                          gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type === 'tagquest';
+                        // launched_games stores game_type capitalised ('TagQuest');
+                        // the scenario gameDataMap uses the lowercase slug. Lowercase
+                        // the launched value so the primary check works without
+                        // depending on the async gameDataMap fallback.
+                        const isTagQuest = selectedGame?.game_type?.toLowerCase() === 'tagquest' ||
+                          gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'tagquest';
                         const showTeammates = isTagQuest && selectedGamePlayMode === 'team';
                         const configTeam = showTeammates
                           ? selectedGameTeamsConfig.find(t => t.chipId === team.key_id || t.name === team.team_name)
@@ -1173,7 +1471,7 @@ export function LaunchedGamesList() {
                                     </div>
                                     {addTeammateState?.teamId !== team.id && (
                                       <button
-                                        onClick={() => setAddTeammateState({ teamId: team.id, chipId: null, name: '' })}
+                                        onClick={() => openAddTeammate(team.id)}
                                         className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300 transition"
                                       >
                                         <UserPlus size={12} />
@@ -1188,6 +1486,15 @@ export function LaunchedGamesList() {
                                         {mate.name}
                                         <span className="text-slate-500 font-mono">#{mate.chipNumber}</span>
                                         <span className="text-slate-600 font-mono text-[10px]">{mate.chipId}</span>
+                                        {mate.chipId !== team.key_id && (
+                                          <button
+                                            onClick={() => handleRemoveTeammate(team.id, mate.chipId, mate.name)}
+                                            className="ml-0.5 -mr-0.5 text-slate-500 hover:text-red-400 transition"
+                                            title="Remove teammate"
+                                          >
+                                            <X size={12} />
+                                          </button>
+                                        )}
                                       </span>
                                     ))}
                                   </div>
@@ -1202,7 +1509,11 @@ export function LaunchedGamesList() {
                                       />
                                       <select
                                         value={addTeammateState.chipId ?? ''}
-                                        onChange={e => setAddTeammateState({ ...addTeammateState, chipId: Number(e.target.value) || null })}
+                                        onChange={e => {
+                                          const id = Number(e.target.value) || null;
+                                          const chip = allChips.find(c => c.id === id);
+                                          setAddTeammateState({ ...addTeammateState, chipId: id, name: chip ? chip.key_name : addTeammateState.name });
+                                        }}
                                         className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
                                       >
                                         <option value="">Select chip...</option>
@@ -1224,6 +1535,17 @@ export function LaunchedGamesList() {
                                           {savingTeammate ? 'Saving...' : 'Save'}
                                         </button>
                                         <button
+                                          onClick={() => {
+                                            const name = pickRandomName();
+                                            if (name) setAddTeammateState(s => (s ? { ...s, name } : s));
+                                          }}
+                                          disabled={namePoolNames.length === 0}
+                                          className="px-2 py-1.5 bg-slate-700 hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-slate-700 text-white rounded text-xs flex items-center gap-1"
+                                          title={namePoolNames.length === 0 ? 'No pooled names for this scenario' : 'Random name'}
+                                        >
+                                          <Dices size={11} />
+                                        </button>
+                                        <button
                                           onClick={() => setAddTeammateState(null)}
                                           className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded text-xs"
                                         >
@@ -1236,24 +1558,24 @@ export function LaunchedGamesList() {
                               )}
                               <div className="flex gap-2">
                                 <button
-                                  onClick={() => handleEditTeam(team)}
-                                  className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm font-medium"
-                                  title="Edit team details"
-                                >
-                                  Edit
-                                </button>
-                                <button
                                   onClick={() => {
                                     const game = games.find(g => g.id === selectedGameId);
                                     if (game) {
-                                      setTeamDetails({ team, gameUniqid: game.game_uniqid });
+                                      setTeamDetails({ team, gameUniqid: game.game_uniqid, gameType: game.game_type });
                                     }
                                   }}
-                                  className="px-3 py-2 bg-slate-600 hover:bg-slate-500 text-white rounded text-sm font-medium flex items-center gap-1.5"
+                                  className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
                                   title="View team details"
                                 >
-                                  <BarChart2 size={14} />
+                                  <BarChart2 size={15} />
                                   Details
+                                </button>
+                                <button
+                                  onClick={() => handleEditTeam(team)}
+                                  className="px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded text-sm font-medium"
+                                  title="Edit team details"
+                                >
+                                  Edit
                                 </button>
                                 <button
                                   onClick={() => {
@@ -1267,6 +1589,13 @@ export function LaunchedGamesList() {
                                 >
                                   <FlaskConical size={14} />
                                   Test
+                                </button>
+                                <button
+                                  onClick={() => handleRemoveTeam(team)}
+                                  className="px-3 py-2 bg-slate-700 hover:bg-red-600 text-slate-300 hover:text-white rounded text-sm font-medium flex items-center"
+                                  title="Remove team"
+                                >
+                                  <Trash2 size={14} />
                                 </button>
                               </div>
                             </>
@@ -1283,7 +1612,7 @@ export function LaunchedGamesList() {
                     <div className="mt-4">
                       {addTeamState === null ? (
                         <button
-                          onClick={() => setAddTeamState({ name: '', chipId: null })}
+                          onClick={openAddTeam}
                           className="w-full flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-slate-600 hover:border-teal-500 text-slate-400 hover:text-teal-400 rounded-lg text-sm transition"
                         >
                           <PlusCircle size={15} />
@@ -1301,7 +1630,11 @@ export function LaunchedGamesList() {
                           />
                           <select
                             value={addTeamState.chipId ?? ''}
-                            onChange={e => setAddTeamState({ ...addTeamState, chipId: Number(e.target.value) || null })}
+                            onChange={e => {
+                              const id = Number(e.target.value) || null;
+                              const chip = allChips.find(c => c.id === id);
+                              setAddTeamState({ ...addTeamState, chipId: id, name: chip ? chip.key_name : addTeamState.name });
+                            }}
                             className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
                           >
                             <option value="">Select chip...</option>
@@ -1313,6 +1646,20 @@ export function LaunchedGamesList() {
                                 </option>
                               ))}
                           </select>
+                          {tracksRouteOptions.length > 1 && (
+                            <select
+                              value={addTeamState.route ?? tracksDefaultRoute}
+                              onChange={e => setAddTeamState({ ...addTeamState, route: e.target.value })}
+                              className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
+                              title="Route for this team (hand them the matching map)"
+                            >
+                              {tracksRouteOptions.map(r => (
+                                <option key={r} value={r}>
+                                  {TRACKS_ROUTE_LABELS[r] ?? r}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                           <div className="flex gap-2">
                             <button
                               onClick={handleAddTeam}
@@ -1321,6 +1668,18 @@ export function LaunchedGamesList() {
                             >
                               <Save size={13} />
                               {savingTeam ? 'Saving...' : 'Save Team'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                const name = pickRandomName();
+                                if (name) setAddTeamState(s => (s ? { ...s, name } : s));
+                              }}
+                              disabled={namePoolNames.length === 0}
+                              className="px-3 py-1.5 bg-slate-700 hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-slate-700 text-white rounded text-sm flex items-center gap-1.5"
+                              title={namePoolNames.length === 0 ? 'No pooled names for this scenario' : 'Random name'}
+                            >
+                              <Dices size={13} />
+                              Random name
                             </button>
                             <button
                               onClick={() => setAddTeamState(null)}
@@ -1352,6 +1711,14 @@ export function LaunchedGamesList() {
           gameLanguage="fr"
           isMother={true}
           onClose={() => setShowDevices(null)}
+        />
+      )}
+
+      {showRawData !== null && (
+        <RawDataModal
+          launchedGameId={showRawData.id}
+          gameName={showRawData.name}
+          onClose={() => setShowRawData(null)}
         />
       )}
 
@@ -1506,6 +1873,8 @@ export function LaunchedGamesList() {
           team={teamDetails.team}
           launchedGameId={selectedGameId}
           gameUniqid={teamDetails.gameUniqid}
+          gameType={teamDetails.gameType}
+          chipIds={chipIdsForTeam(teamDetails.team)}
           onClose={() => setTeamDetails(null)}
         />
       )}
@@ -1556,6 +1925,73 @@ export function LaunchedGamesList() {
             setActiveGamesPage(games);
           }}
         />
+      )}
+
+      {showArchived && (
+        <div
+          className="fixed inset-0 bg-black/70 flex items-center justify-center z-[130] p-4"
+          onClick={() => setShowArchived(false)}
+        >
+          <div
+            className="bg-slate-800 border-2 border-slate-700 rounded-lg w-full max-w-4xl max-h-[85vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between p-6 border-b border-slate-700">
+              <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                <Archive size={20} className="text-indigo-300" />
+                Archived Games
+              </h3>
+              <button onClick={() => setShowArchived(false)} className="text-slate-400 hover:text-white transition">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto">
+              {archivedLoading ? (
+                <p className="text-slate-400 text-center py-8">Loading…</p>
+              ) : archivedSummaries.length === 0 ? (
+                <p className="text-slate-400 text-center py-8">No archived games yet.</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-slate-400 border-b border-slate-700">
+                      <th className="py-2 pr-3">Date</th>
+                      <th className="py-2 pr-3">Name</th>
+                      <th className="py-2 pr-3">Type</th>
+                      <th className="py-2 pr-3">Scenario</th>
+                      <th className="py-2 pr-3 text-right">Teams</th>
+                      <th className="py-2 pr-3 text-right">Players</th>
+                      <th className="py-2 text-center">Synced</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {archivedSummaries.map((s) => (
+                      <tr key={s.summary_uuid} className="border-b border-slate-700/50 text-slate-200">
+                        <td className="py-2 pr-3 whitespace-nowrap">{s.played_at ? formatDate(s.played_at) : '—'}</td>
+                        <td className="py-2 pr-3">{s.name || '—'}</td>
+                        <td className="py-2 pr-3 capitalize">{s.game_type}</td>
+                        <td className="py-2 pr-3">{gameDataMap[s.scenario_uniqid ?? '']?.game?.title ?? s.scenario_uniqid ?? '—'}</td>
+                        <td className="py-2 pr-3 text-right">
+                          {s.teams_played}
+                          {s.teams_launched != null && s.teams_launched !== s.teams_played && (
+                            <span className="text-slate-500"> / {s.teams_launched}</span>
+                          )}
+                        </td>
+                        <td className="py-2 pr-3 text-right">{s.players_played}</td>
+                        <td className="py-2 text-center">
+                          {s.pushed ? (
+                            <CheckCircle size={16} className="inline text-green-400" />
+                          ) : (
+                            <Clock size={16} className="inline text-amber-400" />
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

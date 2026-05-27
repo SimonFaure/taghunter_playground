@@ -14,6 +14,7 @@ import { invoke } from '@tauri-apps/api/core';
 export type DriverState =
   | { kind: 'healthy' }
   | { kind: 'blocked_by_policy' }
+  | { kind: 'driver_not_installed' }
   | { kind: 'other_error'; code: number }
   | { kind: 'device_absent' }
   | { kind: 'unknown' };

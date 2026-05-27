@@ -1,4 +1,4 @@
-import { StrictMode } from 'react';
+import { StrictMode, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import App from './App.tsx';
@@ -8,6 +8,7 @@ import { captureError } from './services/telemetry';
 import { loadConfig } from './utils/config';
 import { LeaderboardPage } from './components/LeaderboardPage';
 import { readProjectorParamsFromUrl, type ProjectorPayload } from './services/projectorWindow';
+import { ensureMotherServer } from './services/lanMotherBoot';
 import './index.css';
 import { registerCatalogFonts } from './fonts/registerCatalogFonts';
 // Slice A/B LAN-mode smoke test: side-effect import registers
@@ -18,6 +19,10 @@ import './services/lanSmokeTest';
 import './services/lanHotspotTest';
 // Footer wifi indicator manual test: registers `window.__wifiIndicatorTest`.
 import './services/wifiIndicatorTest';
+// Offline recovery-codes QA harness: registers `window.__seedRecoveryCodes`
+// (dev builds only) so the recovery prompts can be exercised before the
+// studio + sync slices land.
+import './services/recoveryCodesDevTest';
 
 // Projector-window wrapper: this is what the secondary Tauri WebviewWindow
 // mounts when launched with `?projector=1`. AuthProvider still wraps so the
@@ -26,6 +31,20 @@ import './services/wifiIndicatorTest';
 // While auth is loading or absent, render a neutral placeholder.
 function ProjectorRoot({ params }: { params: ProjectorPayload }) {
   const auth = useAuth();
+  const clientId = auth.user?.client_id;
+
+  // The projector is a separate WebviewWindow with its own JS context, so the
+  // LAN override installed by <App> in the main window does NOT carry over here.
+  // Without it, every launched_games request (the leaderboard's state + meta
+  // poll) falls through to studio, which has no mother-local game → 404.
+  // ensureMotherServer is idempotent: it picks up the already-running mother
+  // via mother_get_server_info (process-global Tauri state, shared across
+  // windows) without restarting it, then installs the override locally.
+  useEffect(() => {
+    if (!clientId) return;
+    void ensureMotherServer(clientId);
+  }, [clientId]);
+
   if (!auth.user) {
     return (
       <div className="fixed inset-0 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900" />

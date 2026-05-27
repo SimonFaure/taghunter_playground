@@ -152,11 +152,50 @@ function toMs(time: number | string): number {
   return n * 1000;
 }
 
+// SI punch times arrive as local "HH:MM:SS" time-of-day strings (see the Rust
+// `Punch::time_hms`). Convert one to seconds-since-local-midnight, or null when
+// it isn't a parseable HH:MM:SS (e.g. a numeric legacy value).
+function punchSecondsOfDay(time: string | number): number | null {
+  const m = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(String(time).trim());
+  if (!m) return null;
+  return (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+}
+
+// Local time-of-day (seconds since midnight) for an epoch-ms instant. Used to
+// line a game's start timestamp up with the reader's local punch clock.
+function localSecondsOfDay(ms: number): number {
+  const d = new Date(ms);
+  return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+}
+
+// A punch is "pre-start" (stale — e.g. an un-wiped card still carrying a
+// previous game's marks) when it happened comfortably before the game began.
+// The grace window absorbs SI base-station clock skew so we never drop a
+// legitimate punch over a couple of minutes of drift; the 12h ceiling avoids
+// midnight-wrap false positives (a punch with a *smaller* seconds-of-day than
+// the start could be the next day during a late-night game, not stale).
+// Limitation: with only a time-of-day on the card we cannot catch a stale
+// punch from a previous game that ran *later* in the day than today's start.
+const PRE_START_GRACE_SEC = 5 * 60;
+function isPreStartPunch(time: string, refStartMs: number | null): boolean {
+  if (refStartMs == null) return false;
+  const ps = punchSecondsOfDay(time);
+  if (ps == null) return false;
+  const delta = localSecondsOfDay(refStartMs) - ps;
+  return delta > PRE_START_GRACE_SEC && delta < 12 * 3600;
+}
+
+// Collapse double-bips: drop a punch at the same station within `windowMs` of a
+// kept one. Ordered and compared on real time-of-day seconds — a previous
+// version parsed "HH:MM:SS" with parseFloat (reading only the hour), which
+// silently merged every same-station punch within the same hour and so blocked
+// legitimate score-mode re-punches.
 function deduplicatePunches(
   punches: CardData['punches'],
   windowMs = 20000
 ): CardData['punches'] {
-  const sorted = [...punches].sort((a, b) => toMs(a.time) - toMs(b.time));
+  const ms = (t: string | number): number => (punchSecondsOfDay(t) ?? 0) * 1000;
+  const sorted = [...punches].sort((a, b) => ms(a.time) - ms(b.time));
 
   const result: CardData['punches'] = [];
   for (const punch of sorted) {
@@ -165,7 +204,7 @@ function deduplicatePunches(
       result.push(punch);
       continue;
     }
-    const diff = Math.abs(toMs(punch.time) - toMs(last.time));
+    const diff = Math.abs(ms(punch.time) - ms(last.time));
     if (diff >= windowMs) {
       result.push(punch);
     }
@@ -191,15 +230,15 @@ async function loadPatternItemsFromFile(
 ): Promise<PatternItem[]> {
   if (!patternUniqid) return [];
   try {
-    // The pattern's JSON is cached inline on the patterns row — decode
-    // the cached pattern_data_json directly.
-    const data = await patternStore.getData(patternUniqid);
-    if (Array.isArray(data)) return data as PatternItem[];
-    if (data && typeof data === 'object' && Array.isArray((data as { pattern_data?: unknown }).pattern_data)) {
-      return (data as { pattern_data: PatternItem[] }).pattern_data;
-    }
-    console.warn('[TagQuest] Local pattern row missing pattern_data array:', patternUniqid);
-    return [];
+    // Route through patternStore.getRouting so the studio's nested
+    // `[{index, assignments:{image_1:station,...}}]` pattern shape is flattened
+    // into the `{item_index, assignment_type, station_key_number}` rows this
+    // scorer filters on — the same adapter Mystery (getMysteryEnigmas) and
+    // Tracks (getTracksCheckpointStations) use. Reading getData() raw here cast
+    // the nested objects straight to PatternItem[], leaving every item_index /
+    // station_key_number undefined, so no quest ever matched a punch and the
+    // score never moved.
+    return await patternStore.getRouting(patternUniqid);
   } catch (err) {
     console.error('[TagQuest] Error loading pattern items from local store:', err);
     return [];
@@ -231,7 +270,14 @@ export async function processTagQuestPunch(
   gameUniqid: string,
   playMode: 'solo' | 'team',
   teamsConfig: Team[],
-  resolveMedia: (key: string) => string = () => ''
+  resolveMedia: (key: string) => string = () => '',
+  // In-memory, per-team set of punch identities ("code@time") already consumed
+  // by a completed quest. Anti-cheat: a physical punch may only ever be counted
+  // once, so re-presenting a card (or a state-poll echo) can't re-score it, and
+  // in score mode a quest only re-completes when its stations are genuinely
+  // re-punched (new times). Owned by the game page (see TagQuestGamePage) so it
+  // persists across reads of the same game; it resets if the kiosk reloads.
+  consumedByTeam: Map<number, Set<string>> = new Map()
 ): Promise<PunchResult> {
   const errorResult = (message: string): PunchResult => ({
     team_name: '',
@@ -378,28 +424,34 @@ export async function processTagQuestPunch(
     const completedQuests = await listCompletedQuests(launchedGameId, team.id);
     const completedQuestNumbers = new Set(completedQuests.map((r) => Number(r.quest_number)));
 
-    // Step 7: Sanitize - remove already-scored quest punches from working set
-    // In score mode, quests can be completed multiple times so we never strip them out.
-    let workingPunches = [...card.punches];
+    // Step 7: Build the working set — every card punch MINUS the ones we must
+    // not count. Two anti-cheat filters, both keyed on a punch's stable
+    // "code@time" identity (a re-read returns the same time; a fresh physical
+    // punch gets a new one):
+    //   (a) consumed — punches already used to complete a quest this game. This
+    //       replaces the old speed-only "strip completed quests by station"
+    //       pass and works in score mode too, so re-presenting a card never
+    //       re-scores, and a quest only re-completes on genuinely new punches.
+    //   (b) pre-start — punches left on an un-wiped card from a previous game,
+    //       detected by time-of-day vs the team's/game's start.
+    const teamConsumed = consumedByTeam.get(team.id) ?? new Set<string>();
+    consumedByTeam.set(team.id, teamConsumed);
+    const punchId = (p: { code: number; time: string }) => `${p.code}@${p.time}`;
 
-    if (!isScoreMode) {
-      for (const questNumber of completedQuestNumbers) {
-        const requiredStations = new Set(
-          patternItems
-            .filter(pi => pi.item_index === questNumber)
-            .map(pi => String(pi.station_key_number))
-        );
+    const refStartMs =
+      team.start_time != null
+        ? team.start_time * 1000
+        : state.start_time
+        ? new Date(state.start_time).getTime()
+        : null;
 
-        const presentStations = new Set(workingPunches.map(p => String(p.code)));
-        const allPresent = [...requiredStations].every(s => presentStations.has(s));
+    let workingPunches = card.punches.filter((p) => {
+      if (teamConsumed.has(punchId(p))) return false;
+      if (isPreStartPunch(p.time, refStartMs)) return false;
+      return true;
+    });
 
-        if (allPresent) {
-          workingPunches = workingPunches.filter(p => !requiredStations.has(String(p.code)));
-        }
-      }
-    }
-
-    // Step 8: Deduplicate punches
+    // Step 8: Deduplicate punches (collapse same-station double-bips)
     workingPunches = deduplicatePunches(workingPunches);
 
     // Step 9: Quest completion analysis
@@ -464,6 +516,31 @@ export async function processTagQuestPunch(
     );
     const beforeCombos = computeCombos(beforeCompletionMap);
 
+    // Punch-consumption pool for THIS read: one physical punch can satisfy at
+    // most one quest completion. As each quest is recorded we mark the earliest
+    // unused punch at each required station as used (so two quests sharing a
+    // station in the same read can't both claim the same punch) and add it to
+    // the team's consumed set so it can never score again — here or later.
+    const consumablePool = workingPunches.map((p) => ({
+      code: String(p.code),
+      time: p.time,
+      used: false,
+    }));
+    const consumeQuestPunches = (itemIndex: number) => {
+      const stations = patternItems
+        .filter((pi) => pi.item_index === itemIndex)
+        .map((pi) => String(pi.station_key_number));
+      for (const st of stations) {
+        const candidate = consumablePool
+          .filter((c) => !c.used && c.code === st)
+          .sort((a, b) => (punchSecondsOfDay(a.time) ?? 0) - (punchSecondsOfDay(b.time) ?? 0))[0];
+        if (candidate) {
+          candidate.used = true;
+          teamConsumed.add(`${candidate.code}@${candidate.time}`);
+        }
+      }
+    };
+
     for (const qp of completedNow) {
       const itemIndex = qp.questIndex + 1;
       const rawPts = qp.quest.points ?? 0;
@@ -483,12 +560,17 @@ export async function processTagQuestPunch(
         allow_duplicates: isScoreMode,
       });
 
-      if (res.inserted && !newCompletedQuest) {
-        newCompletedQuest = {
-          index: itemIndex,
-          name: qp.quest.name,
-          points: pts,
-        };
+      if (res.inserted) {
+        // Burn the punches that completed this quest so they can never score
+        // again (this read or any later one).
+        consumeQuestPunches(itemIndex);
+        if (!newCompletedQuest) {
+          newCompletedQuest = {
+            index: itemIndex,
+            name: qp.quest.name,
+            points: pts,
+          };
+        }
       }
     }
 

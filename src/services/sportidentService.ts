@@ -130,6 +130,17 @@ class SportIdentService {
   private unlisteners: UnlistenFn[] = [];
   private isStarted = false;
   private currentPort: string | null = null;
+  /**
+   * Serialises native reader start/stop so an in-flight `si_stop` always
+   * runs to completion before the next `si_start` (and vice-versa). The
+   * Rust side guards `SportIdentState` with a mutex but does NOT order
+   * competing commands, so without this a fire-and-forget `stop()` from a
+   * page unmount can race the next page's `initializePort`: either the
+   * start sees the old reader still open ("reader already running") or a
+   * late stop tears down the freshly-started reader. Chaining every
+   * start/stop through one promise makes the ordering deterministic.
+   */
+  private opChain: Promise<void> = Promise.resolve();
   private onCardDetected?: (card: CardData) => void;
   private onStationsDetected?: (stations: StationData[]) => void;
   /**
@@ -188,19 +199,40 @@ class SportIdentService {
     if (this.isStarted && this.currentPort === portPath) return true;
     if (this.isStarted) await this.stop();
 
-    try {
-      await this.attachListeners();
-      await invoke('si_start', { deviceId: portPath });
-      this.isStarted = true;
-      this.currentPort = portPath;
-      return true;
-    } catch (err) {
-      console.error('[si] si_start failed:', err);
-      await this.detachListeners();
-      this.isStarted = false;
-      this.currentPort = null;
-      return false;
-    }
+    return this.runExclusive(async () => {
+      // Re-check inside the lock: a queued start for the same port (e.g. the
+      // hotplug poll firing twice) is now a clean no-op instead of a needless
+      // stop/start restart.
+      if (this.isStarted && this.currentPort === portPath) return true;
+      try {
+        await this.attachListeners();
+        try {
+          await invoke('si_start', { deviceId: portPath });
+        } catch (err) {
+          // Self-heal a stale native reader: the Rust process can still hold
+          // an open reader from before a webview reload (its state outlives
+          // the JS module) or from a stop that hasn't landed. The serialised
+          // chain means nothing else is mid-flight here, so it's safe to stop
+          // whatever's running and start once more.
+          if (String(err).includes('already running')) {
+            console.warn('[si] reader already running — stopping stale reader and retrying');
+            await invoke('si_stop').catch(() => {});
+            await invoke('si_start', { deviceId: portPath });
+          } else {
+            throw err;
+          }
+        }
+        this.isStarted = true;
+        this.currentPort = portPath;
+        return true;
+      } catch (err) {
+        console.error('[si] si_start failed:', err);
+        await this.detachListeners();
+        this.isStarted = false;
+        this.currentPort = null;
+        return false;
+      }
+    });
   }
 
   setCardDetectedCallback(callback: (card: CardData) => void) {
@@ -246,15 +278,33 @@ class SportIdentService {
     this.lastCardTimestamps.clear();
     this.stations.clear();
     if (wasStarted) {
-      try {
-        await invoke('si_stop');
-      } catch (err) {
-        console.warn('[si] si_stop warn:', err);
-      }
+      await this.runExclusive(async () => {
+        try {
+          await invoke('si_stop');
+        } catch (err) {
+          console.warn('[si] si_stop warn:', err);
+        }
+      });
     }
   }
 
   // ─── Internals ────────────────────────────────────────────────────
+
+  /**
+   * Runs `task` after every previously-queued start/stop has settled,
+   * regardless of whether they resolved or rejected. Returns the task's
+   * own result/rejection to the caller while keeping the shared chain
+   * alive (its errors are swallowed so one failed op can't wedge the
+   * queue). See `opChain` for why this ordering matters.
+   */
+  private runExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.opChain.then(task, task);
+    this.opChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
 
   private async attachListeners() {
     // Defensive — in normal flow the listener list is already empty.

@@ -67,3 +67,24 @@ async function writeSchemaMeta(db: Database, key: string, value: string): Promis
     [key, value]
   );
 }
+
+// Friendly, user-set name for THIS device (assigned in Settings → My Devices).
+// It lives server-side, so we cache the resolved value locally and let the
+// footer read it instantly and offline. Falls back to the OS hostname when the
+// user hasn't set one (see Footer).
+const DISPLAY_NAME_KEY = 'device_display_name';
+
+export async function getCachedDeviceDisplayName(): Promise<string | null> {
+  const db = await getDb();
+  return readSchemaMeta(db, DISPLAY_NAME_KEY);
+}
+
+export async function setCachedDeviceDisplayName(name: string | null): Promise<void> {
+  const db = await getDb();
+  const trimmed = name?.trim();
+  if (trimmed) {
+    await writeSchemaMeta(db, DISPLAY_NAME_KEY, trimmed);
+  } else {
+    await db.execute('DELETE FROM schema_meta WHERE key = $1', [DISPLAY_NAME_KEY]);
+  }
+}

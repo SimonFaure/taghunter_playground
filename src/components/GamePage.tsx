@@ -2,12 +2,15 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { GameConfig } from './LaunchGameModal';
 import { MysteryGamePage } from './MysteryGamePage';
 import { TagQuestGamePage } from './TagQuestGamePage';
+import { TracksGamePage } from './TracksGamePage';
 import { LeaderboardPage } from './LeaderboardPage';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
 import { ConfirmDialog } from './ConfirmDialog';
 import { GameDevicesModal } from './GameDevicesModal';
 import { VideoControlModal } from './VideoControlModal';
+import { PinExitPrompt } from './PinExitPrompt';
+import { loadConfig } from '../utils/config';
 import * as scenarioStore from '../services/scenarioStore';
 import {
   endLaunchedGame,
@@ -45,6 +48,15 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
   const [showPanel, setShowPanel] = useState(false);
   const tapCountRef = useRef(0);
   const tapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // "Use PIN to exit" gate. When the pref is on, every way out of a running
+  // game (the visible Back buttons in each renderer, the leaderboard Back, and
+  // opening the 4-tap operator panel) is funneled through a PIN prompt. Once
+  // the panel is open the PIN has already been entered, so its internal
+  // actions (Back to Launched Games / End / Delete) use the raw onBack and
+  // don't re-prompt.
+  const [requirePinExit, setRequirePinExit] = useState(false);
+  const [pinGate, setPinGate] = useState<{ run: () => void; subtitle?: string } | null>(null);
 
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -100,6 +112,32 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     loadGameMetadata();
   }, [gameUniqid]);
 
+  // Read the kiosk exit-PIN pref once. Until it resolves we leave gating off;
+  // config.json loads in a few ms and a player won't be hitting Back that fast.
+  useEffect(() => {
+    let cancelled = false;
+    void loadConfig()
+      .then((c) => { if (!cancelled) setRequirePinExit(Boolean(c.requirePinToExitGame)); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Run `action` immediately, or behind a PIN prompt when the pref is on.
+  const runGuarded = useCallback(
+    (run: () => void, subtitle?: string) => {
+      if (requirePinExit) setPinGate({ run, subtitle });
+      else run();
+    },
+    [requirePinExit]
+  );
+
+  // Passed to every game renderer + the leaderboard in place of the raw
+  // onBack, so their visible Back buttons prompt for the PIN first.
+  const guardedBack = useCallback(
+    () => runGuarded(onBack, 'Enter the device PIN to leave the game.'),
+    [runGuarded, onBack]
+  );
+
   const handleCornerTap = useCallback(() => {
     tapCountRef.current += 1;
     if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
@@ -107,9 +145,9 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     if (tapCountRef.current >= 4) {
       tapCountRef.current = 0;
       if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
-      setShowPanel(true);
+      runGuarded(() => setShowPanel(true), 'Enter the device PIN to open game controls.');
     }
-  }, []);
+  }, [runGuarded]);
 
   const loadRankings = async () => {
     if (!launchedGameId) return;
@@ -199,15 +237,18 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
           launchedGameId={launchedGameId}
           config={config}
           gameName={gameMetadata?.title}
-          onBack={onBack}
+          onBack={guardedBack}
         />
       );
     }
     if (gameMetadata?.type === 'mystery') {
-      return <MysteryGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={onBack} onGameEnd={handleGameEnd} />;
+      return <MysteryGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} />;
     }
     if (gameMetadata?.type === 'tagquest') {
-      return <TagQuestGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={onBack} onGameEnd={handleGameEnd} postAnimExitDelayMs={postAnimExitDelayMs} />;
+      return <TagQuestGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} postAnimExitDelayMs={postAnimExitDelayMs} />;
+    }
+    if (gameMetadata?.type === 'tracks') {
+      return <TracksGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} />;
     }
     return (
       <div className="flex items-center justify-center h-full">
@@ -414,6 +455,18 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
         variant={confirmDialog.variant}
         confirmText={confirmDialog.confirmText}
       />
+
+      {pinGate && (
+        <PinExitPrompt
+          subtitle={pinGate.subtitle}
+          onSuccess={() => {
+            const run = pinGate.run;
+            setPinGate(null);
+            run();
+          }}
+          onCancel={() => setPinGate(null)}
+        />
+      )}
     </div>
   );
 }

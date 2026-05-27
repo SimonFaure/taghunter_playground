@@ -1,7 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
-import { Monitor, Smartphone, Tablet, Trash2, Loader2, RefreshCw, LogOut } from 'lucide-react';
-import { listMyDevices, revokeDevice, signOutOfThisDevice, MyDeviceListItem } from '../../services/auth';
+import { useEffect, useState, useCallback, KeyboardEvent } from 'react';
+import { Monitor, Smartphone, Tablet, Trash2, Loader2, RefreshCw, LogOut, Pencil, Check, X } from 'lucide-react';
+import { listMyDevices, revokeDevice, renameDevice, signOutOfThisDevice, MyDeviceListItem } from '../../services/auth';
 import { ApiError } from '../../services/api';
+
+const MAX_DISPLAY_NAME = 120;
 
 interface MyDevicesScreenProps {
   onLoggedOut?: () => void;
@@ -13,6 +15,9 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -58,6 +63,49 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
       onLoggedOut?.();
     } catch (err) {
       setError(extractErrorMessage(err));
+    }
+  }
+
+  function startEdit(d: MyDeviceListItem) {
+    setEditingId(d.id);
+    setDraft(d.display_name ?? d.device_label ?? '');
+    setError(null);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setDraft('');
+  }
+
+  async function saveEdit(d: MyDeviceListItem) {
+    const trimmed = draft.trim();
+    if (trimmed.length > MAX_DISPLAY_NAME) {
+      setError(`Name must be ${MAX_DISPLAY_NAME} characters or fewer`);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await renameDevice(d.id, trimmed === '' ? null : trimmed);
+      setEditingId(null);
+      setDraft('');
+      // Let the footer re-resolve the friendly name for the current device.
+      window.dispatchEvent(new CustomEvent('device:renamed'));
+      await refresh();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleRenameKeyDown(e: KeyboardEvent<HTMLInputElement>, d: MyDeviceListItem) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void saveEdit(d);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEdit();
     }
   }
 
@@ -115,9 +163,52 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
                 <Icon className="w-6 h-6 text-slate-300 shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="text-white font-medium truncate">
-                      {d.device_label || `${d.os ?? 'Unknown'} device`}
-                    </span>
+                    {editingId === d.id ? (
+                      <div className="flex items-center gap-1 min-w-0">
+                        <input
+                          type="text"
+                          autoFocus
+                          value={draft}
+                          onChange={(e) => setDraft(e.target.value)}
+                          onKeyDown={(e) => handleRenameKeyDown(e, d)}
+                          maxLength={MAX_DISPLAY_NAME + 1}
+                          placeholder={d.device_label ?? 'Device name'}
+                          className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm font-medium text-white w-44"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => saveEdit(d)}
+                          disabled={saving}
+                          title="Save"
+                          className="p-1 rounded text-green-300 hover:bg-green-500/20 disabled:opacity-50"
+                        >
+                          <Check className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={cancelEdit}
+                          disabled={saving}
+                          title="Cancel"
+                          className="p-1 rounded text-slate-400 hover:bg-slate-700 disabled:opacity-50"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5 min-w-0 group">
+                        <span className="text-white font-medium truncate">
+                          {d.display_name || d.device_label || `${d.os ?? 'Unknown'} device`}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => startEdit(d)}
+                          title="Rename"
+                          className="opacity-60 hover:opacity-100 p-1 rounded text-slate-400 hover:text-blue-300 hover:bg-slate-700 transition-opacity shrink-0"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
                     {isCurrent && (
                       <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/30 text-blue-200 border border-blue-500/40">
                         This device

@@ -1,4 +1,5 @@
 import { getDb } from './db';
+import { pbkdf2, randomSaltB64, constantTimeEqual } from './localCrypto';
 
 // Local PIN store. Backs the cold-start lock screen.
 //
@@ -11,10 +12,12 @@ import { getDb } from './db';
 // (which still doesn't defeat a determined attacker but at least raises
 // the bar). For now the JWT stays plaintext per the slice-1 trade-off
 // captured in services/strongholdStore.ts.
+//
+// The PBKDF2/salt/compare primitives live in localCrypto.ts, shared with the
+// offline recovery-code store (recoveryCodesStore.ts) so both hash identically.
 
 const KDF_ITERATIONS = 200_000;
 const SALT_BYTES = 16;
-const HASH_BYTES = 32;
 
 // Progressive backoff. After a run of wrong attempts hits one of these
 // thresholds, the next attempt is gated until `locked_until_at` (unix
@@ -48,7 +51,7 @@ export async function hasPin(): Promise<boolean> {
 
 export async function setPin(pin: string): Promise<void> {
   assertPinShape(pin);
-  const salt = randomBase64(SALT_BYTES);
+  const salt = randomSaltB64(SALT_BYTES);
   const hash = await pbkdf2(pin, salt, KDF_ITERATIONS);
   const db = await getDb();
   await db.execute(
@@ -104,6 +107,21 @@ export async function verifyPin(pin: string): Promise<VerifyOutcome> {
   return { ok: false, reason: 'wrong', failedAttempts: failed, lockedUntilAt };
 }
 
+// Lightweight, non-mutating PIN check for the kiosk "use PIN to exit" gates
+// (game page / logo screen). Unlike verifyPin, this NEVER touches
+// failed_attempts / locked_until_at and ignores any active lockout window:
+// an operator repeatedly entering the exit PIN during an event must not be
+// able to lock themselves out of the cold-start device lock, and a bystander
+// mashing digits at the game panel mustn't escalate the shared backoff. The
+// gesture obscurity plus the documented "UX gate, not a cryptographic
+// boundary" threat model above carry the security weight here.
+export async function peekVerifyPin(pin: string): Promise<boolean> {
+  const row = await readRow();
+  if (!row) return false;
+  const candidate = await pbkdf2(pin, row.salt, row.kdf_iterations);
+  return constantTimeEqual(candidate, row.pin_hash);
+}
+
 // Exposed so the lock screen can render a live countdown without forcing
 // a verify round-trip. Returns 0 when the device is free to try again.
 export async function getLockoutEnd(): Promise<number> {
@@ -132,52 +150,4 @@ function assertPinShape(pin: string): void {
   if (!/^\d{4}$/.test(pin)) {
     throw new Error('PIN must be exactly 4 digits');
   }
-}
-
-async function pbkdf2(pin: string, saltB64: string, iterations: number): Promise<string> {
-  const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(pin),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  const salt = base64Decode(saltB64);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, hash: 'SHA-256', iterations },
-    keyMaterial,
-    HASH_BYTES * 8
-  );
-  return base64Encode(new Uint8Array(bits));
-}
-
-function randomBase64(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return base64Encode(bytes);
-}
-
-function base64Encode(bytes: Uint8Array): string {
-  let bin = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    bin += String.fromCharCode(bytes[i]);
-  }
-  return btoa(bin);
-}
-
-function base64Decode(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
 }

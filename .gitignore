@@ -21,3 +21,8 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# Help system — generated from taghunter-help-content at predev/prebuild.
+src/help/_generated/
+public/help-assets/
+public/playground-help.pdf

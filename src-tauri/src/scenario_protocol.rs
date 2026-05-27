@@ -19,17 +19,9 @@ use tauri::http::{Request, Response, StatusCode, Uri};
 use tauri::{AppHandle, Manager};
 
 pub async fn handle(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
-    let uri_str = request.uri().to_string();
-    eprintln!("[scenario_protocol] -> {uri_str}");
     match resolve(app, &request).await {
-        Ok(resp) => {
-            eprintln!("[scenario_protocol] 200 {uri_str}");
-            resp
-        }
-        Err(reason) => {
-            eprintln!("[scenario_protocol] 404 {uri_str} -- {reason}");
-            not_found()
-        }
+        Ok(resp) => resp,
+        Err(_) => not_found(),
     }
 }
 

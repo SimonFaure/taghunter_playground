@@ -20,8 +20,8 @@ import {
   AlertTriangle,
   Download,
   Upload,
-  HardDriveDownload,
   Image as ImageIcon,
+  ShieldCheck,
 } from 'lucide-react';
 import { enable as enableAutostart, disable as disableAutostart } from '@tauri-apps/plugin-autostart';
 import {
@@ -40,6 +40,11 @@ import {
   removeLaunchLogo,
   writeLaunchLogo,
 } from '../utils/launchLogo';
+import {
+  resolveLogoEffect,
+  LOGO_ANIMATION_OPTIONS,
+  type LogoAnimation,
+} from '../utils/logoEffect';
 import * as cardsRepo from '../services/cardsRepo';
 import { on } from '../services/syncEvents';
 import { runCycleNow } from '../services/syncOrchestrator';
@@ -50,6 +55,7 @@ import { MyDevicesScreen } from './settings/MyDevicesScreen';
 import { UpdatesScreen } from './settings/UpdatesScreen';
 import { UsbDriverScreen } from './settings/UsbDriverScreen';
 import { ApiDocsPage } from './ApiDocsPage';
+import { DevicePinSettings } from './settings/DevicePinSettings';
 
 const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
@@ -58,6 +64,11 @@ const DEFAULT_CONFIG: AppConfig = {
   logoScreenOnLaunch: false,
   logoScreenBgColor: '#000000',
   logoScreenLogoFile: null,
+  logoScreenAnimation: 'pulse',
+  logoScreenGlowColor: '#FFFFFF',
+  requirePinToExitGame: false,
+  requirePinToExitLogo: false,
+  requirePinToExitFullscreen: false,
 };
 
 export type SettingsTab =
@@ -273,6 +284,31 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                 </Section>
 
                 <Section
+                  icon={<ShieldCheck className="text-blue-400" size={24} />}
+                  title="Security"
+                >
+                  <Toggle
+                    label="Require PIN to exit a running game"
+                    description="Ask for the device PIN before leaving a running game or opening the operator panel. Stops players from exiting or ending the game. Uses your device PIN."
+                    value={Boolean(config.requirePinToExitGame)}
+                    onChange={(v) => setConfig({ ...config, requirePinToExitGame: v })}
+                  />
+                  <Toggle
+                    label="Require PIN to exit the logo screen"
+                    description="Ask for the device PIN before dismissing the logo screen — at launch and when raised from the nav bar. Turns the logo screen into a step-away lock. Uses your device PIN."
+                    value={Boolean(config.requirePinToExitLogo)}
+                    onChange={(v) => setConfig({ ...config, requirePinToExitLogo: v })}
+                  />
+                  <Toggle
+                    label="Require PIN to exit fullscreen"
+                    description="Ask for the device PIN before F11 leaves fullscreen. Keeps players from dropping out of the kiosk view. Uses your device PIN."
+                    value={Boolean(config.requirePinToExitFullscreen)}
+                    onChange={(v) => setConfig({ ...config, requirePinToExitFullscreen: v })}
+                  />
+                  <DevicePinSettings />
+                </Section>
+
+                <Section
                   icon={<ImageIcon className="text-blue-400" size={24} />}
                   title="Launch logo screen"
                 >
@@ -334,6 +370,49 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                           </span>
                         </div>
                       </div>
+
+                      <div>
+                        <div className="font-semibold mb-1">Animation</div>
+                        <div className="text-sm text-slate-400 mb-2">
+                          A subtle glow that hugs the logo. Works best on a
+                          transparent logo; an opaque one glows by its rectangle.
+                        </div>
+                        <select
+                          value={config.logoScreenAnimation ?? 'pulse'}
+                          onChange={(e) =>
+                            setConfig({
+                              ...config,
+                              logoScreenAnimation: e.target.value as LogoAnimation,
+                            })
+                          }
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-600 rounded-lg text-sm text-white"
+                        >
+                          {LOGO_ANIMATION_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {(config.logoScreenAnimation ?? 'pulse') !== 'none' && (
+                        <div>
+                          <div className="font-semibold mb-1">Glow color</div>
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="color"
+                              value={config.logoScreenGlowColor ?? '#FFFFFF'}
+                              onChange={(e) =>
+                                setConfig({ ...config, logoScreenGlowColor: e.target.value })
+                              }
+                              className="h-10 w-16 rounded bg-transparent cursor-pointer border border-slate-600"
+                            />
+                            <span className="font-mono text-sm text-slate-400">
+                              {(config.logoScreenGlowColor ?? '#FFFFFF').toUpperCase()}
+                            </span>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <div>
@@ -346,11 +425,34 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                         }}
                       >
                         <div className="w-full h-full flex items-center justify-center p-6">
-                          <img
-                            src={previewLogoUrl}
-                            alt=""
-                            className="max-w-[60%] max-h-[60%] object-contain"
-                          />
+                          {(() => {
+                            const effect = resolveLogoEffect(
+                              config.logoScreenAnimation,
+                              config.logoScreenGlowColor,
+                            );
+                            return (
+                              <div
+                                className="relative inline-flex items-center justify-center max-w-[60%] max-h-[60%]"
+                                style={effect.wrapperStyle}
+                              >
+                                <img
+                                  src={previewLogoUrl}
+                                  alt=""
+                                  className={`max-w-full max-h-full object-contain ${effect.imgClassName}`}
+                                />
+                                {effect.showShimmer && (
+                                  <span
+                                    aria-hidden
+                                    className="logo-shimmer pointer-events-none absolute inset-0"
+                                    style={{
+                                      WebkitMaskImage: `url("${previewLogoUrl}")`,
+                                      maskImage: `url("${previewLogoUrl}")`,
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            );
+                          })()}
                         </div>
                       </div>
                       {!hasCustomLogo && (
@@ -367,12 +469,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
             )}
 
             {activeTab === 'hardware' && (
-              <>
-                <ReaderStatusSection
-                  onOpenUsbDriver={() => setActiveTab('usb-driver')}
-                />
-                <CardReaderTestSection />
-              </>
+              <HardwareTab onOpenUsbDriver={() => setActiveTab('usb-driver')} />
             )}
 
             {activeTab === 'account' && <AccountScreen />}
@@ -527,6 +624,18 @@ interface CardWithReceivedAt {
   receivedAt: Date;
 }
 
+// HardwareTab — the Reader status card plus the card-reader test panel. When
+// the reader has a driver problem, the status card links over to the dedicated
+// USB driver settings tab (Developer → USB driver), which owns the full fix.
+function HardwareTab({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
+  return (
+    <>
+      <ReaderStatusSection onOpenUsbDriver={onOpenUsbDriver} />
+      <CardReaderTestSection />
+    </>
+  );
+}
+
 // Read-only status block showing the auto-detected reader port. Replaces the
 // old port-picker section: there's no choice to be made — the app filters
 // available ports by VID 10c4 / PID 800a and takes the first match.
@@ -588,28 +697,41 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
               </div>
               <div className="text-xs text-slate-400 mt-1">
                 The Vulnerable Driver Blocklist is refusing the legacy
-                silabser.sys. Install the signed Universal driver to fix
-                it — no Memory Integrity change needed.
+                silabser.sys. Install the signed driver to fix it — no Memory
+                Integrity change needed.
               </div>
-              <div className="mt-2 flex items-center gap-3 flex-wrap">
-                <button
-                  disabled
-                  title="Coming in the next build"
-                  className="inline-flex items-center gap-2 px-3 py-1.5 bg-red-600/60 rounded font-medium text-white text-sm opacity-60 cursor-not-allowed"
-                >
-                  <HardDriveDownload size={14} />
-                  Install signed driver
-                  <span className="text-xs uppercase tracking-wider opacity-80">
-                    (coming soon)
-                  </span>
-                </button>
-                <button
-                  onClick={onOpenUsbDriver}
-                  className="inline-flex items-center gap-1.5 text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2"
-                >
-                  Learn more
-                </button>
+              <button
+                onClick={onOpenUsbDriver}
+                className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded font-medium text-white text-sm transition-colors"
+              >
+                <Usb size={14} />
+                Fix it in USB driver settings
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : driverState.kind === 'driver_not_installed' ? (
+        // SetupDi saw a CP210x device with CM problem code 28/18 — plugged in
+        // but no driver bound (sits under "Other devices"). Installing one fixes it.
+        <div className="rounded-lg border-2 border-amber-500/50 bg-amber-500/10 px-4 py-3">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="text-amber-400 flex-shrink-0 mt-0.5" size={18} />
+            <div className="flex-1 min-w-0">
+              <div className="text-amber-300 font-medium">
+                We see a SportIdent reader, but its driver isn't installed
               </div>
+              <div className="text-xs text-slate-400 mt-1">
+                Windows has no driver bound to the reader (Device Manager shows
+                it under "Other devices", code 28). Install the SportIdent USB
+                driver to bring it online.
+              </div>
+              <button
+                onClick={onOpenUsbDriver}
+                className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded font-medium text-white text-sm transition-colors"
+              >
+                <Usb size={14} />
+                Install it from USB driver settings
+              </button>
             </div>
           </div>
         </div>
@@ -626,7 +748,7 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
               className="mt-2 inline-flex items-center gap-1.5 text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2"
             >
               <Usb size={13} />
-              Driver blocked or missing? Install the SportIdent USB driver
+              Driver blocked or missing? Open USB driver settings
             </button>
           </div>
         </div>

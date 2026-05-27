@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Loader2, Lock, Mail } from 'lucide-react';
+import { Loader2, Lock, Mail, KeyRound } from 'lucide-react';
 import { OtpInput } from './OtpInput';
-import { verifyPin, getLockoutEnd, type VerifyOutcome } from '../../services/pinStore';
+import { verifyPin, getLockoutEnd, clearPin, type VerifyOutcome } from '../../services/pinStore';
 import { requestPinResetOtp, verifyPinResetOtpAndSet } from '../../services/auth';
 import { isOnline } from '../../services/connectivity';
 import { ApiError } from '../../services/api';
+import { signalPinReset } from '../../services/pinResetSignal';
+import { RecoveryCodePrompt } from '../RecoveryCodePrompt';
 import type { AuthUser } from '../../services/authStore';
 
 // Manual-lock PIN gate. Rendered as a full-screen overlay when the user
@@ -13,17 +15,22 @@ import type { AuthUser } from '../../services/authStore';
 // disk; this screen never touches the server unless the user explicitly
 // taps "Forgot PIN".
 //
-// Recovery flow is the existing OTP infra:
-//   1. tap "Forgot PIN" (online only — button disabled when offline),
-//   2. server emails a code to user.email (read from cached auth_user row),
-//   3. user types the OTP, then a new PIN, both inline on this screen.
+// Two recovery paths:
+//   - "Forgot PIN" (online only): server emails an OTP to user.email, then the
+//     user types the OTP + a new PIN inline (existing infra).
+//   - "Use a recovery code" (works offline): an admin-issued one-time code,
+//     validated locally. On success the device PIN is cleared and the app
+//     unlocks; the operator sets a new PIN via the banner / Settings. This is
+//     the only path that works at an offline event when the email is out of
+//     reach — see RecoveryCodePrompt / recoveryCodesStore.
 
 type Phase =
   | 'enter_pin'
   | 'forgot_request'
   | 'forgot_verify'
   | 'forgot_set_pin'
-  | 'forgot_done';
+  | 'forgot_done'
+  | 'recovery_code';
 
 interface LockScreenProps {
   user: AuthUser;
@@ -166,6 +173,34 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
     setPin('');
   }
 
+  // A valid offline recovery code proves admin authorization. Drop the
+  // forgotten PIN and unlock; the operator re-establishes a PIN via the
+  // "set a new PIN" banner or Settings (and a relaunch forces SetPinScreen).
+  async function handleRecoveryUnlock() {
+    try {
+      await clearPin();
+    } catch (err) {
+      console.error('[LockScreen] clearPin after recovery failed:', err);
+    }
+    signalPinReset();
+    onUnlocked();
+  }
+
+  if (phase === 'recovery_code') {
+    return (
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+        <RecoveryCodePrompt
+          onSuccess={handleRecoveryUnlock}
+          onCancel={() => {
+            setPhase('enter_pin');
+            setError(null);
+            setPin('');
+          }}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
       <div className="w-full max-w-md">
@@ -234,6 +269,23 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
                   Connect to the internet to reset your PIN.
                 </p>
               )}
+
+              <div className="flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPhase('recovery_code');
+                    setError(null);
+                    setPin('');
+                  }}
+                  disabled={busy}
+                  className="text-sm text-slate-400 hover:text-white disabled:opacity-50"
+                  title="Works offline — ask your administrator for a recovery code"
+                >
+                  <KeyRound className="w-4 h-4 inline mr-1.5 align-text-bottom" />
+                  Use a recovery code
+                </button>
+              </div>
             </>
           )}
 

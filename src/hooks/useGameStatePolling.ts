@@ -12,6 +12,11 @@ interface UseGameStatePollingOptions {
   onAllTeamsFinished: () => void;
   onNewBip: (row: RawPunchRow & { launched_game_id: number }) => void;
   enabled?: boolean;
+  // When true, suppress the all-teams-finished auto-end. Used by auto-register
+  // / reuse-cards modes where teams are created dynamically, so a momentary
+  // "all current teams finished" must not end the game. The game then ends
+  // only via the server `ended` flag (manual End game).
+  disableAllFinishedEnd?: boolean;
 }
 
 export function useGameStatePolling({
@@ -21,6 +26,7 @@ export function useGameStatePolling({
   onAllTeamsFinished,
   onNewBip,
   enabled = true,
+  disableAllFinishedEnd = false,
 }: UseGameStatePollingOptions) {
   const lastRawIdRef = useRef<number>(0);
   const gameEndedRef = useRef(false);
@@ -30,12 +36,14 @@ export function useGameStatePolling({
   const onNewBipRef = useRef(onNewBip);
   const launchedGameIdRef = useRef(launchedGameId);
   const numberOfTeamsRef = useRef(numberOfTeams);
+  const disableAllFinishedEndRef = useRef(disableAllFinishedEnd);
 
   useEffect(() => { onGameEndedRef.current = onGameEnded; }, [onGameEnded]);
   useEffect(() => { onAllTeamsFinishedRef.current = onAllTeamsFinished; }, [onAllTeamsFinished]);
   useEffect(() => { onNewBipRef.current = onNewBip; }, [onNewBip]);
   useEffect(() => { launchedGameIdRef.current = launchedGameId; }, [launchedGameId]);
   useEffect(() => { numberOfTeamsRef.current = numberOfTeams; }, [numberOfTeams]);
+  useEffect(() => { disableAllFinishedEndRef.current = disableAllFinishedEnd; }, [disableAllFinishedEnd]);
 
   useEffect(() => {
     if (!launchedGameId || !enabled) return;
@@ -75,7 +83,11 @@ export function useGameStatePolling({
         }
 
         const teams = state.teams ?? [];
-        if (teams.length >= numberOfTeamsRef.current && teams.every((t) => t.end_time !== null)) {
+        if (
+          !disableAllFinishedEndRef.current &&
+          teams.length >= numberOfTeamsRef.current &&
+          teams.every((t) => t.end_time !== null)
+        ) {
           gameEndedRef.current = true;
           onAllTeamsFinishedRef.current();
           return;

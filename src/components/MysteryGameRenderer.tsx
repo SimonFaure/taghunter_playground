@@ -21,6 +21,9 @@ type Localized = Record<string, string>;
 
 export type MysteryScreen = 'instructions' | 'ingame' | 'endgame';
 
+/** Semantic per-enigma scoring result. Drives the colour-blind status marks. */
+export type EnigmaStatusKind = 'correct' | 'incorrect' | 'no_answer' | 'both_answers';
+
 export interface MysteryRendererGameMeta {
   background_image?: string;
   team_name_background_image?: string;
@@ -57,6 +60,9 @@ export interface MysteryGameRendererProps {
   resolveMediaUrl: (filename: string) => string;
   /** Active screen of the gameplay flow. */
   screen: MysteryScreen;
+  /** When true on the 'ingame' screen, render only the background — every board
+   *  element (timer/score/enigmas/gauge) stays hidden until the reveal fires. */
+  boardHidden?: boolean;
   /** Pre-formatted timer string (e.g. "MM:SS"). */
   timerText: string;
   /** Current score (whatever unit `points_units` says). */
@@ -70,6 +76,13 @@ export interface MysteryGameRendererProps {
    * the end-of-game reveal animation to flash green/red/orange/gray on each
    * cell as the score is tallied. */
   enigmaStatusColors?: Record<string, string>;
+  /** Per-enigma semantic result, keyed by `enigma.number`. Populated during the
+   * reveal alongside `enigmaStatusColors`; drives the colour-blind status marks. */
+  enigmaStatusKinds?: Record<string, EnigmaStatusKind>;
+  /** When true, overlay shape-coded status marks (✓ / ✗ / both-biped) on the
+   * featured + recap enigma images so colour-blind operators can read each
+   * result without relying on the green/red/amber background tint. */
+  colorblind?: boolean;
   /** Which enigma to feature in the centre column (0-based). */
   selectedEnigmaIndex: number;
   /** Gauge fill in 0-100. */
@@ -93,16 +106,145 @@ export interface MysteryGameRendererProps {
 const DEFAULT_CANONICAL_WIDTH = 1920;
 const DEFAULT_CANONICAL_HEIGHT = 1080;
 
+// Fade length (each direction) for the centre "main" enigma image.
+const ENIGMA_FADE_MS = 220;
+
+/**
+ * Centre "main" enigma image with a fade-out → fade-in between successive
+ * enigmas during the reveal. Exactly ONE <img> is mounted at a time, so images
+ * never overlap: when the featured enigma changes, the current image fades to
+ * transparent, the src swaps while invisible, then the new image fades back in.
+ * The first image fades in too (it mounts hidden and is shown on the next
+ * frame). `blurred` keeps the existing blur filter (blurred until revealed).
+ */
+function CenterEnigmaImage({ src, blurred, alt }: { src: string; blurred: boolean; alt: string }) {
+  const [shown, setShown] = useState(src); // the src currently in the DOM
+  const [visible, setVisible] = useState(false); // drives the opacity fade
+
+  // Fade the freshly-shown image in on the next frame (also handles the first).
+  useEffect(() => {
+    if (!shown) return;
+    const raf = requestAnimationFrame(() => setVisible(true));
+    return () => cancelAnimationFrame(raf);
+  }, [shown]);
+
+  // On a new src: show immediately if nothing is up yet, else fade the current
+  // image out first, then swap (the effect above fades the new one back in).
+  useEffect(() => {
+    if (src === shown) return;
+    if (!shown) {
+      setShown(src);
+      return;
+    }
+    setVisible(false);
+    const t = setTimeout(() => setShown(src), ENIGMA_FADE_MS);
+    return () => clearTimeout(t);
+  }, [src, shown]);
+
+  if (!shown) return null;
+  return (
+    <img
+      src={shown}
+      alt={alt}
+      className={blurred ? 'mystery-game-blur' : ''}
+      style={{
+        position: 'absolute',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        objectFit: 'contain',
+        opacity: visible ? 1 : 0,
+        transition: `opacity ${ENIGMA_FADE_MS}ms ease`,
+      }}
+    />
+  );
+}
+
+/** Crisp white check/cross drawn as SVG so it renders identically regardless of
+ *  the scenario's (possibly decorative) font. */
+function MarkGlyph({ type, px }: { type: 'check' | 'cross'; px: number }) {
+  return (
+    <svg
+      width={px}
+      height={px}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="#ffffff"
+      strokeWidth={3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ display: 'block', filter: 'drop-shadow(0 1px 1px rgba(0,0,0,0.45))' }}
+    >
+      {type === 'check' ? (
+        <path d="M5 13l4 4L19 7" />
+      ) : (
+        <>
+          <path d="M6 6l12 12" />
+          <path d="M6 18L18 6" />
+        </>
+      )}
+    </svg>
+  );
+}
+
+/**
+ * Shape-coded status badge pinned to the bottom-right corner of an enigma
+ * image. Shown only in colour-blind mode so the result is readable without
+ * relying on the green/red/amber background tint:
+ *   • correct       → ✓ (green badge)
+ *   • incorrect     → ✗ (red badge)
+ *   • both_answers  → ✓✗ (amber pill — both stations were biped)
+ *   • no_answer     → no badge (nothing was biped)
+ * Colour is kept as a secondary cue; the glyph shape carries the meaning.
+ */
+function StatusMark({ kind, size }: { kind: EnigmaStatusKind; size: number }) {
+  if (kind === 'no_answer') return null;
+  const bg = kind === 'correct' ? '#16a34a' : kind === 'incorrect' ? '#dc2626' : '#d97706';
+  const glyphs: Array<'check' | 'cross'> =
+    kind === 'correct' ? ['check'] : kind === 'incorrect' ? ['cross'] : ['check', 'cross'];
+  const isPill = glyphs.length > 1;
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        right: `${size * 0.16}px`,
+        bottom: `${size * 0.16}px`,
+        height: `${size}px`,
+        minWidth: `${size}px`,
+        padding: isPill ? `0 ${size * 0.18}px` : 0,
+        boxSizing: 'border-box',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: isPill ? `${size * 0.08}px` : 0,
+        background: bg,
+        borderRadius: `${size}px`,
+        border: `${Math.max(1, size * 0.05)}px solid rgba(255,255,255,0.92)`,
+        boxShadow: '0 2px 6px rgba(0,0,0,0.55)',
+        zIndex: 5,
+        pointerEvents: 'none',
+      }}
+    >
+      {glyphs.map((g, i) => (
+        <MarkGlyph key={i} type={g} px={size * 0.62} />
+      ))}
+    </div>
+  );
+}
+
 export function MysteryGameRenderer({
   gameMeta,
   enigmas,
   resolveMediaUrl,
   screen,
+  boardHidden,
   timerText,
   score,
   teamName,
   completedEnigmas,
   enigmaStatusColors,
+  enigmaStatusKinds,
+  colorblind,
   selectedEnigmaIndex,
   gaugePercent,
   onStartGame,
@@ -212,7 +354,7 @@ export function MysteryGameRenderer({
             flexDirection: 'column',
           }}
         >
-          {screen === 'ingame' && (
+          {screen === 'ingame' && !boardHidden && (
             <>
               {/* Top 3-column row */}
               <div
@@ -278,6 +420,7 @@ export function MysteryGameRenderer({
                     const text = enigma.text || `Enigma ${enigma.number ?? selectedEnigmaIndex + 1}`;
                     const revealed = completedEnigmas.has(parseInt(enigma.number, 10));
                     const featuredOverlay = enigmaStatusColors?.[enigma.number];
+                    const featuredKind = enigmaStatusKinds?.[enigma.number];
                     return (
                       <>
                         <div
@@ -292,32 +435,38 @@ export function MysteryGameRenderer({
                         >
                           {text}
                         </div>
+                        {/* Flexible area that centres a SQUARE tile so the
+                            green/red/amber status tint hugs the (square) enigma
+                            image instead of filling a wide rectangle. */}
                         <div
                           style={{
                             flex: '1 1 0',
                             width: '100%',
                             minHeight: 0,
-                            position: 'relative',
-                            background: featuredOverlay || 'rgba(255,255,255,0.06)',
-                            borderRadius: 12,
-                            overflow: 'hidden',
-                            transition: 'background 0.3s ease',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
                           }}
                         >
-                          {imgSrc && (
-                            <img
-                              src={imgSrc}
-                              alt={text}
-                              className={revealed ? '' : 'mystery-game-blur'}
-                              style={{
-                                position: 'absolute',
-                                inset: 0,
-                                width: '100%',
-                                height: '100%',
-                                objectFit: 'contain',
-                              }}
-                            />
-                          )}
+                          <div
+                            style={{
+                              position: 'relative',
+                              height: '100%',
+                              aspectRatio: '1 / 1',
+                              maxWidth: '100%',
+                              background: featuredOverlay || 'rgba(255,255,255,0.06)',
+                              borderRadius: 12,
+                              overflow: 'hidden',
+                              transition: 'background 0.3s ease',
+                            }}
+                          >
+                            {imgSrc && (
+                              <CenterEnigmaImage src={imgSrc} blurred={!revealed} alt={text} />
+                            )}
+                            {colorblind && featuredKind && (
+                              <StatusMark kind={featuredKind} size={stage.height * 0.075} />
+                            )}
+                          </div>
                         </div>
                       </>
                     );
@@ -363,6 +512,7 @@ export function MysteryGameRenderer({
                       const imgSrc = enigma.good_answer_image ? resolveMediaUrl(enigma.good_answer_image) : '';
                       const revealed = completedEnigmas.has(parseInt(enigma.number, 10));
                       const overlay = enigmaStatusColors?.[enigma.number];
+                      const overlayKind = enigmaStatusKinds?.[enigma.number];
                       return (
                         <div
                           key={`recap-${enigma.number ?? idx}`}
@@ -383,6 +533,9 @@ export function MysteryGameRenderer({
                               className={revealed ? '' : 'mystery-game-blur'}
                               style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                             />
+                          )}
+                          {colorblind && overlayKind && (
+                            <StatusMark kind={overlayKind} size={stage.height * 0.04} />
                           )}
                         </div>
                       );
@@ -460,6 +613,10 @@ export function MysteryGameRenderer({
                     const nodes: React.ReactNode[] = [];
                     entries.forEach(([key, level], idx) => {
                       const pts = parseFloat(level?.points ?? '0') || 0;
+                      // Levels are hidden by default and only appear once the
+                      // team's score reaches them — during the reveal each level
+                      // pops in as the running tally crosses its threshold.
+                      if (score < pts) return;
                       const clamped = Math.max(0, Math.min(fullGame, pts));
                       const fraction = clamped / fullGame;
                       const isTop = idx % 2 === 0;

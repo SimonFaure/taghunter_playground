@@ -10,6 +10,8 @@ export type ContentKind =
   | 'layouts'
   | 'cards'
   | 'on_demand_cards'
+  | 'team_names'
+  | 'recovery_codes'
   | 'game_types'
   | 'game_type_overrides';
 
@@ -17,6 +19,8 @@ export type CyclePhase = 'push_pending' | 'manifest' | 'download';
 export type WorkItemKind =
   | 'cards'
   | 'on_demand'
+  | 'team_names'
+  | 'recovery_codes'
   | 'pattern'
   | 'layout'
   | 'scenario_meta'

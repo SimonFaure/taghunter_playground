@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, ChevronRight, ChevronLeft, Usb } from 'lucide-react';
+import { X, ChevronRight, ChevronLeft, Usb, Save } from 'lucide-react';
 import type { SiPuce } from '../types/database';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -7,6 +7,15 @@ import * as patternStore from '../services/patternStore';
 import * as scenarioStore from '../services/scenarioStore';
 import * as gameTypesStore from '../services/gameTypesStore';
 import * as clientPreferencesStore from '../services/clientPreferencesStore';
+import * as launchConfigsStore from '../services/launchConfigsStore';
+import {
+  buildRoster,
+  extractTracksOptions,
+  EMPTY_TRACKS_OPTIONS,
+  type TracksLaunchOptions,
+  type PatternOption,
+} from '../services/launchResolve';
+import { ConfirmDialog } from './ConfirmDialog';
 import {
   listActiveLaunchedGames,
   getLaunchedGameState,
@@ -63,12 +72,6 @@ function extractDefaultLanguage(rawGameData: unknown): string | null {
   return null;
 }
 
-interface PatternOption {
-  slug: string;
-  name: string;
-  uniqid: string;
-}
-
 // The on-disk game-data.json may be the raw `game_data` blob or a legacy
 // envelope with `{scenario, game_data}` siblings — depending on which sync
 // generation wrote it. Probe known paths for `default_pattern_id`.
@@ -88,6 +91,75 @@ function extractDefaultPatternId(rawGameData: unknown): string | null {
   return null;
 }
 
+// ---------------------------------------------------------------- Tracks
+// Tracks launch options are parsed from the scenario's game_meta. The editor
+// enables a subset of each group; the operator picks one at launch. Labels
+// mirror the studio's RoutesSection / DisplaysSection / etc. copy.
+const TRACKS_ROUTE_LABELS: Record<string, string> = {
+  default: 'Default (all checkpoints)',
+  first_half: 'First half',
+  last_half: 'Last half',
+  odd: 'Odd checkpoints',
+  even: 'Even checkpoints',
+};
+const TRACKS_DISPLAY_LABELS: Record<string, string> = {
+  full: 'Full',
+  map: 'Map',
+  simple: 'Simple',
+};
+const TRACKS_PLAY_MODE_LABELS: Record<string, string> = {
+  itinerary: 'Itinerary (ordered)',
+  free: 'Free (any order)',
+};
+const TRACKS_SCORE_TYPE_LABELS: Record<string, string> = {
+  percentage: 'Percentage',
+  points: 'Points',
+};
+
+/** Compact radio group for a tracks launch option. Hidden when ≤1 option (auto-selected). */
+function TracksRadioGroup({
+  label,
+  name,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  name: string;
+  options: Array<{ key: string; label: string }>;
+  value: string;
+  onChange: (key: string) => void;
+}) {
+  if (options.length <= 1) return null;
+  return (
+    <div className="space-y-2">
+      <label className="block text-sm font-medium text-slate-300">{label}</label>
+      <div className="flex flex-wrap gap-2">
+        {options.map((o) => (
+          <label
+            key={o.key}
+            className={`px-3 py-2 rounded-lg border-2 cursor-pointer text-sm transition-all ${
+              value === o.key
+                ? 'border-blue-500 bg-blue-500/10 text-blue-300'
+                : 'border-slate-600 bg-slate-800 text-slate-300 hover:border-slate-500'
+            }`}
+          >
+            <input
+              type="radio"
+              name={name}
+              value={o.key}
+              checked={value === o.key}
+              onChange={() => onChange(o.key)}
+              className="sr-only"
+            />
+            {o.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 interface LaunchGameModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -95,9 +167,15 @@ interface LaunchGameModalProps {
   gameUniqid: string;
   gameTypeName: string;
   onLaunch: (config: GameConfig, deviceSelection: LaunchDeviceSelection) => void;
+  /** Seed step-1 from a saved config (Edit a config, or headless critical-fallback). */
+  prefillConfig?: Partial<GameConfig>;
+  /** When editing an existing config, its current name (seeds the Save field). */
+  prefillConfigName?: string;
+  /** Amber banner shown atop step 1 — e.g. the reason a headless launch fell back here. */
+  noticeText?: string;
+  /** Fired after a config is saved so the host can refresh counts / toast. */
+  onConfigSaved?: (name: string) => void;
 }
-
-export type TagquestVisibilityMode = 'persist' | 'hide_after_delay';
 
 export interface GameConfig {
   name: string;
@@ -108,16 +186,35 @@ export interface GameConfig {
   messageDisplayDuration: number;
   enigmaImageDisplayDuration: number;
   colorblindMode: boolean;
+  /** Mystery: relabeled "Auto-reset page" — auto-return the display to ready after results. */
   autoResetTeam: boolean;
+  /** Mystery: when true, an instructions screen holds until Enter/click before
+   *  the reveal animation; when false the board stays hidden and the reveal
+   *  plays automatically on the finishing (second) bip. Defaults to true. */
+  revealResultsOnInput?: boolean;
+  /** Seconds the results stay on screen before the auto page-reset (when autoResetTeam). */
   delayBeforeReset: number;
+  /** Mystery+tracks: no roster pre-built; each registered card's first bip creates+starts a team. */
+  autoRegisterTeam?: boolean;
+  /** Mystery+tracks: a finished card can start a fresh run after the cooldown. */
+  reuseCards?: boolean;
+  /** Mystery+tracks: each team types its own name on its first bip. Implies dynamic
+   *  team mode (no roster) — the bip creates the team, then prompts for the name. */
+  selfRegisterTeam?: boolean;
+  /** Minutes after a card finishes before it can be reused (when reuseCards). */
+  reuseDelayMinutes?: number;
+  /** Mystery+tracks: draw a fun pooled team name (by audience+language) instead of the card's key_name. */
+  useNamePool?: boolean;
+  /** Audience for the name pool draw — defaults to the scenario's game_public, overridable here.
+   *  Canonical trio mirrors studio's src/types/audience.ts. */
+  namePoolAudience?: 'mini_kids' | 'kids' | 'ado_adultes';
   victoryType?: 'speed' | 'score';
   playMode?: 'solo' | 'team';
   teammatesPerTeam?: number;
   testMode?: boolean;
   teams?: Team[];
-  /** Tagquest HUD value visibility — persists by default. */
-  visibilityMode?: TagquestVisibilityMode;
-  /** Seconds before HUD values fade out after an animation completes (used when visibilityMode === 'hide_after_delay'). */
+  /** Tagquest: seconds to keep the result (full image + score) on screen after
+   *  each punch animation completes, before the page resets to its hidden state. */
   visibilityHideDelaySec?: number;
   /** Selected language code from the launch picker (drives translations + video subtitles). */
   language?: string;
@@ -125,6 +222,19 @@ export interface GameConfig {
   playTutorialOnBip?: boolean;
   /** Play intro video (per-scenario scenario_video) on each team's first bip. Off if scenario has none. */
   playIntroOnBip?: boolean;
+  /** Tracks: selected route key (default | first_half | last_half | odd | even). */
+  route?: string;
+  /** Tracks: the studio-enabled route set, persisted so the Add Team form can
+   *  offer a per-team route override. */
+  tracksRoutes?: string[];
+  /** Tracks: selected display mode (full | map | simple). */
+  displayMode?: string;
+  /** Tracks: selected play mode (itinerary | free). Named distinctly from tagquest's `playMode`. */
+  trackPlayMode?: 'itinerary' | 'free';
+  /** Tracks: selected score type (percentage | points). */
+  scoreType?: 'percentage' | 'points';
+  /** Tracks: malus subtracted per minute over the time limit (points or %). */
+  malusPerMinute?: number;
 }
 
 export interface Teammate {
@@ -140,7 +250,33 @@ export interface Team {
   teammates?: Teammate[];
 }
 
-export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTypeName, onLaunch }: LaunchGameModalProps) {
+// Canonical audience trio for the name-pool draw — mirrors studio's
+// src/types/audience.ts (game_meta.game_public). Legacy values fold onto it.
+type NamePoolAudience = 'mini_kids' | 'kids' | 'ado_adultes';
+const NAME_POOL_AUDIENCES: { value: NamePoolAudience; label: string }[] = [
+  { value: 'mini_kids', label: 'Mini Kids' },
+  { value: 'kids', label: 'Kids' },
+  { value: 'ado_adultes', label: 'Teens/Adults' },
+];
+function normalizeGamePublic(raw: unknown): NamePoolAudience {
+  const v = String(raw ?? '').toLowerCase();
+  if (['adults', 'adult', 'adultes', 'teens', 'ado'].includes(v)) return 'ado_adultes';
+  if (v === 'mini_kids' || v === 'ado_adultes') return v;
+  return 'kids';
+}
+
+export function LaunchGameModal({
+  isOpen,
+  onClose,
+  gameTitle,
+  gameUniqid,
+  gameTypeName,
+  onLaunch,
+  prefillConfig,
+  prefillConfigName,
+  noticeText,
+  onConfigSaved,
+}: LaunchGameModalProps) {
   const { user } = useAuth();
 
   const getDefaultName = () => {
@@ -161,12 +297,16 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
     colorblindMode: false,
     autoResetTeam: false,
     delayBeforeReset: 10,
+    revealResultsOnInput: true,
+    autoRegisterTeam: false,
+    reuseCards: false,
+    selfRegisterTeam: false,
+    reuseDelayMinutes: 5,
     victoryType: 'score',
     playMode: 'team',
     teammatesPerTeam: 2,
     testMode: false,
-    visibilityMode: 'persist',
-    visibilityHideDelaySec: 5,
+    visibilityHideDelaySec: 10,
   });
   const [patternFolders, setPatternFolders] = useState<PatternOption[]>([]);
   const [defaultPattern, setDefaultPattern] = useState<string>('');
@@ -180,17 +320,33 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
   const [motherChecked, setMotherChecked] = useState(true);
   const [scenarioLanguages, setScenarioLanguages] = useState<string[]>([]);
   const [scenarioDefaultLang, setScenarioDefaultLang] = useState<string>('en');
+  // Scenario's audience (game_meta.game_public) — default for the name-pool draw.
+  const [scenarioPublic, setScenarioPublic] = useState<NamePoolAudience>('kids');
   const [gameTypeRow, setGameTypeRow] = useState<gameTypesStore.GameTypeRow | null>(null);
   const [hasTutorialVideo, setHasTutorialVideo] = useState(false);
   const [hasIntroVideo, setHasIntroVideo] = useState(false);
   const [prefTutorialDefault, setPrefTutorialDefault] = useState(false);
   const [prefIntroDefault, setPrefIntroDefault] = useState(false);
   const [teams, setTeams] = useState<Team[]>([]);
+  const [tracksOptions, setTracksOptions] = useState<TracksLaunchOptions>(EMPTY_TRACKS_OPTIONS);
+  const [showTracksAdvanced, setShowTracksAdvanced] = useState(false);
+  // Tracks: checkpoint count from game_meta + a warning when the selected
+  // pattern's row count doesn't match it (the checkpoint↔station binding is
+  // positional, so a mismatch silently misaligns scoring).
+  const [tracksCheckpointCount, setTracksCheckpointCount] = useState(0);
+  const [tracksPatternWarning, setTracksPatternWarning] = useState('');
   const [availableChips, setAvailableChips] = useState<SiPuce[]>([]);
   const [onDemandChips, setOnDemandChips] = useState<SiPuce[]>([]);
   const [hasOnDemandCards, setHasOnDemandCards] = useState(false);
   const [useOnDemandCards, setUseOnDemandCards] = useState(false);
   const [usedChipIds, setUsedChipIds] = useState<Set<number>>(new Set());
+  // Save-configuration UI (step 1). The inline name field appears when the
+  // operator clicks "Save configuration"; saving does NOT launch.
+  const [showSaveField, setShowSaveField] = useState(false);
+  const [configName, setConfigName] = useState('');
+  const [savePending, setSavePending] = useState(false);
+  const [overwriteConfirm, setOverwriteConfirm] = useState<string | null>(null);
+  const [savedFlash, setSavedFlash] = useState<string | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
@@ -229,6 +385,24 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       const defaultLang = extractDefaultLanguage(rawGameData) || sortedLangs[0] || 'en';
       setScenarioDefaultLang(defaultLang);
 
+      // Audience for name-pool draws: scenario's game_meta.game_public, folded
+      // onto the canonical trio (legacy 'adults'/'teens' -> 'ado_adultes').
+      const gp = (rawGameData as { game_meta?: { game_public?: unknown } } | null)?.game_meta?.game_public;
+      setScenarioPublic(normalizeGamePublic(gp));
+
+      // Tracks: parse the enabled route/display/play_mode/score_type sets +
+      // default time/malus from game_meta. No-op (empty) for other types.
+      if (gameTypeLc === 'tracks') {
+        setTracksOptions(extractTracksOptions(rawGameData));
+        const gm = (rawGameData as { game_meta?: { checkpoints?: unknown } } | null)?.game_meta
+          ?? (rawGameData as { game_data?: { game_meta?: { checkpoints?: unknown } } } | null)?.game_data?.game_meta;
+        const cps = gm?.checkpoints;
+        setTracksCheckpointCount(Array.isArray(cps) ? cps.length : 0);
+      } else {
+        setTracksOptions(EMPTY_TRACKS_OPTIONS);
+        setTracksCheckpointCount(0);
+      }
+
       // Resolve game-type capabilities + whether tutorial/intro videos are
       // actually available locally so we know whether to render each toggle.
       const gameTypeLcLocal = gameTypeName.toLowerCase();
@@ -258,40 +432,103 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
 
   useEffect(() => {
     if (isOpen) {
+      const isTracksType = gameTypeName.toLowerCase() === 'tracks';
+      const isMysteryType = gameTypeName.toLowerCase() === 'mystery';
+      // Tracks default selections: first enabled key in declaration order;
+      // score type uses the `default`-flagged one, falling back to first enabled.
+      const defaultScoreType =
+        tracksOptions.scoreTypes.find((s) => s.isDefault)?.key ??
+        tracksOptions.scoreTypes[0]?.key;
       setConfig({
-        name: '',
         numberOfTeams: 10,
         firstChipIndex: 1,
         pattern: defaultPattern,
-        duration: 60,
+        duration: isTracksType ? tracksOptions.defaultTime : (isMysteryType ? 90 : 60),
         messageDisplayDuration: 5,
         enigmaImageDisplayDuration: 1,
         colorblindMode: false,
         autoResetTeam: false,
         delayBeforeReset: 10,
+        revealResultsOnInput: true,
+        autoRegisterTeam: false,
+        reuseCards: false,
+        selfRegisterTeam: false,
+        reuseDelayMinutes: 5,
+        useNamePool: false,
+        namePoolAudience: scenarioPublic,
         victoryType: 'score',
         playMode: 'team',
         teammatesPerTeam: 2,
         testMode: false,
-        visibilityMode: 'persist',
-        visibilityHideDelaySec: 5,
+        visibilityHideDelaySec: 10,
         language: scenarioDefaultLang,
         playTutorialOnBip: hasTutorialVideo && prefTutorialDefault,
         playIntroOnBip: hasIntroVideo && prefIntroDefault,
+        route: tracksOptions.routes[0],
+        tracksRoutes: tracksOptions.routes,
+        displayMode: tracksOptions.displays[0],
+        trackPlayMode: tracksOptions.playModes[0] as 'itinerary' | 'free' | undefined,
+        scoreType: defaultScoreType as 'percentage' | 'points' | undefined,
+        malusPerMinute: tracksOptions.defaultMalus,
+        // A saved config (Edit / headless fallback) overrides the computed
+        // defaults. `name` stays blank — it's per-instance, never restored.
+        ...(prefillConfig ?? {}),
+        name: '',
       });
       setStep(1);
       setTeams([]);
       setPairedDevices([]);
       setSelectedDeviceIds(new Set());
       setMotherChecked(true);
+      setShowTracksAdvanced(false);
+      // Seed the save field when editing an existing config; otherwise reset.
+      setConfigName(prefillConfigName ?? '');
+      setShowSaveField(!!prefillConfigName);
+      setSavePending(false);
+      setOverwriteConfirm(null);
+      setSavedFlash(null);
     }
-  }, [isOpen, defaultPattern, scenarioDefaultLang, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault]);
+  }, [isOpen, defaultPattern, scenarioDefaultLang, scenarioPublic, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, prefillConfig, prefillConfigName]);
+
+  // Tracks: warn when the selected pattern's row count doesn't match the
+  // course's checkpoint count. The checkpoint↔station binding is positional
+  // (pattern row N ↔ Nth checkpoint), so a mismatch silently misaligns scoring.
+  useEffect(() => {
+    if (gameTypeName.toLowerCase() !== 'tracks' || !config.pattern || tracksCheckpointCount === 0) {
+      setTracksPatternWarning('');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const stations = await patternStore.getTracksCheckpointStations(config.pattern);
+        if (cancelled) return;
+        if (stations.size !== tracksCheckpointCount) {
+          setTracksPatternWarning(
+            `This pattern defines ${stations.size} checkpoint row(s) but the course has ${tracksCheckpointCount} checkpoint(s). Scoring may misalign — make sure the pattern matches this scenario.`,
+          );
+        } else {
+          setTracksPatternWarning('');
+        }
+      } catch {
+        if (!cancelled) setTracksPatternWarning('');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [gameTypeName, config.pattern, tracksCheckpointCount]);
 
   const allChips = useOnDemandCards
     ? [...availableChips, ...onDemandChips]
     : availableChips;
 
   const isTagQuest = gameTypeName.toLowerCase() === 'tagquest';
+  const isTracks = gameTypeName.toLowerCase() === 'tracks';
+  const isMystery = gameTypeName.toLowerCase() === 'mystery';
+  // Auto-register + reuse-cards are offered for the card-collection runtimes
+  // that create teams on bip (mystery, tracks) — not tagquest.
+  const supportsDynamicTeams = isMystery || isTracks;
   const isTeamMode = isTagQuest && config.playMode === 'team';
   const chipsPerTeam = isTeamMode ? (config.teammatesPerTeam ?? 2) : 1;
   const totalChipsNeeded = config.numberOfTeams * chipsPerTeam;
@@ -384,40 +621,10 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
   }, [isOpen, user]);
 
   const handleNextStep = () => {
-    const startIndex = config.firstChipIndex;
-    const numberOfTeams = config.numberOfTeams;
-
+    // Roster build lives in launchResolve so the headless Quick Launch path
+    // produces an identical roster from the same inputs.
     const combinedChips = [...availableChips, ...onDemandChips];
-
-    if (isTeamMode) {
-      const newTeams: Team[] = [];
-      for (let i = 0; i < numberOfTeams; i++) {
-        const teamChips = combinedChips.slice(startIndex + i * chipsPerTeam, startIndex + i * chipsPerTeam + chipsPerTeam);
-        if (teamChips.length === 0) break;
-        const firstChip = teamChips[0];
-        const teammates: Teammate[] = teamChips.map(chip => ({
-          chipId: chip.id,
-          chipNumber: chip.key_number,
-          name: chip.key_name,
-        }));
-        newTeams.push({
-          chipId: firstChip.id,
-          chipNumber: firstChip.key_number,
-          name: firstChip.key_name,
-          teammates,
-        });
-      }
-      setTeams(newTeams);
-    } else {
-      const chipsForTeams = combinedChips.slice(startIndex, startIndex + numberOfTeams);
-      const newTeams: Team[] = chipsForTeams.map(chip => ({
-        chipId: chip.id,
-        chipNumber: chip.key_number,
-        name: chip.key_name,
-      }));
-      setTeams(newTeams);
-    }
-
+    setTeams(buildRoster(config, combinedChips, gameTypeName));
     setStep(2);
   };
 
@@ -486,33 +693,44 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
     return ids;
   };
 
+  // Advance to the device picker (step 3). Lazy-fetch the paired list and
+  // pre-check the mother + every currently-online satellite. Offline peers
+  // are visible but unchecked — the operator can opt to queue a join_game
+  // command that wakes them up when they reconnect (15-minute TTL on the
+  // pending_commands row).
+  const advanceToDevices = async () => {
+    setStep(3);
+    setPairedLoading(true);
+    try {
+      const rows = await listPairedDevicesForLaunch();
+      setPairedDevices(rows);
+      setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online).map(r => r.id)));
+      setMotherChecked(true);
+    } catch (err) {
+      console.error('[LaunchGameModal] failed to load paired devices:', err);
+      setPairedDevices([]);
+    } finally {
+      setPairedLoading(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (step === 1) {
-      handleNextStep();
+      // Dynamic-team modes (auto-register / self-register) build no roster, so
+      // skip the team-config step.
+      if (config.autoRegisterTeam || config.selfRegisterTeam) {
+        setTeams([]);
+        await advanceToDevices();
+      } else {
+        handleNextStep();
+      }
       return;
     }
 
     if (step === 2) {
-      // Advance to the device picker. Lazy-fetch the paired list and
-      // pre-check the mother + every currently-online satellite. Offline
-      // peers are visible but unchecked — the operator can opt to queue a
-      // join_game command that will wake them up when they reconnect
-      // (15-minute TTL on the pending_commands row).
-      setStep(3);
-      setPairedLoading(true);
-      try {
-        const rows = await listPairedDevicesForLaunch();
-        setPairedDevices(rows);
-        setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online).map(r => r.id)));
-        setMotherChecked(true);
-      } catch (err) {
-        console.error('[LaunchGameModal] failed to load paired devices:', err);
-        setPairedDevices([]);
-      } finally {
-        setPairedLoading(false);
-      }
+      await advanceToDevices();
       return;
     }
 
@@ -530,6 +748,37 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
       include_self: motherChecked,
       satellite_targets,
     });
+  };
+
+  // Persist the current step-1 settings as a named, scenario-assigned config.
+  // Does NOT launch and does NOT advance the wizard. Strips the per-instance
+  // name/teams (handled in launchConfigsStore).
+  const performSaveConfig = async (name: string) => {
+    if (!user?.client_id) return;
+    setSavePending(true);
+    try {
+      await launchConfigsStore.upsertByName(user.client_id, gameUniqid, name, config);
+      setOverwriteConfirm(null);
+      setSavedFlash(name);
+      onConfigSaved?.(name);
+      window.setTimeout(() => setSavedFlash(null), 2500);
+    } catch (err) {
+      console.error('[LaunchGameModal] failed to save launch config:', err);
+    } finally {
+      setSavePending(false);
+    }
+  };
+
+  const handleSaveConfigClick = async () => {
+    const name = configName.trim();
+    if (!name || !user?.client_id) return;
+    // Overwrite-on-name-match: confirm before replacing an existing config.
+    const exists = await launchConfigsStore.existsByName(user.client_id, gameUniqid, name);
+    if (exists) {
+      setOverwriteConfirm(name);
+    } else {
+      await performSaveConfig(name);
+    }
   };
 
   if (!isOpen) return null;
@@ -550,6 +799,11 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
           {step === 1 && (
           <>
+          {noticeText && (
+            <div className="flex items-start gap-3 p-4 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-sm">
+              <span>{noticeText}</span>
+            </div>
+          )}
           <div className="space-y-2">
             <label htmlFor="name" className="block text-sm font-medium text-slate-300">
               Game Name
@@ -566,6 +820,8 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {!(config.autoRegisterTeam || config.selfRegisterTeam) && (
+            <>
             <div className="space-y-2">
               <label htmlFor="numberOfTeams" className="block text-sm font-medium text-slate-300">
                 Number of Teams
@@ -619,6 +875,8 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
                 required
               />
             </div>
+            </>
+            )}
 
             <div className="space-y-2">
               <label htmlFor="pattern" className="block text-sm font-medium text-slate-300">
@@ -642,6 +900,12 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
                   ))
                 )}
               </select>
+              {tracksPatternWarning && (
+                <p className="text-xs text-amber-300/90 flex items-start gap-1.5">
+                  <span aria-hidden>⚠️</span>
+                  <span>{tracksPatternWarning}</span>
+                </p>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -865,6 +1129,70 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
             </>
           )}
 
+          {isTracks && (
+            <div className="space-y-4 p-4 bg-slate-800/50 rounded-lg">
+              <TracksRadioGroup
+                label="Route"
+                name="tracksRoute"
+                options={tracksOptions.routes.map((k) => ({ key: k, label: TRACKS_ROUTE_LABELS[k] ?? k }))}
+                value={config.route ?? ''}
+                onChange={(k) => setConfig({ ...config, route: k })}
+              />
+              <TracksRadioGroup
+                label="Display mode"
+                name="tracksDisplay"
+                options={tracksOptions.displays.map((k) => ({ key: k, label: TRACKS_DISPLAY_LABELS[k] ?? k }))}
+                value={config.displayMode ?? ''}
+                onChange={(k) => setConfig({ ...config, displayMode: k })}
+              />
+              <TracksRadioGroup
+                label="Play mode"
+                name="tracksPlayMode"
+                options={tracksOptions.playModes.map((k) => ({ key: k, label: TRACKS_PLAY_MODE_LABELS[k] ?? k }))}
+                value={config.trackPlayMode ?? ''}
+                onChange={(k) => setConfig({ ...config, trackPlayMode: k as 'itinerary' | 'free' })}
+              />
+              <TracksRadioGroup
+                label="Score type"
+                name="tracksScoreType"
+                options={tracksOptions.scoreTypes.map((s) => ({ key: s.key, label: TRACKS_SCORE_TYPE_LABELS[s.key] ?? s.key }))}
+                value={config.scoreType ?? ''}
+                onChange={(k) => setConfig({ ...config, scoreType: k as 'percentage' | 'points' })}
+              />
+
+              <div className="pt-1 border-t border-slate-700/60">
+                <button
+                  type="button"
+                  onClick={() => setShowTracksAdvanced((v) => !v)}
+                  className="text-sm text-slate-400 hover:text-slate-200 transition"
+                >
+                  {showTracksAdvanced ? '▾' : '▸'} Advanced
+                </button>
+                {showTracksAdvanced && (
+                  <div className="mt-3 space-y-2">
+                    <label htmlFor="malusPerMinute" className="block text-sm font-medium text-slate-300">
+                      Malus per minute over (points or %)
+                    </label>
+                    <input
+                      type="number"
+                      id="malusPerMinute"
+                      min={0}
+                      value={config.malusPerMinute ?? tracksOptions.defaultMalus}
+                      onChange={(e) =>
+                        setConfig({ ...config, malusPerMinute: Math.max(0, parseInt(e.target.value) || 0) })
+                      }
+                      className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                    <p className="text-xs text-slate-500">
+                      Game time is set by the Duration field above. The malus is
+                      subtracted from the final score for each minute over.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="space-y-4 p-4 bg-slate-800/50 rounded-lg">
             {hasOnDemandCards && (
               <div className="flex items-center gap-3 pb-3 border-b border-slate-700">
@@ -907,6 +1235,118 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               </label>
             </div>
 
+            {supportsDynamicTeams && (
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="autoRegisterTeam"
+                  checked={!!config.autoRegisterTeam}
+                  onChange={(e) => setConfig({ ...config, autoRegisterTeam: e.target.checked })}
+                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <label htmlFor="autoRegisterTeam" className="text-sm font-medium text-slate-300">
+                  Auto register team
+                  <span className="ml-2 text-xs text-slate-400 font-normal">(first bip of each registered card creates and starts a team)</span>
+                </label>
+              </div>
+            )}
+
+            {supportsDynamicTeams && (
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="selfRegisterTeam"
+                  checked={!!config.selfRegisterTeam}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      selfRegisterTeam: e.target.checked,
+                      // The name pool is meaningless when players type their own
+                      // name (self-register overwrites it), so clear it.
+                      useNamePool: e.target.checked ? false : config.useNamePool,
+                    })
+                  }
+                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <label htmlFor="selfRegisterTeam" className="text-sm font-medium text-slate-300">
+                  Self-register team names
+                  <span className="ml-2 text-xs text-slate-400 font-normal">(each team types its own name on first bip — teams are created on bip)</span>
+                </label>
+              </div>
+            )}
+
+            {supportsDynamicTeams && (
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="reuseCards"
+                  checked={!!config.reuseCards}
+                  onChange={(e) => setConfig({ ...config, reuseCards: e.target.checked })}
+                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <label htmlFor="reuseCards" className="text-sm font-medium text-slate-300">
+                  Reuse cards
+                  <span className="ml-2 text-xs text-slate-400 font-normal">(a finished card can start a fresh run after a delay)</span>
+                </label>
+              </div>
+            )}
+
+            {supportsDynamicTeams && config.reuseCards && (
+              <div className="ml-8 space-y-2">
+                <label htmlFor="reuseDelayMinutes" className="block text-sm font-medium text-slate-300">
+                  Delay before a finished card can be reused (minutes)
+                </label>
+                <input
+                  type="number"
+                  id="reuseDelayMinutes"
+                  min="0"
+                  value={config.reuseDelayMinutes ?? 5}
+                  onChange={(e) => setConfig({ ...config, reuseDelayMinutes: Math.max(0, parseInt(e.target.value) || 0) })}
+                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  required
+                />
+              </div>
+            )}
+
+            {/* Name pool — only meaningful when teams are created dynamically and
+                the players aren't naming themselves (self-register overwrites it). */}
+            {supportsDynamicTeams && (config.autoRegisterTeam || config.reuseCards) && !config.selfRegisterTeam && (
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="useNamePool"
+                  checked={!!config.useNamePool}
+                  onChange={(e) => setConfig({ ...config, useNamePool: e.target.checked })}
+                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <label htmlFor="useNamePool" className="text-sm font-medium text-slate-300">
+                  Use team-name pool
+                  <span className="ml-2 text-xs text-slate-400 font-normal">(draw a fun name instead of the card name)</span>
+                </label>
+              </div>
+            )}
+
+            {supportsDynamicTeams && (config.autoRegisterTeam || config.reuseCards) && !config.selfRegisterTeam && config.useNamePool && (
+              <div className="ml-8 space-y-2">
+                <label htmlFor="namePoolAudience" className="block text-sm font-medium text-slate-300">
+                  Audience
+                  <span className="ml-2 text-xs text-slate-400 font-normal">(defaults to the scenario's public)</span>
+                </label>
+                <select
+                  id="namePoolAudience"
+                  value={config.namePoolAudience ?? scenarioPublic}
+                  onChange={(e) => setConfig({ ...config, namePoolAudience: e.target.value as NamePoolAudience })}
+                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  {NAME_POOL_AUDIENCES.map((a) => (
+                    <option key={a.value} value={a.value}>{a.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {isMystery && (
+            <>
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
@@ -916,7 +1356,8 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
                 className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
               />
               <label htmlFor="autoResetTeam" className="text-sm font-medium text-slate-300">
-                Auto-reset Team
+                Auto-reset page
+                <span className="ml-2 text-xs text-slate-400 font-normal">(returns the display to the ready screen after results — no Enter/reset needed)</span>
               </label>
             </div>
 
@@ -937,56 +1378,45 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               </div>
             )}
 
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="revealResultsOnInput"
+                checked={config.revealResultsOnInput ?? true}
+                onChange={(e) => setConfig({ ...config, revealResultsOnInput: e.target.checked })}
+                className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+              />
+              <label htmlFor="revealResultsOnInput" className="text-sm font-medium text-slate-300">
+                Use Enter or click to reveal results
+                <span className="ml-2 text-xs text-slate-400 font-normal">(checked: an instructions screen holds until Enter/click, then plays the reveal. Unchecked: the board stays hidden and reveals automatically on the finishing bip.)</span>
+              </label>
+            </div>
+            </>
+            )}
+
             <div className="pt-1 border-t border-slate-700/60 space-y-2">
               <label className="block text-sm font-medium text-slate-300">
-                HUD values display
+                Keep result on screen
               </label>
-              <div className="space-y-2">
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="visibilityMode"
-                    value="persist"
-                    checked={(config.visibilityMode ?? 'persist') === 'persist'}
-                    onChange={() => setConfig({ ...config, visibilityMode: 'persist' })}
-                    className="mt-1 w-4 h-4 bg-slate-700 border-slate-600 text-blue-600 focus:ring-2 focus:ring-blue-500"
-                  />
-                  <span className="text-sm text-slate-300">
-                    Persist until next punch
-                    <span className="ml-1 text-xs text-slate-400">— values stay visible after each punch animation</span>
-                  </span>
-                </label>
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="visibilityMode"
-                    value="hide_after_delay"
-                    checked={config.visibilityMode === 'hide_after_delay'}
-                    onChange={() => setConfig({ ...config, visibilityMode: 'hide_after_delay' })}
-                    className="mt-1 w-4 h-4 bg-slate-700 border-slate-600 text-blue-600 focus:ring-2 focus:ring-blue-500"
-                  />
-                  <span className="text-sm text-slate-300">
-                    Hide after
-                    <input
-                      type="number"
-                      min={1}
-                      max={60}
-                      value={config.visibilityHideDelaySec ?? 5}
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          visibilityHideDelaySec: Math.max(1, parseInt(e.target.value) || 5),
-                        })
-                      }
-                      onClick={(e) => e.stopPropagation()}
-                      disabled={config.visibilityMode !== 'hide_after_delay'}
-                      className="mx-1 w-14 px-2 py-0.5 text-sm bg-slate-800 border border-slate-700 rounded text-white disabled:opacity-50"
-                    />
-                    seconds
-                    <span className="ml-1 text-xs text-slate-400">— values fade out after the animation completes</span>
-                  </span>
-                </label>
+              <div className="flex items-center gap-2 text-sm text-slate-300">
+                <input
+                  type="number"
+                  min={0}
+                  max={60}
+                  value={config.visibilityHideDelaySec ?? 10}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      visibilityHideDelaySec: Math.max(0, parseInt(e.target.value) || 0),
+                    })
+                  }
+                  className="w-16 px-2 py-0.5 text-sm bg-slate-800 border border-slate-700 rounded text-white"
+                />
+                seconds
               </div>
+              <p className="text-xs text-slate-400">
+                After each punch animation, the full image + score stay on screen for this long, then everything hides until the next punch.
+              </p>
             </div>
 
             <div className="flex items-center gap-3 pt-1 border-t border-slate-700/60">
@@ -1011,21 +1441,66 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
             </div>
           </div>
 
-          <div className="flex items-center justify-end gap-4 pt-4 border-t border-slate-700">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium flex items-center gap-2"
-            >
-              Next
-              <ChevronRight size={20} />
-            </button>
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-slate-700">
+            {/* Save-configuration control — persists step-1 settings as a named,
+                scenario-assigned preset. Does NOT launch or advance. */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {!showSaveField ? (
+                <button
+                  type="button"
+                  onClick={() => setShowSaveField(true)}
+                  className="px-4 py-2 text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition font-medium flex items-center gap-2 text-sm"
+                >
+                  <Save size={16} />
+                  Save configuration
+                </button>
+              ) : (
+                <>
+                  <input
+                    type="text"
+                    value={configName}
+                    onChange={(e) => setConfigName(e.target.value)}
+                    placeholder="Configuration name"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void handleSaveConfigClick();
+                      }
+                    }}
+                    className="px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveConfigClick()}
+                    disabled={!configName.trim() || savePending}
+                    className="px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-lg transition font-medium flex items-center gap-2 text-sm"
+                  >
+                    <Save size={16} />
+                    {savePending ? 'Saving…' : 'Save'}
+                  </button>
+                  {savedFlash && (
+                    <span className="text-sm text-green-400">Saved “{savedFlash}”</span>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="flex items-center gap-4">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium flex items-center gap-2"
+              >
+                Next
+                <ChevronRight size={20} />
+              </button>
+            </div>
           </div>
           </>
           )}
@@ -1281,7 +1756,7 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
               <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-700">
                 <button
                   type="button"
-                  onClick={() => setStep(2)}
+                  onClick={() => setStep(config.autoRegisterTeam || config.selfRegisterTeam ? 1 : 2)}
                   className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium flex items-center gap-2"
                 >
                   <ChevronLeft size={20} />
@@ -1308,6 +1783,17 @@ export function LaunchGameModal({ isOpen, onClose, gameTitle, gameUniqid, gameTy
           )}
         </form>
       </div>
+
+      <ConfirmDialog
+        isOpen={overwriteConfirm !== null}
+        onConfirm={() => overwriteConfirm && void performSaveConfig(overwriteConfirm)}
+        onCancel={() => setOverwriteConfirm(null)}
+        title="Replace configuration"
+        message={`A configuration named “${overwriteConfirm}” already exists for this scenario. Replace it?`}
+        confirmText="Replace"
+        cancelText="Cancel"
+        variant="warning"
+      />
     </div>
   );
 }

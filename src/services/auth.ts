@@ -1,6 +1,10 @@
 import { apiCall, ApiError } from './api';
 import { saveJwt, loadJwt, clearJwt } from './strongholdStore';
-import { getDeviceMetadata } from './device';
+import {
+  getDeviceMetadata,
+  getCachedDeviceDisplayName,
+  setCachedDeviceDisplayName,
+} from './device';
 import {
   persistAuthState,
   clearAuthUser,
@@ -21,6 +25,7 @@ export interface DeviceListItem {
   id: number;
   device_uniq: string;
   device_label: string | null;
+  display_name?: string | null;
   os: string | null;
   os_version: string | null;
   app_version?: string | null;
@@ -194,11 +199,42 @@ export async function listMyDevices(): Promise<{
   });
 }
 
+// Resolve THIS device's friendly display name from the server, cache it, and
+// return it (or null if none is set). Safe to call offline — falls back to the
+// last cached value. The footer uses this to show the operator-assigned name.
+export async function refreshDeviceDisplayName(): Promise<string | null> {
+  const user = await getAuthUser();
+  if (!user?.current_device_id) return getCachedDeviceDisplayName();
+  try {
+    const { devices, current_device_id } = await listMyDevices();
+    const myId = current_device_id ?? user.current_device_id;
+    const me = devices.find((d) => d.id === myId);
+    const name = me?.display_name?.trim() || null;
+    await setCachedDeviceDisplayName(name);
+    return name;
+  } catch {
+    return getCachedDeviceDisplayName();
+  }
+}
+
 export async function revokeDevice(deviceId: number): Promise<void> {
   await apiCall('secure_auth', 'playground-revoke-device', {
     method: 'POST',
     bearer: true,
     body: { device_id: deviceId },
+  });
+}
+
+// Sets the user-chosen display name for one of the caller's own devices.
+// Pass null (or an empty string) to clear it and fall back to the OS hostname.
+export async function renameDevice(
+  deviceId: number,
+  displayName: string | null
+): Promise<void> {
+  await apiCall('secure_auth', 'playground-rename-device', {
+    method: 'POST',
+    bearer: true,
+    body: { device_id: deviceId, display_name: displayName },
   });
 }
 

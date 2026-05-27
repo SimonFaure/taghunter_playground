@@ -566,6 +566,124 @@ fn playground_migrations() -> Vec<Migration> {
             "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "team-name pools sync state (incremental version compare, like cards_state)",
+            sql: r#"
+                CREATE TABLE IF NOT EXISTS name_pools_state (
+                    client_id INTEGER PRIMARY KEY,
+                    remote_version REAL,
+                    local_version REAL,
+                    fetched_at TEXT,
+                    failed_attempts INTEGER NOT NULL DEFAULT 0
+                );
+
+                UPDATE schema_meta SET value = '12' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 13,
+            description: "launch_configs: named, scenario-assigned saved launch presets (local-only)",
+            sql: r#"
+                CREATE TABLE IF NOT EXISTS launch_configs (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id   INTEGER NOT NULL,
+                    game_uniqid TEXT    NOT NULL,
+                    name        TEXT    NOT NULL,
+                    config_json TEXT    NOT NULL,
+                    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(client_id, game_uniqid, name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_launch_configs_scope
+                    ON launch_configs(client_id, game_uniqid);
+
+                UPDATE schema_meta SET value = '13' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 14,
+            description: "lg_game_summaries: durable per-game stats record (survives lg_* deletion on archive; pushed to studio as game_summary telemetry)",
+            sql: r#"
+                -- One row per summarised launched game, keyed by the same
+                -- summary_uuid as lg_launched_games (stable cloud identity).
+                -- Deliberately NOT a child of lg_launched_games: the row must
+                -- survive Archive (which deletes lg_launched_games + cascades).
+                -- pushed_at NULL = needs (re)enqueue to studio; content_hash
+                -- detects post-game edits so we only re-emit on real change.
+                -- archived_at NULL = still in the active list; NOT NULL = archived.
+                CREATE TABLE IF NOT EXISTS lg_game_summaries (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    summary_uuid    TEXT    NOT NULL UNIQUE,
+                    launched_game_id INTEGER NULL,
+                    client_id       INTEGER NOT NULL,
+                    game_uniqid     TEXT    NOT NULL,
+                    name            TEXT    NOT NULL,
+                    game_type       TEXT    NOT NULL,
+                    played_at       TEXT    NULL,
+                    teams_launched  INTEGER NULL,
+                    teams_played    INTEGER NOT NULL,
+                    players_played  INTEGER NOT NULL,
+                    content_hash    TEXT    NULL,
+                    pushed_at       TEXT    NULL,
+                    archived_at     TEXT    NULL,
+                    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_lgsum_client_archived
+                    ON lg_game_summaries(client_id, archived_at);
+                CREATE INDEX IF NOT EXISTS idx_lgsum_needs_push
+                    ON lg_game_summaries(pushed_at);
+
+                UPDATE schema_meta SET value = '14' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 15,
+            description: "recovery_codes: offline, admin-issued one-time PIN-recovery codes (per-device burn) + sync state",
+            sql: r#"
+                -- The client's pool of admin-issued recovery codes, synced down
+                -- from studio (plaintext over TLS) and stored here as salted
+                -- PBKDF2 hashes only — same "UX gate, not crypto" threat model
+                -- as device_pin (see services/pinStore.ts). A code is consumed
+                -- ONCE PER DEVICE: used_at flips locally on use, so the same
+                -- code can still be used once on a different device. Entering a
+                -- valid code clears the device PIN (all exit gates then bypass).
+                --
+                -- code_index is the code's stable 1..N position in the admin's
+                -- pool (identity for the best-effort report-up to studio).
+                -- pool_version mirrors the synced version; replacing the pool
+                -- (admin "Regenerate all") clears this table and re-inserts.
+                -- All rows in a pool share one salt (generated on the device
+                -- when the pool is stored) so a verify hashes the typed code
+                -- once and compares against every unused hash.
+                CREATE TABLE IF NOT EXISTS recovery_codes (
+                    code_index     INTEGER PRIMARY KEY,
+                    code_hash      TEXT    NOT NULL,
+                    salt           TEXT    NOT NULL,
+                    kdf_iterations INTEGER NOT NULL,
+                    pool_version   REAL    NOT NULL,
+                    used_at        TEXT    NULL,
+                    reported_at    TEXT    NULL
+                );
+
+                -- Incremental version compare for the sync orchestrator, like
+                -- name_pools_state / cards_state.
+                CREATE TABLE IF NOT EXISTS recovery_codes_state (
+                    client_id       INTEGER PRIMARY KEY,
+                    remote_version  REAL,
+                    local_version   REAL,
+                    fetched_at      TEXT,
+                    failed_attempts INTEGER NOT NULL DEFAULT 0
+                );
+
+                UPDATE schema_meta SET value = '15' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

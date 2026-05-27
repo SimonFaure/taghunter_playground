@@ -91,6 +91,18 @@ export function onDemandCardsFileRel(): string {
   return `media/cards/on_demand.json`;
 }
 
+// Merged team-name pools (global ∪ this client's), grouped audience -> language
+// -> [names]. Written by the sync orchestrator, read at team creation by both
+// the cloud-mode draw (TS) and the LAN mother (Rust, same absolute path).
+export function teamNamesFileRel(): string {
+  return `media/name_pools/team_names.json`;
+}
+
+export async function teamNamesFileAbs(): Promise<string> {
+  const root = await mediaRootAbs();
+  return join(root, 'name_pools', 'team_names.json');
+}
+
 // ---------- write helpers ----------
 
 export async function ensureDir(relPath: string): Promise<void> {
@@ -292,5 +304,6 @@ export async function wipeAllContent(): Promise<void> {
   await db.execute('DELETE FROM layouts');
   await db.execute('DELETE FROM cards_state');
   await db.execute('DELETE FROM cards');
+  await db.execute('DELETE FROM name_pools_state');
   await removeRecursive('media');
 }

@@ -11,6 +11,7 @@
 
 import { apiCall } from './api';
 import { withRetry } from './apiRetry';
+import { captureGameSummary, type GameSummaryPayload } from './telemetry';
 
 // ---------- types ----------
 
@@ -26,6 +27,8 @@ export interface LaunchedGameRow {
   ended?: number | boolean;
   created_at?: string;
   updated_at?: string;
+  /** True when launched with testMode — excluded from statistics; deletable. */
+  is_test?: boolean;
 }
 
 export interface TeamRow {
@@ -162,6 +165,31 @@ export async function updateLaunchedGameMeta(id: number, meta: Record<string, st
   );
 }
 
+// `update_meta` REPLACES the whole KV map atomically (DELETE-then-insert on the
+// server), so adding or removing a single key means read-merge-write. These two
+// helpers wrap that gotcha once. They are last-writer-wins: only call them from
+// the single kiosk that owns a game's loop — never fan per-team writes across
+// satellites.
+export async function mergeLaunchedGameMeta(
+  id: number,
+  patch: Record<string, string>
+): Promise<void> {
+  const current = await getLaunchedGameMeta(id);
+  await updateLaunchedGameMeta(id, { ...current, ...patch });
+}
+
+export async function removeLaunchedGameMetaKeys(id: number, keys: string[]): Promise<void> {
+  const current = await getLaunchedGameMeta(id);
+  let changed = false;
+  for (const k of keys) {
+    if (k in current) {
+      delete current[k];
+      changed = true;
+    }
+  }
+  if (changed) await updateLaunchedGameMeta(id, current);
+}
+
 // State endpoint — the 1s poll target. Returns ended flag, current teams, and
 // any raw_data rows newer than `sinceRawId`.
 export async function getLaunchedGameState(id: number, sinceRawId: number): Promise<LaunchedGameStatePayload> {
@@ -222,18 +250,47 @@ export async function endTeam(teamId: number, endTime: number): Promise<void> {
   return updateTeam(teamId, { end_time: endTime });
 }
 
+// Remove a team from a launched game (and its completed-quest rows). Used by
+// the operator's "Remove team" action in the launched-games list.
+export async function deleteTeam(teamId: number): Promise<void> {
+  await withRetry(() =>
+    apiCall('launched_games', 'delete_team', {
+      method: 'POST',
+      bearer: true,
+      body: { team_id: teamId },
+    })
+  );
+}
+
 export async function addTeamToLaunchedGame(input: {
   launched_game_id: number;
   team_number: number;
   team_name?: string | null;
   pattern?: number;
   key_id?: number | null;
+  // When true and the launch enabled a name pool, the server replaces the
+  // provided team_name with a drawn pooled name (server-side for uniqueness).
+  // team_name is kept as the fallback if the pool is empty/exhausted.
+  draw_from_pool?: boolean;
 }): Promise<{ id: number }> {
   return withRetry(() =>
     apiCall<{ id: number }>('launched_games', 'add_team', {
       method: 'POST',
       bearer: true,
       body: input,
+    })
+  );
+}
+
+// Record the game's start timestamp once (idempotent server-side). Pass an
+// ISO-8601 UTC string (e.g. new Date(ms).toISOString()). Returns the effective
+// start_time — the first writer wins, so re-entry never resets the clock.
+export async function startLaunchedGame(id: number, startTime: string): Promise<{ start_time: string | null }> {
+  return withRetry(() =>
+    apiCall<{ start_time: string | null }>('launched_games', 'start_game', {
+      method: 'POST',
+      bearer: true,
+      body: { id, start_time: startTime },
     })
   );
 }
@@ -246,6 +303,9 @@ export async function endLaunchedGame(id: number): Promise<void> {
       body: { id },
     })
   );
+  // A just-ended game is eligible for summarising; push it up promptly
+  // (best-effort — the periodic sync is the safety net).
+  void syncGameSummaries();
 }
 
 export async function deleteLaunchedGame(id: number): Promise<void> {
@@ -256,6 +316,96 @@ export async function deleteLaunchedGame(id: number): Promise<void> {
       body: { id },
     })
   );
+}
+
+// ---------- game-summary statistics + Archive ----------
+
+export interface GameSummaryRow extends GameSummaryPayload {
+  archived_at?: string | null;
+  pushed?: boolean;
+}
+
+/**
+ * Archive a launched game: the mother finalises its summary (kept forever in
+ * lg_game_summaries) and deletes the heavy lg_* rows. Then push the summary up.
+ */
+export async function archiveLaunchedGame(
+  id: number
+): Promise<{ success: boolean; summary_kept: boolean }> {
+  const res = await withRetry(() =>
+    apiCall<{ success: boolean; summary_kept: boolean }>('launched_games', 'archive_game', {
+      method: 'POST',
+      bearer: true,
+      body: { id },
+    })
+  );
+  void syncGameSummaries();
+  return res;
+}
+
+/** The local Archived-games view: every archived summary, newest first. */
+export async function listArchivedSummaries(): Promise<GameSummaryRow[]> {
+  const res = await withRetry(() =>
+    apiCall<{ summaries: GameSummaryRow[] }>('launched_games', 'list_archived_summaries', {
+      method: 'GET',
+      bearer: true,
+    })
+  );
+  return res.summaries ?? [];
+}
+
+let summarySyncInFlight = false;
+
+/**
+ * Push pending per-game statistics to studio. Asks the local mother to auto-end
+ * stale (>24h) games and recompute summaries, then enqueues a game_summary
+ * telemetry event for each summary still awaiting a push and marks them pushed.
+ * Best-effort and self-healing: a crash mid-flight just re-pushes next cycle
+ * (studio upserts on summary_uuid). No-op when there is no mother / no auth.
+ */
+export async function syncGameSummaries(): Promise<void> {
+  if (summarySyncInFlight) return;
+  summarySyncInFlight = true;
+  try {
+    const res = await apiCall<{ summaries: GameSummaryPayload[] }>(
+      'launched_games',
+      'sync_summaries',
+      { method: 'POST', bearer: true }
+    );
+    const summaries = res.summaries ?? [];
+    if (summaries.length === 0) return;
+    for (const s of summaries) {
+      await captureGameSummary(s);
+    }
+    await apiCall('launched_games', 'mark_summaries_pushed', {
+      method: 'POST',
+      bearer: true,
+      body: { summary_uuids: summaries.map((s) => s.summary_uuid) },
+    });
+  } catch (err) {
+    console.warn('[summaries] syncGameSummaries skipped:', err);
+  } finally {
+    summarySyncInFlight = false;
+  }
+}
+
+let summaryTimer: ReturnType<typeof setInterval> | null = null;
+const SUMMARY_SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 min, matching the drainer
+
+/** Start the periodic game-summary sync (boot + every 5 min). Idempotent. */
+export function startSummarySync(): void {
+  if (summaryTimer !== null) return;
+  summaryTimer = setInterval(() => {
+    void syncGameSummaries();
+  }, SUMMARY_SYNC_INTERVAL_MS);
+  void syncGameSummaries();
+}
+
+export function stopSummarySync(): void {
+  if (summaryTimer !== null) {
+    clearInterval(summaryTimer);
+    summaryTimer = null;
+  }
 }
 
 export async function registerDeviceForGame(launchedGameId: number): Promise<void> {
@@ -415,6 +565,22 @@ export async function recordCompletedQuest(input: {
 }): Promise<{ inserted: boolean; id: number }> {
   return withRetry(() =>
     apiCall<{ inserted: boolean; id: number }>('launched_games', 'record_completed_quest', {
+      method: 'POST',
+      bearer: true,
+      body: input,
+    })
+  );
+}
+
+// Removes the most-recent completion row for (team, quest_number). Used by the
+// operator's manual quest-count adjustment in the Team Details modal.
+export async function deleteCompletedQuest(input: {
+  launched_game_id: number;
+  team_id: number;
+  quest_number: string;
+}): Promise<{ deleted: boolean }> {
+  return withRetry(() =>
+    apiCall<{ deleted: boolean }>('launched_games', 'delete_completed_quest', {
       method: 'POST',
       bearer: true,
       body: input,

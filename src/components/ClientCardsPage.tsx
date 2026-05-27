@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CreditCard, RefreshCw, Package, Layers } from 'lucide-react';
+import { CreditCard, RefreshCw, Package, Layers, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
 import * as patternStore from '../services/patternStore';
 import { runCycleNow, getState } from '../services/syncOrchestrator';
 import { on } from '../services/syncEvents';
@@ -8,8 +8,9 @@ import { CardsManager } from './cards/CardsManager';
 
 // Cards & patterns overview for the currently-authenticated client. Layout
 // mirrors ConfigurationPage: a left sidebar with tab buttons + a main panel
-// that renders the active section. Cards CRUD is handled by CardsManager;
-// patterns are display-only (synced from studio).
+// that renders the active section. Cards CRUD is handled by CardsManager.
+// Patterns are synced from studio; each one can be expanded to inspect its
+// station→item routing and removed from this device (re-syncs from cloud).
 
 type CardsTab = 'cards' | 'patterns';
 
@@ -55,6 +56,14 @@ export default function ClientCardsPage() {
     }
   };
 
+  const handleDeletePattern = useCallback(
+    async (uniqid: string) => {
+      await patternStore.remove(uniqid);
+      await refresh();
+    },
+    [refresh]
+  );
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white py-8">
       <div className="container mx-auto px-6">
@@ -95,11 +104,13 @@ export default function ClientCardsPage() {
                       title="Default Patterns"
                       rows={defaultPatterns}
                       icon={<Package className="text-blue-400" size={24} />}
+                      onDelete={handleDeletePattern}
                     />
                     <PatternSection
                       title="Custom Patterns"
                       rows={customPatterns}
                       icon={<Layers className="text-blue-400" size={24} />}
+                      onDelete={handleDeletePattern}
                     />
                   </>
                 )}
@@ -172,10 +183,12 @@ function PatternSection({
   title,
   rows,
   icon,
+  onDelete,
 }: {
   title: string;
   rows: patternStore.PatternRow[];
   icon: React.ReactNode;
+  onDelete: (uniqid: string) => void | Promise<void>;
 }) {
   return (
     <Section
@@ -187,29 +200,199 @@ function PatternSection({
       ) : (
         <div className="space-y-3">
           {rows.map((p) => (
-            <div
-              key={p.pattern_uniqid}
-              className="flex items-center justify-between p-4 rounded-lg border border-slate-700 bg-slate-900/40"
-            >
-              <div className="flex-1">
-                <h3 className="font-semibold text-white">{p.name}</h3>
-                <div className="flex items-center gap-4 mt-1 text-sm text-slate-400 flex-wrap">
-                  <span>Game type: {p.game_type}</span>
-                  <span>
-                    Version: {p.local_version ?? '—'}
-                    {p.local_version !== p.remote_version && (
-                      <span className="text-amber-400 ml-1">(server v{p.remote_version})</span>
-                    )}
-                  </span>
-                  <span className="font-mono text-xs px-2 py-1 rounded bg-slate-800 text-slate-300">
-                    {p.pattern_uniqid}
-                  </span>
-                </div>
-              </div>
-            </div>
+            <PatternCard key={p.pattern_uniqid} pattern={p} onDelete={onDelete} />
           ))}
         </div>
       )}
     </Section>
   );
+}
+
+// One pattern row: header (name + metadata + actions) over an optional,
+// lazily-loaded routing detail panel that shows which station maps to which
+// enigma / checkpoint / quest.
+function PatternCard({
+  pattern,
+  onDelete,
+}: {
+  pattern: patternStore.PatternRow;
+  onDelete: (uniqid: string) => void | Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [routing, setRouting] = useState<patternStore.PatternRoutingItem[] | null>(null);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const toggleDetails = async () => {
+    if (!expanded && routing === null) {
+      setLoadingDetails(true);
+      try {
+        setRouting(await patternStore.getRouting(pattern.pattern_uniqid));
+      } finally {
+        setLoadingDetails(false);
+      }
+    }
+    setExpanded((v) => !v);
+  };
+
+  const handleDelete = async () => {
+    const ok = window.confirm(
+      `Remove "${pattern.name}" from this device?\n\n` +
+        'It will reappear on the next sync if it still exists in your account.'
+    );
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await onDelete(pattern.pattern_uniqid);
+    } catch {
+      setDeleting(false);
+    }
+  };
+
+  const downloaded = pattern.local_version !== null;
+  const groups = routing ? groupRouting(routing, pattern.game_type) : [];
+
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-900/40">
+      <div className="flex items-center justify-between gap-3 p-4">
+        <div className="flex-1 min-w-0">
+          <h3 className="font-semibold text-white truncate">{pattern.name}</h3>
+          <div className="flex items-center gap-4 mt-1 text-sm text-slate-400 flex-wrap">
+            <span>Game type: {pattern.game_type}</span>
+            <span>
+              Version: {pattern.local_version ?? '—'}
+              {pattern.local_version !== pattern.remote_version && (
+                <span className="text-amber-400 ml-1">(server v{pattern.remote_version})</span>
+              )}
+            </span>
+            <span className="font-mono text-xs px-2 py-1 rounded bg-slate-800 text-slate-300">
+              {pattern.pattern_uniqid}
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={toggleDetails}
+            className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
+            aria-expanded={expanded}
+          >
+            {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+            <span>Details</span>
+          </button>
+          <button
+            onClick={handleDelete}
+            disabled={deleting}
+            title="Remove from this device"
+            className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 disabled:opacity-50 transition-colors"
+          >
+            <Trash2 size={16} />
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="border-t border-slate-700 px-4 py-4">
+          {loadingDetails ? (
+            <div className="flex items-center gap-2 text-slate-400 text-sm">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              Loading routing…
+            </div>
+          ) : !downloaded ? (
+            <p className="text-slate-400 italic text-sm">
+              Routing not downloaded yet — run a sync to fetch this pattern's data.
+            </p>
+          ) : groups.length === 0 ? (
+            <p className="text-slate-400 italic text-sm">This pattern has no station assignments.</p>
+          ) : (
+            <div className="space-y-3">
+              {groups.map((g) => (
+                <div key={g.itemIndex} className="rounded-md bg-slate-800/60 p-3">
+                  <div className="font-medium text-slate-200 mb-2">{g.itemLabel}</div>
+                  <div className="space-y-1.5">
+                    {g.assignments.map((a, i) => (
+                      <div key={i} className="flex items-start gap-2 text-sm flex-wrap">
+                        <span className="text-slate-400 min-w-[7rem]">{a.label}:</span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {a.stations.map((s, j) => (
+                            <span
+                              key={j}
+                              className="font-mono text-xs px-2 py-0.5 rounded bg-blue-500/15 text-blue-300"
+                            >
+                              station {s}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Routing detail helpers -------------------------------------------------
+
+interface RoutingGroup {
+  itemIndex: number;
+  itemLabel: string;
+  assignments: { label: string; stations: number[] }[];
+}
+
+// The noun a pattern's items map to, per game type. Patterns are
+// scenario-agnostic (they only carry indices + station codes), so labels are
+// generic positional names rather than the specific enigma/checkpoint titles.
+function itemNoun(gameType: string): string {
+  switch (gameType.toLowerCase()) {
+    case 'tracks':
+      return 'Checkpoint';
+    case 'mystery':
+      return 'Enigma';
+    case 'tagquest':
+      return 'Quest';
+    default:
+      return 'Item';
+  }
+}
+
+function assignmentLabel(type: string): string {
+  switch (type) {
+    case 'good_answer_station':
+      return 'Good answer';
+    case 'wrong_answer_station':
+      return 'Wrong answer';
+    case 'checkpoint_station':
+      return 'Checkpoint';
+    default:
+      return type.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+}
+
+function groupRouting(items: patternStore.PatternRoutingItem[], gameType: string): RoutingGroup[] {
+  const noun = itemNoun(gameType);
+  const byItem = new Map<number, Map<string, number[]>>();
+  for (const it of items) {
+    let assignments = byItem.get(it.item_index);
+    if (!assignments) {
+      assignments = new Map();
+      byItem.set(it.item_index, assignments);
+    }
+    const stations = assignments.get(it.assignment_type) ?? [];
+    stations.push(it.station_key_number);
+    assignments.set(it.assignment_type, stations);
+  }
+  return Array.from(byItem.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([idx, assignments]) => ({
+      itemIndex: idx,
+      itemLabel: `${noun} ${idx}`,
+      assignments: Array.from(assignments.entries()).map(([type, stations]) => ({
+        label: assignmentLabel(type),
+        stations,
+      })),
+    }));
 }

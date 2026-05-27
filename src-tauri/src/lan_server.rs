@@ -142,6 +142,7 @@ pub async fn mother_start_local_server(
 
     let app_state = AppState {
         db: Arc::new(conn),
+        media_root: resolve_media_root(&app)?,
         client_id,
         mother_uuid: self_pair.mother_device_uuid.clone(),
         self_peer_id: self_pair.peer_id,
@@ -283,6 +284,14 @@ fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("playground.db"))
 }
 
+fn resolve_media_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    Ok(dir.join("media"))
+}
+
 // ─── self-pair bootstrap ─────────────────────────────────────────────────────
 
 struct SelfPair {
@@ -362,6 +371,9 @@ fn random_token(bytes: usize) -> String {
 #[derive(Clone)]
 struct AppState {
     db: Arc<DbConnection>,
+    /// `<app_data_dir>/media` — where synced content lives. Used by add_team to
+    /// read the team-name pools JSON (media/name_pools/team_names.json).
+    media_root: PathBuf,
     client_id: i64,
     /// Stable identity of this mother device. Returned by /ping.php so the
     /// child can verify it's still talking to the same machine it paired with.
@@ -575,8 +587,14 @@ async fn dispatch_launched_games(
         ("POST", "update_team") => update_team(&state, body).await,
         ("POST", "add_team") => add_team(&state, body).await,
         ("POST", "end_team") => end_team(&state, body).await,
+        ("POST", "delete_team") => delete_team(&state, body).await,
+        ("POST", "start_game") => start_game(&state, body).await,
         ("POST", "end_game") => end_game(&state, body).await,
         ("POST", "delete_game") => delete_game(&state, body).await,
+        ("POST", "archive_game") => archive_game(&state, body).await,
+        ("POST", "sync_summaries") => sync_summaries(&state).await,
+        ("POST", "mark_summaries_pushed") => mark_summaries_pushed(&state, body).await,
+        ("GET", "list_archived_summaries") => list_archived_summaries(&state).await,
         ("POST", "register_device") => register_device(&state, peer_id, body).await,
         ("GET", "get_devices") => get_devices(&state, &q.rest).await,
         ("GET", "list_paired_with_status") => list_paired_with_status(&state, &q.rest).await,
@@ -586,6 +604,7 @@ async fn dispatch_launched_games(
         ("POST", "ack_command") => ack_command(&state, peer_id, body).await,
         ("GET", "list_completed_quests") => list_completed_quests(&state, &q.rest).await,
         ("POST", "record_completed_quest") => record_completed_quest(&state, body).await,
+        ("POST", "delete_completed_quest") => delete_completed_quest(&state, body).await,
         ("", _) | (_, "") => Err(ApiErr::bad("action is required")),
         _ => Err(ApiErr::status(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1066,7 +1085,11 @@ async fn list(
             let (sql, args): (&str, Vec<SqlValue>) = match ended_filter.as_deref() {
                 Some("0") => (
                     "SELECT id, game_uniqid, name, number_of_teams, game_type, duration,
-                            start_time, started, ended, created_at, updated_at
+                            start_time, started, ended, created_at, updated_at,
+                            EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                                   WHERE m.launched_game_id = lg_launched_games.id
+                                     AND m.meta_name = 'testMode'
+                                     AND m.meta_value = 'true') AS is_test
                      FROM lg_launched_games
                      WHERE client_id = ? AND ended = 0
                      ORDER BY created_at DESC",
@@ -1074,7 +1097,11 @@ async fn list(
                 ),
                 Some("1") => (
                     "SELECT id, game_uniqid, name, number_of_teams, game_type, duration,
-                            start_time, started, ended, created_at, updated_at
+                            start_time, started, ended, created_at, updated_at,
+                            EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                                   WHERE m.launched_game_id = lg_launched_games.id
+                                     AND m.meta_name = 'testMode'
+                                     AND m.meta_value = 'true') AS is_test
                      FROM lg_launched_games
                      WHERE client_id = ? AND ended = 1
                      ORDER BY created_at DESC",
@@ -1082,7 +1109,11 @@ async fn list(
                 ),
                 _ => (
                     "SELECT id, game_uniqid, name, number_of_teams, game_type, duration,
-                            start_time, started, ended, created_at, updated_at
+                            start_time, started, ended, created_at, updated_at,
+                            EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                                   WHERE m.launched_game_id = lg_launched_games.id
+                                     AND m.meta_name = 'testMode'
+                                     AND m.meta_value = 'true') AS is_test
                      FROM lg_launched_games
                      WHERE client_id = ?
                      ORDER BY created_at DESC",
@@ -1103,6 +1134,7 @@ async fn list(
                     "ended": r.get::<_, i64>(8)?,
                     "created_at": r.get::<_, String>(9)?,
                     "updated_at": r.get::<_, String>(10)?,
+                    "is_test": r.get::<_, i64>(11)? != 0,
                 }))
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1415,6 +1447,87 @@ async fn update_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     Ok(json!({ "success": true }))
 }
 
+// Draw an unused team name from the synced pools JSON for this game's
+// configured audience+language, or None if the pool is disabled / missing /
+// exhausted. Called inside the add_team DB closure so the used-names read and
+// the eventual INSERT are serialized on one connection (cross-station
+// uniqueness). Any failure (no file, parse error, missing keys) collapses to
+// None — the caller keeps the key_name fallback.
+fn draw_team_name_from_pool(
+    c: &rusqlite::Connection,
+    media_root: &std::path::Path,
+    launched_game_id: i64,
+) -> Option<String> {
+    // Launch meta: useNamePool / namePoolAudience / language.
+    let mut use_pool = false;
+    let mut audience = String::new();
+    let mut language = String::new();
+    {
+        let mut stmt = c
+            .prepare("SELECT meta_name, meta_value FROM lg_launched_game_meta WHERE launched_game_id = ?1")
+            .ok()?;
+        let rows = stmt
+            .query_map(params![launched_game_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .ok()?;
+        for row in rows.flatten() {
+            match row.0.as_str() {
+                "useNamePool" => use_pool = row.1.as_deref() == Some("true"),
+                "namePoolAudience" => audience = row.1.unwrap_or_default(),
+                "language" => language = row.1.unwrap_or_default().to_lowercase(),
+                _ => {}
+            }
+        }
+    }
+    if !use_pool {
+        return None;
+    }
+    // Normalize legacy game_public values onto the canonical trio
+    // (mirror of src/types/audience.ts normalizeAudience).
+    let audience = match audience.to_lowercase().as_str() {
+        "adults" | "adult" | "adultes" | "teens" | "ado" => "ado_adultes".to_string(),
+        other => other.to_string(),
+    };
+    if !matches!(audience.as_str(), "mini_kids" | "kids" | "ado_adultes") || language.is_empty() {
+        return None;
+    }
+
+    // Candidate names from the synced JSON: pools[audience][language] = [..].
+    let path = media_root.join("name_pools").join("team_names.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let json: Value = serde_json::from_str(&text).ok()?;
+    let arr = json.get("pools")?.get(&audience)?.get(&language)?.as_array()?;
+    let candidates: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Exclude names already used by any team in this game (case-insensitive).
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(mut us) = c.prepare(
+        "SELECT team_name FROM lg_teams WHERE launched_game_id = ?1 AND team_name IS NOT NULL",
+    ) {
+        if let Ok(urows) = us.query_map(params![launched_game_id], |r| r.get::<_, String>(0)) {
+            for n in urows.flatten() {
+                used.insert(n.trim().to_lowercase());
+            }
+        }
+    }
+    let free: Vec<&String> = candidates
+        .iter()
+        .filter(|n| !used.contains(&n.trim().to_lowercase()))
+        .collect();
+    if free.is_empty() {
+        return None;
+    }
+    let idx = rand::thread_rng().gen_range(0..free.len());
+    Some(free[idx].clone())
+}
+
 async fn add_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let launched_game_id = json_i64(&body, "launched_game_id")?;
     let team_number = json_i64(&body, "team_number")?;
@@ -1432,10 +1545,42 @@ async fn add_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let key_id = body
         .get("key_id")
         .and_then(|v| if v.is_null() { None } else { v.as_i64() });
+    let draw_from_pool = body
+        .get("draw_from_pool")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let media_root = state.media_root.clone();
     require_game_owned(state, launched_game_id).await?;
     let new_id = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
+            // Multi-station safety: at most one active (end_time NULL) team per
+            // (launched_game, key_id). A concurrent add_team for a card that
+            // already has an active run returns that team's id instead of
+            // inserting a duplicate. (key_id None skips the guard.)
+            if let Some(kid) = key_id {
+                let existing: Option<i64> = c
+                    .query_row(
+                        "SELECT id FROM lg_teams
+                         WHERE launched_game_id = ?1 AND key_id = ?2 AND end_time IS NULL
+                         LIMIT 1",
+                        params![launched_game_id, kid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = existing {
+                    return Ok(id);
+                }
+            }
+            // Name pool: replace the key_name fallback with a drawn pooled name
+            // (server-side for cross-station uniqueness). Keeps the fallback if
+            // the pool is disabled / empty / exhausted.
+            let mut team_name = team_name;
+            if draw_from_pool {
+                if let Some(drawn) = draw_team_name_from_pool(c, &media_root, launched_game_id) {
+                    team_name = Some(drawn);
+                }
+            }
             c.execute(
                 "INSERT INTO lg_teams
                    (launched_game_id, team_number, team_name, pattern, score, key_id)
@@ -1465,6 +1610,57 @@ async fn end_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     Ok(json!({ "success": true }))
 }
 
+// Remove a team from a launched game, along with its completed-quest rows.
+// Used by the operator's "Remove team" action in the launched-games list.
+async fn delete_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let team_id = json_i64(&body, "team_id")?;
+    require_team_owned(state, team_id).await?;
+    state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+            let tx = c.transaction()?;
+            tx.execute(
+                "DELETE FROM lg_team_completed_quests WHERE team_id = ?",
+                params![team_id],
+            )?;
+            tx.execute("DELETE FROM lg_teams WHERE id = ?", params![team_id])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(json!({ "success": true }))
+}
+
+// Record the game's start timestamp ONCE. Idempotent: the `start_time IS NULL`
+// guard means re-entering the game page never resets the clock. The caller
+// supplies the timestamp (an ISO-8601 UTC string) so it isn't tied to the
+// server clock and parses unambiguously on the client. Returns the effective
+// start_time (the first writer's value wins).
+async fn start_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let id = json_i64(&body, "id")?;
+    let start_time = json_str(&body, "start_time")?.to_string();
+    require_game_owned(state, id).await?;
+    let effective = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+            c.execute(
+                "UPDATE lg_launched_games SET start_time = ?, started = 1
+                 WHERE id = ? AND start_time IS NULL",
+                params![start_time, id],
+            )?;
+            Ok(c
+                .query_row(
+                    "SELECT start_time FROM lg_launched_games WHERE id = ?",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+        .await?;
+    Ok(json!({ "start_time": effective }))
+}
+
 async fn end_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let id = json_i64(&body, "id")?;
     require_game_owned(state, id).await?;
@@ -1488,6 +1684,15 @@ async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+            // Hard delete also discards any non-archived local summary for this
+            // game (Delete = "throw it away"; Archive is the "keep the summary"
+            // path). Archived summaries point at a now-gone game id and are left
+            // intact. A summary already pushed to studio stays in studio.
+            c.execute(
+                "DELETE FROM lg_game_summaries
+                 WHERE launched_game_id = ? AND client_id = ? AND archived_at IS NULL",
+                params![id, client_id],
+            )?;
             c.execute(
                 "DELETE FROM lg_launched_games WHERE id = ? AND client_id = ?",
                 params![id, client_id],
@@ -1496,6 +1701,332 @@ async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
         })
         .await?;
     Ok(json!({ "success": true }))
+}
+
+// ─── game-summary statistics (pushed to studio as `game_summary` telemetry) ────
+//
+// A summary is the durable per-game stat record. It is computed from the local
+// lg_* tables when a game is ended/eligible, persisted to lg_game_summaries
+// (which survives Archive, unlike lg_launched_games), and pushed to the studio
+// cloud via the telemetry outbox. See project_playground_statistics_to_studio.
+
+struct ComputedSummary {
+    summary_uuid: String,
+    client_id: i64,
+    game_uniqid: String,
+    name: String,
+    game_type: String,
+    /// played_at = start_time, fallback created_at (both UTC "%Y-%m-%d %H:%M:%S").
+    played_at: Option<String>,
+    teams_launched: i64,
+    teams_played: i64,
+    players_played: i64,
+    content_hash: String,
+}
+
+/// True when the launch was flagged as a test (meta testMode='true'). Tests are
+/// never summarised.
+fn game_is_test(c: &rusqlite::Connection, game_id: i64) -> rusqlite::Result<bool> {
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM lg_launched_game_meta
+         WHERE launched_game_id = ?1 AND meta_name = 'testMode' AND meta_value = 'true'",
+        params![game_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns the computed summary for a game, or None when the game is ineligible
+/// (test, missing, or no team "actually played"). A qualifying team has a start
+/// time, an end time, and a non-zero score (<>0 covers negative Mystery scores).
+/// players_played = (#qualifying teams) + (distinct teammate chips that punched
+/// across those teams) — Option 2 from the design.
+fn compute_summary(
+    c: &rusqlite::Connection,
+    game_id: i64,
+) -> rusqlite::Result<Option<ComputedSummary>> {
+    let row = c
+        .query_row(
+            "SELECT summary_uuid, client_id, game_uniqid, name, game_type, number_of_teams,
+                    COALESCE(start_time, created_at)
+             FROM lg_launched_games WHERE id = ?1",
+            params![game_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (summary_uuid, client_id, game_uniqid, name, game_type, teams_launched, played_at) =
+        match row {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+    if game_is_test(c, game_id)? {
+        return Ok(None);
+    }
+
+    let teams_played: i64 = c.query_row(
+        "SELECT COUNT(*) FROM lg_teams
+         WHERE launched_game_id = ?1
+           AND start_time IS NOT NULL AND end_time IS NOT NULL AND score <> 0",
+        params![game_id],
+        |r| r.get(0),
+    )?;
+    if teams_played == 0 {
+        return Ok(None);
+    }
+
+    let extra_members: i64 = c.query_row(
+        "SELECT COUNT(DISTINCT cq.teammate_chip_id)
+         FROM lg_team_completed_quests cq
+         JOIN lg_teams t ON t.id = cq.team_id
+         WHERE t.launched_game_id = ?1
+           AND t.start_time IS NOT NULL AND t.end_time IS NOT NULL AND t.score <> 0
+           AND cq.teammate_chip_id IS NOT NULL",
+        params![game_id],
+        |r| r.get(0),
+    )?;
+    let players_played = teams_played + extra_members;
+
+    let content_hash = format!(
+        "{game_type}|{game_uniqid}|{name}|{}|{teams_launched}|{teams_played}|{players_played}",
+        played_at.clone().unwrap_or_default()
+    );
+
+    Ok(Some(ComputedSummary {
+        summary_uuid,
+        client_id,
+        game_uniqid,
+        name,
+        game_type,
+        played_at,
+        teams_launched,
+        teams_played,
+        players_played,
+        content_hash,
+    }))
+}
+
+/// Inserts a new summary, or updates an existing one only when its content
+/// changed (a post-game score edit). A change resets pushed_at = NULL so the
+/// next sync re-emits it (studio upserts, last-write-wins). archived_at is
+/// never touched here.
+fn upsert_summary(
+    c: &rusqlite::Connection,
+    game_id: i64,
+    s: &ComputedSummary,
+    now: &str,
+) -> rusqlite::Result<()> {
+    let existing: Option<String> = c
+        .query_row(
+            "SELECT content_hash FROM lg_game_summaries WHERE summary_uuid = ?1",
+            params![s.summary_uuid],
+            |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            c.execute(
+                "INSERT INTO lg_game_summaries
+                   (summary_uuid, launched_game_id, client_id, game_uniqid, name, game_type,
+                    played_at, teams_launched, teams_played, players_played, content_hash,
+                    pushed_at, archived_at, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12,?12)",
+                params![
+                    s.summary_uuid, game_id, s.client_id, s.game_uniqid, s.name, s.game_type,
+                    s.played_at, s.teams_launched, s.teams_played, s.players_played,
+                    s.content_hash, now
+                ],
+            )?;
+        }
+        Some(old_hash) if old_hash != s.content_hash => {
+            c.execute(
+                "UPDATE lg_game_summaries
+                   SET launched_game_id=?2, game_uniqid=?3, name=?4, game_type=?5, played_at=?6,
+                       teams_launched=?7, teams_played=?8, players_played=?9,
+                       content_hash=?10, pushed_at=NULL, updated_at=?11
+                 WHERE summary_uuid=?1",
+                params![
+                    s.summary_uuid, game_id, s.game_uniqid, s.name, s.game_type, s.played_at,
+                    s.teams_launched, s.teams_played, s.players_played, s.content_hash, now
+                ],
+            )?;
+        }
+        Some(_) => { /* unchanged — leave pushed_at as-is */ }
+    }
+    Ok(())
+}
+
+/// Run on app boot + every telemetry drain. Auto-ends stale games (started or
+/// never-started, older than 24h), recomputes summaries for every eligible
+/// ended game, and returns the summaries that still need pushing to studio
+/// (pushed_at IS NULL). The TS caller enqueues a `game_summary` telemetry event
+/// for each, then calls mark_summaries_pushed.
+async fn sync_summaries(state: &AppState) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    let to_push = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+            // 1. Auto-end stale games (>24h since start, or since creation when
+            //    never started — the latter just clears them from the list).
+            c.execute(
+                "UPDATE lg_launched_games
+                   SET ended = 1, updated_at = ?2
+                 WHERE client_id = ?1 AND ended = 0
+                   AND COALESCE(start_time, created_at) < datetime('now','-24 hours')",
+                params![client_id, now],
+            )?;
+
+            // 2. Recompute summaries for all ended games still present locally.
+            let ids: Vec<i64> = {
+                let mut stmt = c.prepare(
+                    "SELECT id FROM lg_launched_games WHERE client_id = ?1 AND ended = 1",
+                )?;
+                let rows = stmt.query_map(params![client_id], |r| r.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in ids {
+                if let Some(s) = compute_summary(c, id)? {
+                    upsert_summary(c, id, &s, &now)?;
+                }
+            }
+
+            // 3. Return everything still awaiting a push (new, changed, or a
+            //    previous push that never got acked).
+            let mut stmt = c.prepare(
+                "SELECT summary_uuid, name, game_type, game_uniqid, played_at,
+                        teams_launched, teams_played, players_played
+                 FROM lg_game_summaries
+                 WHERE client_id = ?1 AND pushed_at IS NULL",
+            )?;
+            let rows = stmt.query_map(params![client_id], |r| {
+                Ok(json!({
+                    "summary_uuid": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "game_type": r.get::<_, String>(2)?,
+                    "scenario_uniqid": r.get::<_, String>(3)?,
+                    "played_at": r.get::<_, Option<String>>(4)?,
+                    "teams_launched": r.get::<_, Option<i64>>(5)?,
+                    "teams_played": r.get::<_, i64>(6)?,
+                    "players_played": r.get::<_, i64>(7)?,
+                }))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(json!({ "summaries": to_push }))
+}
+
+/// Marks the given summary_uuids as pushed (pushed_at = now) so they aren't
+/// re-emitted until they change again. Idempotent; ignores already-pushed rows.
+async fn mark_summaries_pushed(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    let uuids: Vec<String> = body
+        .get("summary_uuids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uuids.is_empty() {
+        return Ok(json!({ "updated": 0 }));
+    }
+    let updated = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<usize> {
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let mut n = 0;
+            for u in &uuids {
+                n += c.execute(
+                    "UPDATE lg_game_summaries SET pushed_at = ?3, updated_at = ?3
+                     WHERE client_id = ?1 AND summary_uuid = ?2 AND pushed_at IS NULL",
+                    params![client_id, u, now],
+                )?;
+            }
+            Ok(n)
+        })
+        .await?;
+    Ok(json!({ "updated": updated }))
+}
+
+/// Archive a launched game: finalise its summary (kept forever) and delete the
+/// heavy lg_* rows. Ineligible games (test / nobody played) keep no summary, so
+/// archiving them is equivalent to a delete.
+async fn archive_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let id = json_i64(&body, "id")?;
+    require_game_owned(state, id).await?;
+    let client_id = state.client_id;
+    let kept = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let kept = if let Some(s) = compute_summary(c, id)? {
+                upsert_summary(c, id, &s, &now)?;
+                c.execute(
+                    "UPDATE lg_game_summaries SET archived_at = ?3, updated_at = ?3
+                     WHERE client_id = ?1 AND summary_uuid = ?2",
+                    params![client_id, s.summary_uuid, now],
+                )?;
+                true
+            } else {
+                false
+            };
+            // Cascades to lg_teams / lg_team_completed_quests / meta / devices /
+            // raw_data. The summary row (no FK to the game) survives.
+            c.execute(
+                "DELETE FROM lg_launched_games WHERE id = ?1 AND client_id = ?2",
+                params![id, client_id],
+            )?;
+            Ok(kept)
+        })
+        .await?;
+    Ok(json!({ "success": true, "summary_kept": kept }))
+}
+
+/// The local Archived-games view: every archived summary, newest first.
+async fn list_archived_summaries(state: &AppState) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    let rows = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+            let mut stmt = c.prepare(
+                "SELECT summary_uuid, name, game_type, game_uniqid, played_at,
+                        teams_launched, teams_played, players_played, archived_at, pushed_at
+                 FROM lg_game_summaries
+                 WHERE client_id = ?1 AND archived_at IS NOT NULL
+                 ORDER BY (played_at IS NULL), played_at DESC",
+            )?;
+            let rows = stmt.query_map(params![client_id], |r| {
+                Ok(json!({
+                    "summary_uuid": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "game_type": r.get::<_, String>(2)?,
+                    "scenario_uniqid": r.get::<_, String>(3)?,
+                    "played_at": r.get::<_, Option<String>>(4)?,
+                    "teams_launched": r.get::<_, Option<i64>>(5)?,
+                    "teams_played": r.get::<_, i64>(6)?,
+                    "players_played": r.get::<_, i64>(7)?,
+                    "archived_at": r.get::<_, Option<String>>(8)?,
+                    "pushed": r.get::<_, Option<String>>(9)?.is_some(),
+                }))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(json!({ "summaries": rows }))
 }
 
 async fn register_device(
@@ -2010,6 +2541,49 @@ async fn record_completed_quest(state: &AppState, body: Value) -> Result<Value, 
         })
         .await?;
     Ok(json!({ "inserted": true, "id": new_id }))
+}
+
+// Delete the most-recent completion row for (team, quest_number). Used by the
+// operator's manual quest-count adjustment in the Team Details modal. Returns
+// { deleted } so the caller knows whether a row was actually removed.
+async fn delete_completed_quest(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let launched_game_id = json_i64(&body, "launched_game_id")?;
+    let team_id = json_i64(&body, "team_id")?;
+    let quest_number = json_str(&body, "quest_number")?.to_string();
+
+    require_game_owned(state, launched_game_id).await?;
+
+    let team_belongs: Option<i64> = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+            Ok(c.query_row(
+                "SELECT id FROM lg_teams WHERE id = ? AND launched_game_id = ?",
+                params![team_id, launched_game_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    if team_belongs.is_none() {
+        return Err(ApiErr::not_found("Team not found"));
+    }
+
+    let deleted = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+            let n = c.execute(
+                "DELETE FROM lg_team_completed_quests
+                 WHERE id = (
+                   SELECT id FROM lg_team_completed_quests
+                   WHERE launched_game_id = ? AND team_id = ? AND quest_number = ?
+                   ORDER BY id DESC LIMIT 1
+                 )",
+                params![launched_game_id, team_id, quest_number],
+            )?;
+            Ok(n > 0)
+        })
+        .await?;
+    Ok(json!({ "deleted": deleted }))
 }
 
 // ─── action handlers: pair ───────────────────────────────────────────────────

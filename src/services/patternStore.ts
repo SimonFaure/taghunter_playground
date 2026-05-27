@@ -156,6 +156,26 @@ export async function getMysteryEnigmas(patternUniqid: string): Promise<PatternE
     }));
 }
 
+// Tracks: map each checkpoint index → the station key number(s) that count as
+// a "hit" for that checkpoint. A checkpoint is binary (reached or not), so we
+// bucket ALL routing stations by item_index regardless of `assignment_type`
+// (tracks patterns may use a single `checkpoint_station` assignment or reuse
+// the mystery `good_answer_station` label — either works here).
+//
+// NOTE (Slice C): this mapping is the one piece the design grill left open
+// (checkpoint → station code). Verify against a real tracks pattern once one
+// exists; the any-station-hit interpretation is intentionally liberal.
+export async function getTracksCheckpointStations(patternUniqid: string): Promise<Map<number, number[]>> {
+  const routing = await getRouting(patternUniqid);
+  const map = new Map<number, number[]>();
+  for (const r of routing) {
+    const arr = map.get(r.item_index) ?? [];
+    arr.push(r.station_key_number);
+    map.set(r.item_index, arr);
+  }
+  return map;
+}
+
 export async function listGameTypes(): Promise<string[]> {
   const db = await getDb();
   const rows = await db.select<Array<{ game_type: string }>>(
@@ -219,6 +239,15 @@ export async function incrementFailedAttempts(patternUniqid: string): Promise<vo
     'UPDATE patterns SET failed_attempts = failed_attempts + 1 WHERE pattern_uniqid = $1',
     [patternUniqid]
   );
+}
+
+// Locally remove a single pattern from this device. This only touches the
+// local SQLite cache — the pattern still exists in the user's cloud account,
+// so the next sync cycle will re-add it (see `upsertFromManifest`). Used by
+// the Cards & Patterns screen's per-pattern delete action.
+export async function remove(patternUniqid: string): Promise<void> {
+  const db = await getDb();
+  await db.execute('DELETE FROM patterns WHERE pattern_uniqid = $1', [patternUniqid]);
 }
 
 export async function tombstoneMissing(keepUniqids: string[]): Promise<string[]> {

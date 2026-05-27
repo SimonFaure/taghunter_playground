@@ -11,6 +11,9 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "help:gen": "node scripts/help.mjs --app playground",
+    "predev": "node scripts/help.mjs --app playground",
+    "prebuild": "node scripts/help.mjs --app playground --pdf",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
@@ -31,8 +34,12 @@
     "@tauri-apps/plugin-updater": "^2",
     "jszip": "^3.10.1",
     "lucide-react": "^0.344.0",
+    "minisearch": "^7.1.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",

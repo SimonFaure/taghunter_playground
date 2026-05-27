@@ -8,8 +8,10 @@ import {
   Database as DatabaseIcon,
   Lock,
   Image as ImageIcon,
+  HelpCircle,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { HelpProvider, DocsShell, playgroundOpenPdf } from './help';
 import { GameList } from './components/GameList';
 import { Footer } from './components/Footer';
 import { ConfigurationPage, type SettingsTab } from './components/ConfigurationPage';
@@ -25,6 +27,7 @@ import ClientCardsPage from './components/ClientCardsPage';
 import { DatabaseInspector } from './components/DatabaseInspector';
 import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
 import { LogoLaunchScreen } from './components/LogoLaunchScreen';
+import type { LogoAnimation } from './utils/logoEffect';
 import { SyncStatusPill } from './components/sync/SyncStatusPill';
 import { SyncFailureBanner } from './components/sync/SyncFailureBanner';
 import { UpdateRequiredOverlay } from './components/update/UpdateRequiredOverlay';
@@ -45,13 +48,16 @@ import {
   startDrainer,
   stopDrainer,
 } from './services/telemetry';
+import { startSummarySync, stopSummarySync } from './services/launchedGames';
 import { loadConfig } from './utils/config';
+import { onPinReset } from './services/pinResetSignal';
 
 type Page =
   | 'scenarios'
   | 'launched'
   | 'cards'
   | 'settings'
+  | 'help'
   | 'admin-config'
   | 'database';
 
@@ -65,6 +71,9 @@ function App() {
   // banner when the user clicks them; consumed by ConfigurationPage which
   // honors it once and is then free to track its own tab state.
   const [pendingSettingsTab, setPendingSettingsTab] = useState<SettingsTab | undefined>(undefined);
+  // Raised when an offline recovery code cleared the device PIN — nudges the
+  // operator to set a new one (the gates bypass with no PIN). Dismissable.
+  const [pinResetNotice, setPinResetNotice] = useState(false);
   const processedRef = useRef<boolean>(false);
   const startedRef = useRef<boolean>(false);
 
@@ -80,6 +89,17 @@ function App() {
   const navigateToUpdates = () => {
     setCurrentPage('settings');
     setPendingSettingsTab('updates');
+  };
+
+  // Surface the "set a new PIN" banner whenever a recovery code clears the PIN.
+  useEffect(() => onPinReset(() => setPinResetNotice(true)), []);
+
+  // The Security section (with the Device PIN control) lives in the Preferences
+  // tab — deep-link there from the banner.
+  const navigateToSecurity = () => {
+    setCurrentPage('settings');
+    setPendingSettingsTab('general');
+    setPinResetNotice(false);
   };
 
   // Listen for mother-issued LAN commands relayed by `client_ping_mother`.
@@ -135,9 +155,18 @@ function App() {
   // the last gate before the home page — after the update and first-launch
   // gates. Dismissed by any click/tap/keypress.
   const [logoPhase, setLogoPhase] = useState<'loading' | 'show' | 'done'>('loading');
-  const [logoCfg, setLogoCfg] = useState<{ bg: string; file: string | null }>({
+  const [logoCfg, setLogoCfg] = useState<{
+    bg: string;
+    file: string | null;
+    animation: LogoAnimation;
+    glowColor: string;
+    requirePin: boolean;
+  }>({
     bg: '#000000',
     file: null,
+    animation: 'pulse',
+    glowColor: '#FFFFFF',
+    requirePin: false,
   });
 
   useEffect(() => {
@@ -147,6 +176,9 @@ function App() {
         setLogoCfg({
           bg: cfg.logoScreenBgColor ?? '#000000',
           file: cfg.logoScreenLogoFile ?? null,
+          animation: cfg.logoScreenAnimation ?? 'pulse',
+          glowColor: cfg.logoScreenGlowColor ?? '#FFFFFF',
+          requirePin: Boolean(cfg.requirePinToExitLogo),
         });
         setLogoPhase(cfg.logoScreenOnLaunch ? 'show' : 'done');
       } catch {
@@ -164,6 +196,9 @@ function App() {
       setLogoCfg({
         bg: cfg.logoScreenBgColor ?? '#000000',
         file: cfg.logoScreenLogoFile ?? null,
+        animation: cfg.logoScreenAnimation ?? 'pulse',
+        glowColor: cfg.logoScreenGlowColor ?? '#FFFFFF',
+        requirePin: Boolean(cfg.requirePinToExitLogo),
       });
     } catch {
       /* keep whatever config was loaded at startup */
@@ -297,6 +332,10 @@ function App() {
     void recoverPendingPanic();
     void sendHeartbeat();
     startDrainer();
+    // Game-summary stats: auto-end stale games + push per-game played-stats to
+    // studio on boot and every 5 min. Mother-gated and best-effort, so safe to
+    // start before the mother is up / before login.
+    startSummarySync();
     // Fire-and-forget mDNS browse so the footer's first child-mode ping has a
     // hot endpoint cache. No-op when paired_mothers is empty. Failure is
     // silent: the footer's failure-threshold path will run mDNS again if
@@ -304,6 +343,7 @@ function App() {
     void invoke('client_refresh_mother_endpoints').catch(() => {});
     return () => {
       stopDrainer();
+      stopSummarySync();
     };
   }, []);
 
@@ -375,12 +415,21 @@ function App() {
       <LogoLaunchScreen
         bgColor={logoCfg.bg}
         logoFile={logoCfg.file}
+        animation={logoCfg.animation}
+        glowColor={logoCfg.glowColor}
+        requirePin={logoCfg.requirePin}
         onDismiss={() => setLogoPhase('done')}
       />
     );
   }
 
   return (
+    <HelpProvider
+      audience="operator"
+      navigateToDocs={() => setCurrentPage('help')}
+      openPdfFile={(pdf) => void playgroundOpenPdf(pdf)}
+      assetBase=""
+    >
     <div
       className={`min-h-screen pb-16 ${
         isAdminMode
@@ -394,6 +443,32 @@ function App() {
           onDismiss={() => setOptionalUpdate(null)}
           onOpenUpdates={navigateToUpdates}
         />
+      )}
+
+      {pinResetNotice && (
+        <div className="bg-amber-500/15 border-b border-amber-500/30 text-amber-200">
+          <div className="container mx-auto px-6 py-2 flex items-center justify-between gap-4 text-sm">
+            <span>
+              The device PIN was reset with a recovery code. Set a new PIN so the
+              security gates work again.
+            </span>
+            <div className="flex items-center gap-3 shrink-0">
+              <button
+                onClick={navigateToSecurity}
+                className="px-3 py-1.5 rounded-md bg-amber-500/20 hover:bg-amber-500/30 font-medium transition-colors"
+              >
+                Set a new PIN
+              </button>
+              <button
+                onClick={() => setPinResetNotice(false)}
+                className="text-amber-300/80 hover:text-amber-100"
+                aria-label="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       <SyncFailureBanner onAuthInvalid={auth.refresh} onViewDetails={navigateToSync} />
@@ -422,6 +497,10 @@ function App() {
               <NavButton page="settings" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
                 <Settings size={16} />
                 Settings
+              </NavButton>
+              <NavButton page="help" current={currentPage} onClick={setCurrentPage} admin={isAdminMode}>
+                <HelpCircle size={16} />
+                Help
               </NavButton>
               {isAdminMode && (
                 <>
@@ -462,9 +541,16 @@ function App() {
       </nav>
 
       {currentPage === 'scenarios' && <GameList />}
-      {currentPage === 'launched' && <LaunchedGamesList />}
+      {currentPage === 'launched' && <LaunchedGamesList isAdminMode={isAdminMode} />}
       {currentPage === 'cards' && <ClientCardsPage />}
       {currentPage === 'settings' && <ConfigurationPage initialTab={pendingSettingsTab} />}
+      {currentPage === 'help' && (
+        <div className="container mx-auto px-6 py-4">
+          <div className="h-[calc(100vh-9rem)] overflow-hidden rounded-xl border border-slate-700 bg-white">
+            <DocsShell />
+          </div>
+        </div>
+      )}
       {currentPage === 'database' && isAdminMode && <DatabaseInspector />}
       {currentPage === 'admin-config' && isAdminMode && <AdminConfigPage />}
 
@@ -478,6 +564,7 @@ function App() {
       <Footer />
       <OperatorVideoOverlay />
     </div>
+    </HelpProvider>
   );
 }
 

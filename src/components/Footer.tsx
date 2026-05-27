@@ -3,7 +3,12 @@ import { Usb, Wifi } from 'lucide-react';
 import { platform } from '@tauri-apps/plugin-os';
 import { invoke } from '@tauri-apps/api/core';
 import { isReaderConnected } from '../services/sportidentService';
-import { getDeviceMetadata, type DeviceMetadata } from '../services/device';
+import {
+  getDeviceMetadata,
+  getCachedDeviceDisplayName,
+  type DeviceMetadata,
+} from '../services/device';
+import { refreshDeviceDisplayName } from '../services/auth';
 import {
   useMotherConnection,
   type MotherConnectionState,
@@ -15,6 +20,9 @@ type ReaderState = 'unknown' | 'ok' | 'bad';
 
 export function Footer() {
   const [device, setDevice] = useState<DeviceMetadata | null>(null);
+  // Operator-assigned friendly name (Settings → My Devices). Falls back to the
+  // OS hostname (device.device_label) when unset.
+  const [displayName, setDisplayName] = useState<string | null>(null);
   const [readerState, setReaderState] = useState<ReaderState>('unknown');
   // Windows-only for this slice — non-Windows hides the wifi icon entirely.
   // null while the platform() promise hasn't resolved (one render frame).
@@ -39,6 +47,26 @@ export function Footer() {
     })();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  // Friendly device name: show the cached value instantly (offline-safe), then
+  // reconcile with the server. Re-fetch whenever the user renames a device in
+  // Settings → My Devices (which dispatches `device:renamed`).
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const cached = await getCachedDeviceDisplayName().catch(() => null);
+      if (!cancelled && cached) setDisplayName(cached);
+      const fresh = await refreshDeviceDisplayName().catch(() => null);
+      if (!cancelled) setDisplayName(fresh);
+    };
+    void load();
+    const onRenamed = () => void load();
+    window.addEventListener('device:renamed', onRenamed);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('device:renamed', onRenamed);
     };
   }, []);
 
@@ -104,7 +132,11 @@ export function Footer() {
             />
           </div>
           <div className="text-slate-500">
-            {device ? `${device.device_label} · v${device.app_version}` : '…'}
+            {(() => {
+              const name = displayName ?? device?.device_label ?? null;
+              if (!name) return '…';
+              return device ? `${name} · v${device.app_version}` : name;
+            })()}
           </div>
         </div>
       </div>
