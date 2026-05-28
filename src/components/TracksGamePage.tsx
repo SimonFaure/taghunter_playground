@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { ArrowLeft } from 'lucide-react';
 import { GameConfig } from './LaunchGameModal';
 import { sportidentService as siReader, CardData, StationData, detectReaderPort } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
@@ -27,8 +26,10 @@ import { SelfRegisterOverlay } from './SelfRegisterOverlay';
 import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
 import {
   TracksGameRenderer,
+  readLocalized,
   type TracksScreen,
   type TracksDisplayMode,
+  type TracksBigReveal,
 } from './TracksGameRenderer';
 import {
   checkpointsForRoute,
@@ -78,6 +79,7 @@ const SOUND_SLOTS = [
 ] as const;
 
 const IMAGE_SLOTS = [
+  'background_image',
   'map_image',
   'team_name_background_image',
   'timer_background_image',
@@ -173,8 +175,12 @@ const REVEAL_STEP_MS = 700;
 export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onGameEnd }: TracksGamePageProps) {
   const [data, setData] = useState<TracksGameData | null>(null);
   const dataRef = useRef<TracksGameData | null>(null);
-  // Re-render tick (1s) so the live HUD timer recomputes; holds wall-clock ms.
-  const [nowTick, setNowTick] = useState(() => Date.now());
+  // Punches read by THIS device's USB reader are processed immediately in
+  // saveCardData; the 1s state poll then echoes those same raw_data rows back.
+  // Track the row ids handled locally so the poll skips them — otherwise each
+  // own-reader bip runs twice (now + ~1s later), which would start AND reveal a
+  // team on its very first bip.
+  const processedRawIdsRef = useRef<Set<number>>(new Set());
   const [audioElements, setAudioElements] = useState<Record<string, HTMLAudioElement>>({});
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
   const [showCardAlert, setShowCardAlert] = useState(false);
@@ -183,22 +189,22 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   const msgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Focused-team display state — driven by the most recent bip.
-  const [screen, setScreen] = useState<TracksScreen>('ingame');
+  // Default screen is the resting background image; the map only appears for the
+  // second-bip reveal (see tracks-reveal-redesign.md).
+  const [screen, setScreen] = useState<TracksScreen>('background');
   const [focusTeamName, setFocusTeamName] = useState('');
-  const [focusHits, setFocusHits] = useState<Set<string>>(new Set());
-  const [focusReveal, setFocusReveal] = useState<string | null>(null);
   const [focusScoreText, setFocusScoreText] = useState('');
+  const [focusHitCount, setFocusHitCount] = useState(0);
   const [topRevealUrl, setTopRevealUrl] = useState('');
-  // Full-screen feedback cue image (legacy maximus): shown on an itinerary
-  // wrong-order break (wrong_order_image) or a zero-checkpoint run
-  // (missing_checkpoint_image). '' = hidden.
-  const [feedbackImageUrl, setFeedbackImageUrl] = useState('');
+  // Reveal state: checkpoints already placed on the map (cpId → per-status image
+  // URL, accumulates during the walk) + the full-mode big-center reveal.
+  const [placedCheckpoints, setPlacedCheckpoints] = useState<Map<string, string>>(new Map());
+  const [bigReveal, setBigReveal] = useState<TracksBigReveal | null>(null);
   // The focused team's resolved route (per-team meta override else launch
   // default) — drives which markers render and which checkpoints score.
   const [focusRoute, setFocusRoute] = useState(config.route ?? 'default');
-  // HUD timer is the FOCUSED team's run time: ticks live from start_time during
-  // the run, freezes at the final duration on the reveal, blank when idle.
-  const [focusStartTime, setFocusStartTime] = useState<number | null>(null);
+  // HUD timer shows the focused team's frozen final run duration during the
+  // reveal; blank otherwise (no HUD over the background during the run).
   const [focusFrozenSec, setFocusFrozenSec] = useState<number | null>(null);
 
   // First-bip video overlay state. Captures the start to finalize once all
@@ -249,11 +255,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     void load();
   }, [gameUniqid]);
 
-  // 1s tick driving the live HUD timer recompute.
+  // No on-screen back button on the kiosk display — Esc exits (operator keyboard).
   useEffect(() => {
-    const t = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onBack();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onBack]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
@@ -359,7 +368,6 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 return;
               }
               const finishedTeam = teamsForCard[teamsForCard.length - 1];
-              const allCps2 = gd.checkpoints;
               // Show the finished team's own route on the clues review.
               try {
                 const m = await getLaunchedGameMeta(launchedGameId);
@@ -368,7 +376,6 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 setFocusRoute(route);
               }
               setFocusTeamName(finishedTeam.team_name ?? '');
-              setFocusHits(new Set(allCps2.map((c) => c.id)));
               setScreen('clues');
               if (gd.autoReset) {
                 await new Promise((r) => setTimeout(r, 6000));
@@ -415,8 +422,10 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               // card reuse does not re-score stale punches. Persisted to meta
               // (durable across reload — tracks runs are long). Matched on
               // code+time so a legit re-punch (new time) still counts at scoring.
+              let staleCount = 0;
               try {
                 const stale = (card.punches ?? []).filter((p) => p.time && p.time !== '00:00:00');
+                staleCount = stale.length;
                 if (stale.length > 0) {
                   await mergeLaunchedGameMeta(launchedGameId, {
                     [`baseline:${team.id}`]: JSON.stringify(stale.map((p) => `${p.code}@${p.time}`)),
@@ -430,15 +439,15 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               } catch (err) {
                 console.error('[TracksGamePage] baseline snapshot error:', err);
               }
-              setFocusTeamName(effectiveName);
-              setFocusRoute(teamRoute);
-              setFocusHits(new Set());
-              setFocusReveal(null);
-              setFocusScoreText(scoreType === 'percentage' ? '0%' : '0 pts');
-              // Start the focused-team HUD clock ticking from now.
-              setFocusStartTime(startSec);
-              setFocusFrozenSec(null);
-              setScreen('ingame');
+              // First bip → confirm the start (like mystery's "C'est parti !").
+              // The resting background stays up; this transient message is the
+              // only first-bip feedback the operator/team gets.
+              const warn =
+                staleCount > 0 ? ` — ⚠️ Carte non vide : ${staleCount} passage(s) ignoré(s)` : '';
+              showMessage(`C'est parti ! ${effectiveName}${warn}`, warn ? 'warning' : 'success');
+              setScreen('background');
+              setBigReveal(null);
+              setPlacedCheckpoints(new Map());
             };
 
             // Gate the start on the first-bip video overlay when enabled.
@@ -529,11 +538,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
         // Itinerary = strict in-order prefix; free = any reached checkpoint.
         let hitIds: Set<string>;
-        let deviated = false;
         if (trackPlayMode === 'itinerary') {
-          const ordered = orderedHitCheckpointIds(routeCps, hitTimeByCp);
-          hitIds = ordered.hitIds;
-          deviated = ordered.deviated;
+          hitIds = orderedHitCheckpointIds(routeCps, hitTimeByCp).hitIds;
         } else {
           hitIds = new Set<string>();
           for (const cp of routeCps) {
@@ -559,64 +565,97 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           console.error('[TracksGamePage] baseline clear error:', err);
         }
 
-        // --- Reveal animation -------------------------------------------------
+        // --- Reveal -----------------------------------------------------------
+        // The map is the reveal surface; per-checkpoint status images accumulate
+        // on it. Free → correct/missing; itinerary → correct/wrong/missing.
         setFocusTeamName(teamName);
         setFocusRoute(teamRoute);
-        // Freeze the HUD clock at this team's final run duration.
-        setFocusStartTime(team.start_time);
-        setFocusFrozenSec(endTime - team.start_time);
-        setScreen('ingame');
-        // Announce the scored outcome: success when checkpoints were found,
-        // neutral info when the run scored nothing.
-        showMessage(
-          (teamName ? `${teamName} — ` : '') +
-            localizedStatus(hitIds.size > 0 ? 'track_finished' : 'no_checkpoints', language),
-          hitIds.size > 0 ? 'success' : 'info',
-        );
-        // In itinerary mode a shorter-than-route credited prefix means the team
-        // skipped or went out of order → mark the break with checkpoint_error.
-        const itineraryDeviation = trackPlayMode === 'itinerary' && deviated;
-        // Surface the matching full-screen feedback cue image (legacy maximus),
-        // if one is configured for this scenario. No-op when the slot is empty.
-        const showFeedbackImage = (slot: string) => {
-          const url = getImageUrl(gd.images[slot]);
-          if (url) setFeedbackImageUrl(url);
+        setFocusFrozenSec(endTime - team.start_time); // frozen run duration
+        setFocusHitCount(hitIds.size);
+        setBigReveal(null);
+        setPlacedCheckpoints(new Map());
+        setScreen('reveal');
+
+        const statusOf = (cp: TracksCheckpoint): 'correct' | 'wrong' | 'missing' => {
+          if (hitIds.has(cp.id)) return 'correct';
+          if (hitTimeByCp.get(cp.id) !== undefined) return 'wrong'; // punched, not credited
+          return 'missing';
         };
-        if (displayMode === 'full') {
-          // Walk hits one at a time, lighting each marker + reveal panel.
-          const built = new Set<string>();
-          for (const cp of routeCps) {
-            if (!hitIds.has(cp.id)) continue;
-            built.add(cp.id);
-            setFocusHits(new Set(built));
-            setFocusReveal(cp.id);
-            playSound('checkpoint_success');
-            // eslint-disable-next-line no-await-in-loop
-            await new Promise((r) => setTimeout(r, REVEAL_STEP_MS));
-          }
-          // Fire the error cue right after the last lit prefix checkpoint.
-          if (itineraryDeviation) {
-            playSound('checkpoint_error');
-            showFeedbackImage('wrong_order_image');
-          } else if (hitIds.size === 0) {
-            playSound('checkpoint_no_answer');
-            showFeedbackImage('missing_checkpoint_image');
-          }
+        const correctImage = (cp: TracksCheckpoint) =>
+          gd.checkpoints_unique_image
+            ? getImageUrl(gd.images.checkpoints_unique_image_id)
+            : getImageUrl(gd.checkpointImages[cp.id]);
+        const statusImage = (cp: TracksCheckpoint, status: 'correct' | 'wrong' | 'missing') =>
+          status === 'correct'
+            ? correctImage(cp)
+            : status === 'wrong'
+              ? getImageUrl(gd.images.wrong_order_image)
+              : getImageUrl(gd.images.missing_checkpoint_image);
+        const statusSound = (status: 'correct' | 'wrong' | 'missing') =>
+          status === 'correct'
+            ? 'checkpoint_success'
+            : status === 'wrong'
+              ? 'checkpoint_error'
+              : 'checkpoint_no_answer';
+
+        if (displayMode === 'simple') {
+          // No per-checkpoint walk — settle straight onto the summary HUD, then
+          // hold it long enough to read before top-X / reset (otherwise it would
+          // flash past instantly).
+          setFocusScoreText(scoreText(finalScore));
+          playSound(hitIds.size > 0 ? 'checkpoint_success' : 'checkpoint_no_answer');
+          await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
         } else {
-          // map / simple — light everything at once.
-          setFocusHits(new Set(hitIds));
-          setFocusReveal(null);
-          if (itineraryDeviation) {
-            playSound('checkpoint_error');
-            showFeedbackImage('wrong_order_image');
-          } else if (hitIds.size > 0) {
-            playSound('checkpoint_success');
-          } else {
-            playSound('checkpoint_no_answer');
-            showFeedbackImage('missing_checkpoint_image');
+          // full + map: walk every route checkpoint in order, accumulating its
+          // status image on the map; correct checkpoints count the score up.
+          const denom = routeCps.length || 1;
+          const rawIncrement = (cp: TracksCheckpoint) =>
+            scoreType === 'percentage' ? 100 / denom : typeof cp.points === 'number' ? cp.points : 1;
+          let runningRaw = 0;
+          const placed = new Map<string, string>();
+          setFocusScoreText(scoreType === 'percentage' ? '0%' : '0 pts');
+          for (const cp of routeCps) {
+            const status = statusOf(cp);
+            const url = statusImage(cp, status);
+            const bump = () => {
+              if (status !== 'correct') return;
+              runningRaw =
+                scoreType === 'percentage'
+                  ? Math.min(100, runningRaw + rawIncrement(cp))
+                  : runningRaw + rawIncrement(cp);
+              setFocusScoreText(scoreText(runningRaw));
+            };
+            if (displayMode === 'full') {
+              // Phase A — big centered status image (name/description only for correct).
+              setBigReveal({
+                imageUrl: url,
+                title: status === 'correct' ? readLocalized(cp.title as Record<string, string> | string | undefined, language) : '',
+                description:
+                  status === 'correct' ? readLocalized(cp.description as Record<string, string> | string | undefined, language) : '',
+              });
+              playSound(statusSound(status));
+              bump();
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
+              // Phase B — the image lands on the map and stays.
+              setBigReveal(null);
+              placed.set(cp.id, url);
+              setPlacedCheckpoints(new Map(placed));
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise((r) => setTimeout(r, 500));
+            } else {
+              // map mode — Phase B only: place each status image sequentially.
+              placed.set(cp.id, url);
+              setPlacedCheckpoints(new Map(placed));
+              playSound(statusSound(status));
+              bump();
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise((r) => setTimeout(r, REVEAL_STEP_MS));
+            }
           }
+          // Apply the time malus as a visible drop to the final score.
+          setFocusScoreText(scoreText(finalScore));
         }
-        setFocusScoreText(scoreText(finalScore));
 
         // --- Top-X reveal: rank the team among all teams ----------------------
         const refreshed = await getLaunchedGameState(launchedGameId, 0);
@@ -626,8 +665,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         if (tier) {
           const url = getImageUrl(gd.images[`${tier}_image`]);
           setTopRevealUrl(url);
-          setGameMessage(''); // clear the scored-outcome wash before the top-X celebration
-          setFeedbackImageUrl(''); // and any wrong-order / missing-checkpoint cue
+          setGameMessage(''); // clear any lingering warning before the celebration
           setScreen('topreveal');
           playSound(`${tier}_sound`);
           // eslint-disable-next-line no-await-in-loop
@@ -648,20 +686,19 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.playTutorialOnBip, config.playIntroOnBip, gameUniqid, playSound, scoreText, showMessage, language],
+    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.messageDisplayDuration, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.playTutorialOnBip, config.playIntroOnBip, gameUniqid, playSound, scoreText, showMessage, language],
   );
 
   const resetDisplay = () => {
-    setScreen('ingame');
-    setFocusHits(new Set());
-    setFocusReveal(null);
+    // Back to the resting background screen until the next team interacts.
+    setScreen('background');
+    setPlacedCheckpoints(new Map());
+    setBigReveal(null);
     setTopRevealUrl('');
     setGameMessage('');
-    setFeedbackImageUrl('');
-    // Blank the HUD clock until the next team interacts.
-    setFocusStartTime(null);
     setFocusFrozenSec(null);
-    // Back to the launch-default route when idle.
+    setFocusScoreText('');
+    setFocusHitCount(0);
     setFocusRoute(route);
   };
 
@@ -680,7 +717,10 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     async (card: CardData) => {
       if (!launchedGameId) return;
       try {
-        await recordPunch(launchedGameId, JSON.parse(JSON.stringify(card)));
+        // Remember the row id we just created so the poll's echo of it is
+        // skipped in handleNewBip (own-reader de-dupe).
+        const { id } = await recordPunch(launchedGameId, JSON.parse(JSON.stringify(card)));
+        if (typeof id === 'number') processedRawIdsRef.current.add(id);
         await handleCardPunchLogic(card);
       } catch (err) {
         console.error('[TracksGamePage] saveCardData error:', err);
@@ -688,8 +728,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     },
     [launchedGameId, handleCardPunchLogic],
   );
+  // Always dispatch to the LATEST saveCardData without re-binding the reader.
+  // Binding the effect to `saveCardData` (which changes whenever the punch logic
+  // does) tore the USB reader down + re-initialized it repeatedly, dropping
+  // punches. Mirror MysteryGamePage: bind once per game, call through a ref.
+  const saveCardDataRef = useRef(saveCardData);
+  useEffect(() => {
+    saveCardDataRef.current = saveCardData;
+  }, [saveCardData]);
 
-  // Reader binding — mirrors MysteryGamePage.
+  // Reader binding — bind once per launched game (mirrors MysteryGamePage).
   useEffect(() => {
     let cancelled = false;
     const initUSB = async () => {
@@ -700,7 +748,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         const ok = await siReader.initializePort(detected.path);
         if (!ok) return;
         siReader.setCardDetectedCallback((card: CardData) => {
-          void saveCardData(card);
+          void saveCardDataRef.current(card);
           setLastCardData(card);
           setShowCardAlert(true);
           setTimeout(() => setShowCardAlert(false), 5000);
@@ -721,11 +769,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
       if (siReader.isAvailable()) siReader.stop().catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [saveCardData]);
+  }, [launchedGameId]);
 
   // Test/simulation bips arrive through the state poll.
   const handleNewBip = useCallback(
-    (row: { raw_data: unknown }) => {
+    (row: { id?: number; raw_data: unknown }) => {
+      // Skip rows this device already processed via its own USB reader (the poll
+      // echoes them back ~1s later). Remote/test punches aren't in the set.
+      if (row.id != null && processedRawIdsRef.current.has(row.id)) return;
       const card = row.raw_data as CardData;
       if (card && dataRef.current) {
         setLastCardData(card);
@@ -757,14 +808,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   const fontFamily = resolveFontFamily(data.font) || undefined;
   const routeCheckpoints = checkpointsForRoute(data.checkpoints, focusRoute);
 
-  // Focused team's clock: frozen final duration on reveal, else live elapsed
-  // from start_time, else blank when idle.
-  const timerDisplay =
-    focusFrozenSec != null
-      ? formatTime(focusFrozenSec)
-      : focusStartTime != null
-        ? formatTime(Math.max(0, Math.floor(nowTick / 1000) - focusStartTime))
-        : '';
+  // Focused team's clock: the frozen final run duration during the reveal,
+  // blank otherwise (no HUD over the background during the run).
+  const timerDisplay = focusFrozenSec != null ? formatTime(focusFrozenSec) : '';
 
   const resolveCheckpointImage = (cp: TracksCheckpoint) => {
     if (data.checkpoints_unique_image) return getImageUrl(data.images.checkpoints_unique_image_id);
@@ -808,56 +854,26 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         fontFamily={fontFamily}
       />
 
-      {/* Full-screen wrong-order / missing-checkpoint cue image (legacy maximus).
-          Sits above the message wash (z-90) so the configured image dominates. */}
-      {feedbackImageUrl && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 95,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            background: 'rgba(0,0,0,0.85)',
-            pointerEvents: 'none',
-          }}
-        >
-          <img
-            src={feedbackImageUrl}
-            alt=""
-            style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
-          />
+      {/* No top nav on the in-game (kiosk) display. Exit is via Esc (operator
+          keyboard) — see the keydown handler. The reader-not-connected banner is
+          kept as a thin diagnostic strip since it explains missing punches. */}
+      {siReader.isAvailable() && !detectedReader.isPresent && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-center gap-3 px-4 py-1.5 bg-orange-500/20">
+          <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
+          <span className="text-orange-200 text-xs">
+            Reader not connected — punches start landing as soon as you plug in the dongle.
+          </span>
         </div>
       )}
-
-      <header className="fixed top-0 left-0 right-0 z-50 bg-slate-900/40 backdrop-blur-sm">
-        <div className="px-4 py-2 flex items-center gap-3">
-          <button
-            onClick={onBack}
-            className="p-2 text-slate-300 hover:text-white hover:bg-white/10 rounded-lg transition"
-          >
-            <ArrowLeft size={22} />
-          </button>
-          <span className="text-white/80 text-sm">{config.name}</span>
-        </div>
-        {siReader.isAvailable() && !detectedReader.isPresent && (
-          <div className="flex items-center justify-center gap-3 px-4 py-1.5 bg-orange-500/20">
-            <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
-            <span className="text-orange-200 text-xs">
-              Reader not connected — punches start landing as soon as you plug in the dongle.
-            </span>
-          </div>
-        )}
-      </header>
 
       <TracksGameRenderer
         screen={screen}
         displayMode={displayMode}
+        backgroundUrl={getImageUrl(data.images.background_image)}
         mapUrl={getImageUrl(data.images.map_image)}
         routeCheckpoints={routeCheckpoints}
-        hitCheckpointIds={focusHits}
-        revealCheckpointId={focusReveal}
+        placedCheckpoints={placedCheckpoints}
+        bigReveal={bigReveal}
         resolveCheckpointImage={resolveCheckpointImage}
         iconSizePercent={data.iconSizePercent}
         hud={{
@@ -870,6 +886,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         timerText={timerDisplay}
         scoreText={focusScoreText || (scoreType === 'percentage' ? '0%' : '0 pts')}
         showScore={data.showScore}
+        hitCount={focusHitCount}
         language={language}
         clues={data.clues}
         topRevealUrl={topRevealUrl}

@@ -124,6 +124,17 @@ export async function getMediaPath(
   return assetUrl(fileAbs);
 }
 
+// Scenario versions are semantic DECIMALS (studio bumps 1.0 → 1.1 → …) stored in
+// a VARCHAR, so the manifest can deliver them as strings. Parse to a float so
+// remote_version stays numeric: a 0.1 bump is then detected by
+// listPendingDownloads (`local_version <> remote_version`) and produces a
+// distinct version dir (`v1.1`). Storing the raw string risks integer-affinity
+// coercion in SQLite and string/number compare quirks.
+export function parseScenarioVersion(v: unknown): number {
+  const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
 // Bulk upsert from a manifest. Called inside the orchestrator's manifest
 // transaction. Existing local_version is preserved; only remote_version and
 // metadata are updated.
@@ -141,7 +152,7 @@ export async function upsertFromManifest(rows: ScenarioManifestRow[], seenAt: st
          is_product = excluded.is_product,
          remote_version = excluded.remote_version,
          last_manifest_seen_at = excluded.last_manifest_seen_at`,
-      [r.uniqid, r.title, r.game_type, r.is_product ? 1 : 0, r.version, seenAt]
+      [r.uniqid, r.title, r.game_type, r.is_product ? 1 : 0, parseScenarioVersion(r.version), seenAt]
     );
   }
 }

@@ -1,23 +1,26 @@
 /**
- * Tracks game renderer — the on-screen game surface for the 3 display modes
- * plus the clues page and the end-of-game top-X reveal.
+ * Tracks game renderer — the on-screen game surface.
  *
- *   - full:   map + checkpoint markers + a reveal panel (title/desc/image)
- *             for the most-recently-hit checkpoint
- *   - map:    map + markers that light up as they're hit (no reveal panel)
- *   - simple: minimal centered HUD (team name + score + checkpoint count),
- *             no map
+ *   - background: the resting screen (background_image) shown at idle + during a
+ *                 run. Black when no background image is configured.
+ *   - reveal:     the second-bip reveal surface. Shows the map with checkpoint
+ *                 markers that ACCUMULATE as the run is revealed (each marker is
+ *                 a per-status image: own image / wrong-order / missing). In full
+ *                 mode a `bigReveal` panel shows the current checkpoint big +
+ *                 centered (with name/description for correct hits) before it
+ *                 lands on the map. Simple mode shows a minimal summary HUD
+ *                 instead of the map.
+ *   - clues:      map-style review page listing every checkpoint (auto-triggered
+ *                 when a finished card re-bips and the clues page is enabled).
+ *   - topreveal:  end-of-run top-X reward image.
  *
- * The clues page (auto-triggered on the team's second bip) always renders as
- * a map-style page with every checkpoint revealed, gated by show_title /
- * show_text / show_image.
- *
- * Design plan: C:\Users\faure\.claude\plans\tracks-game-type-design.md (§6)
+ * Design plan: C:\Users\faure\.claude\plans\tracks-reveal-redesign.md
  */
 
+import { useState, useRef, useEffect, useCallback } from 'react';
 import type { TracksCheckpoint } from '../services/tracksScoring';
 
-export type TracksScreen = 'ingame' | 'clues' | 'topreveal';
+export type TracksScreen = 'background' | 'reveal' | 'clues' | 'topreveal';
 export type TracksDisplayMode = 'full' | 'map' | 'simple';
 
 type Localizedish = Record<string, string> | string | undefined | null;
@@ -39,18 +42,27 @@ export interface TracksRendererCluesConfig {
   show_image: boolean;
 }
 
+/** The full-mode big-center reveal for the current checkpoint. */
+export interface TracksBigReveal {
+  imageUrl: string;
+  title: string;
+  description: string;
+}
+
 export interface TracksGameRendererProps {
   screen: TracksScreen;
   displayMode: TracksDisplayMode;
-  /** Background map image URL (already resolved). */
+  /** Resting background image URL (already resolved); '' → black. */
+  backgroundUrl: string;
+  /** Map image URL (already resolved) — the reveal surface. */
   mapUrl: string;
-  /** Checkpoints that count for the active route, in order. */
+  /** Checkpoints that count for the active route, in order (positions + clues). */
   routeCheckpoints: TracksCheckpoint[];
-  /** Ids of checkpoints already hit by the focused team. */
-  hitCheckpointIds: Set<string>;
-  /** The checkpoint to feature in the full-mode reveal panel (most recent hit). */
-  revealCheckpointId: string | null;
-  /** Resolve a per-checkpoint marker image filename → URL. */
+  /** cpId → resolved per-status image URL currently placed on the map (accumulates). */
+  placedCheckpoints: Map<string, string>;
+  /** Full-mode center reveal for the current checkpoint, or null. */
+  bigReveal: TracksBigReveal | null;
+  /** Resolve a checkpoint's own image filename → URL (clues page). */
   resolveCheckpointImage: (cp: TracksCheckpoint) => string;
   /** Marker size as a % of map width. */
   iconSizePercent: number;
@@ -65,6 +77,8 @@ export interface TracksGameRendererProps {
   timerText: string;
   scoreText: string;
   showScore: boolean;
+  /** Correct-checkpoint count for the simple summary ("X / N"). */
+  hitCount: number;
   language: string;
   clues: TracksRendererCluesConfig;
   /** Top-X reveal image URL (when screen === 'topreveal'); '' to skip. */
@@ -105,10 +119,11 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
   const {
     screen,
     displayMode,
+    backgroundUrl,
     mapUrl,
     routeCheckpoints,
-    hitCheckpointIds,
-    revealCheckpointId,
+    placedCheckpoints,
+    bigReveal,
     resolveCheckpointImage,
     iconSizePercent,
     hud,
@@ -116,6 +131,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     timerText,
     scoreText,
     showScore,
+    hitCount,
     language,
     clues,
     topRevealUrl,
@@ -133,7 +149,58 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     background: '#000',
   };
 
-  // --- Top-X reveal: full-screen image (end of game) -------------------------
+  // Map-image rect within the viewport (object-contain letterbox), in % of the
+  // viewport. Checkpoint positions are stored as % of the MAP IMAGE (the exact
+  // referential the studio LayoutEditor uses), so markers must be placed inside
+  // this rect — NOT against the full viewport — to land where the editor showed.
+  const mapImgRef = useRef<HTMLImageElement>(null);
+  const [imgBounds, setImgBounds] = useState({ x: 0, y: 0, width: 100, height: 100 });
+  const recalcBounds = useCallback(() => {
+    const img = mapImgRef.current;
+    const cw = window.innerWidth;
+    const ch = window.innerHeight;
+    if (!img || !img.naturalWidth || !img.naturalHeight || !cw || !ch) {
+      setImgBounds({ x: 0, y: 0, width: 100, height: 100 });
+      return;
+    }
+    const imgAR = img.naturalWidth / img.naturalHeight;
+    const cAR = cw / ch;
+    let aw: number, ah: number, ox: number, oy: number;
+    if (imgAR > cAR) {
+      aw = cw;
+      ah = cw / imgAR;
+      ox = 0;
+      oy = (ch - ah) / 2;
+    } else {
+      ah = ch;
+      aw = ch * imgAR;
+      oy = 0;
+      ox = (cw - aw) / 2;
+    }
+    setImgBounds({ x: (ox / cw) * 100, y: (oy / ch) * 100, width: (aw / cw) * 100, height: (ah / ch) * 100 });
+  }, []);
+  useEffect(() => {
+    recalcBounds();
+    window.addEventListener('resize', recalcBounds);
+    return () => window.removeEventListener('resize', recalcBounds);
+  }, [recalcBounds, mapUrl]);
+
+  // --- Background: the resting screen (idle + run) ---------------------------
+  if (screen === 'background') {
+    return (
+      <div style={rootStyle}>
+        {backgroundUrl && (
+          <img
+            src={backgroundUrl}
+            alt=""
+            className="absolute inset-0 w-full h-full object-cover select-none pointer-events-none"
+          />
+        )}
+      </div>
+    );
+  }
+
+  // --- Top-X reveal: full-screen image (end of run) --------------------------
   if (screen === 'topreveal') {
     return (
       <div style={rootStyle} className="flex items-center justify-center">
@@ -146,9 +213,8 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     );
   }
 
-  // --- Simple mode: minimal centered HUD, no map -----------------------------
-  if (displayMode === 'simple' && screen === 'ingame') {
-    const hitCount = routeCheckpoints.filter((c) => hitCheckpointIds.has(c.id)).length;
+  // --- Simple mode reveal: minimal centered HUD, no map ----------------------
+  if (displayMode === 'simple' && screen === 'reveal') {
     return (
       <div style={rootStyle} className="flex flex-col items-center justify-center gap-6">
         <div className="text-5xl font-bold">{teamName}</div>
@@ -161,57 +227,50 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     );
   }
 
-  // --- Map / Full / Clues all render the map with markers --------------------
-  const showRevealPanel = displayMode === 'full' && screen === 'ingame';
+  // --- Reveal (full/map) + clues both render the map -------------------------
   const isClues = screen === 'clues';
-  const revealCp = revealCheckpointId
-    ? routeCheckpoints.find((c) => c.id === revealCheckpointId) ?? null
-    : null;
 
   return (
     <div style={rootStyle}>
       {/* Map background */}
       {mapUrl && (
         <img
+          ref={mapImgRef}
+          onLoad={recalcBounds}
           src={mapUrl}
           alt="map"
           className="absolute inset-0 w-full h-full object-contain select-none pointer-events-none"
         />
       )}
 
-      {/* Checkpoint markers */}
-      {routeCheckpoints.map((cp) => {
-        const pos = cp.position ?? { top: 50, left: 50 };
-        const hit = hitCheckpointIds.has(cp.id) || isClues;
-        const img = resolveCheckpointImage(cp);
-        return (
-          <div
-            key={cp.id}
-            className="absolute -translate-x-1/2 -translate-y-1/2 transition-opacity duration-500"
-            style={{
-              top: `${pos.top}%`,
-              left: `${pos.left}%`,
-              width: `${iconSizePercent}%`,
-              opacity: hit ? 1 : 0.25,
-              filter: hit ? 'none' : 'grayscale(1)',
-            }}
-          >
-            {img ? (
-              <img src={img} alt="" className="w-full h-auto" />
-            ) : (
-              <div
-                className="rounded-full border-2"
-                style={{
-                  width: '100%',
-                  paddingBottom: '100%',
-                  borderColor: hit ? '#22c55e' : '#94a3b8',
-                  background: hit ? 'rgba(34,197,94,0.4)' : 'rgba(148,163,184,0.2)',
-                }}
-              />
-            )}
-          </div>
-        );
-      })}
+      {/* Reveal markers — only the checkpoints already placed on the map, each
+          using its per-status image (own / wrong-order / missing). Positioned
+          inside the map-image rect (same referential as the studio editor). */}
+      {screen === 'reveal' &&
+        routeCheckpoints.map((cp) => {
+          if (!placedCheckpoints.has(cp.id)) return null;
+          const url = placedCheckpoints.get(cp.id) || '';
+          const pos = cp.position ?? { top: 50, left: 50 };
+          const left = imgBounds.x + (Number(pos.left) / 100) * imgBounds.width;
+          const top = imgBounds.y + (Number(pos.top) / 100) * imgBounds.height;
+          const w = (iconSizePercent / 100) * imgBounds.width;
+          return (
+            <div
+              key={cp.id}
+              className="absolute -translate-x-1/2 -translate-y-1/2 transition-opacity duration-300"
+              style={{ top: `${top}%`, left: `${left}%`, width: `${w}%` }}
+            >
+              {url ? (
+                <img src={url} alt="" className="w-full h-auto" />
+              ) : (
+                <div
+                  className="rounded-full border-2"
+                  style={{ width: '100%', paddingBottom: '100%', borderColor: '#22c55e', background: 'rgba(34,197,94,0.4)' }}
+                />
+              )}
+            </div>
+          );
+        })}
 
       {/* Top HUD strip (team / timer / score) — hidden on the clues page */}
       {!isClues && (
@@ -222,22 +281,24 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         </div>
       )}
 
-      {/* Full-mode reveal panel for the most-recently-hit checkpoint */}
-      {showRevealPanel && revealCp && (
-        <div className="absolute bottom-0 left-0 right-0 p-6 bg-black/60 backdrop-blur-sm flex items-center gap-6">
-          {resolveCheckpointImage(revealCp) && (
+      {/* Full-mode big-center reveal for the current checkpoint */}
+      {screen === 'reveal' && bigReveal && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center px-10 pointer-events-none" style={{ background: 'rgba(0,0,0,0.45)' }}>
+          {bigReveal.imageUrl && (
             <img
-              src={resolveCheckpointImage(revealCp)}
+              src={bigReveal.imageUrl}
               alt=""
-              className="h-40 w-auto object-contain rounded-lg"
+              className="max-w-[60%] max-h-[60%] object-contain"
             />
           )}
-          <div className="flex-1">
-            <div className="text-3xl font-bold">{readLocalized(revealCp.title as Localizedish, language)}</div>
-            <div className="text-xl opacity-80 mt-2 whitespace-pre-wrap">
-              {readLocalized(revealCp.description as Localizedish, language)}
+          {bigReveal.title && (
+            <div className="mt-5 text-4xl font-bold text-center">{bigReveal.title}</div>
+          )}
+          {bigReveal.description && (
+            <div className="mt-3 text-2xl opacity-85 text-center whitespace-pre-wrap max-w-[80%]">
+              {bigReveal.description}
             </div>
-          </div>
+          )}
         </div>
       )}
 

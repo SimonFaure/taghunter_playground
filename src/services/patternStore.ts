@@ -184,6 +184,14 @@ export async function listGameTypes(): Promise<string[]> {
   return rows.map(r => r.game_type);
 }
 
+// Versions may be semantic decimals (e.g. 1.0 → 1.1) delivered as strings (the
+// studio column is VARCHAR). Parse to a float so `remote_version` stays numeric
+// and a 0.1 bump is detected by `listPendingDownloads` — same fix as scenarios.
+function parseManifestVersion(v: unknown): number {
+  const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
+  return Number.isFinite(n) ? n : 0;
+}
+
 export async function upsertFromManifest(rows: PatternManifestRow[], seenAt: string): Promise<void> {
   const db = await getDb();
   for (const r of rows) {
@@ -199,7 +207,7 @@ export async function upsertFromManifest(rows: PatternManifestRow[], seenAt: str
          is_default = excluded.is_default,
          remote_version = excluded.remote_version,
          last_manifest_seen_at = excluded.last_manifest_seen_at`,
-      [r.pattern_uniqid, r.name, r.game_type, r.is_default ? 1 : 0, r.version, seenAt]
+      [r.pattern_uniqid, r.name, r.game_type, r.is_default ? 1 : 0, parseManifestVersion(r.version), seenAt]
     );
   }
 }

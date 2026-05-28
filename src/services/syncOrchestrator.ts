@@ -474,12 +474,11 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     emit('content:updated', { kind: 'patterns', ids: [], removed: removedPatterns });
   }
 
-  // Layouts.
-  await layoutStore.upsertFromManifest(manifest.layouts, seenAt);
-  const removedLayouts = await layoutStore.tombstoneMissing(manifest.layouts.map((l) => l.id));
-  if (removedLayouts.length) {
-    emit('content:updated', { kind: 'layouts', ids: [], removed: removedLayouts });
-  }
+  // Layouts are NO LONGER synced. They were only ever consumed by tagquest's
+  // HUD positioning, which now falls back to its bundled default layout; tracks
+  // places its elements via game_meta.checkpoints[].position (synced with the
+  // scenario), and mystery doesn't use layouts. Skipping the manifest apply +
+  // download keeps the cycle lean. (manifest.layouts is intentionally ignored.)
 
   // Global admin translations (inline JSON, no separate download pool).
   await translationsStore.upsertFromManifest(manifest.translations ?? [], seenAt);
@@ -565,15 +564,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       label: `Pattern: ${p.name}`,
     });
   }
-  for (const l of await layoutStore.listPendingDownloads()) {
-    work.push({
-      kind: 'layout',
-      priority: 3,
-      id: l.id,
-      remoteVersion: l.remote_version,
-      label: `Layout: ${l.game_type} v${l.remote_version}`,
-    });
-  }
+  // Layouts intentionally not enqueued — see the manifest-apply note above.
   for (const s of await scenarioStore.listPendingDownloads()) {
     work.push({
       kind: 'scenario_meta',

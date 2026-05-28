@@ -9,6 +9,7 @@ import {
   recordPunch,
   updateTeam,
 } from '../services/launchedGames';
+import { checkpointsForRoute, computeScore, type TracksScoreType } from '../services/tracksScoring';
 
 interface GameTestModalProps {
   gameId: number;
@@ -398,6 +399,97 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         }
         setTestResults(results);
         appendLog('Simulation complete.');
+        return;
+      }
+
+      if (gameType?.toLowerCase() === 'tracks') {
+        const trPattern = meta.pattern || '';
+        appendLog(`Loading tracks pattern: ${trPattern}`);
+        const trStations = await patternStore.getTracksCheckpointStations(trPattern);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let checkpoints: any[] = [];
+        if (state.game_uniqid) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const gdj = (await scenarioStore.getGameData(state.game_uniqid)) as any;
+          checkpoints = gdj?.game_meta?.checkpoints ?? gdj?.game_data?.game_meta?.checkpoints ?? [];
+        }
+        const launchRoute = meta.route || 'default';
+        const scoreType = (meta.scoreType as TracksScoreType) || 'percentage';
+        appendLog(`${checkpoints.length} checkpoint(s); ${trStations.size} mapped in pattern; route ${launchRoute}`);
+        if (trStations.size === 0) {
+          appendLog('Warning: pattern has no checkpoint→station rows — scoring will be 0.');
+        }
+        // SI clock string "HH:MM:SS" from unix seconds (for itinerary ordering).
+        const toClock = (sec: number) =>
+          [new Date(sec * 1000).getHours(), new Date(sec * 1000).getMinutes(), new Date(sec * 1000).getSeconds()]
+            .map((n) => String(n).padStart(2, '0'))
+            .join(':');
+
+        const results: TestResult[] = [];
+        for (const team of teamsToTest) {
+          appendLog(`Processing: ${team.team_name}`);
+          if (team.start_time || team.end_time) {
+            await updateTeam(team.id, { start_time: null, end_time: null, score: 0 });
+            appendLog('  Reset previous run');
+          }
+          const startTime = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 1200 + 300);
+          await updateTeam(team.id, { start_time: startTime });
+
+          // Per-team route override (manual Add Team) else the launch default.
+          const teamRoute = meta[`route:${team.id}`] || launchRoute;
+          const routeCps = checkpointsForRoute(checkpoints, teamRoute);
+
+          // Randomly "hit" route checkpoints per the Good% slider, punching the
+          // checkpoint's first pattern station (code matched the way the runtime
+          // matches it).
+          const punches: Array<{ code: number; time: string }> = [];
+          const hitIds = new Set<string>();
+          let t = startTime + 60;
+          for (let i = 0; i < checkpoints.length; i++) {
+            const cp = checkpoints[i];
+            if (!routeCps.some((c) => c.id === cp.id)) continue;
+            const cpStations = trStations.get(i + 1) ?? [];
+            if (cpStations.length === 0) continue;
+            if (Math.random() * 100 < testConfig.goodAnswerPercent) {
+              punches.push({ code: cpStations[0], time: toClock(t) });
+              hitIds.add(cp.id);
+              t += 90;
+            }
+          }
+
+          const mockCard = {
+            id: team.key_id,
+            series: 0,
+            cardType: 'SI11',
+            nbPunch: punches.length,
+            start: null,
+            check: null,
+            end: null,
+            punches,
+          };
+          await recordPunch(gameId, mockCard);
+
+          const endTime = Math.floor(Date.now() / 1000);
+          const score = computeScore({
+            routeCheckpoints: routeCps,
+            hitCheckpointIds: hitIds,
+            scoreType,
+            elapsedMinutes: (endTime - startTime) / 60,
+            timeLimitMinutes: 60, // under the limit for a quick sim → no malus
+            malusPerMinute: 0,
+          });
+          await updateTeam(team.id, { end_time: endTime, score });
+          appendLog(`  Done — ${hitIds.size}/${routeCps.length} checkpoint(s), score ${score}`);
+          results.push({
+            teamName: team.team_name,
+            score,
+            status: 'success',
+            message: `${hitIds.size}/${routeCps.length} checkpoints — score ${score}`,
+          });
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        setTestResults(results);
+        appendLog('Simulation complete. (To see the on-screen reveal, bip a card on the live game display.)');
         return;
       }
 
