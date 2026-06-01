@@ -22,6 +22,7 @@ import {
   type ListPairedWithStatusResp,
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
+import { HelpButton, HelpDot } from '../help';
 
 interface GameDevicesModalProps {
   launchedGameId: number;
@@ -267,13 +268,16 @@ export function GameDevicesModal({
             <Monitor size={24} className="text-purple-500" />
             Game Devices
           </h3>
-          <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-white p-1"
-            aria-label="Close"
-          >
-            <X size={24} />
-          </button>
+          <div className="flex items-center gap-2">
+            <HelpButton chapter="devices" label="Help" className="text-slate-300 hover:text-white" />
+            <button
+              onClick={onClose}
+              className="text-slate-400 hover:text-white p-1"
+              aria-label="Close"
+            >
+              <X size={24} />
+            </button>
+          </div>
         </div>
 
         {/* Section A — In this game */}
@@ -342,6 +346,7 @@ export function GameDevicesModal({
                   </div>
                 )}
               </div>
+              <HelpDot topic="devices.play" />
               <button
                 className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg text-sm flex items-center gap-1.5"
                 disabled={selectedForVideo.size === 0}
@@ -355,6 +360,7 @@ export function GameDevicesModal({
                 <StopCircle size={14} />
                 Stop
               </button>
+              <HelpDot topic="devices.stop" />
             </div>
           )}
           {buckets.in_game.length === 0 ? (

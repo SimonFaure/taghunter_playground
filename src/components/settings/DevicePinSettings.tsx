@@ -3,6 +3,7 @@ import { Loader2 } from 'lucide-react';
 import { OtpInput } from '../auth/OtpInput';
 import { hasPin, setPin } from '../../services/pinStore';
 import { onPinReset } from '../../services/pinResetSignal';
+import { HelpDot } from '../../help';
 
 // Set / change the device PIN from Settings (no relaunch, no email). Needed so
 // an operator can re-establish a PIN after an offline recovery code cleared it
@@ -29,7 +30,10 @@ export function DevicePinSettings() {
   return (
     <div className="flex items-center justify-between p-4 rounded-lg border-2 border-slate-700 bg-slate-700/30 mb-3">
       <div>
-        <div className="font-semibold text-lg">Device PIN</div>
+        <div className="font-semibold text-lg flex items-center gap-1.5">
+          Device PIN
+          <HelpDot topic="security.pin" />
+        </div>
         <div className="text-sm text-slate-400">
           Used by the security gates above and the nav-bar Lock button.{' '}
           {pinSet === null ? '' : pinSet ? 'A PIN is currently set.' : 'No PIN is set.'}

@@ -23,6 +23,7 @@ import {
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
 import { useAuth } from './auth/AuthProvider';
+import { HelpButton, HelpDot } from '../help';
 
 export interface LaunchDeviceSelection {
   /** Whether to register the mother itself as a participating device. */
@@ -788,12 +789,15 @@ export function LaunchGameModal({
       <div className="relative w-full h-full max-w-4xl max-h-screen overflow-auto bg-slate-900 shadow-2xl md:rounded-xl md:m-8 md:h-auto">
         <div className="sticky top-0 z-10 flex items-center justify-between p-6 bg-slate-800 border-b border-slate-700">
           <h2 className="text-2xl font-bold text-white">Launch Game Configuration</h2>
-          <button
-            onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition"
-          >
-            <X size={24} />
-          </button>
+          <div className="flex items-center gap-2">
+            <HelpButton chapter="launching-a-game" label="Help" className="text-slate-300 hover:text-white" />
+            <button
+              onClick={onClose}
+              className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition"
+            >
+              <X size={24} />
+            </button>
+          </div>
         </div>
 
         <form onSubmit={handleSubmit} className="p-6 space-y-6">
@@ -909,9 +913,12 @@ export function LaunchGameModal({
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="duration" className="block text-sm font-medium text-slate-300">
-                Duration (minutes)
-              </label>
+              <div className="flex items-center gap-1">
+                <label htmlFor="duration" className="block text-sm font-medium text-slate-300">
+                  Duration (minutes)
+                </label>
+                <HelpDot topic="launch.duration" />
+              </div>
               <input
                 type="number"
                 id="duration"
@@ -956,9 +963,12 @@ export function LaunchGameModal({
 
           {scenarioLanguages.length > 0 && (
             <div className="space-y-2">
-              <label htmlFor="language" className="block text-sm font-medium text-slate-300">
-                Language
-              </label>
+              <div className="flex items-center gap-1">
+                <label htmlFor="language" className="block text-sm font-medium text-slate-300">
+                  Language
+                </label>
+                <HelpDot topic="launch.language" />
+              </div>
               <select
                 id="language"
                 value={config.language || scenarioDefaultLang}
@@ -1248,6 +1258,7 @@ export function LaunchGameModal({
                   Auto register team
                   <span className="ml-2 text-xs text-slate-400 font-normal">(first bip of each registered card creates and starts a team)</span>
                 </label>
+                <HelpDot topic="launch.auto-register" />
               </div>
             )}
 
@@ -1288,6 +1299,7 @@ export function LaunchGameModal({
                   Reuse cards
                   <span className="ml-2 text-xs text-slate-400 font-normal">(a finished card can start a fresh run after a delay)</span>
                 </label>
+                <HelpDot topic="launch.reuse-cards" />
               </div>
             )}
 
@@ -1359,6 +1371,7 @@ export function LaunchGameModal({
                 Auto-reset page
                 <span className="ml-2 text-xs text-slate-400 font-normal">(returns the display to the ready screen after results — no Enter/reset needed)</span>
               </label>
+              <HelpDot topic="launch.auto-reset" />
             </div>
 
             {config.autoResetTeam && (
