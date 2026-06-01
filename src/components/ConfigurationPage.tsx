@@ -56,6 +56,7 @@ import { UpdatesScreen } from './settings/UpdatesScreen';
 import { UsbDriverScreen } from './settings/UsbDriverScreen';
 import { ApiDocsPage } from './ApiDocsPage';
 import { DevicePinSettings } from './settings/DevicePinSettings';
+import { HelpButton } from '../help';
 
 const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
@@ -229,6 +230,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
         <div className="flex items-center gap-3 mb-8">
           <Settings className="text-blue-400" size={32} />
           <h1 className="text-3xl font-bold">Configuration</h1>
+          <HelpButton chapter="settings" className="text-slate-400 hover:text-slate-200 ml-1" />
         </div>
 
         <div className="flex gap-6">
