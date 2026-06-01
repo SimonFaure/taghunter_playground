@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, KeyboardEvent } from 'react';
 import { Monitor, Smartphone, Tablet, Trash2, Loader2, RefreshCw, LogOut, Pencil, Check, X } from 'lucide-react';
 import { listMyDevices, revokeDevice, renameDevice, signOutOfThisDevice, MyDeviceListItem } from '../../services/auth';
 import { ApiError } from '../../services/api';
+import { HelpButton } from '../../help';
 
 const MAX_DISPLAY_NAME = 120;
 
@@ -112,7 +113,10 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
   return (
     <div className="container mx-auto px-6 py-8 max-w-3xl">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-white">My Devices</h1>
+        <div className="flex items-center gap-2">
+          <h1 className="text-2xl font-bold text-white">My Devices</h1>
+          <HelpButton chapter="devices" className="text-slate-400 hover:text-slate-200" />
+        </div>
         <div className="flex gap-2">
           <button
             onClick={refresh}
