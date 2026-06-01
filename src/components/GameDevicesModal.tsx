@@ -282,7 +282,7 @@ export function GameDevicesModal({
 
         {/* Section A — In this game */}
         <section className="mb-6">
-          <SectionHeader title="In this game" count={buckets.in_game.length} dotClass="bg-green-500" />
+          <SectionHeader title="In this game" count={buckets.in_game.length} dotClass="bg-green-500" helpDot={<HelpDot topic="devices.bucket-in-game" />} />
           {isMother && buckets.in_game.length > 0 && (
             <div className="flex items-center gap-3 mb-3 px-1 flex-wrap">
               {inGameSelectableCount > 0 ? (
@@ -389,6 +389,7 @@ export function GameDevicesModal({
             title="Paired, available to launch"
             count={buckets.available_online.length}
             dotClass="bg-blue-500"
+            helpDot={<HelpDot topic="devices.bucket-available" />}
           />
           {buckets.available_online.length === 0 ? (
             <EmptyHint text="No other paired devices are online right now." />
@@ -415,6 +416,7 @@ export function GameDevicesModal({
             title="Paired, offline"
             count={buckets.offline.length}
             dotClass="bg-slate-500"
+            helpDot={<HelpDot topic="devices.bucket-offline" />}
           />
           {buckets.offline.length === 0 ? (
             <EmptyHint text="No offline paired devices." />
@@ -437,10 +439,12 @@ function SectionHeader({
   title,
   count,
   dotClass,
+  helpDot,
 }: {
   title: string;
   count: number;
   dotClass: string;
+  helpDot?: React.ReactNode;
 }) {
   return (
     <div className="flex items-center gap-2 mb-3">
@@ -449,6 +453,7 @@ function SectionHeader({
         {title}
       </h4>
       <span className="text-xs text-slate-500">({count})</span>
+      {helpDot}
     </div>
   );
 }
