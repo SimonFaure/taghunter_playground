@@ -33,6 +33,7 @@ import {
 } from '../services/launchedGames';
 import { useAuth } from './auth/AuthProvider';
 import gamesData from '../../data/games.json';
+import { HelpButton } from '../help';
 
 interface GameType {
   id: string;
@@ -756,6 +757,9 @@ export function GameList() {
       )}
 
       <main className="flex-1 container mx-auto px-6 py-8">
+        <div className="mb-3 flex justify-end">
+          <HelpButton chapter="scenarios" className="text-slate-400 hover:text-slate-200" />
+        </div>
         <div className="mb-8">
           <div className="flex flex-col md:flex-row gap-4">
             <div className="flex-1 relative">
