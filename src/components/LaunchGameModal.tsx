@@ -124,17 +124,22 @@ function TracksRadioGroup({
   options,
   value,
   onChange,
+  helpDot,
 }: {
   label: string;
   name: string;
   options: Array<{ key: string; label: string }>;
   value: string;
   onChange: (key: string) => void;
+  helpDot?: React.ReactNode;
 }) {
   if (options.length <= 1) return null;
   return (
     <div className="space-y-2">
-      <label className="block text-sm font-medium text-slate-300">{label}</label>
+      <div className="flex items-center gap-1">
+        <label className="block text-sm font-medium text-slate-300">{label}</label>
+        {helpDot}
+      </div>
       <div className="flex flex-wrap gap-2">
         {options.map((o) => (
           <label
@@ -1168,6 +1173,7 @@ export function LaunchGameModal({
                 options={tracksOptions.scoreTypes.map((s) => ({ key: s.key, label: TRACKS_SCORE_TYPE_LABELS[s.key] ?? s.key }))}
                 value={config.scoreType ?? ''}
                 onChange={(k) => setConfig({ ...config, scoreType: k as 'percentage' | 'points' })}
+                helpDot={<HelpDot topic="launch.score-type" />}
               />
 
               <div className="pt-1 border-t border-slate-700/60">
