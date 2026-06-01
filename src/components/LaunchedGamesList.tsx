@@ -6,6 +6,7 @@ import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
 import * as scenarioStore from '../services/scenarioStore';
 import * as namePoolsStore from '../services/namePoolsStore';
+import { LANG_NAMES } from '../services/langFlags';
 import {
   listLaunchedGames,
   getLaunchedGameMeta,
@@ -36,6 +37,7 @@ import { LeaderboardPage } from './LeaderboardPage';
 import { RankingsModal } from './RankingsModal';
 import { TimeRangeLeaderboard } from './TimeRangeLeaderboard';
 import { MultiGameLeaderboard } from './MultiGameLeaderboard';
+import { HelpDot } from '../help';
 import type { ScenarioOption, TimeRange, ActiveGameOption } from './RankingsModal';
 import type { GameConfig, Team as ConfigTeam, Teammate } from './LaunchGameModal';
 import type { SiPuce } from '../types/database';
@@ -76,6 +78,7 @@ interface Team {
   start_time: number | null;
   end_time: number | null;
   key_id: number;
+  language?: string | null;
   currentLevel?: { level: number; name: string } | null;
 }
 
@@ -153,7 +156,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   const [selectedGameTeamsConfig, setSelectedGameTeamsConfig] = useState<ConfigTeam[]>([]);
   const [allChips, setAllChips] = useState<SiPuce[]>([]);
   const [addTeammateState, setAddTeammateState] = useState<{ teamId: number; chipId: number | null; name: string } | null>(null);
-  const [addTeamState, setAddTeamState] = useState<{ name: string; chipId: number | null; route?: string } | null>(null);
+  const [addTeamState, setAddTeamState] = useState<{ name: string; chipId: number | null; route?: string; language?: string } | null>(null);
   // Tracks: enabled route set + launch default route (from launch meta), so the
   // Add Team form can offer a per-team route override (manual assignment only).
   const [tracksRouteOptions, setTracksRouteOptions] = useState<string[]>([]);
@@ -163,6 +166,9 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   const [nameDrawAudience, setNameDrawAudience] = useState<string>('kids');
   const [nameDrawLang, setNameDrawLang] = useState<string>('en');
   const [namePoolNames, setNamePoolNames] = useState<string[]>([]);
+  // The scenario's available languages (from launch meta) — drives the Add-Team
+  // and team-details per-team language selects. Empty ⇒ no language picker shown.
+  const [selectedGameLanguages, setSelectedGameLanguages] = useState<string[]>([]);
   const [savingTeammate, setSavingTeammate] = useState(false);
   const [savingTeam, setSavingTeam] = useState(false);
   const [teamDetails, setTeamDetails] = useState<{ team: Team; gameUniqid: string; gameType: string } | null>(null);
@@ -252,6 +258,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           }
           setNameDrawAudience(normalizeAudience(audienceRaw));
           setNameDrawLang((lang || 'en').toLowerCase());
+          setSelectedGameLanguages(map.availableLanguages ? map.availableLanguages.split(',') : []);
         })
         .catch((err) => console.error('[LaunchedGamesList] meta load failed:', err));
     }
@@ -304,6 +311,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         start_time: t.start_time,
         end_time: t.end_time,
         key_id: t.key_id ?? 0,
+        language: t.language ?? null,
       }));
     } catch (err) {
       console.error('Error loading teams:', err);
@@ -668,7 +676,13 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   // seeded from the card (per the launched-game team/player creation UX).
   const openAddTeam = () => {
     const chip = firstFreeChip();
-    setAddTeamState({ chipId: chip?.id ?? null, name: chip?.key_name ?? '', route: tracksDefaultRoute });
+    setAddTeamState({
+      chipId: chip?.id ?? null,
+      name: chip?.key_name ?? '',
+      route: tracksDefaultRoute,
+      // Default the per-team language to the launch language.
+      language: nameDrawLang,
+    });
   };
 
   const openAddTeammate = (teamId: number) => {
@@ -730,6 +744,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         team_name: addTeamState.name.trim(),
         pattern: 0,
         key_id: chip.id,
+        language: addTeamState.language ?? nameDrawLang ?? null,
       });
       // Persist a per-team route override only when it differs from the launch
       // default (the runtime falls back to the default when no override exists).
@@ -883,6 +898,12 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       reuseCards: metaMap.reuseCards === 'true',
       selfRegisterTeam: metaMap.selfRegisterTeam === 'true',
       reuseDelayMinutes: parseInt(metaMap.reuseDelayMinutes || '5'),
+      useNamePool: metaMap.useNamePool === 'true',
+      namePoolAudience: (metaMap.namePoolAudience as GameConfig['namePoolAudience']) || undefined,
+      addRandomNameOption: metaMap.addRandomNameOption === 'true',
+      allowPlayerLanguageChoice: metaMap.allowPlayerLanguageChoice === 'true',
+      scenarioLanguages: metaMap.availableLanguages ? metaMap.availableLanguages.split(',') : undefined,
+      language: metaMap.language || undefined,
       visibilityHideDelaySec: parseInt(metaMap.visibilityHideDelaySec || '10'),
       testMode: metaMap.testMode === 'true',
       victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
@@ -1660,6 +1681,23 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                               ))}
                             </select>
                           )}
+                          {selectedGameLanguages.length >= 2 && (
+                            <div className="flex items-center gap-2">
+                              <select
+                                value={addTeamState.language ?? nameDrawLang}
+                                onChange={e => setAddTeamState({ ...addTeamState, language: e.target.value })}
+                                className="flex-1 min-w-0 px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                title="Display language for this team"
+                              >
+                                {selectedGameLanguages.map(l => (
+                                  <option key={l} value={l}>
+                                    {LANG_NAMES[l] ?? l}
+                                  </option>
+                                ))}
+                              </select>
+                              <HelpDot topic="team.language" align="right" />
+                            </div>
+                          )}
                           <div className="flex gap-2">
                             <button
                               onClick={handleAddTeam}
@@ -1875,6 +1913,9 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           gameUniqid={teamDetails.gameUniqid}
           gameType={teamDetails.gameType}
           chipIds={chipIdsForTeam(teamDetails.team)}
+          languages={selectedGameLanguages}
+          launchLanguage={nameDrawLang}
+          onTeamUpdated={() => loadTeams(selectedGameId)}
           onClose={() => setTeamDetails(null)}
         />
       )}

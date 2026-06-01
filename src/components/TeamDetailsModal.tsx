@@ -3,6 +3,8 @@ import { X, Award, Zap, Target, Clock, List, ChevronDown, ChevronUp, BarChart2, 
 import * as scenarioStore from '../services/scenarioStore';
 import * as patternStore from '../services/patternStore';
 import { scenarioAssetUrl } from '../services/contentFs';
+import { LANG_NAMES } from '../services/langFlags';
+import { HelpDot } from '../help';
 import {
   getLaunchedGameState,
   getLaunchedGameMeta,
@@ -21,6 +23,7 @@ interface Team {
   start_time: number | null;
   end_time: number | null;
   key_id: number;
+  language?: string | null;
 }
 
 interface CompletedQuest {
@@ -52,6 +55,12 @@ interface TeamDetailsModalProps {
    *  member punches with their own chip, so the punch tab must look at all of
    *  them, not just the leader's key_id. Defaults to [team.key_id]. */
   chipIds?: number[];
+  /** Scenario's available languages — when 2+, a per-team language select shows. */
+  languages?: string[];
+  /** Launch language, used as the select's default when the team has none. */
+  launchLanguage?: string;
+  /** Called after the team's language is changed so the list can refresh. */
+  onTeamUpdated?: () => void;
   onClose: () => void;
 }
 
@@ -261,7 +270,7 @@ function computeLevel(
   return best;
 }
 
-export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, chipIds, onClose }: TeamDetailsModalProps) {
+export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, chipIds, languages, launchLanguage, onTeamUpdated, onClose }: TeamDetailsModalProps) {
   // launched_games stores game_type capitalised ('Mystery'), while scenario rows
   // use the lowercase slug — compare case-insensitively so either value matches.
   const isMystery = (gameType ?? '').toLowerCase() === 'mystery';
@@ -561,6 +570,22 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     }
   };
 
+  // Change this team's display language (operator override). Drives in-game text
+  // for this team and the team's name-pool draw language.
+  const handleLanguageChange = async (lang: string) => {
+    setMutating(true);
+    setCurrentTeam((t) => ({ ...t, language: lang })); // optimistic
+    try {
+      await updateTeam(team.id, { language: lang });
+      onTeamUpdated?.();
+    } catch (err) {
+      console.error('[TeamDetailsModal] handleLanguageChange failed:', err);
+      setCurrentTeam((t) => ({ ...t, language: currentTeam.language })); // roll back
+    } finally {
+      setMutating(false);
+    }
+  };
+
   // Mystery header summary values.
   const enigmaFoundCount = enigmaRows.filter((r) => r.effective === 'found').length;
   const mysteryScore = enigmaRows.reduce((s, r) => s + r.points, 0);
@@ -584,12 +609,30 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
             <h2 className="text-white font-semibold text-lg">{team.team_name}</h2>
             <p className="text-slate-400 text-sm">Game details — Chip #{team.key_id}</p>
           </div>
-          <button
-            onClick={onClose}
-            className="p-2 hover:bg-slate-700 rounded-lg transition text-slate-400 hover:text-white"
-          >
-            <X size={18} />
-          </button>
+          <div className="flex items-center gap-3">
+            {(languages?.length ?? 0) >= 2 && (
+              <>
+                <select
+                  value={currentTeam.language ?? launchLanguage ?? 'en'}
+                  disabled={mutating}
+                  onChange={(e) => void handleLanguageChange(e.target.value)}
+                  className="px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                  title="Team display language"
+                >
+                  {languages!.map((l) => (
+                    <option key={l} value={l}>{LANG_NAMES[l] ?? l}</option>
+                  ))}
+                </select>
+                <HelpDot topic="team.language" align="right" className="text-slate-400 hover:text-slate-200" />
+              </>
+            )}
+            <button
+              onClick={onClose}
+              className="p-2 hover:bg-slate-700 rounded-lg transition text-slate-400 hover:text-white"
+            >
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         {/* Score summary */}
