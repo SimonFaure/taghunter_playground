@@ -5,6 +5,7 @@ import { runCycleNow, getState } from '../services/syncOrchestrator';
 import { on } from '../services/syncEvents';
 import { useAuth } from './auth/AuthProvider';
 import { CardsManager } from './cards/CardsManager';
+import { HelpButton } from '../help';
 
 // Cards & patterns overview for the currently-authenticated client. Layout
 // mirrors ConfigurationPage: a left sidebar with tab buttons + a main panel
@@ -71,6 +72,7 @@ export default function ClientCardsPage() {
           <div className="flex items-center gap-3">
             <CreditCard className="text-blue-400" size={32} />
             <h1 className="text-3xl font-bold">Cards &amp; Patterns</h1>
+            <HelpButton chapter="cards" className="ml-1 text-slate-400 hover:text-slate-200" />
           </div>
           <button
             onClick={handleSync}
