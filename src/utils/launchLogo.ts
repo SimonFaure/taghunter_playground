@@ -38,7 +38,7 @@ export function mimeForExt(ext: string): string {
   }
 }
 
-// Best-effort extension for a picked File — prefers the filename, falls
+// Best-effort extension for a picked File - prefers the filename, falls
 // back to the MIME subtype.
 export function extForFile(file: File): string {
   const fromName = file.name.includes('.')
@@ -73,7 +73,7 @@ export async function removeLaunchLogo(filename: string): Promise<void> {
       await remove(filename, FS_OPTS);
     }
   } catch {
-    // best effort — an orphan file is harmless
+    // best effort - an orphan file is harmless
   }
 }
 

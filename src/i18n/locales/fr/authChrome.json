@@ -1,0 +1,82 @@
+{
+  "errors": {
+    "requestFailed": "Échec de la requête ({{status}})",
+    "generic": "Une erreur est survenue. Veuillez réessayer."
+  },
+  "provider": {
+    "loading": "Chargement…"
+  },
+  "login": {
+    "title": "Tag Hunter Playground",
+    "subtitle": "Connectez-vous pour continuer",
+    "emailLabel": "Adresse email",
+    "emailPlaceholder": "vous@exemple.com",
+    "sendingCode": "Envoi du code…",
+    "sendCode": "Envoyer le code de connexion",
+    "adminNote": "Les comptes sont créés par votre administrateur.",
+    "codeSentTo": "Nous avons envoyé un code à 6 chiffres à",
+    "verifying": "Vérification…",
+    "useDifferentEmail": "← Utiliser un autre email",
+    "resendCode": "Renvoyer le code"
+  },
+  "lock": {
+    "enterPinTitle": "Saisissez votre code PIN",
+    "checkEmailTitle": "Consultez vos emails",
+    "chooseNewPinTitle": "Choisissez un nouveau code PIN",
+    "confirmNewPinTitle": "Confirmez votre nouveau code PIN",
+    "pinUpdatedTitle": "Code PIN mis à jour",
+    "signedInAs": "Connecté en tant que {{email}}",
+    "codeSentTo": "Nous avons envoyé un code à 6 chiffres à {{email}}",
+    "pickNewPin": "Choisissez un nouveau code PIN à 4 chiffres pour cet appareil.",
+    "typeOnceMore": "Saisissez-le une nouvelle fois pour vérifier qu’il correspond.",
+    "unlocking": "Déverrouillage…",
+    "lockedOut": "Trop de tentatives erronées. Réessayez dans {{time}}.",
+    "checking": "Vérification…",
+    "connectToResetTitle": "Connectez-vous à Internet pour réinitialiser votre code PIN",
+    "forgotPin": "Code PIN oublié ?",
+    "connectToReset": "Connectez-vous à Internet pour réinitialiser votre code PIN.",
+    "recoveryHint": "Fonctionne hors ligne - demandez un code de récupération à votre administrateur",
+    "useRecoveryCode": "Utiliser un code de récupération",
+    "sendingCode": "Envoi du code…",
+    "backToPin": "← Retour au code PIN",
+    "resendCode": "Renvoyer le code",
+    "cancel": "Annuler",
+    "saving": "Enregistrement…",
+    "noPin": "Aucun code PIN défini sur cet appareil. Redémarrez l’application pour continuer.",
+    "tooManyAttempts": "Trop de tentatives erronées. Réessayez sous peu.",
+    "wrongPin": "Code PIN incorrect. Réessayez.",
+    "couldNotCheck": "Impossible de vérifier le code PIN. Réessayez.",
+    "pinsDontMatch": "Les codes PIN ne correspondent pas. Choisissez à nouveau un code PIN.",
+    "remainingSeconds": "{{count}} s",
+    "remainingMinutes": "{{count}} min",
+    "remainingHours": "{{count}} h"
+  },
+  "offlineGrace": {
+    "bannerLastReached_one": "Mode hors ligne - dernier contact avec le serveur il y a {{count}} jour.",
+    "bannerLastReached_other": "Mode hors ligne - dernier contact avec le serveur il y a {{count}} jours.",
+    "bannerRemaining_one": "Il reste {{count}} jour d’accès hors ligne.",
+    "bannerRemaining_other": "Il reste {{count}} jours d’accès hors ligne.",
+    "reconnectRequired": "Reconnexion requise.",
+    "retryNow": "Réessayer maintenant",
+    "lockTitle": "Reconnectez-vous pour continuer",
+    "lockBody": "Cet appareil n’a pas contacté le serveur depuis {{ageDays}} jours, dépassant votre autorisation d’accès hors ligne de {{graceDays}} jours. Connectez-vous à Internet pour reprendre.",
+    "retryConnection": "Réessayer la connexion"
+  },
+  "capReached": {
+    "title": "Limite d’appareils atteinte",
+    "message_one": "Votre compte autorise {{count}} appareil. Choisissez-en un à déconnecter pour ajouter celui-ci.",
+    "message_other": "Votre compte autorise {{count}} appareils. Choisissez-en un à déconnecter pour ajouter celui-ci.",
+    "unknownOs": "Inconnu",
+    "deviceLabel": "Appareil {{os}}",
+    "lastSeen": "vu pour la dernière fois {{time}}",
+    "cancel": "Annuler",
+    "removing": "Suppression…",
+    "removeAndContinue": "Supprimer et continuer"
+  },
+  "appDisabled": {
+    "title": "Playground indisponible",
+    "body": "Ce compte ({{email}}) n’a plus accès à l’application Playground. Contactez votre administrateur pour la réactiver.",
+    "checkAgain": "Vérifier à nouveau",
+    "signOut": "Se déconnecter de cet appareil"
+  }
+}

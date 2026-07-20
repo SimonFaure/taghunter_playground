@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
 import { OtpInput } from '../auth/OtpInput';
 import { hasPin, setPin } from '../../services/pinStore';
@@ -7,12 +8,13 @@ import { HelpDot } from '../../help';
 
 // Set / change the device PIN from Settings (no relaunch, no email). Needed so
 // an operator can re-establish a PIN after an offline recovery code cleared it
-// — the recovery banner points here — and to change a remembered PIN at will.
+// - the recovery banner points here - and to change a remembered PIN at will.
 // Reaching Settings already means the operator is past the lock, so this
 // doesn't re-ask for the current PIN. Setting a PIN re-arms whichever security
 // gates are enabled in this section.
 
 export function DevicePinSettings() {
+  const { t } = useTranslation();
   const [pinSet, setPinSet] = useState<boolean | null>(null);
   const [open, setOpen] = useState(false);
 
@@ -28,22 +30,22 @@ export function DevicePinSettings() {
   }, []);
 
   return (
-    <div className="flex items-center justify-between p-4 rounded-lg border-2 border-slate-700 bg-slate-700/30 mb-3">
+    <div className="flex items-center justify-between p-4 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] mb-3">
       <div>
-        <div className="font-semibold text-lg flex items-center gap-1.5">
-          Device PIN
+        <div className="font-semibold text-lg flex items-center gap-1.5 text-[var(--pg-text)]">
+          {t('pinSetup:devicePin')}
           <HelpDot topic="security.pin" />
         </div>
-        <div className="text-sm text-slate-400">
-          Used by the security gates above and the nav-bar Lock button.{' '}
-          {pinSet === null ? '' : pinSet ? 'A PIN is currently set.' : 'No PIN is set.'}
+        <div className="text-sm text-[var(--pg-text-dim)]">
+          {t('pinSetup:gatesHint')}{' '}
+          {pinSet === null ? '' : pinSet ? t('pinSetup:pinCurrentlySet') : t('pinSetup:noPinSet')}
         </div>
       </div>
       <button
         onClick={() => setOpen(true)}
-        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors text-sm font-medium whitespace-nowrap"
+        className="pg-btn pg-btn--primary pg-btn--sm whitespace-nowrap"
       >
-        {pinSet ? 'Change PIN' : 'Set PIN'}
+        {pinSet ? t('pinSetup:changePin') : t('pinSetup:setPin')}
       </button>
 
       {open && (
@@ -60,6 +62,7 @@ export function DevicePinSettings() {
 }
 
 function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<'choose' | 'confirm'>('choose');
   const [first, setFirst] = useState('');
   const [second, setSecond] = useState('');
@@ -75,7 +78,7 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
 
   async function handleSecondComplete(value: string) {
     if (value !== first) {
-      setError('PINs don’t match. Choose a PIN again.');
+      setError(t('pinSetup:pinsDontMatch'));
       setFirst('');
       setSecond('');
       setPhase('choose');
@@ -87,7 +90,7 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
       onSaved();
     } catch (err) {
       console.error('[DevicePinSettings] setPin failed:', err);
-      setError(err instanceof Error ? err.message : 'Failed to save PIN. Try again.');
+      setError(err instanceof Error ? err.message : t('pinSetup:saveFailed'));
       setFirst('');
       setSecond('');
       setPhase('choose');
@@ -97,20 +100,20 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
   }
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/70 backdrop-blur-sm">
+    <div className="pg-overlay z-[200]">
       <div className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
         <div className="text-center mb-6">
-          <h1 className="text-2xl font-bold text-white mb-1">
-            {phase === 'choose' ? 'Choose a PIN' : 'Confirm your PIN'}
+          <h1 className="text-2xl font-bold text-[var(--pg-text)] mb-1">
+            {phase === 'choose' ? t('pinSetup:chooseTitle') : t('pinSetup:confirmTitle')}
           </h1>
-          <p className="text-slate-400 text-sm">
+          <p className="text-[var(--pg-text-dim)] text-sm">
             {phase === 'choose'
-              ? 'Pick a 4-digit PIN for this device.'
-              : 'Type it once more to make sure it matches.'}
+              ? t('pinSetup:chooseSubtitle')
+              : t('pinSetup:typeAgain')}
           </p>
         </div>
 
-        <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+        <div className="pg-panel p-6 space-y-4">
           {phase === 'choose' ? (
             <OtpInput
               length={4}
@@ -131,9 +134,9 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
 
           {error && <div className="text-sm text-red-400 text-center">{error}</div>}
           {busy && (
-            <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+            <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
               <Loader2 className="w-4 h-4 animate-spin" />
-              Saving…
+              {t('pinSetup:saving')}
             </div>
           )}
 
@@ -147,18 +150,19 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
                   setSecond('');
                   setError(null);
                 }}
-                className="text-sm text-slate-400 hover:text-white"
+                className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)]"
               >
-                ← Pick a different PIN
+                {'← '}
+                {t('pinSetup:pickDifferent')}
               </button>
             )}
             <button
               type="button"
               onClick={onClose}
               disabled={busy}
-              className="text-sm text-slate-400 hover:text-white disabled:opacity-50"
+              className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
             >
-              Cancel
+              {t('pinSetup:cancel')}
             </button>
           </div>
         </div>

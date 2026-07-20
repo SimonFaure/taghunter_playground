@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Loader2, KeyRound } from 'lucide-react';
 import { OtpInput } from './auth/OtpInput';
 import {
@@ -22,19 +23,28 @@ interface RecoveryCodePromptProps {
   subtitle?: string;
   onSuccess: () => void;
   onCancel: () => void;
+  // Which gate is consuming the code: 'pin' (forgot-PIN) or 'billing'
+  // (device-lock reprieve). Reported up so studio can distinguish them.
+  // project_client_device_lock.
+  context?: 'pin' | 'billing';
 }
 
 export function RecoveryCodePrompt({
-  title = 'Enter a recovery code',
-  subtitle = 'Ask your administrator for a recovery code, then type it here.',
+  title,
+  subtitle,
   onSuccess,
   onCancel,
+  context = 'pin',
 }: RecoveryCodePromptProps) {
+  const { t } = useTranslation();
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // null = still checking; true/false = whether unused codes exist locally.
   const [hasCodes, setHasCodes] = useState<boolean | null>(null);
+
+  const resolvedTitle = title ?? t('recoveryCode:title');
+  const resolvedSubtitle = subtitle ?? t('recoveryCode:subtitle');
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +64,7 @@ export function RecoveryCodePrompt({
     setBusy(true);
     setError(null);
     try {
-      const outcome = await tryConsumeRecoveryCode(value);
+      const outcome = await tryConsumeRecoveryCode(value, context);
       if (outcome.ok) {
         onSuccess();
         return;
@@ -63,11 +73,11 @@ export function RecoveryCodePrompt({
         setHasCodes(false);
         return;
       }
-      setError('That code didn’t work. Check it and try again.');
+      setError(t('recoveryCode:wrongCode'));
       setCode('');
     } catch (err) {
       console.error('[RecoveryCodePrompt] verify failed:', err);
-      setError('Could not check the code. Try again.');
+      setError(t('recoveryCode:checkFailed'));
       setCode('');
     } finally {
       setBusy(false);
@@ -82,23 +92,22 @@ export function RecoveryCodePrompt({
       onClick={(e) => e.stopPropagation()}
     >
       <div className="text-center mb-6">
-        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-500/20 border border-blue-500/40 mb-4">
-          <KeyRound className="w-7 h-7 text-blue-300" />
+        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--pg-accent-tint)] border border-[var(--pg-accent-line)] mb-4">
+          <KeyRound className="w-7 h-7 text-[var(--pg-accent-bright)]" />
         </div>
-        <h1 className="text-2xl font-bold text-white mb-1">{title}</h1>
-        <p className="text-slate-400 text-sm">{subtitle}</p>
+        <h1 className="text-2xl font-bold text-[var(--pg-text)] mb-1">{resolvedTitle}</h1>
+        <p className="text-[var(--pg-text-dim)] text-sm">{resolvedSubtitle}</p>
       </div>
 
-      <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+      <div className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-2xl p-6 space-y-4">
         {hasCodes === null ? (
-          <div className="flex items-center justify-center gap-2 text-slate-400 text-sm py-4">
+          <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm py-4">
             <Loader2 className="w-4 h-4 animate-spin" />
-            Loading…
+            {t('recoveryCode:loading')}
           </div>
         ) : hasCodes === false ? (
           <div className="text-center text-sm text-amber-300 py-2">
-            No recovery codes are available on this device. Connect to the
-            internet and reset your PIN by email, or contact your administrator.
+            {t('recoveryCode:noCodes')}
           </div>
         ) : (
           <>
@@ -111,9 +120,9 @@ export function RecoveryCodePrompt({
             />
             {error && <div className="text-sm text-red-400 text-center">{error}</div>}
             {busy && (
-              <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+              <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Checking…
+                {t('recoveryCode:checking')}
               </div>
             )}
           </>
@@ -124,9 +133,9 @@ export function RecoveryCodePrompt({
             type="button"
             onClick={onCancel}
             disabled={busy}
-            className="text-sm text-slate-400 hover:text-white disabled:opacity-50"
+            className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
           >
-            Cancel
+            {t('recoveryCode:cancel')}
           </button>
         </div>
       </div>

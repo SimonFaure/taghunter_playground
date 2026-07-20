@@ -280,7 +280,7 @@ export async function runLanSmokeTest(opts?: {
     record('peer_authed_record_punch', true, { device_id: newRow!.device_id });
 
     // Re-pairing the same peer_uuid should be refused while a paired_devices
-    // entry exists — the mother UI must revoke first.
+    // entry exists - the mother UI must revoke first.
     const reqAgain = await pairRequest(LAN_BASE, {
       peer_uuid: fakePeerUuid,
       peer_label: fakePeerLabel,

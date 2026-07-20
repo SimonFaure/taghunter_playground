@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Mail, Loader2 } from 'lucide-react';
 import { OtpInput } from './OtpInput';
 import { CapReachedDialog } from './CapReachedDialog';
@@ -13,6 +15,7 @@ interface LoginScreenProps {
 }
 
 export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>('email');
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
@@ -33,7 +36,7 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
       setPhase('code');
       setCode('');
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setBusy(false);
     }
@@ -55,7 +58,7 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
         setPhase('cap_reached');
       }
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
       setCode('');
     } finally {
       setBusy(false);
@@ -70,7 +73,7 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
       const user = await evictAndVerify(email.trim(), capState.approval_token, deviceId);
       onAuthenticated(user);
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setBusy(false);
     }
@@ -89,31 +92,31 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="min-h-screen flex items-center justify-center p-6 pg-app-bg">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-white mb-2">Tag Hunter Playground</h1>
-          <p className="text-slate-400">Sign in to continue</p>
+          <h1 className="text-3xl font-bold text-[var(--pg-text)] mb-2">{t('authChrome:login.title')}</h1>
+          <p className="text-[var(--pg-text-dim)]">{t('authChrome:login.subtitle')}</p>
         </div>
 
         {phase === 'email' && (
           <form
             onSubmit={handleRequestOtp}
-            className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4"
+            className="pg-panel p-6 space-y-4"
           >
             <label className="block">
-              <span className="text-sm text-slate-300 block mb-2">Email address</span>
+              <span className="pg-label block mb-2">{t('authChrome:login.emailLabel')}</span>
               <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" />
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-[var(--pg-text-dim)] z-10" />
                 <input
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="you@example.com"
+                  placeholder={t('authChrome:login.emailPlaceholder')}
                   required
                   autoFocus
                   disabled={busy}
-                  className="w-full pl-10 pr-3 py-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                  className="pg-input !pl-10 disabled:opacity-50"
                 />
               </div>
             </label>
@@ -121,24 +124,24 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
             <button
               type="submit"
               disabled={busy || !email.includes('@')}
-              className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg font-medium flex items-center justify-center gap-2"
+              className="pg-btn pg-btn--primary w-full !py-3 disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {busy && <Loader2 className="w-4 h-4 animate-spin" />}
-              {busy ? 'Sending code…' : 'Send login code'}
+              {busy ? t('authChrome:login.sendingCode') : t('authChrome:login.sendCode')}
             </button>
-            <p className="text-xs text-slate-500 text-center">
-              Accounts are created by your administrator.
+            <p className="text-xs text-[var(--pg-text-dim)] text-center">
+              {t('authChrome:login.adminNote')}
             </p>
           </form>
         )}
 
         {phase === 'code' && (
-          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+          <div className="pg-panel p-6 space-y-4">
             <div className="text-center">
-              <p className="text-slate-300">
-                We sent a 6-digit code to
+              <p className="text-[var(--pg-text-muted)]">
+                {t('authChrome:login.codeSentTo')}
               </p>
-              <p className="text-white font-medium">{email}</p>
+              <p className="text-[var(--pg-text)] font-medium">{email}</p>
             </div>
 
             <OtpInput value={code} onChange={setCode} onComplete={handleVerifyOtp} disabled={busy} />
@@ -146,9 +149,9 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
             {error && <div className="text-sm text-red-400 text-center">{error}</div>}
 
             {busy && (
-              <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+              <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Verifying…
+                {t('authChrome:login.verifying')}
               </div>
             )}
 
@@ -157,17 +160,17 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
                 type="button"
                 onClick={handleResetEmail}
                 disabled={busy}
-                className="text-slate-400 hover:text-white disabled:opacity-50"
+                className="text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
               >
-                ← Use a different email
+                {t('authChrome:login.useDifferentEmail')}
               </button>
               <button
                 type="button"
                 onClick={() => handleRequestOtp({ preventDefault() {} } as React.FormEvent)}
                 disabled={busy}
-                className="text-blue-400 hover:text-blue-300 disabled:opacity-50"
+                className="text-[var(--pg-accent-bright)] hover:text-[var(--pg-accent-hover)] disabled:opacity-50"
               >
-                Resend code
+                {t('authChrome:login.resendCode')}
               </button>
             </div>
           </div>
@@ -187,12 +190,12 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   );
 }
 
-function extractErrorMessage(err: unknown): string {
+function extractErrorMessage(err: unknown, t: TFunction): string {
   console.error('[LoginScreen] auth call failed:', err);
   if (err instanceof ApiError) {
     const body = err.body as { error?: string } | null;
     if (body?.error) return body.error;
-    return `Request failed (${err.status})`;
+    return t('authChrome:errors.requestFailed', { status: err.status });
   }
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
@@ -205,5 +208,5 @@ function extractErrorMessage(err: unknown): string {
       // fallthrough
     }
   }
-  return 'Something went wrong. Please try again.';
+  return t('authChrome:errors.generic');
 }

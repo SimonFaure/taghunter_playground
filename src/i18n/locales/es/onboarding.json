@@ -1,0 +1,56 @@
+{
+  "stepOf": "Paso {{current}} de {{total}}",
+  "back": "Atrás",
+  "continue": "Continuar",
+  "finish": "Finalizar configuración",
+  "lang": {
+    "title": "Elige tu idioma",
+    "subtitle": "Esto define el idioma de la aplicación. Puedes cambiarlo más tarde en Ajustes."
+  },
+  "internet": {
+    "title": "Conéctate a internet",
+    "subtitle": "Este dispositivo necesita conectarse a Tag Hunter para iniciar sesión.",
+    "checking": "Comprobando conexión…",
+    "offline": "No podemos conectar con Tag Hunter. Conecta este ordenador a internet y vuelve a intentarlo.",
+    "retry": "Reintentar"
+  },
+  "name": {
+    "title": "Nombra este dispositivo",
+    "subtitle": "Un nombre claro facilita reconocer esta máquina en tu cuenta y en soporte.",
+    "label": "Nombre del dispositivo",
+    "placeholder": "p. ej. PC de recepción"
+  },
+  "hotspot": {
+    "title": "¿Punto de acceso Wi-Fi predeterminado?",
+    "subtitle": "Usar este ordenador como punto de acceso Wi-Fi predeterminado al que tus otros dispositivos se conectarán automáticamente.",
+    "yes": "Sí, usar este ordenador como punto de acceso",
+    "no": "No",
+    "note": "El punto de acceso se activará la próxima vez que se inicie la aplicación - tu conexión a internet sigue activa durante el resto de la configuración.",
+    "conflictTitle": "Ya existe un punto de acceso predeterminado",
+    "conflictBody": "Tu cuenta ya tiene un punto de acceso predeterminado ({{names}}). ¿Añadir este ordenador como otro punto de acceso predeterminado?",
+    "conflictConfirm": "Añadir como otro predeterminado",
+    "conflictCancel": "No añadir este"
+  },
+  "mother": {
+    "title": "¿Servidor de juego predeterminado?",
+    "subtitle": "Usar este ordenador como servidor de juego predeterminado (la «madre») que ejecuta tus juegos en la red local.",
+    "yes": "Sí, usar este ordenador como servidor de juego",
+    "no": "No"
+  },
+  "operatorOnly": {
+    "title": "¿Dispositivo solo de operador?",
+    "subtitle": "Usar este ordenador solo para gestionar y lanzar juegos, nunca para jugarlos.",
+    "yes": "Sí, es un dispositivo solo de operador",
+    "no": "No, también se jugará en este dispositivo",
+    "explainer": "Activa esto cuando este ordenador nunca se use para jugar - solo para preparar y lanzar juegos en otros dispositivos. Entonces descarga solo los datos y la imagen de portada de cada juego (no todos los medios ni los vídeos tutoriales), ahorrando espacio en disco, y no necesita lector de tarjetas ni su controlador."
+  },
+  "appearance": {
+    "title": "Elige una apariencia",
+    "subtitle": "Elige el aspecto de la aplicación. Puedes cambiarlo más tarde en Ajustes.",
+    "red": "Rojo táctico",
+    "blue": "Azul táctico",
+    "redLight": "Rojo claro",
+    "blueLight": "Azul claro"
+  },
+  "syncingNote": "Terminaremos de sincronizar esto con el servidor en breve."
+}

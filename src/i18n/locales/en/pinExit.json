@@ -1,0 +1,9 @@
+{
+  "title": "Enter your PIN",
+  "subtitle": "Enter the device PIN to continue.",
+  "wrongPin": "Wrong PIN. Try again.",
+  "checkFailed": "Could not check PIN. Try again.",
+  "checking": "Checking…",
+  "forgotPin": "Forgot PIN?",
+  "cancel": "Cancel"
+}

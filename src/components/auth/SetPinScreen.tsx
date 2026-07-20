@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Loader2, Lock } from 'lucide-react';
 import { OtpInput } from './OtpInput';
 import { setPin } from '../../services/pinStore';
@@ -22,6 +23,7 @@ interface SetPinScreenProps {
 }
 
 export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>('choose');
   const [firstEntry, setFirstEntry] = useState('');
   const [secondEntry, setSecondEntry] = useState('');
@@ -38,7 +40,7 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
   async function handleSecondComplete(value: string) {
     setError(null);
     if (value !== firstEntry) {
-      setError('PINs don’t match. Choose a PIN again.');
+      setError(t('pinSetup:pinsDontMatch'));
       setPhase('choose');
       setFirstEntry('');
       setSecondEntry('');
@@ -51,7 +53,7 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
       onPinSet();
     } catch (err) {
       console.error('[SetPinScreen] setPin failed:', err);
-      setError(err instanceof Error ? err.message : 'Failed to save PIN. Try again.');
+      setError(err instanceof Error ? err.message : t('pinSetup:saveFailed'));
       setPhase('choose');
       setFirstEntry('');
       setSecondEntry('');
@@ -68,24 +70,26 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="min-h-screen flex items-center justify-center p-6 pg-app-bg">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-500/20 border border-blue-500/40 mb-4">
-            <Lock className="w-7 h-7 text-blue-300" />
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--pg-accent-tint)] border border-[var(--pg-accent-line)] mb-4">
+            <Lock className="w-7 h-7 text-[var(--pg-accent-bright)]" />
           </div>
-          <h1 className="text-2xl font-bold text-white mb-1">
-            {phase === 'choose' ? 'Set a PIN for this device' : 'Confirm your PIN'}
+          <h1 className="text-2xl font-bold text-[var(--pg-text)] mb-1">
+            {phase === 'choose' ? t('pinSetup:setTitle') : t('pinSetup:confirmTitle')}
           </h1>
-          <p className="text-slate-400 text-sm">
+          <p className="text-[var(--pg-text-dim)] text-sm">
             {phase === 'choose'
-              ? 'You’ll use this PIN to unlock the app after you lock it. No internet needed.'
-              : 'Type it once more to make sure it matches.'}
+              ? t('pinSetup:setSubtitle')
+              : t('pinSetup:typeAgain')}
           </p>
-          <p className="text-slate-500 text-xs mt-2">Signed in as {user.email}</p>
+          <p className="text-[var(--pg-text-dim)] text-xs mt-2">
+            {t('pinSetup:signedInAs', { email: user.email })}
+          </p>
         </div>
 
-        <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+        <div className="pg-panel p-6 space-y-4">
           {phase === 'choose' && (
             <OtpInput
               length={4}
@@ -109,9 +113,9 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
           {error && <div className="text-sm text-red-400 text-center">{error}</div>}
 
           {busy && (
-            <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+            <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
               <Loader2 className="w-4 h-4 animate-spin" />
-              Saving PIN…
+              {t('pinSetup:savingPin')}
             </div>
           )}
 
@@ -120,9 +124,10 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
               <button
                 type="button"
                 onClick={handleBack}
-                className="text-sm text-slate-400 hover:text-white"
+                className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)]"
               >
-                ← Pick a different PIN
+                {'← '}
+                {t('pinSetup:pickDifferent')}
               </button>
             </div>
           )}

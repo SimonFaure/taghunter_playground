@@ -10,7 +10,7 @@
 // next STX.
 //
 // Resync rule: on any validation failure (bad CRC, missing ETX, oversized
-// LEN considered invalid by a higher layer — not enforced here), drop the
+// LEN considered invalid by a higher layer - not enforced here), drop the
 // leading STX and rescan. WAKEUP (0xFF) bytes before a frame are skipped
 // silently; they're a known protocol artifact, not corruption.
 
@@ -29,7 +29,7 @@ pub enum ResyncReason {
     /// didn't match.
     BadCrc,
     /// Frame ended with a byte other than ETX. Almost always means the
-    /// LEN byte was wrong — i.e. the STX we picked was a false positive.
+    /// LEN byte was wrong - i.e. the STX we picked was a false positive.
     BadEtx,
 }
 
@@ -45,7 +45,7 @@ pub enum DecodeEvent {
 #[derive(Debug, Default)]
 pub struct Decoder {
     /// Pending bytes received from the wire. We don't consume any of
-    /// these until we have a *full* candidate frame to validate — that
+    /// these until we have a *full* candidate frame to validate - that
     /// way a partial frame can wait across many push() calls without
     /// changing the decoder's state machine.
     buf: VecDeque<u8>,
@@ -111,7 +111,7 @@ impl Decoder {
 
             // BadEtx takes priority over BadCrc when both fail: a wrong
             // ETX strongly suggests the LEN byte was bogus, i.e. the STX
-            // we picked was a false positive — log accordingly.
+            // we picked was a false positive - log accordingly.
             if etx != ETX {
                 let dropped = self.buf.pop_front().unwrap();
                 out.push(DecodeEvent::Resync {
@@ -186,7 +186,7 @@ mod tests {
     fn feed_one_byte_at_a_time_yields_identical_events() {
         // Two back-to-back frames, plus a leading wakeup byte. The
         // fragmentation equivalence test is the strongest guarantee a
-        // streaming decoder can give — if this passes, the decoder is
+        // streaming decoder can give - if this passes, the decoder is
         // safe against any chunking the OS happens to deliver.
         let mut wire = vec![WAKEUP];
         wire.extend(build_frame(0xE8, &[0x01, 0x02, 0x03]));
@@ -244,9 +244,9 @@ mod tests {
         let bad: Vec<u8> = vec![
             STX,
             0xE8, // CMD
-            0x03, // LEN (NB: not 0x02; not 0x03 either — wait, ETX is 0x03. Decoder doesn't scan for ETX in phase 1, only STX, so 0x03 in LEN is fine.)
-            0x11, 0x33, 0x55, // payload — none equal 0x02
-            0xAA, 0xBB, // CRC — deliberately wrong; will not match calc_crc(...)
+            0x03, // LEN (NB: not 0x02; not 0x03 either - wait, ETX is 0x03. Decoder doesn't scan for ETX in phase 1, only STX, so 0x03 in LEN is fine.)
+            0x11, 0x33, 0x55, // payload - none equal 0x02
+            0xAA, 0xBB, // CRC - deliberately wrong; will not match calc_crc(...)
             ETX,
         ];
         let mut wire = bad.clone();

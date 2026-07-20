@@ -1,0 +1,56 @@
+{
+  "stepOf": "Step {{current}} of {{total}}",
+  "back": "Back",
+  "continue": "Continue",
+  "finish": "Finish setup",
+  "lang": {
+    "title": "Choose your language",
+    "subtitle": "This sets the language of the app. You can change it later in Settings."
+  },
+  "internet": {
+    "title": "Connect to the internet",
+    "subtitle": "This device needs to reach Tag Hunter to sign you in.",
+    "checking": "Checking connection…",
+    "offline": "We can’t reach Tag Hunter. Connect this computer to the internet, then try again.",
+    "retry": "Try again"
+  },
+  "name": {
+    "title": "Name this device",
+    "subtitle": "A friendly name makes this machine easy to recognize on your account and in support.",
+    "label": "Device name",
+    "placeholder": "e.g. Front-desk PC"
+  },
+  "hotspot": {
+    "title": "Default Wi-Fi hotspot?",
+    "subtitle": "Use this computer as a default Wi-Fi hotspot that your other devices can join automatically.",
+    "yes": "Yes, use this computer as a hotspot",
+    "no": "No",
+    "note": "The hotspot turns on the next time the app starts - your internet stays connected for the rest of setup.",
+    "conflictTitle": "A default hotspot already exists",
+    "conflictBody": "Your account already has a default hotspot ({{names}}). Add this computer as another default hotspot?",
+    "conflictConfirm": "Add as another default",
+    "conflictCancel": "Don’t add this one"
+  },
+  "mother": {
+    "title": "Default game server?",
+    "subtitle": "Use this computer as the default game server (the “mother”) that runs your games on the local network.",
+    "yes": "Yes, use this computer as the game server",
+    "no": "No"
+  },
+  "operatorOnly": {
+    "title": "Operator-only device?",
+    "subtitle": "Use this computer only to manage and launch games, never to play them.",
+    "yes": "Yes, this is an operator-only device",
+    "no": "No, games will also be played on this device",
+    "explainer": "Turn this on when this computer will never be played on - only used to set up and launch games for other devices. It then downloads only each game's data and cover image (not the full media or tutorial videos), saving disk space, and doesn't need a card reader or its driver."
+  },
+  "appearance": {
+    "title": "Choose an appearance",
+    "subtitle": "Pick the look of the app. You can change it later in Settings.",
+    "red": "Tactical red",
+    "blue": "Tactical blue",
+    "redLight": "Light red",
+    "blueLight": "Light blue"
+  },
+  "syncingNote": "We’ll finish syncing this with the server shortly."
+}

@@ -1,0 +1,39 @@
+{
+  "rankings": {
+    "title": "Clasificaciones",
+    "tabTimeRange": "Periodo",
+    "tabActiveGames": "Partidas activas",
+    "scenario": "Escenario",
+    "noScenarios": "No se han encontrado escenarios.",
+    "selectScenario": "Selecciona un escenario",
+    "timeRange": "Periodo",
+    "viewRankings": "Ver clasificación",
+    "noActiveGames": "No hay partidas activas en este momento.",
+    "selectUpTo_one": "Selecciona hasta {{count}} partida para comparar en paralelo.",
+    "selectUpTo_other": "Selecciona hasta {{count}} partidas para comparar en paralelo.",
+    "maximumReached": "Máximo alcanzado.",
+    "rangeToday": "Hoy",
+    "rangeWeek": "Esta semana",
+    "rangeMonth": "Este mes",
+    "rangeQuarter": "Este trimestre",
+    "rangeYear": "Este año",
+    "rangeAll": "Todo"
+  },
+  "addTime": {
+    "title": "Añadir tiempo",
+    "minutesToAdd": "Minutos a añadir",
+    "failed": "Error al añadir tiempo",
+    "adding": "Añadiendo…",
+    "addMinutes": "Añadir {{count}} min",
+    "cancel": "Cancelar"
+  },
+  "devicePicker": {
+    "close": "Cerrar"
+  },
+  "cardDetection": {
+    "detected": "Tarjeta detectada",
+    "id": "ID: {{id}}",
+    "punches_one": "Marcaje: {{count}}",
+    "punches_other": "Marcajes: {{count}}"
+  }
+}

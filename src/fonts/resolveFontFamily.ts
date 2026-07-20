@@ -2,7 +2,7 @@
  * Resolve a stored `game_meta.font` value to a CSS `font-family` stack.
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ DUPLICATED VERBATIM — keep in sync:                                      │
+ * │ DUPLICATED VERBATIM - keep in sync:                                      │
  * │   studio-taghunter/src/fonts/resolveFontFamily.ts                        │
  * │   taghunter_playground/src/fonts/resolveFontFamily.ts                    │
  * └─────────────────────────────────────────────────────────────────────────┘

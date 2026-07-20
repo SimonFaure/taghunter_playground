@@ -17,7 +17,7 @@ import {
 // Ensures a fresh active team exists for `cardId` and returns it. Returns null
 // if the card isn't registered locally (caller should ignore/toast).
 //
-// `state` is the most recent state snapshot the caller already holds — used to
+// `state` is the most recent state snapshot the caller already holds - used to
 // derive the run index (for naming) and the next team_number without an extra
 // round-trip. After creating, we re-read state so the returned row reflects the
 // server's authoritative team (and survives multi-station dedup races, where a

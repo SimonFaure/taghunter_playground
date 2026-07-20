@@ -1,0 +1,715 @@
+// Clash runtime - the live territory dashboard + local validation.
+//
+// Validation runs ONLY from the local SportIdent reader callback (not the state
+// poll), so the combo reveal plays on the station that took the bip while every
+// other screen just reflects the standings change via the getClashState poll.
+// The mother is the validation authority; this page shuttles card-reads to it.
+//
+// Design: project_clash_game_type_design.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { GameConfig } from './LaunchGameModal';
+import { sportidentService as usbReaderService, CardData, detectReaderPort } from '../services/sportidentService';
+import { GameMessageOverlay } from './GameMessageOverlay';
+import { PendingTeamsBar } from './PendingTeamsBar';
+import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import type { GameMessageType } from '../services/gameMessages';
+import * as scenarioStore from '../services/scenarioStore';
+import { scenarioAssetUrl } from '../services/contentFs';
+import { recordPunch, startLaunchedGame, endLaunchedGame, getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
+import { useGameStatePolling } from '../hooks/useGameStatePolling';
+import { clashValidate, clashRegister, getClashState, type ClashStandings } from '../services/clash';
+import { onPendingConfigReload } from '../services/pendingJoinStore';
+// Station-based registration assignment: this device may be hard-locked to
+// specific clan(s) during self-registration (meta.regAssignments, keyed by
+// device_id). Design: project_selfregister_team_device_assignment.
+import {
+  parseRegAssignments,
+  assignedTeamNumbersFor,
+  getSelfDeviceId,
+  REG_ASSIGNMENTS_META_KEY,
+  type RegAssignmentMap,
+} from '../services/regAssignments';
+import { ClashGameRenderer, type ClashClanVisual } from './ClashGameRenderer';
+import { ClashRegistrationScreen } from './ClashRegistrationScreen';
+import { ClashResultsScreen } from './ClashResultsScreen';
+
+interface ClashGamePageProps {
+  config: GameConfig;
+  gameUniqid: string;
+  launchedGameId: number | null;
+  onBack: () => void;
+  onGameEnd?: () => void;
+}
+
+interface ClashClanMeta {
+  id?: string;
+  name?: Record<string, string> | string;
+  color?: string;
+  banner?: string;
+  logo?: string;
+  score_card?: string;
+}
+interface ClashTerritoryMeta {
+  id?: string;
+  name?: Record<string, string> | string;
+  points?: string;
+  balises?: number[];
+  banner_position?: { top: number; left: number };
+  label_position?: { top: number; left: number };
+  purge_position?: { top: number; left: number };
+}
+interface ClashTextElementMeta {
+  id: string;
+  text?: Record<string, string> | string;
+  position?: { left: number; top: number; width: number; height: number };
+  font?: string;
+  font_color?: string;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  align?: 'left' | 'center' | 'right';
+  shadow?: boolean;
+  background?: boolean;
+}
+interface ClashGameMetaRuntime {
+  game_visual?: string;
+  background_image?: string;
+  map_image?: string;
+  timer_position?: { top: number; left: number };
+  clans?: ClashClanMeta[];
+  territories?: ClashTerritoryMeta[];
+  text_elements?: ClashTextElementMeta[];
+  font?: string;
+  font_color?: string;
+  frame_separator?: string;
+  frame_ranking?: string;
+  frame_territory_name?: string;
+  frame_gauge?: string;
+  frame_event?: string;
+  frame_timer?: string;
+  /** The Purge marker/announcement image (its presence gates the launch toggle). */
+  purge_image?: string;
+  /** Sound played on every in-game device when a purge fires (optional). */
+  purge_sound?: string;
+}
+
+const FALLBACK_COLORS = ['#c0392b', '#2980b9', '#27ae60', '#8e44ad'];
+
+// Self-register: pick the station's selected clan. Keeps the current selection
+// while it has room; when it's full (or nothing is selected yet) advance to the
+// next clan with room, scanning forward from the current position and wrapping.
+// All-full keeps the current selection (the server rejects further joins with
+// clan_full anyway). Mirrors TagQuest's nextRegSelection.
+// Station assignment: restrict the pickable clans to this device's assigned
+// team_numbers (null ⇒ unrestricted - the legacy full grid).
+function filterAssignedClans<T extends { team_number: number }>(
+  clans: T[],
+  assigned: number[] | null,
+): T[] {
+  return assigned ? clans.filter((c) => assigned.includes(c.team_number)) : clans;
+}
+
+function nextClanSelection(
+  clans: Array<{ team_id: number; member_count: number }>,
+  currentId: number | null,
+  maxPerClan: number,
+): number | null {
+  if (clans.length === 0) return null;
+  const isFull = (c: { member_count: number }) => maxPerClan > 0 && c.member_count >= maxPerClan;
+  const curIdx = currentId != null ? clans.findIndex((c) => c.team_id === currentId) : -1;
+  if (curIdx >= 0 && !isFull(clans[curIdx])) return currentId;
+  // No/invalid selection scans from the first clan; a full selection scans
+  // from the clan after it.
+  const start = curIdx >= 0 ? curIdx : clans.length - 1;
+  for (let k = 1; k <= clans.length; k++) {
+    const cand = clans[(start + k) % clans.length];
+    if (!isFull(cand)) return cand.team_id;
+  }
+  return currentId ?? clans[0].team_id;
+}
+
+function pickLocalized(v: Record<string, string> | string | undefined, lang: string): string {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  return v[lang] || Object.values(v)[0] || '';
+}
+
+export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: ClashGamePageProps) {
+  const lang = config.language || 'fr';
+  const registrationMode: 'self' | 'bulk' = config.clashRegistrationMode ?? 'self';
+  const [meta, setMeta] = useState<ClashGameMetaRuntime | null>(null);
+  const [standings, setStandings] = useState<ClashStandings | null>(null);
+  const [phase, setPhase] = useState<'register' | 'playing' | 'ended'>('register');
+  const [selectedTeamId, setSelectedTeamId] = useState<number | null>(null);
+  const [lastJoin, setLastJoin] = useState<{ teamId: number; status: string } | null>(null);
+  const [remainingSec, setRemainingSec] = useState<number | null>(null);
+  // Station assignment: meta.regAssignments + this device's paired id. When
+  // this device has an entry, registration hard-locks to those clan
+  // team_numbers (no entry ⇒ the legacy pick-any-clan grid). Self mode only.
+  const [regAssignMap, setRegAssignMap] = useState<RegAssignmentMap>({});
+  const [selfDeviceId, setSelfDeviceId] = useState<number | null>(null);
+  const assignedTeamNumbers =
+    registrationMode === 'self' ? assignedTeamNumbersFor(regAssignMap, selfDeviceId) : null;
+  const endMsRef = useRef<number | null>(null);
+  const phaseRef = useRef(phase);
+  const selectedTeamIdRef = useRef(selectedTeamId);
+  const standingsRef = useRef(standings);
+  const assignedTeamNumbersRef = useRef(assignedTeamNumbers);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  useEffect(() => { selectedTeamIdRef.current = selectedTeamId; }, [selectedTeamId]);
+  useEffect(() => { standingsRef.current = standings; }, [standings]);
+  useEffect(() => { assignedTeamNumbersRef.current = assignedTeamNumbers; });
+
+  const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState<GameMessageType>('info');
+  const msgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Local message presentation queue (this station only). A bip landing while a
+  // message is on screen waits its turn; the waiting clans show in the bottom
+  // line. There is no combo/piece art in V2 - feedback is a status message.
+  const queue = usePresentationQueue();
+
+  const resolveMedia = useCallback(
+    (filename: string) => (filename ? scenarioAssetUrl(gameUniqid, filename.replace(/^media\//, '')) : ''),
+    [gameUniqid],
+  );
+
+  // ── load scenario meta ─────────────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const gd = (await scenarioStore.getGameData(gameUniqid)) as { game_data?: any } | any | null;
+        const raw = gd?.game_data ?? gd;
+        const gm = (raw?.game_meta ?? raw) as ClashGameMetaRuntime | undefined;
+        if (!cancelled && gm) setMeta(gm);
+      } catch (err) {
+        console.error('[Clash] failed to load game meta', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [gameUniqid]);
+
+  // ── derived lookups ────────────────────────────────────────────────────────
+  const clanByTeamId = useMemo(() => {
+    const map: Record<number, ClashClanVisual> = {};
+    const clans = meta?.clans ?? [];
+    for (const s of standings?.clans ?? []) {
+      const idx = s.team_number - 1;
+      const sc = clans[idx];
+      map[s.team_id] = {
+        team_id: s.team_id,
+        team_number: s.team_number,
+        name: s.team_name || pickLocalized(sc?.name, lang) || `Clan ${s.team_number}`,
+        color: sc?.color || FALLBACK_COLORS[idx % FALLBACK_COLORS.length],
+        banner: sc?.banner || '',
+        logo: sc?.logo || '',
+        scoreCard: sc?.score_card || '',
+      };
+    }
+    return map;
+  }, [standings, meta, lang]);
+
+  const territoryNames = useMemo(() => {
+    const names: Record<number, string> = {};
+    (meta?.territories ?? []).forEach((t, i) => {
+      names[i] = pickLocalized(t.name, lang) || `Territory ${i + 1}`;
+    });
+    return names;
+  }, [meta, lang]);
+
+  // Authored anchors (percent of map) keyed by territory index: the banner
+  // plants at banner_position, the name+gauge cluster at label_position. Missing
+  // entries fall back to the renderer's grid.
+  const anchors = useMemo(() => {
+    const out: Record<
+      number,
+      {
+        index: number;
+        bannerLeftPct: number;
+        bannerTopPct: number;
+        labelLeftPct: number;
+        labelTopPct: number;
+        purgeLeftPct?: number;
+        purgeTopPct?: number;
+      }
+    > = {};
+    (meta?.territories ?? []).forEach((t, i) => {
+      if (t.banner_position || t.label_position) {
+        const label = t.label_position ?? t.banner_position!;
+        const banner = t.banner_position ?? t.label_position!;
+        out[i] = {
+          index: i,
+          bannerLeftPct: banner.left,
+          bannerTopPct: banner.top,
+          labelLeftPct: label.left,
+          labelTopPct: label.top,
+          // Purge anchor rides along when placed; the renderer derives a spot
+          // below the label cluster otherwise.
+          ...(t.purge_position
+            ? { purgeLeftPct: t.purge_position.left, purgeTopPct: t.purge_position.top }
+            : {}),
+        };
+      }
+    });
+    return out;
+  }, [meta]);
+
+  // The Purge - resolved marker image ('' ⇒ purge visuals off) + preloaded
+  // announcement sound (played on EVERY device when any clan's purge fires).
+  const purgeImageUrl = useMemo(
+    () => (meta?.purge_image ? resolveMedia(meta.purge_image) : ''),
+    [meta, resolveMedia],
+  );
+  const purgeAudioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    purgeAudioRef.current = meta?.purge_sound ? new Audio(resolveMedia(meta.purge_sound)) : null;
+  }, [meta, resolveMedia]);
+
+  // Authored timer anchor (percent of map); null ⇒ renderer default (top-centre).
+  const timerPos = useMemo(
+    () =>
+      meta?.timer_position
+        ? { leftPct: meta.timer_position.left, topPct: meta.timer_position.top }
+        : null,
+    [meta],
+  );
+
+  // Optional dashboard chrome frame images (resolved; '' ⇒ default styling).
+  const frames = useMemo(
+    () => ({
+      ranking: meta?.frame_ranking ? resolveMedia(meta.frame_ranking) : '',
+      timer: meta?.frame_timer ? resolveMedia(meta.frame_timer) : '',
+      event: meta?.frame_event ? resolveMedia(meta.frame_event) : '',
+      gauge: meta?.frame_gauge ? resolveMedia(meta.frame_gauge) : '',
+      territoryName: meta?.frame_territory_name ? resolveMedia(meta.frame_territory_name) : '',
+      separator: meta?.frame_separator ? resolveMedia(meta.frame_separator) : '',
+    }),
+    [meta, resolveMedia],
+  );
+
+  // Placed, translatable map labels (authored in the LayoutEditor). Style:
+  // element override → scenario default.
+  const textElements = useMemo(() => {
+    const sFont = meta?.font;
+    const sColor = meta?.font_color;
+    return (meta?.text_elements ?? [])
+      .filter((te) => te.position)
+      .map((te) => ({
+        id: te.id,
+        text: pickLocalized(te.text, lang),
+        leftPct: te.position!.left,
+        topPct: te.position!.top,
+        widthPct: te.position!.width,
+        heightPct: te.position!.height,
+        fontFamily: te.font || sFont,
+        color: te.font_color || sColor,
+        bold: te.bold,
+        italic: te.italic,
+        underline: te.underline,
+        align: te.align ?? 'center',
+        shadow: te.shadow,
+        background: te.background,
+      }));
+  }, [meta, lang]);
+
+  // ── The Purge: game-wide announcement (sound + full-screen flash) ─────────
+  // Fired locally from the validate response on the bipping station, and on
+  // every other device by spotting a NEW 'purge' event in the polled standings.
+  // The first standings snapshot is a silent BASELINE so a station joining
+  // mid-match doesn't replay historical purges.
+  const [purgeFlash, setPurgeFlash] = useState<{
+    clanName: string;
+    clanColor: string;
+    terrName: string;
+  } | null>(null);
+  const purgeFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenPurgeKeysRef = useRef<Set<string>>(new Set());
+  const purgeBaselineDoneRef = useRef(false);
+
+  const firePurgeAnnouncement = useCallback(
+    (teamId: number | null, terrIndex: number) => {
+      const clan = teamId != null ? clanByTeamId[teamId] : undefined;
+      setPurgeFlash({
+        clanName: clan?.name ?? `Clan`,
+        clanColor: clan?.color ?? '#fff',
+        terrName: territoryNames[terrIndex] || `Territory ${terrIndex + 1}`,
+      });
+      const audio = purgeAudioRef.current;
+      if (audio) {
+        audio.currentTime = 0;
+        void audio.play().catch(() => {});
+      }
+      if (purgeFlashTimerRef.current) clearTimeout(purgeFlashTimerRef.current);
+      purgeFlashTimerRef.current = setTimeout(() => setPurgeFlash(null), 4000);
+    },
+    [clanByTeamId, territoryNames],
+  );
+
+  useEffect(() => {
+    if (!standings) return;
+    const purgeEvents = (standings.events ?? []).filter((e) => e.kind === 'purge');
+    if (!purgeBaselineDoneRef.current) {
+      purgeEvents.forEach((e) =>
+        seenPurgeKeysRef.current.add(`${e.team_id}-${e.territory_index}-${e.at}`),
+      );
+      purgeBaselineDoneRef.current = true;
+      return;
+    }
+    for (const e of purgeEvents) {
+      const key = `${e.team_id}-${e.territory_index}-${e.at}`;
+      if (seenPurgeKeysRef.current.has(key)) continue;
+      seenPurgeKeysRef.current.add(key);
+      if (phaseRef.current === 'playing') firePurgeAnnouncement(e.team_id, e.territory_index);
+    }
+  }, [standings, firePurgeAnnouncement]);
+
+  // ── standings poll (registration counts + live dashboard) ──────────────────
+  useEffect(() => {
+    if (!launchedGameId) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await getClashState(launchedGameId);
+        if (!cancelled) setStandings(s);
+      } catch { /* transient - next tick retries */ }
+    };
+    void tick();
+    const h = setInterval(tick, 1000);
+    return () => { cancelled = true; clearInterval(h); };
+  }, [launchedGameId]);
+
+  // ── Station assignment: while registering (self mode), resolve this device's
+  // paired id + read meta.regAssignments, and re-read it on a reload_config
+  // push so a Devices-modal reassignment re-locks this kiosk live. ────────────
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'register' || registrationMode !== 'self') return;
+    let cancelled = false;
+    void getSelfDeviceId(launchedGameId).then((id) => {
+      if (!cancelled) setSelfDeviceId(id);
+    });
+    const readMap = async () => {
+      try {
+        const meta = await getLaunchedGameMeta(launchedGameId);
+        if (!cancelled) setRegAssignMap(parseRegAssignments(meta[REG_ASSIGNMENTS_META_KEY]));
+      } catch (err) {
+        console.error('[Clash] regAssignments read failed', err);
+      }
+    };
+    void readMap();
+    const off = onPendingConfigReload((gid) => {
+      if (gid === launchedGameId) void readMap();
+    });
+    return () => { cancelled = true; off(); };
+  }, [launchedGameId, phase, registrationMode]);
+
+  // Registration selection: default to the first clan with room once standings
+  // load, and hop off a clan that filled up (possibly from another station) so
+  // the next bip lands on a clan with room. An assigned station only ever
+  // scans within its own clan(s) - a hard lock, not a preference.
+  useEffect(() => {
+    if (phase !== 'register' || !standings?.clans?.length) return;
+    setSelectedTeamId((cur) =>
+      nextClanSelection(
+        filterAssignedClans(standings.clans, assignedTeamNumbers),
+        cur,
+        standings.max_per_clan ?? 0,
+      ),
+    );
+  }, [standings, phase, assignedTeamNumbers]);
+
+  // Lifecycle: a server `ended` flip (operator End, or another station's
+  // expiry) drives us to the results screen rather than straight out.
+  useGameStatePolling({
+    launchedGameId,
+    numberOfTeams: config.numberOfTeams,
+    onGameEnded: () => { queue.clear(); setPhase('ended'); },
+    onAllTeamsFinished: () => {},
+    onNewBip: () => {},
+    enabled: phase === 'playing',
+    disableAllFinishedEnd: true,
+  });
+
+  // Timer + expiry lock. Captures start_time + duration once the match starts,
+  // counts down, and at expiry ends the game on the mother (idempotent - the
+  // first writer wins; clash_validate then rejects late bips) and shows results.
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'playing') return;
+    let cancelled = false;
+
+    const prime = async () => {
+      try {
+        const st = await getLaunchedGameState(launchedGameId, 0);
+        if (cancelled) return;
+        const startMs = st.start_time ? Date.parse(st.start_time) : NaN;
+        const durationSec = (st.duration ?? 0) * 60; // duration is stored in minutes
+        if (!Number.isNaN(startMs) && durationSec > 0) {
+          endMsRef.current = startMs + durationSec * 1000;
+        }
+      } catch { /* retry on next tick */ }
+    };
+
+    let ticks = 0;
+    const tick = () => {
+      // Re-prime every ~5s so an operator "add time" (a server duration bump on
+      // any station) extends the countdown on every screen.
+      if (endMsRef.current == null || ticks % 5 === 0) void prime();
+      ticks += 1;
+      if (endMsRef.current == null) return;
+      const remaining = Math.max(0, Math.round((endMsRef.current - Date.now()) / 1000));
+      setRemainingSec(remaining);
+      if (remaining <= 0) {
+        void endLaunchedGame(launchedGameId).catch(() => {});
+        queue.clear();
+        setPhase('ended');
+      }
+    };
+
+    void prime();
+    const h = setInterval(tick, 1000);
+    return () => { cancelled = true; clearInterval(h); };
+  }, [launchedGameId, phase]);
+
+  // Messages serialise through the shared queue (label = null: Clash messages
+  // aren't team chips - the combo reveal already carries the clan chip).
+  const showMessage = useCallback((text: string, type: GameMessageType = 'info', label: string | null = null) => {
+    void queue.enqueue(label, () => new Promise<void>((resolve) => {
+      setMessage(text);
+      setMessageType(type);
+      if (msgTimerRef.current) clearTimeout(msgTimerRef.current);
+      msgTimerRef.current = setTimeout(() => {
+        setMessage('');
+        msgTimerRef.current = null;
+        resolve();
+      }, (config.messageDisplayDuration || 5) * 1000);
+    }));
+  }, [config.messageDisplayDuration, queue.enqueue]);
+
+  // ── local reader → register (pre-start) or validate (in-match) ─────────────
+  const handleLocalCard = useCallback(async (card: CardData) => {
+    if (!launchedGameId) return;
+
+    // Registration phase: bind the chip to the station's selected clan.
+    if (phaseRef.current === 'register') {
+      if (registrationMode !== 'self') return; // bulk mode assigns from the DB form
+      const teamId = selectedTeamIdRef.current;
+      if (teamId == null) return;
+      try {
+        const res = await clashRegister(launchedGameId, teamId, card.id);
+        setLastJoin({ teamId, status: res.status });
+        // Reflect the server's authoritative count immediately (the 1s poll
+        // would lag one bip behind), then hop the station's selection to the
+        // next clan with room when this bip filled the clan - or when it had
+        // already filled from another station (clan_full race).
+        const prev = standingsRef.current;
+        if (prev && (res.status === 'ok' || res.status === 'clan_full')) {
+          const clans = prev.clans.map((c) =>
+            c.team_id === teamId ? { ...c, member_count: res.member_count } : c,
+          );
+          setStandings({ ...prev, clans });
+          setSelectedTeamId((cur) =>
+            nextClanSelection(
+              filterAssignedClans(clans, assignedTeamNumbersRef.current),
+              cur,
+              prev.max_per_clan ?? 0,
+            ),
+          );
+        }
+      } catch (err) {
+        console.error('[Clash] register failed', err);
+      }
+      return;
+    }
+
+    // Best-effort audit trail (also surfaces the bip in raw_data for other tools).
+    void recordPunch(launchedGameId, card).catch(() => {});
+    try {
+      const res = await clashValidate(launchedGameId, card.id, card.punches ?? []);
+      if (res.status === 'not_registered') {
+        showMessage('Chip not registered to a clan', 'warning');
+        return;
+      }
+      if (res.status === 'game_over') {
+        showMessage('Game over', 'info');
+        return;
+      }
+      if (res.status !== 'ok') return;
+      // The Purge - this read carried a purge-station punch. Success flashes
+      // the game-wide announcement immediately on this station (other devices
+      // pick it up from the poll ≤1s later); rejections queue a local message.
+      // Either way the physical punch was consumed (re-punch to retry).
+      if (res.purge?.attempted) {
+        if (res.purge.status === 'ok' && res.purge.territory_index != null) {
+          // Mark the server-authored purge event(s) as seen so the standings
+          // effect doesn't double-fire the announcement on the next poll.
+          (res.standings?.events ?? [])
+            .filter((e) => e.kind === 'purge')
+            .forEach((e) =>
+              seenPurgeKeysRef.current.add(`${e.team_id}-${e.territory_index}-${e.at}`),
+            );
+          firePurgeAnnouncement(res.team_id ?? null, res.purge.territory_index);
+        } else if (res.purge.status === 'already_used') {
+          showMessage('Purge déjà utilisée par votre clan', 'warning');
+        } else if (res.purge.status === 'own_territory') {
+          showMessage('Impossible de purger votre propre territoire', 'warning');
+        } else if (res.purge.status === 'no_target') {
+          showMessage('Aucun territoire à purger pour le moment', 'info');
+        }
+      }
+      if (res.credited.length === 0) {
+        // A purge attempt already produced its own feedback - skip the
+        // "keep going" filler in that case.
+        if (!res.purge?.attempted) showMessage('Continue - aucun territoire complété', 'info');
+        return;
+      }
+      // V2: at most one territory credited per read (no combo/piece art).
+      const clan = res.team_id != null ? clanByTeamId[res.team_id] : undefined;
+      const terrName = territoryNames[res.credited[0].territory_index];
+      showMessage(
+        terrName ? `${terrName} complété !` : 'Territoire complété !',
+        'success',
+        clan?.name ?? null,
+      );
+    } catch (err) {
+      console.error('[Clash] validate failed', err);
+    }
+  }, [launchedGameId, registrationMode, clanByTeamId, territoryNames, queue.enqueue, showMessage, firePurgeAnnouncement]);
+
+  const handleLocalCardRef = useRef(handleLocalCard);
+  useEffect(() => { handleLocalCardRef.current = handleLocalCard; });
+
+  // ── USB reader wiring (active in both registration + play phases) ──────────
+  useEffect(() => {
+    if (!launchedGameId) return;
+    let cancelled = false;
+
+    const initUSB = async () => {
+      if (!usbReaderService.isAvailable()) return;
+      const detected = await detectReaderPort();
+      if (cancelled || !detected) return;
+      try {
+        const ok = await usbReaderService.initializePort(detected.path);
+        if (!ok) return;
+        usbReaderService.setCardDetectedCallback((card: CardData) => {
+          handleLocalCardRef.current(card);
+        });
+        await usbReaderService.start();
+      } catch (err) {
+        console.error('[Clash] USB init failed', err);
+      }
+    };
+
+    const onReaderStatus = () => { void initUSB(); };
+    void initUSB();
+    window.addEventListener('reader:status', onReaderStatus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('reader:status', onReaderStatus);
+      if (usbReaderService.isAvailable()) usbReaderService.stop().catch(() => {});
+    };
+  }, [launchedGameId]);
+
+  // Resume an already-started game (e.g. a station joining mid-match) → skip
+  // registration and go straight to the live dashboard.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const st = await getLaunchedGameState(launchedGameId, 0);
+        if (!cancelled && (st.started || st.start_time)) setPhase('playing');
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [launchedGameId]);
+
+  const handleStart = useCallback(async () => {
+    if (!launchedGameId) return;
+    try {
+      await startLaunchedGame(launchedGameId, new Date().toISOString());
+    } catch (err) {
+      console.error('[Clash] start failed', err);
+    } finally {
+      setPhase('playing');
+    }
+  }, [launchedGameId]);
+
+  const fontFamily = meta?.font;
+
+  if (phase === 'register' && launchedGameId) {
+    // Scenario visual shown as the registration background; the screen falls
+    // back to the clan banners when the scenario has none.
+    const regVisualUrl = resolveMedia(meta?.game_visual || meta?.background_image || '');
+    return (
+      <ClashRegistrationScreen
+        launchedGameId={launchedGameId}
+        standings={standings}
+        clanByTeamId={clanByTeamId}
+        mode={registrationMode}
+        selectedTeamId={selectedTeamId}
+        onSelectClan={setSelectedTeamId}
+        onStart={handleStart}
+        onBack={onBack}
+        lastJoin={lastJoin}
+        visualUrl={regVisualUrl}
+        resolveMedia={resolveMedia}
+        assignedTeamNumbers={assignedTeamNumbers}
+      />
+    );
+  }
+
+  if (phase === 'ended') {
+    return (
+      <ClashResultsScreen
+        standings={standings}
+        clanByTeamId={clanByTeamId}
+        territoryNames={territoryNames}
+        resolveMedia={resolveMedia}
+        fontFamily={fontFamily}
+        onBack={onBack}
+      />
+    );
+  }
+
+  return (
+    <>
+      <ClashGameRenderer
+        standings={standings}
+        territoryNames={territoryNames}
+        clanByTeamId={clanByTeamId}
+        resolveMedia={resolveMedia}
+        mapImage={meta?.map_image ?? ''}
+        anchors={anchors}
+        textElements={textElements}
+        frames={frames}
+        fontFamily={fontFamily}
+        remainingSec={remainingSec}
+        timerPos={timerPos}
+        purge={standings?.purge ?? null}
+        purgeImageUrl={purgeImageUrl}
+      />
+
+      {/* The Purge announcement - the game's biggest twist moment, flashed on
+          EVERY in-game device (locally on the bipping station, poll-detected on
+          the others) alongside the scenario purge sound. */}
+      {purgeFlash && purgeImageUrl && (
+        <div className="fixed inset-0 z-40 flex flex-col items-center justify-center bg-black/75 pointer-events-none">
+          <img
+            src={purgeImageUrl}
+            alt=""
+            className="h-48 object-contain animate-pulse drop-shadow-2xl"
+          />
+          <div className="mt-6 text-4xl font-bold text-center px-8" style={{ fontFamily }}>
+            <span style={{ color: purgeFlash.clanColor }}>{purgeFlash.clanName}</span>
+            <span className="text-white"> a purgé {purgeFlash.terrName} !</span>
+          </div>
+        </div>
+      )}
+
+      <GameMessageOverlay message={message} type={messageType} fontFamily={fontFamily} />
+
+      <PendingTeamsBar labels={queue.pending} fontFamily={fontFamily} />
+    </>
+  );
+}

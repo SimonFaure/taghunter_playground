@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
-import { X, ChevronRight, ChevronLeft, Usb, Save } from 'lucide-react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { X, ChevronRight, ChevronLeft, Usb, Save, Upload, FileDown } from 'lucide-react';
 import type { SiPuce } from '../types/database';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -8,40 +9,59 @@ import * as scenarioStore from '../services/scenarioStore';
 import * as gameTypesStore from '../services/gameTypesStore';
 import * as clientPreferencesStore from '../services/clientPreferencesStore';
 import * as launchConfigsStore from '../services/launchConfigsStore';
+import * as namePoolsStore from '../services/namePoolsStore';
 import {
   buildRoster,
   extractTracksOptions,
+  extractDefaultPatternId,
+  resolveDefaultPattern,
   EMPTY_TRACKS_OPTIONS,
   type TracksLaunchOptions,
   type PatternOption,
 } from '../services/launchResolve';
 import { ConfirmDialog } from './ConfirmDialog';
+import { RosterImportModal } from './RosterImportModal';
+import {
+  parseRosterFile,
+  buildTemplateCsv,
+  RosterImportError,
+  type RosterImportResult,
+  type RosterImportMode,
+} from '../services/rosterImport';
+import { isOperatorOnly } from '../services/operatorMode';
 import {
   listActiveLaunchedGames,
   getLaunchedGameState,
   listPairedDevicesForLaunch,
+  listBusyDeviceIds,
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
 import { useAuth } from './auth/AuthProvider';
-import { HelpButton, HelpDot } from '../help';
+import { HelpDot } from '../help';
+import { LANG_NAMES, SUPPORTED_LANGS } from '../services/langFlags';
+import { computeAutoRegAssignments, type RegAssignmentMap } from '../services/regAssignments';
+import { displayDeviceLabel } from '../services/lanPairing';
+import { RegAssignChips, type RegTeamDef } from './RegAssignChips';
 
 export interface LaunchDeviceSelection {
   /** Whether to register the mother itself as a participating device. */
   include_self: boolean;
   /** paired_devices.id of every non-self peer to send a join_game command to. */
   satellite_targets: number[];
+  /** Station-based self-register modes only: the resolved device_id →
+   *  team_numbers registration assignment (persisted as meta.regAssignments).
+   *  Absent ⇒ the launch path auto-assigns (headless Quick Launch). */
+  reg_assignments?: RegAssignmentMap;
 }
 
-const LANG_NAMES: Record<string, string> = {
-  en: 'English', fr: 'Français', es: 'Español', de: 'Deutsch', it: 'Italiano',
-  pt: 'Português', nl: 'Nederlands', pl: 'Polski', ru: 'Русский',
-  ja: '日本語', zh: '中文', ar: 'العربية',
-};
-
-// Walk a `Localized<>` map shape — `{ en: '...', fr: '...' }` — looking for
+// Walk a `Localized<>` map shape - `{ en: '...', fr: '...' }` - looking for
 // every language key that has at least one non-empty value across the whole
 // gameMeta. Used to populate the launch language picker so we only offer
 // languages the scenario actually has translations for.
+//
+// The key must be a KNOWN language code, not just any 2-letter key - otherwise
+// ubiquitous fields like `id: "123"` get mistaken for a language (Indonesian),
+// surfacing a bogus "id (id)" option and falsely enabling the flag picker.
 function collectScenarioLanguages(value: unknown, found: Set<string>): void {
   if (!value || typeof value !== 'object') return;
   if (Array.isArray(value)) {
@@ -50,12 +70,34 @@ function collectScenarioLanguages(value: unknown, found: Set<string>): void {
   }
   const obj = value as Record<string, unknown>;
   for (const [k, v] of Object.entries(obj)) {
-    if (k.length === 2 && typeof v === 'string' && v.trim().length > 0 && /^[a-z]{2}$/.test(k)) {
+    if (SUPPORTED_LANGS.includes(k) && typeof v === 'string' && v.trim().length > 0) {
       found.add(k);
     } else {
       collectScenarioLanguages(v, found);
     }
   }
+}
+
+// The authoritative language list studio writes alongside the data. Prefer this
+// over walking for Localized keys: on disk (post playground.php compat) the
+// translatable fields are flattened to default-lang strings and the per-language
+// copies live in a `translations` envelope, so the tree-walk under-reports.
+function extractAvailableLanguages(rawGameData: unknown): string[] {
+  if (!rawGameData || typeof rawGameData !== 'object') return [];
+  const root = rawGameData as Record<string, unknown>;
+  const candidates: unknown[] = [
+    root.available_languages,
+    (root.scenario as { available_languages?: unknown } | undefined)?.available_languages,
+    (root.game_data as { available_languages?: unknown } | undefined)?.available_languages,
+    (root.game_meta as { available_languages?: unknown } | undefined)?.available_languages,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      const langs = c.filter((x): x is string => typeof x === 'string' && SUPPORTED_LANGS.includes(x));
+      if (langs.length > 0) return langs;
+    }
+  }
+  return [];
 }
 
 function extractDefaultLanguage(rawGameData: unknown): string | null {
@@ -73,52 +115,35 @@ function extractDefaultLanguage(rawGameData: unknown): string | null {
   return null;
 }
 
-// The on-disk game-data.json may be the raw `game_data` blob or a legacy
-// envelope with `{scenario, game_data}` siblings — depending on which sync
-// generation wrote it. Probe known paths for `default_pattern_id`.
-function extractDefaultPatternId(rawGameData: unknown): string | null {
-  if (!rawGameData || typeof rawGameData !== 'object') return null;
-  const root = rawGameData as Record<string, unknown>;
-  const candidates: unknown[] = [
-    root.default_pattern_id,
-    (root.scenario as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
-    (root.game_data as { scenario?: { default_pattern_id?: unknown }; default_pattern_id?: unknown } | undefined)?.scenario?.default_pattern_id,
-    (root.game_data as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
-    (root.game_meta as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'string' && c) return c;
-  }
-  return null;
-}
-
 // ---------------------------------------------------------------- Tracks
 // Tracks launch options are parsed from the scenario's game_meta. The editor
 // enables a subset of each group; the operator picks one at launch. Labels
 // mirror the studio's RoutesSection / DisplaysSection / etc. copy.
-const TRACKS_ROUTE_LABELS: Record<string, string> = {
-  default: 'Default (all checkpoints)',
-  first_half: 'First half',
-  last_half: 'Last half',
-  odd: 'Odd checkpoints',
-  even: 'Even checkpoints',
+// The values here are i18next keys (in the `launchModal` namespace), resolved
+// to display copy at the call sites via `t()`.
+export const TRACKS_ROUTE_LABELS: Record<string, string> = {
+  default: 'launchModal:routeDefault',
+  first_half: 'launchModal:routeFirstHalf',
+  last_half: 'launchModal:routeLastHalf',
+  odd: 'launchModal:routeOdd',
+  even: 'launchModal:routeEven',
 };
-const TRACKS_DISPLAY_LABELS: Record<string, string> = {
-  full: 'Full',
-  map: 'Map',
-  simple: 'Simple',
+export const TRACKS_DISPLAY_LABELS: Record<string, string> = {
+  full: 'launchModal:displayFull',
+  map: 'launchModal:displayMap',
+  simple: 'launchModal:displaySimple',
 };
-const TRACKS_PLAY_MODE_LABELS: Record<string, string> = {
-  itinerary: 'Itinerary (ordered)',
-  free: 'Free (any order)',
+export const TRACKS_PLAY_MODE_LABELS: Record<string, string> = {
+  itinerary: 'launchModal:playModeItinerary',
+  free: 'launchModal:playModeFree',
 };
-const TRACKS_SCORE_TYPE_LABELS: Record<string, string> = {
-  percentage: 'Percentage',
-  points: 'Points',
+export const TRACKS_SCORE_TYPE_LABELS: Record<string, string> = {
+  percentage: 'launchModal:scoreTypePercentage',
+  points: 'launchModal:scoreTypePoints',
 };
 
 /** Compact radio group for a tracks launch option. Hidden when ≤1 option (auto-selected). */
-function TracksRadioGroup({
+export function TracksRadioGroup({
   label,
   name,
   options,
@@ -137,7 +162,7 @@ function TracksRadioGroup({
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-1">
-        <label className="block text-sm font-medium text-slate-300">{label}</label>
+        <label className="pg-label !mb-0">{label}</label>
         {helpDot}
       </div>
       <div className="flex flex-wrap gap-2">
@@ -146,8 +171,8 @@ function TracksRadioGroup({
             key={o.key}
             className={`px-3 py-2 rounded-lg border-2 cursor-pointer text-sm transition-all ${
               value === o.key
-                ? 'border-blue-500 bg-blue-500/10 text-blue-300'
-                : 'border-slate-600 bg-slate-800 text-slate-300 hover:border-slate-500'
+                ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]'
+                : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] hover:border-[var(--pg-line-strong)]'
             }`}
           >
             <input
@@ -166,6 +191,65 @@ function TracksRadioGroup({
   );
 }
 
+/** Multi-select variant for tracks routes. Hidden when ≤1 option (the single
+ *  route is auto-selected). At least one option must stay checked. */
+export function TracksCheckboxGroup({
+  label,
+  options,
+  value,
+  onChange,
+  hint,
+}: {
+  label: string;
+  options: Array<{ key: string; label: string }>;
+  value: string[];
+  onChange: (keys: string[]) => void;
+  hint?: string;
+}) {
+  if (options.length <= 1) return null;
+  const toggle = (key: string) => {
+    const set = new Set(value);
+    if (set.has(key)) {
+      // Don't allow unchecking the last remaining route.
+      if (set.size <= 1) return;
+      set.delete(key);
+    } else {
+      set.add(key);
+    }
+    // Preserve declaration order so team assignment is deterministic.
+    onChange(options.map((o) => o.key).filter((k) => set.has(k)));
+  };
+  return (
+    <div className="space-y-2">
+      <label className="pg-label !mb-0">{label}</label>
+      <div className="flex flex-wrap gap-2">
+        {options.map((o) => {
+          const checked = value.includes(o.key);
+          return (
+            <label
+              key={o.key}
+              className={`px-3 py-2 rounded-lg border-2 cursor-pointer text-sm transition-all ${
+                checked
+                  ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]'
+                  : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] hover:border-[var(--pg-line-strong)]'
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={() => toggle(o.key)}
+                className="sr-only"
+              />
+              {o.label}
+            </label>
+          );
+        })}
+      </div>
+      {hint && <p className="text-xs text-[var(--pg-text-dim)]">{hint}</p>}
+    </div>
+  );
+}
+
 interface LaunchGameModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -177,7 +261,7 @@ interface LaunchGameModalProps {
   prefillConfig?: Partial<GameConfig>;
   /** When editing an existing config, its current name (seeds the Save field). */
   prefillConfigName?: string;
-  /** Amber banner shown atop step 1 — e.g. the reason a headless launch fell back here. */
+  /** Amber banner shown atop step 1 - e.g. the reason a headless launch fell back here. */
   noticeText?: string;
   /** Fired after a config is saved so the host can refresh counts / toast. */
   onConfigSaved?: (name: string) => void;
@@ -187,33 +271,63 @@ export interface GameConfig {
   name: string;
   numberOfTeams: number;
   firstChipIndex: number;
+  /** Manual-roster path (all game types): pre-fill the step-2 team names from the
+   *  scenario's audience name pool instead of the cards' key_name. Purely a UI
+   *  convenience applied when building / re-rolling the roster - the names are
+   *  baked into `teams`, so nothing server-side depends on this flag. */
+  nameFromPool?: boolean;
   pattern: string;
   duration: number;
   messageDisplayDuration: number;
   enigmaImageDisplayDuration: number;
   colorblindMode: boolean;
-  /** Mystery: relabeled "Auto-reset page" — auto-return the display to ready after results. */
+  /** Mystery: relabeled "Auto-reset page" - auto-return the display to ready after results. */
   autoResetTeam: boolean;
-  /** Mystery: when true, an instructions screen holds until Enter/click before
-   *  the reveal animation; when false the board stays hidden and the reveal
-   *  plays automatically on the finishing (second) bip. Defaults to true. */
-  revealResultsOnInput?: boolean;
+  /** Mystery: once a team's results summary is on screen, pressing Enter resets
+   *  the display (same as the on-screen refresh button). Defaults to true. */
+  enterToReset?: boolean;
   /** Seconds the results stay on screen before the auto page-reset (when autoResetTeam). */
   delayBeforeReset: number;
+  /** Mystery: show the author-placed idle layout (title + subtitle) on the
+   *  between-teams screen. When off, the idle screen shows the background only. */
+  showIdleLayout?: boolean;
+  /** Mystery: subtitle text shown on the idle (between-teams) screen, under the
+   *  scenario title. Only used when showIdleLayout is on and the scenario's idle
+   *  layout enables the subtitle element.
+   *  Leave blank to hide the subtitle (the title still shows). */
+  idleSubtitle?: string;
   /** Mystery+tracks: no roster pre-built; each registered card's first bip creates+starts a team. */
   autoRegisterTeam?: boolean;
   /** Mystery+tracks: a finished card can start a fresh run after the cooldown. */
   reuseCards?: boolean;
+  /** Mystery+tracks: mass start (all teams start together) vs staggered starts
+   *  (départs différés, the default - each team starts on its own first bip).
+   *  Mass start pre-registers the roster (autoRegisterTeam off, counts on step 2)
+   *  and is incompatible with self-registration, so selecting it forces
+   *  selfRegisterTeam off. Tracks multi-route launches use their own fixed-roster
+   *  flow instead (selecting 2+ parcours resets this to false). */
+  massStart?: boolean;
   /** Mystery+tracks: each team types its own name on its first bip. Implies dynamic
-   *  team mode (no roster) — the bip creates the team, then prompts for the name. */
+   *  team mode (no roster) - the bip creates the team, then prompts for the name. */
   selfRegisterTeam?: boolean;
   /** Minutes after a card finishes before it can be reused (when reuseCards). */
   reuseDelayMinutes?: number;
-  /** Mystery+tracks: draw a fun pooled team name (by audience+language) instead of the card's key_name. */
+  /** Mystery+tracks: draw a fun pooled team name (by audience+language) instead of the card's key_name.
+   *  Mutually exclusive with selfRegisterTeam (both children of autoRegisterTeam). */
   useNamePool?: boolean;
-  /** Audience for the name pool draw — defaults to the scenario's game_public, overridable here.
+  /** Audience for the name pool draw - always derived from the scenario's game_public
+   *  (no manual override). Persisted so the server-side draw keeps working.
    *  Canonical trio mirrors studio's src/types/audience.ts. */
   namePoolAudience?: 'mini_kids' | 'kids' | 'ado_adultes';
+  /** Self-register child: show a "Choose my team name for me" button in the overlay
+   *  that draws a pooled name (scenario audience + the player's/launch language). */
+  addRandomNameOption?: boolean;
+  /** Self-register child: let the player pick their team's display language via flag
+   *  radios in the overlay. Only offered when the scenario ships 2+ languages. */
+  allowPlayerLanguageChoice?: boolean;
+  /** The scenario's available languages (2-letter codes). Carried so the runtime
+   *  self-register overlay can offer the flag radios. Persisted as meta.availableLanguages. */
+  scenarioLanguages?: string[];
   victoryType?: 'speed' | 'score';
   playMode?: 'solo' | 'team';
   teammatesPerTeam?: number;
@@ -228,8 +342,14 @@ export interface GameConfig {
   playTutorialOnBip?: boolean;
   /** Play intro video (per-scenario scenario_video) on each team's first bip. Off if scenario has none. */
   playIntroOnBip?: boolean;
-  /** Tracks: selected route key (default | first_half | last_half | odd | even). */
+  /** Tracks: the selected route key(s). `route` carries the primary/fallback
+   *  (always the first of `routes`); `routes` carries the full multi-selection.
+   *  When 2+ routes are selected, auto-register is disabled and each team is
+   *  assigned a route in order (team N → routes[(N-1) % routes.length]). */
   route?: string;
+  /** Tracks: the operator-selected route set (1+). With 2+ entries the launch is
+   *  multi-route: teams are assigned a route in order on the team-config step. */
+  routes?: string[];
   /** Tracks: the studio-enabled route set, persisted so the Add Team form can
    *  offer a per-team route override. */
   tracksRoutes?: string[];
@@ -241,6 +361,53 @@ export interface GameConfig {
   scoreType?: 'percentage' | 'points';
   /** Tracks: malus subtracted per minute over the time limit (points or %). */
   malusPerMinute?: number;
+  /** Tracks: "clues page on team return" - on the second bip after a team
+   *  returns, show the map with every checkpoint revealed (no per-checkpoint
+   *  animation). Was a studio scenario option; now chosen per launch. */
+  cluesPage?: { enabled: boolean; show_title: boolean; show_text: boolean; show_image: boolean };
+  /** Clash: number of active clans (2-4). */
+  clashNumClans?: number;
+  /** Clash: max players per clan; 0/undefined ⇒ unlimited. */
+  clashMaxPerClan?: number;
+  /** Clash: how players bind to a clan at runtime. Stored for the registration UX. */
+  clashRegistrationMode?: 'self' | 'bulk';
+  /** Clash: per-territory physical balise station codes, pre-filled from the
+   *  scenario and overridable per venue at launch (replaces the old pattern). */
+  clashBalises?: number[][];
+  /** Clash: chip→clan assignments imported from Excel/CSV. Applied AFTER launch
+   *  (clans/team_ids only exist post-launch) via clashRegister. clanIndex is the
+   *  1..N clan number (matches team_number). */
+  clashChipAssignments?: Array<{ chipId: number; chipNumber: number; clanIndex: number; name?: string }>;
+  /** Clash "The Purge": launch toggle, default ON - only offered when the
+   *  scenario has a purge image (forced off otherwise, no built-in fallback). */
+  clashPurgeEnabled?: boolean;
+  /** Clash "The Purge": physical SI station whose punch attempts a purge.
+   *  Default 25; must not collide with any territory balise station. */
+  clashPurgeStation?: number;
+  /** TagQuest: when true the roster is NOT pre-built - players bind their chip
+   *  to a team at game start on the registration screen (mirrors Clash's
+   *  clashRegistrationMode='self'). Team mode → predefined named teams players
+   *  join (reuses the server clash_register / lg_clash_members binding). Solo
+   *  mode → each bipped chip enrolls itself as its own team on the fly. */
+  tagquestSelfRegister?: boolean;
+  /** TagQuest self-register (team mode): max players per team; 0/undefined ⇒
+   *  unlimited. Persisted into clash_config.max_per_clan so the mother enforces
+   *  the cap in clash_register, exactly like Clash. */
+  tagquestMaxPerTeam?: number;
+  /** TagQuest self-register (team mode): the predefined team display names, one
+   *  per team (numberOfTeams). Seeded "Équipe N" and editable at launch. */
+  tagquestTeamNames?: string[];
+  /** TagQuest: show the quest images as a low-opacity ghost grid at the start of
+   *  every punch animation (before the one-by-one reveal). Off ⇒ unrevealed slots
+   *  are invisible instead of dimmed - the staggered reveal itself is unchanged.
+   *  Defaults from the scenario's audience: on for mini_kids/kids, off for
+   *  ado_adultes. Missing in meta ⇒ true (pre-feature games keep the ghost). */
+  tagquestShowQuestPreview?: boolean;
+  /** TagQuest (score victory + team mode only): weight each team's earned
+   *  points by largest-headcount ÷ own-headcount so uneven team sizes compete
+   *  fairly - the same effectif rule Clash applies. Default on. Missing in
+   *  meta ⇒ false (pre-feature games keep raw scores). See tagquestScoring.ts. */
+  tagquestScoreWeighting?: boolean;
 }
 
 export interface Teammate {
@@ -254,16 +421,16 @@ export interface Team {
   chipNumber: number;
   name: string;
   teammates?: Teammate[];
+  /** Per-team display language (2-letter ISO). Defaults to the launch language. */
+  language?: string;
+  /** Tracks multi-route launch: this team's assigned route key. Persisted at
+   *  launch as a `route:{teamId}` meta override (read by the tracks runtime). */
+  route?: string;
 }
 
-// Canonical audience trio for the name-pool draw — mirrors studio's
+// Canonical audience trio for the name-pool draw - mirrors studio's
 // src/types/audience.ts (game_meta.game_public). Legacy values fold onto it.
 type NamePoolAudience = 'mini_kids' | 'kids' | 'ado_adultes';
-const NAME_POOL_AUDIENCES: { value: NamePoolAudience; label: string }[] = [
-  { value: 'mini_kids', label: 'Mini Kids' },
-  { value: 'kids', label: 'Kids' },
-  { value: 'ado_adultes', label: 'Teens/Adults' },
-];
 function normalizeGamePublic(raw: unknown): NamePoolAudience {
   const v = String(raw ?? '').toLowerCase();
   if (['adults', 'adult', 'adultes', 'teens', 'ado'].includes(v)) return 'ado_adultes';
@@ -283,6 +450,7 @@ export function LaunchGameModal({
   noticeText,
   onConfigSaved,
 }: LaunchGameModalProps) {
+  const { t } = useTranslation();
   const { user } = useAuth();
 
   const getDefaultName = () => {
@@ -301,11 +469,14 @@ export function LaunchGameModal({
     messageDisplayDuration: 5,
     enigmaImageDisplayDuration: 1,
     colorblindMode: false,
-    autoResetTeam: false,
+    autoResetTeam: true,
     delayBeforeReset: 10,
-    revealResultsOnInput: true,
+    enterToReset: false,
+    showIdleLayout: true,
+    idleSubtitle: '',
     autoRegisterTeam: false,
     reuseCards: false,
+    massStart: false,
     selfRegisterTeam: false,
     reuseDelayMinutes: 5,
     victoryType: 'score',
@@ -313,29 +484,78 @@ export function LaunchGameModal({
     teammatesPerTeam: 2,
     testMode: false,
     visibilityHideDelaySec: 10,
+    tagquestSelfRegister: false,
+    tagquestMaxPerTeam: 0,
+    tagquestShowQuestPreview: true,
+    tagquestScoreWeighting: true,
   });
   const [patternFolders, setPatternFolders] = useState<PatternOption[]>([]);
   const [defaultPattern, setDefaultPattern] = useState<string>('');
   const [step, setStep] = useState<1 | 2 | 3>(1);
-  // Step-3 state — the paired-device picker. Loaded lazily when the user
+  // Step-3 state - the paired-device picker. Loaded lazily when the user
   // advances to step 3; reset on modal close so a fresh open doesn't show
   // stale online indicators.
   const [pairedDevices, setPairedDevices] = useState<PairedDeviceStatusRow[]>([]);
   const [pairedLoading, setPairedLoading] = useState(false);
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<Set<number>>(new Set());
   const [motherChecked, setMotherChecked] = useState(true);
+  // Station-based self-register modes: per-device registration-team overrides.
+  // Auto-until-touched - a device with no entry shows (and launches with) the
+  // live round-robin auto-deal; an entry pins the operator's explicit choice
+  // and survives team/device changes until reset to auto.
+  const [regOverrides, setRegOverrides] = useState<Map<number, number[]>>(new Map());
+  // The per-device assignment UI is opt-in: OFF by default so the common case
+  // (every device shows the full team grid) stays uncluttered. Launching with
+  // the switch off sends no assignments; pinned overrides are kept in memory
+  // so flipping the switch back on restores them.
+  const [regAssignActive, setRegAssignActive] = useState(false);
+  // Operator-only device: this machine never participates in games. When true
+  // the "this device participates" checkbox is forced off + disabled.
+  const [operatorOnly, setOperatorOnly] = useState(false);
+  // paired_devices.id of devices already running another active game - these
+  // can't be selected here (one game per device). The launching device itself
+  // can still dispatch; it just can't also *participate* if it's busy.
+  const [busyDeviceIds, setBusyDeviceIds] = useState<Set<number>>(new Set());
   const [scenarioLanguages, setScenarioLanguages] = useState<string[]>([]);
   const [scenarioDefaultLang, setScenarioDefaultLang] = useState<string>('en');
-  // Scenario's audience (game_meta.game_public) — default for the name-pool draw.
+  // Clash: scenario territories (name + points) for the launch-time balise
+  // override grid. Editable station codes live in config.clashBalises.
+  const [clashTerritories, setClashTerritories] = useState<
+    Array<{ index: number; name: string; points: number }>
+  >([]);
+  // Clash: per-territory balise station codes pre-filled from the scenario,
+  // seeded into the launch config (the isOpen effect reads it from state).
+  const [clashBalisesSeed, setClashBalisesSeed] = useState<number[][]>([]);
+  // Clash: scenario-authored clan display names, indexed 0..N-1. Used to build
+  // the import's clan set (resolve a "clan" cell by number or name).
+  const [clashClanNames, setClashClanNames] = useState<string[]>([]);
+  // Clash "The Purge": the feature is only offered when the scenario ships a
+  // purge image (game_meta.purge_image) - no built-in fallback marker exists.
+  const [clashHasPurgeImage, setClashHasPurgeImage] = useState(false);
+  // Scenario's audience (game_meta.game_public) - default for the name-pool draw.
   const [scenarioPublic, setScenarioPublic] = useState<NamePoolAudience>('kids');
-  const [gameTypeRow, setGameTypeRow] = useState<gameTypesStore.GameTypeRow | null>(null);
+  // Scenario-authored timing defaults (game_meta) that prefill the launch fields:
+  // message_display_time -> messageDisplayDuration, animation_enigma_duration ->
+  // enigmaImageDisplayDuration. Operator can still override per launch.
+  const [scenarioMessageDisplayTime, setScenarioMessageDisplayTime] = useState<number>(5);
+  const [scenarioEnigmaDuration, setScenarioEnigmaDuration] = useState<number>(1);
   const [hasTutorialVideo, setHasTutorialVideo] = useState(false);
   const [hasIntroVideo, setHasIntroVideo] = useState(false);
   const [prefTutorialDefault, setPrefTutorialDefault] = useState(false);
   const [prefIntroDefault, setPrefIntroDefault] = useState(false);
   const [teams, setTeams] = useState<Team[]>([]);
+  // Candidate pooled team names for the scenario's audience + launch language,
+  // split into the client's own list and the default catalog so the bulk
+  // "Utiliser les noms de la liste" assignment prefers the client's names and
+  // only completes from the default pool when the client list is too short.
+  // Empty when no pool file is synced - the pool controls hide in that case.
+  const [poolNamesClient, setPoolNamesClient] = useState<string[]>([]);
+  const [poolNamesGlobal, setPoolNamesGlobal] = useState<string[]>([]);
   const [tracksOptions, setTracksOptions] = useState<TracksLaunchOptions>(EMPTY_TRACKS_OPTIONS);
-  const [showTracksAdvanced, setShowTracksAdvanced] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  // Mystery shows the pattern read-only behind a "Modify" toggle so the
+  // scenario's own pattern isn't changed by accident.
+  const [editPattern, setEditPattern] = useState(false);
   // Tracks: checkpoint count from game_meta + a warning when the selected
   // pattern's row count doesn't match it (the checkpoint↔station binding is
   // positional, so a mismatch silently misaligns scoring).
@@ -353,6 +573,36 @@ export function LaunchGameModal({
   const [savePending, setSavePending] = useState(false);
   const [overwriteConfirm, setOverwriteConfirm] = useState<string | null>(null);
   const [savedFlash, setSavedFlash] = useState<string | null>(null);
+  // Excel/CSV roster import (step 2). The hidden file input is triggered by the
+  // Import button; a successful parse opens the preview/confirm modal.
+  const rosterFileInputRef = useRef<HTMLInputElement>(null);
+  const clashFileInputRef = useRef<HTMLInputElement>(null);
+  const [importResult, setImportResult] = useState<RosterImportResult | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void isOperatorOnly().then(setOperatorOnly).catch(() => setOperatorOnly(false));
+  }, []);
+
+  // Load pooled team names for the scenario's audience + the launch language
+  // (falling back to the scenario default). Refreshes when the language changes.
+  useEffect(() => {
+    let cancelled = false;
+    const lang = config.language ?? scenarioDefaultLang;
+    namePoolsStore
+      .listPoolNamesTiered(scenarioPublic, lang)
+      .then((tiers) => {
+        if (cancelled) return;
+        setPoolNamesClient(tiers.client);
+        setPoolNamesGlobal(tiers.global);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setPoolNamesClient([]);
+        setPoolNamesGlobal([]);
+      });
+    return () => { cancelled = true; };
+  }, [scenarioPublic, config.language, scenarioDefaultLang]);
 
   useEffect(() => {
     const loadData = async () => {
@@ -368,33 +618,86 @@ export function LaunchGameModal({
         slug: r.pattern_slug ?? r.pattern_uniqid,
         name: r.name || r.pattern_slug || r.pattern_uniqid,
         uniqid: r.pattern_uniqid,
+        isDefault: r.is_default,
       }));
       setPatternFolders(options);
 
-      const defaultPatternId = extractDefaultPatternId(rawGameData);
-      let resolvedPattern = '';
-      if (defaultPatternId && options.some(o => o.uniqid === defaultPatternId)) {
-        resolvedPattern = defaultPatternId;
-      }
-      if (!resolvedPattern) {
-        resolvedPattern = options[0]?.uniqid || '';
-      }
-      setDefaultPattern(resolvedPattern);
+      // Pre-select the scenario's own default pattern, else the game type's
+      // is_default pattern, else the first - a wrong pre-selected pattern
+      // silently breaks scoring (no station ever matches a punch).
+      setDefaultPattern(resolveDefaultPattern(options, extractDefaultPatternId(rawGameData)));
 
-      // Discover languages the scenario has translations for. Default to the
+      // Discover the scenario's languages. Prefer the authoritative
+      // `available_languages` array studio writes; fall back to walking for
+      // Localized keys only when it's absent (older/partial data). Default to the
       // scenario's declared default_language; fall back to 'en' if neither
-      // exists. Empty set means no localization — picker stays hidden.
-      const langs = new Set<string>();
-      collectScenarioLanguages(rawGameData, langs);
-      const sortedLangs = Array.from(langs).sort();
+      // exists. Empty set means no localization - picker stays hidden.
+      let sortedLangs = extractAvailableLanguages(rawGameData);
+      if (sortedLangs.length === 0) {
+        const langs = new Set<string>();
+        collectScenarioLanguages(rawGameData, langs);
+        sortedLangs = Array.from(langs).sort();
+      }
       setScenarioLanguages(sortedLangs);
       const defaultLang = extractDefaultLanguage(rawGameData) || sortedLangs[0] || 'en';
       setScenarioDefaultLang(defaultLang);
+
+      // Clash: parse territories → grid labels + pre-filled balise station codes.
+      const gmClash =
+        ((rawGameData as { game_meta?: Record<string, unknown> } | null)?.game_meta
+          ?? (rawGameData as { game_data?: { game_meta?: Record<string, unknown> } } | null)?.game_data
+            ?.game_meta) ?? {};
+      const terrArr = Array.isArray((gmClash as { territories?: unknown }).territories)
+        ? ((gmClash as { territories: unknown[] }).territories)
+        : [];
+      const resolveTerrName = (n: unknown): string =>
+        typeof n === 'string'
+          ? n
+          : n && typeof n === 'object'
+            ? String(
+                (n as Record<string, string>)[defaultLang] ??
+                  Object.values(n as Record<string, string>)[0] ??
+                  '',
+              )
+            : '';
+      const clashBalisesInit: number[][] = terrArr.map((t) =>
+        Array.isArray((t as { balises?: unknown }).balises)
+          ? ((t as { balises: unknown[] }).balises).map(Number).filter((x) => !Number.isNaN(x))
+          : [],
+      );
+      setClashBalisesSeed(clashBalisesInit);
+      setClashTerritories(
+        terrArr.map((t, i) => ({
+          index: i,
+          name: resolveTerrName((t as { name?: unknown }).name) || `T${i + 1}`,
+          points: parseInt(String((t as { points?: unknown }).points ?? '0'), 10) || 0,
+        })),
+      );
+      // Clan display names (same localisation shape as territory names).
+      const clansArr = Array.isArray((gmClash as { clans?: unknown }).clans)
+        ? ((gmClash as { clans: unknown[] }).clans)
+        : [];
+      setClashClanNames(clansArr.map((c) => resolveTerrName((c as { name?: unknown }).name)));
+      setClashHasPurgeImage(
+        typeof (gmClash as { purge_image?: unknown }).purge_image === 'string' &&
+          ((gmClash as { purge_image: string }).purge_image).length > 0,
+      );
 
       // Audience for name-pool draws: scenario's game_meta.game_public, folded
       // onto the canonical trio (legacy 'adults'/'teens' -> 'ado_adultes').
       const gp = (rawGameData as { game_meta?: { game_public?: unknown } } | null)?.game_meta?.game_public;
       setScenarioPublic(normalizeGamePublic(gp));
+
+      // Scenario-authored timing defaults → prefill the launch fields. Both live
+      // in game_meta (top-level or under legacy game_data.game_meta). Fall back
+      // to the historic launch defaults (5s / 1s) when unset or non-positive.
+      const gmTiming =
+        (rawGameData as { game_meta?: Record<string, unknown> } | null)?.game_meta
+        ?? (rawGameData as { game_data?: { game_meta?: Record<string, unknown> } } | null)?.game_data?.game_meta;
+      const msgTime = parseInt(String(gmTiming?.message_display_time ?? ''), 10);
+      setScenarioMessageDisplayTime(Number.isFinite(msgTime) && msgTime > 0 ? msgTime : 5);
+      const enigDur = parseInt(String(gmTiming?.animation_enigma_duration ?? ''), 10);
+      setScenarioEnigmaDuration(Number.isFinite(enigDur) && enigDur > 0 ? enigDur : 1);
 
       // Tracks: parse the enabled route/display/play_mode/score_type sets +
       // default time/malus from game_meta. No-op (empty) for other types.
@@ -413,7 +716,6 @@ export function LaunchGameModal({
       // actually available locally so we know whether to render each toggle.
       const gameTypeLcLocal = gameTypeName.toLowerCase();
       const gt = await gameTypesStore.getGameType(gameTypeLcLocal);
-      setGameTypeRow(gt);
       const resolvedTutorial = await gameTypesStore.resolveTutorialVideoUrl(gameTypeLcLocal);
       setHasTutorialVideo(!!gt?.supports_tutorial_video && resolvedTutorial !== null);
 
@@ -450,14 +752,22 @@ export function LaunchGameModal({
         firstChipIndex: 1,
         pattern: defaultPattern,
         duration: isTracksType ? tracksOptions.defaultTime : (isMysteryType ? 90 : 60),
-        messageDisplayDuration: 5,
-        enigmaImageDisplayDuration: 1,
+        messageDisplayDuration: scenarioMessageDisplayTime,
+        enigmaImageDisplayDuration: scenarioEnigmaDuration,
         colorblindMode: false,
-        autoResetTeam: false,
+        autoResetTeam: true,
         delayBeforeReset: 10,
-        revealResultsOnInput: true,
-        autoRegisterTeam: false,
+        enterToReset: false,
+        showIdleLayout: true,
+        idleSubtitle: '',
+        // Mystery and Tracks teams both form dynamically on first bip - there is
+        // no pre-built roster by default, so auto-register is implicit (the launch
+        // UI exposes only the name-source choice, never an on/off toggle). A fixed
+        // roster is reached only via Import roster or, for Tracks, selecting 2+
+        // parcours (which forces auto-register off further down).
+        autoRegisterTeam: isMysteryType || isTracksType,
         reuseCards: false,
+        massStart: false,
         selfRegisterTeam: false,
         reuseDelayMinutes: 5,
         useNamePool: false,
@@ -471,14 +781,53 @@ export function LaunchGameModal({
         playTutorialOnBip: hasTutorialVideo && prefTutorialDefault,
         playIntroOnBip: hasIntroVideo && prefIntroDefault,
         route: tracksOptions.routes[0],
+        routes: tracksOptions.routes[0] ? [tracksOptions.routes[0]] : [],
         tracksRoutes: tracksOptions.routes,
         displayMode: tracksOptions.displays[0],
         trackPlayMode: tracksOptions.playModes[0] as 'itinerary' | 'free' | undefined,
         scoreType: defaultScoreType as 'percentage' | 'points' | undefined,
         malusPerMinute: tracksOptions.defaultMalus,
+        // Clues page on team return - off by default; the operator opts in per launch.
+        cluesPage: { enabled: false, show_title: true, show_text: true, show_image: true },
+        // Clash defaults - 2 clans, unlimited per clan, self-registration.
+        clashNumClans: 2,
+        clashMaxPerClan: 0,
+        clashRegistrationMode: 'self',
+        clashBalises: clashBalisesSeed,
+        // The Purge - ON by default when the scenario has a purge image.
+        clashPurgeEnabled: clashHasPurgeImage,
+        clashPurgeStation: 25,
+        // TagQuest teams are predetermined by default (operator builds the
+        // roster on step 2). Self-register is an opt-in that mirrors Clash.
+        tagquestSelfRegister: false,
+        tagquestMaxPerTeam: 0,
+        // Ghost preview of the quest images on each bip - audience-driven
+        // default (kids audiences like the spoiler, adults don't). Re-derived
+        // whenever scenarioPublic loads/changes; a saved config overrides below.
+        tagquestShowQuestPreview: scenarioPublic !== 'ado_adultes',
+        // Effectif weighting - on by default so uneven team sizes compete
+        // fairly out of the box (score victory + team mode only).
+        tagquestScoreWeighting: true,
         // A saved config (Edit / headless fallback) overrides the computed
-        // defaults. `name` stays blank — it's per-instance, never restored.
+        // defaults. `name` stays blank - it's per-instance, never restored.
         ...(prefillConfig ?? {}),
+        // A saved config may carry a pattern that no longer exists (deleted /
+        // renamed in studio). Fall back to the default pattern rather than
+        // launching with a stale id that silently breaks scoring.
+        ...(prefillConfig?.pattern &&
+        patternFolders.length > 0 &&
+        !patternFolders.some((o) => o.uniqid === prefillConfig.pattern)
+          ? { pattern: defaultPattern }
+          : {}),
+        // Mystery never persists an auto-register=off state EXCEPT for mass
+        // start (whose fixed roster is the point), so re-assert it after any
+        // saved-config restore unless the saved config is mass-start. Tracks
+        // needs no re-assert: its saved configs carry a consistent pair
+        // (multi-route and mass-start both persist auto-register off).
+        ...(isMysteryType ? { autoRegisterTeam: !prefillConfig?.massStart } : {}),
+        // A saved config can't re-enable the purge on a scenario that (no
+        // longer) has a purge image - clamp AFTER the prefill spread.
+        ...(clashHasPurgeImage ? {} : { clashPurgeEnabled: false }),
         name: '',
       });
       setStep(1);
@@ -486,7 +835,10 @@ export function LaunchGameModal({
       setPairedDevices([]);
       setSelectedDeviceIds(new Set());
       setMotherChecked(true);
-      setShowTracksAdvanced(false);
+      setRegOverrides(new Map());
+      setRegAssignActive(false);
+      setShowAdvanced(false);
+      setEditPattern(false);
       // Seed the save field when editing an existing config; otherwise reset.
       setConfigName(prefillConfigName ?? '');
       setShowSaveField(!!prefillConfigName);
@@ -494,7 +846,7 @@ export function LaunchGameModal({
       setOverwriteConfirm(null);
       setSavedFlash(null);
     }
-  }, [isOpen, defaultPattern, scenarioDefaultLang, scenarioPublic, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, prefillConfig, prefillConfigName]);
+  }, [isOpen, defaultPattern, patternFolders, scenarioDefaultLang, scenarioPublic, scenarioMessageDisplayTime, scenarioEnigmaDuration, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, clashBalisesSeed, clashHasPurgeImage, prefillConfig, prefillConfigName]);
 
   // Tracks: warn when the selected pattern's row count doesn't match the
   // course's checkpoint count. The checkpoint↔station binding is positional
@@ -511,7 +863,10 @@ export function LaunchGameModal({
         if (cancelled) return;
         if (stations.size !== tracksCheckpointCount) {
           setTracksPatternWarning(
-            `This pattern defines ${stations.size} checkpoint row(s) but the course has ${tracksCheckpointCount} checkpoint(s). Scoring may misalign — make sure the pattern matches this scenario.`,
+            t('launchModal:tracksPatternMismatch', {
+              rows: stations.size,
+              checkpoints: tracksCheckpointCount,
+            }),
           );
         } else {
           setTracksPatternWarning('');
@@ -532,10 +887,108 @@ export function LaunchGameModal({
   const isTagQuest = gameTypeName.toLowerCase() === 'tagquest';
   const isTracks = gameTypeName.toLowerCase() === 'tracks';
   const isMystery = gameTypeName.toLowerCase() === 'mystery';
+  const isClash = gameTypeName.toLowerCase() === 'clash';
+  // The Purge: the purge station must not collide with any territory balise
+  // station (effective set = launch override, else scenario seed) - the same
+  // physical punch can't both validate and purge. This is a HARD launch gate.
+  const clashPurgeCollision = useMemo(() => {
+    if (!isClash || !config.clashPurgeEnabled) return null;
+    const station = config.clashPurgeStation ?? 25;
+    for (const terr of clashTerritories) {
+      const override = config.clashBalises?.[terr.index];
+      const effective =
+        override && override.length > 0 ? override : clashBalisesSeed[terr.index] ?? [];
+      if (effective.includes(station)) {
+        return { station, territory: terr.name };
+      }
+    }
+    return null;
+  }, [isClash, config.clashPurgeEnabled, config.clashPurgeStation, config.clashBalises, clashTerritories, clashBalisesSeed]);
+  // Tracks multi-route launch: 2+ routes selected ⇒ teams get a per-team route
+  // (assigned in order on the team-config step) and auto-register is disabled.
+  const multipleRoutes = isTracks && (config.routes?.length ?? 0) > 1;
   // Auto-register + reuse-cards are offered for the card-collection runtimes
-  // that create teams on bip (mystery, tracks) — not tagquest.
+  // that create teams on bip (mystery, tracks) - not tagquest.
   const supportsDynamicTeams = isMystery || isTracks;
   const isTeamMode = isTagQuest && config.playMode === 'team';
+  // Dynamic-team launches build no roster, so step 2 (Configure teams) is
+  // skipped: step 1 advances straight to the device picker, and the device
+  // picker's Back button must return to step 1 (not the never-visited step 2).
+  // Clash self-register is the same: clans come from the scenario and players
+  // bind chips on the registration screen, so there is no roster to edit.
+  const skipsRosterStep =
+    !!config.autoRegisterTeam ||
+    !!config.selfRegisterTeam ||
+    (isTagQuest && !!config.tagquestSelfRegister) ||
+    (isClash && (config.clashRegistrationMode ?? 'self') === 'self');
+  // Station-based self-register: step 3 lets the operator pin each selected
+  // device to specific team(s) for registration (a hard-locked kiosk). Clash
+  // 'self' mode + TagQuest self-register team mode only - bulk hands out chip
+  // blocks from one place and solo has no predefined teams to assign.
+  // Design: project_selfregister_team_device_assignment.
+  const regAssignEnabled =
+    (isClash && (config.clashRegistrationMode ?? 'self') === 'self') ||
+    (isTagQuest && !!config.tagquestSelfRegister && config.playMode === 'team');
+  // The assignment chips/payload only apply once the operator opts in via the
+  // step-3 slide switch - `regAssignEnabled` is "this mode supports it".
+  const regAssignOn = regAssignEnabled && regAssignActive;
+  const regTeamDefs: RegTeamDef[] = !regAssignEnabled
+    ? []
+    : isClash
+      ? Array.from(
+          { length: Math.max(2, Math.min(config.clashNumClans ?? 2, 4)) },
+          (_, i) => ({ number: i + 1, name: clashClanNames[i] || `Clan ${i + 1}` }),
+        )
+      : Array.from({ length: Math.max(1, config.numberOfTeams) }, (_, i) => ({
+          number: i + 1,
+          name: config.tagquestTeamNames?.[i] || `Équipe ${i + 1}`,
+        }));
+  // The live auto-deal: teams round-robin over the selected satellites that
+  // have a reader, in listing order. The mother and reader-less devices are
+  // excluded from the deal by default but stay manually assignable.
+  const autoRegAssignments: RegAssignmentMap = regAssignOn
+    ? computeAutoRegAssignments(
+        pairedDevices
+          .filter(
+            (d) =>
+              !d.is_self &&
+              selectedDeviceIds.has(d.id) &&
+              !busyDeviceIds.has(d.id) &&
+              d.has_reader,
+          )
+          .map((d) => d.id),
+        regTeamDefs.length,
+      )
+    : {};
+  // Auto-until-touched: an override pins the operator's explicit choice (team
+  // numbers beyond the current team count are dropped, not persisted); no
+  // override shows whatever the auto-deal currently computes.
+  const effectiveRegAssignment = (deviceId: number): { teams: number[]; manual: boolean } => {
+    const override = regOverrides.get(deviceId);
+    if (override) {
+      return { teams: override.filter((n) => n <= regTeamDefs.length), manual: true };
+    }
+    return { teams: autoRegAssignments[deviceId] ?? [], manual: false };
+  };
+  const toggleRegTeam = (deviceId: number, teamNumber: number) => {
+    setRegOverrides((prev) => {
+      const next = new Map(prev);
+      const cur = next.get(deviceId) ?? autoRegAssignments[deviceId] ?? [];
+      const set = new Set(cur.filter((n) => n <= regTeamDefs.length));
+      if (set.has(teamNumber)) set.delete(teamNumber);
+      else set.add(teamNumber);
+      next.set(deviceId, Array.from(set).sort((a, b) => a - b));
+      return next;
+    });
+  };
+  const resetRegAssignment = (deviceId: number) => {
+    setRegOverrides((prev) => {
+      if (!prev.has(deviceId)) return prev;
+      const next = new Map(prev);
+      next.delete(deviceId);
+      return next;
+    });
+  };
   const chipsPerTeam = isTeamMode ? (config.teammatesPerTeam ?? 2) : 1;
   const totalChipsNeeded = config.numberOfTeams * chipsPerTeam;
   const maxTeams = allChips.length > 0 ? Math.floor(allChips.length / chipsPerTeam) : undefined;
@@ -626,18 +1079,285 @@ export function LaunchGameModal({
     loadUsedChips();
   }, [isOpen, user]);
 
+  // The full candidate set (client list ∪ default catalog, de-duplicated
+  // case-insensitively, client names first) - used only for presence checks
+  // (whether to show the "Utiliser les noms de la liste" affordances).
+  const poolNames = (() => {
+    const seenLc = new Set(poolNamesClient.map((n) => n.trim().toLowerCase()));
+    const extra = poolNamesGlobal.filter((n) => !seenLc.has(n.trim().toLowerCase()));
+    return [...poolNamesClient, ...extra];
+  })();
+
+  const shuffleNames = (arr: string[]): string[] => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  // Draw sequence for the "Utiliser les noms de la liste" assignment: the
+  // client's own names first (shuffled), then the default catalog (shuffled,
+  // de-duplicated against the client list) to COMPLETE when the client pool is
+  // too small for the team count. Only wraps once BOTH tiers are exhausted.
+  const buildPoolNameSequence = (): string[] => {
+    const seenLc = new Set(poolNamesClient.map((n) => n.trim().toLowerCase()));
+    const globalExtra = poolNamesGlobal.filter((n) => !seenLc.has(n.trim().toLowerCase()));
+    return [...shuffleNames(poolNamesClient), ...shuffleNames(globalExtra)];
+  };
+
+  // Assign pooled names to a roster: draw the client-first / default-completed
+  // sequence and hand each team a distinct name (wrapping only if there are more
+  // teams than names across both tiers). Returns the list unchanged when no pool
+  // is available. Only the team name is overwritten - teammate names + chips are
+  // left intact.
+  const applyPoolNames = (list: Team[]): Team[] => {
+    const seq = buildPoolNameSequence();
+    if (seq.length === 0) return list;
+    return list.map((team, i) => ({ ...team, name: seq[i % seq.length] }));
+  };
+
+  // TagQuest self-register: fill the predefined team-name inputs from the pool
+  // (client names first, completed from the default catalog), one per team.
+  const assignTagquestTeamNamesFromPool = () => {
+    const seq = buildPoolNameSequence();
+    if (seq.length === 0) return;
+    const count = Math.max(1, config.numberOfTeams);
+    const names = Array.from({ length: count }, (_, i) => seq[i % seq.length]);
+    setConfig({ ...config, tagquestTeamNames: names });
+  };
+
   const handleNextStep = () => {
     // Roster build lives in launchResolve so the headless Quick Launch path
     // produces an identical roster from the same inputs.
     const combinedChips = [...availableChips, ...onDemandChips];
-    setTeams(buildRoster(config, combinedChips, gameTypeName));
+    let roster = buildRoster(config, combinedChips, gameTypeName);
+    // Pre-fill pooled names when the operator chose the pool source (mystery/
+    // tracks mass-start fixed roster) or the legacy TagQuest fill-from-pool toggle.
+    if (config.nameFromPool || ((isMystery || isTracks) && config.useNamePool)) roster = applyPoolNames(roster);
+    // Tracks multi-route: pre-assign each team a route in order (cycling). The
+    // operator can override per team via the step-2 dropdown; GameList applies
+    // the same default for any team left unassigned (e.g. headless launches).
+    if (multipleRoutes) {
+      const sel = config.routes ?? [];
+      roster = roster.map((team, i) => ({ ...team, route: team.route ?? sel[i % sel.length] }));
+    }
+    setTeams(roster);
     setStep(2);
+  };
+
+  // Mass-start Mystery/Tracks registers its roster on step 2: the team-count
+  // and first-chip controls live there and rebuild the roster in place on change.
+  // Rebuilding discards manual name edits (like adjusting the count on step 1
+  // would), so the operator sets counts first, then names.
+  const rebuildRosterFromCounts = (patch: Partial<GameConfig>) => {
+    const next: GameConfig = { ...config, ...patch };
+    setConfig(next);
+    const combinedChips = [...availableChips, ...onDemandChips];
+    let roster = buildRoster(next, combinedChips, gameTypeName);
+    if (next.useNamePool || next.nameFromPool) roster = applyPoolNames(roster);
+    setTeams(roster);
+  };
+
+  // ---- Excel/CSV team roster import (step 2) ------------------------------
+  // Single-chip modes (Mystery/Tracks/solo TagQuest) parse {chip, name}; team
+  // mode adds a "team name" column and groups rows into multi-member teams.
+  const teamImportMode: RosterImportMode = isTeamMode ? 'team' : 'single';
+
+  // Clash clan set for the chip→clan import: 1..N slots with scenario-authored
+  // names (fall back to "Clan N"). Resolves a "clan" cell by number or name.
+  const clashClanDefs = Array.from({ length: config.clashNumClans ?? 2 }, (_, i) => ({
+    index: i + 1,
+    name: clashClanNames[i] || `Clan ${i + 1}`,
+  }));
+
+  // Step-1 affordance: reach the roster step for a dynamic-team game (Mystery
+  // defaults to auto-register, which normally skips step 2). Turning auto/self
+  // register off makes the imported fixed roster the source of truth.
+  const goToManualRosterStep = () => {
+    const next: GameConfig = { ...config, autoRegisterTeam: false, selfRegisterTeam: false };
+    setConfig(next);
+    const combinedChips = [...availableChips, ...onDemandChips];
+    let roster = buildRoster(next, combinedChips, gameTypeName);
+    if (next.nameFromPool) roster = applyPoolNames(roster);
+    setTeams(roster);
+    setStep(2);
+  };
+
+  const handleRosterFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file
+    if (!file) return;
+    setImportError(null);
+    try {
+      const result = await parseRosterFile(file, {
+        mode: teamImportMode,
+        chips: allChips,
+        busyChipIds: usedChipIds,
+      });
+      setImportResult(result);
+    } catch (err) {
+      setImportError(rosterImportErrorMessage(err, teamImportMode));
+    }
+  };
+
+  const handleClashFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setImportError(null);
+    try {
+      const result = await parseRosterFile(file, {
+        mode: 'clan',
+        chips: allChips,
+        busyChipIds: usedChipIds,
+        clans: clashClanDefs,
+      });
+      setImportResult(result);
+    } catch (err) {
+      setImportError(rosterImportErrorMessage(err, 'clan'));
+    }
+  };
+
+  // Translate a thrown import error (fatal, whole-file) into a display string.
+  const rosterImportErrorMessage = (err: unknown, mode: RosterImportMode): string => {
+    if (err instanceof RosterImportError) {
+      if (err.code === 'missing-columns') {
+        const needs =
+          mode === 'team'
+            ? t('launchModal:importNeedsTeam')
+            : mode === 'clan'
+              ? t('launchModal:importNeedsClan')
+              : t('launchModal:importNeedsName');
+        return t('launchModal:importErrorMissingColumns', { needs });
+      }
+      const map: Record<string, string> = {
+        'empty-file': 'launchModal:importErrorEmptyFile',
+        'no-header': 'launchModal:importErrorNoHeader',
+        'no-clans': 'launchModal:importErrorNoClans',
+      };
+      return t(map[err.code] ?? 'launchModal:importErrorGeneric', { message: err.code });
+    }
+    return t('launchModal:importErrorGeneric', { message: err instanceof Error ? err.message : String(err) });
+  };
+
+  // Turn the confirmed import into the teams roster (replace-all) and jump to
+  // the roster step if we were still on step 1.
+  const applyRosterImport = () => {
+    if (!importResult) return;
+    const { mode, entries } = importResult;
+
+    // Clash: store chip→clan assignments in config; applied after launch.
+    if (mode === 'clan') {
+      setConfig((prev) => ({
+        ...prev,
+        clashChipAssignments: entries.map((en) => ({
+          chipId: en.chip.id,
+          chipNumber: en.chip.key_number,
+          clanIndex: en.clanIndex ?? 1,
+          name: en.name,
+        })),
+      }));
+      setImportResult(null);
+      return;
+    }
+
+    let newTeams: Team[];
+    let teammatesPerTeam = config.teammatesPerTeam ?? 2;
+
+    if (mode === 'team') {
+      // Group by team name, preserving first-seen order.
+      const order: string[] = [];
+      const groups = new Map<string, typeof entries>();
+      for (const en of entries) {
+        const key = en.group ?? '';
+        if (!groups.has(key)) { groups.set(key, []); order.push(key); }
+        groups.get(key)!.push(en);
+      }
+      newTeams = order.map((label) => {
+        const members = groups.get(label)!;
+        const first = members[0];
+        return {
+          chipId: first.chip.id,
+          chipNumber: first.chip.key_number,
+          name: label,
+          teammates: members.map((m) => ({
+            chipId: m.chip.id,
+            chipNumber: m.chip.key_number,
+            name: m.name,
+          })),
+        };
+      });
+      teammatesPerTeam = Math.max(2, ...newTeams.map((tm) => tm.teammates?.length ?? 1));
+    } else {
+      newTeams = entries.map((en) => ({
+        chipId: en.chip.id,
+        chipNumber: en.chip.key_number,
+        name: en.name,
+      }));
+    }
+
+    setConfig((prev) => ({
+      ...prev,
+      autoRegisterTeam: false,
+      selfRegisterTeam: false,
+      numberOfTeams: newTeams.length,
+      ...(mode === 'team' ? { teammatesPerTeam } : {}),
+    }));
+    setTeams(newTeams);
+    setImportResult(null);
+    if (step === 1) setStep(2);
+  };
+
+  const downloadImportTemplate = (mode: RosterImportMode) => {
+    const csv = buildTemplateCsv(mode, allChips, mode === 'clan' ? clashClanDefs : undefined);
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${mode === 'clan' ? 'clans' : 'teams'}-template-${gameTypeName.toLowerCase()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Clash capacity pre-check: clans whose imported assignment count exceeds the
+  // per-clan cap. Surfaced as warnings in the preview (non-blocking).
+  const clashCapacityWarnings = (() => {
+    if (importResult?.mode !== 'clan') return [];
+    const cap = config.clashMaxPerClan ?? 0;
+    if (cap <= 0) return [];
+    const counts = new Map<number, number>();
+    for (const e of importResult.entries) {
+      counts.set(e.clanIndex ?? 0, (counts.get(e.clanIndex ?? 0) ?? 0) + 1);
+    }
+    return clashClanDefs
+      .filter((c) => (counts.get(c.index) ?? 0) > cap)
+      .map((c) => ({ clan: c.name, max: cap, count: counts.get(c.index) ?? 0 }));
+  })();
+
+  const updateTeamRoute = (index: number, route: string) => {
+    setTeams(prev => {
+      const updated = [...prev];
+      updated[index] = { ...updated[index], route };
+      return updated;
+    });
   };
 
   const updateTeamName = (index: number, newName: string) => {
     setTeams(prev => {
       const updated = [...prev];
       updated[index] = { ...updated[index], name: newName };
+      return updated;
+    });
+  };
+
+  const updateTeamLanguage = (index: number, lang: string) => {
+    setTeams(prev => {
+      const updated = [...prev];
+      updated[index] = { ...updated[index], language: lang };
       return updated;
     });
   };
@@ -701,32 +1421,96 @@ export function LaunchGameModal({
 
   // Advance to the device picker (step 3). Lazy-fetch the paired list and
   // pre-check the mother + every currently-online satellite. Offline peers
-  // are visible but unchecked — the operator can opt to queue a join_game
+  // are visible but unchecked - the operator can opt to queue a join_game
   // command that wakes them up when they reconnect (15-minute TTL on the
   // pending_commands row).
   const advanceToDevices = async () => {
     setStep(3);
     setPairedLoading(true);
     try {
-      const rows = await listPairedDevicesForLaunch();
+      const [rows, busy] = await Promise.all([listPairedDevicesForLaunch(), listBusyDeviceIds()]);
       setPairedDevices(rows);
-      setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online).map(r => r.id)));
-      setMotherChecked(true);
+      setBusyDeviceIds(busy);
+      // Pre-check only online, non-self peers that aren't already in a game.
+      setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online && !busy.has(r.id)).map(r => r.id)));
+      // This device participates by default unless it's already running a game.
+      // Operator-only devices never participate.
+      const selfRow = rows.find(r => r.is_self);
+      setMotherChecked(operatorOnly ? false : !(selfRow && busy.has(selfRow.id)));
     } catch (err) {
       console.error('[LaunchGameModal] failed to load paired devices:', err);
       setPairedDevices([]);
+      setBusyDeviceIds(new Set());
     } finally {
       setPairedLoading(false);
     }
+  };
+
+  // Step 3, station-based self-register: the per-device registration-team
+  // chips shown under each participating device row.
+  const renderRegAssignRow = (deviceId: number) => {
+    if (!regAssignOn || regTeamDefs.length === 0) return null;
+    const { teams: assigned, manual } = effectiveRegAssignment(deviceId);
+    return (
+      <div className="flex flex-wrap items-center gap-2 px-3 pb-3 pl-10">
+        <span className="text-xs text-[var(--pg-text-dim)] shrink-0">
+          {t('launchModal:regAssignLabel')}
+        </span>
+        <RegAssignChips
+          teams={regTeamDefs}
+          value={assigned}
+          onToggle={(n) => toggleRegTeam(deviceId, n)}
+          trailing={
+            <>
+              {assigned.length === 0 && (
+                <span className="text-xs italic text-[var(--pg-text-dim)]">
+                  {t('launchModal:regAssignAllTeams')}
+                </span>
+              )}
+              {manual ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    resetRegAssignment(deviceId);
+                  }}
+                  className="text-[10px] uppercase px-1.5 py-0.5 rounded border border-[var(--pg-line)] text-[var(--pg-text-muted)] hover:text-[var(--pg-text)] hover:border-[var(--pg-line-strong)]"
+                  title={t('launchModal:regAssignResetTitle')}
+                >
+                  {t('launchModal:regAssignReset')}
+                </button>
+              ) : (
+                <span
+                  className="text-[10px] uppercase px-1.5 py-0.5 rounded border border-[var(--pg-line)] text-[var(--pg-text-dim)]"
+                  title={t('launchModal:regAssignAutoTitle')}
+                >
+                  {t('launchModal:regAssignAuto')}
+                </span>
+              )}
+            </>
+          }
+        />
+      </div>
+    );
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (step === 1) {
+      // HARD gate: the purge station colliding with a balise station would make
+      // one physical punch mean two things. Surface the error (auto-open the
+      // Advanced card where it lives) and refuse to advance.
+      if (clashPurgeCollision) {
+        setShowAdvanced(true);
+        return;
+      }
       // Dynamic-team modes (auto-register / self-register) build no roster, so
-      // skip the team-config step.
-      if (config.autoRegisterTeam || config.selfRegisterTeam) {
+      // skip the team-config step. TagQuest self-register is the same: players
+      // bind their chip to a team at game start (Clash-style), so there is no
+      // pre-built roster to edit here.
+      if (skipsRosterStep) {
         setTeams([]);
         await advanceToDevices();
       } else {
@@ -748,11 +1532,38 @@ export function LaunchGameModal({
       ...config,
       name: config.name.trim() || getDefaultName(),
       teams,
+      // Always derive the name-pool audience from the scenario (no manual
+      // override), and carry the scenario's languages for the self-register
+      // overlay's flag radios.
+      namePoolAudience: scenarioPublic,
+      scenarioLanguages,
     };
-    const satellite_targets = Array.from(selectedDeviceIds);
+    // Never dispatch to a device already in another game, even if a stale id
+    // lingered in the selection. Likewise, don't let this device participate
+    // if it's busy (one game per device - it can still host/dispatch).
+    const selfRow = pairedDevices.find((r) => r.is_self);
+    const selfBusy = !!(selfRow && busyDeviceIds.has(selfRow.id));
+    const satellite_targets = Array.from(selectedDeviceIds).filter((id) => !busyDeviceIds.has(id));
+    const includeSelf = motherChecked && !selfBusy && !operatorOnly;
+    // Station-based self-register: resolve the auto/manual per-device teams
+    // into the final map persisted as meta.regAssignments. Devices with no
+    // teams get no entry (they keep the pick-any-team grid).
+    let reg_assignments: RegAssignmentMap | undefined;
+    if (regAssignOn) {
+      reg_assignments = {};
+      const participantIds = [
+        ...(includeSelf && selfRow ? [selfRow.id] : []),
+        ...satellite_targets,
+      ];
+      for (const id of participantIds) {
+        const { teams: assigned } = effectiveRegAssignment(id);
+        if (assigned.length > 0) reg_assignments[id] = assigned;
+      }
+    }
     onLaunch(finalConfig, {
-      include_self: motherChecked,
+      include_self: includeSelf,
       satellite_targets,
+      ...(reg_assignments ? { reg_assignments } : {}),
     });
   };
 
@@ -790,15 +1601,14 @@ export function LaunchGameModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="relative w-full h-full max-w-4xl max-h-screen overflow-auto bg-slate-900 shadow-2xl md:rounded-xl md:m-8 md:h-auto">
-        <div className="sticky top-0 z-10 flex items-center justify-between p-6 bg-slate-800 border-b border-slate-700">
-          <h2 className="text-2xl font-bold text-white">Launch Game Configuration</h2>
+    <div className="pg-overlay">
+      <div className="relative w-full h-full max-w-4xl max-h-screen overflow-auto bg-[var(--pg-bg)] shadow-2xl md:rounded-[var(--pg-radius-lg)] md:m-8 md:h-auto">
+        <div className="sticky top-0 z-10 flex items-center justify-between p-6 bg-[var(--pg-surface)] border-b border-[var(--pg-line)]">
+          <h2 className="pg-modal-title text-2xl">{t('launchModal:title')}</h2>
           <div className="flex items-center gap-2">
-            <HelpButton chapter="launching-a-game" label="Help" className="text-slate-300 hover:text-white" />
             <button
               onClick={onClose}
-              className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition"
+              className="pg-modal-close"
             >
               <X size={24} />
             </button>
@@ -814,8 +1624,8 @@ export function LaunchGameModal({
             </div>
           )}
           <div className="space-y-2">
-            <label htmlFor="name" className="block text-sm font-medium text-slate-300">
-              Game Name
+            <label htmlFor="name" className="pg-label">
+              {t('launchModal:gameName')}
             </label>
             <input
               type="text"
@@ -823,20 +1633,351 @@ export function LaunchGameModal({
               value={config.name}
               onChange={(e) => setConfig({ ...config, name: e.target.value })}
               placeholder={getDefaultName()}
-              className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="pg-input"
             />
-            <p className="text-xs text-slate-500">Leave empty to use default: {getDefaultName()}</p>
+            <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:gameNameHint', { default: getDefaultName() })}</p>
           </div>
 
+          {/* TagQuest: Duration + Language sit directly under the title, on one
+              row (Mystery-style). For other types they live in the shared grid. */}
+          {isTagQuest && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <div className="flex items-center gap-1">
+                  <label htmlFor="duration" className="pg-label !mb-0">
+                    {t('launchModal:durationMinutes')}
+                  </label>
+                  <HelpDot topic="launch.duration" />
+                </div>
+                <input
+                  type="number"
+                  id="duration"
+                  min="1"
+                  value={config.duration}
+                  onChange={(e) => setConfig({ ...config, duration: parseInt(e.target.value) || 1 })}
+                  className="pg-input"
+                  required
+                />
+              </div>
+              {scenarioLanguages.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-1">
+                    <label htmlFor="language" className="pg-label !mb-0">
+                      {t('launchModal:language')}
+                    </label>
+                    <HelpDot topic="launch.language" />
+                  </div>
+                  <select
+                    id="language"
+                    value={config.language || scenarioDefaultLang}
+                    onChange={(e) => setConfig({ ...config, language: e.target.value })}
+                    className="pg-select"
+                  >
+                    {scenarioLanguages.map((lang) => (
+                      <option key={lang} value={lang}>
+                        {LANG_NAMES[lang] || lang} ({lang})
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-[var(--pg-text-dim)]">
+                    {t('launchModal:languageHint')}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {isTagQuest && (
+            <>
+              <div className="space-y-3 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+                <label className="pg-label">
+                  {t('launchModal:victoryType')}
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setConfig({ ...config, victoryType: 'score' })}
+                    className={`relative p-4 rounded-[var(--pg-radius-md)] border-2 text-left transition-all ${
+                      config.victoryType === 'score'
+                        ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)]'
+                        : 'border-[var(--pg-line)] bg-[var(--pg-surface-3)] hover:border-[var(--pg-line-strong)]'
+                    }`}
+                  >
+                    <div className={`font-semibold text-sm mb-1 ${config.victoryType === 'score' ? 'text-[var(--pg-accent-bright)]' : 'text-[var(--pg-text-muted)]'}`}>
+                      {t('launchModal:victoryScore')}
+                    </div>
+                    <div className="text-xs text-[var(--pg-text-dim)] leading-snug">
+                      {t('launchModal:victoryScoreDesc')}
+                    </div>
+                    {config.victoryType === 'score' && (
+                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-[var(--pg-accent)]" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfig({ ...config, victoryType: 'speed' })}
+                    className={`relative p-4 rounded-[var(--pg-radius-md)] border-2 text-left transition-all ${
+                      config.victoryType === 'speed'
+                        ? 'border-orange-500 bg-orange-500/10'
+                        : 'border-[var(--pg-line)] bg-[var(--pg-surface-3)] hover:border-[var(--pg-line-strong)]'
+                    }`}
+                  >
+                    <div className={`font-semibold text-sm mb-1 ${config.victoryType === 'speed' ? 'text-orange-400' : 'text-[var(--pg-text-muted)]'}`}>
+                      {t('launchModal:victorySpeed')}
+                    </div>
+                    <div className="text-xs text-[var(--pg-text-dim)] leading-snug">
+                      {t('launchModal:victorySpeedDesc')}
+                    </div>
+                    {config.victoryType === 'speed' && (
+                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-orange-500" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Merged "Mode de jeu" card - play mode + team registration +
+                  the team-count controls (Number of teams / teammates / first
+                  chip) all live here. Pattern moved to Advanced (Mystery-style);
+                  Duration + Language keep the Mystery-style two-column row below. */}
+              <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+                <label className="pg-label">
+                  {t('launchModal:playMode')}
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setConfig({ ...config, playMode: 'team' })}
+                    className={`relative p-4 rounded-[var(--pg-radius-md)] border-2 text-left transition-all ${
+                      config.playMode === 'team'
+                        ? 'border-teal-500 bg-teal-500/10'
+                        : 'border-[var(--pg-line)] bg-[var(--pg-surface-3)] hover:border-[var(--pg-line-strong)]'
+                    }`}
+                  >
+                    <div className={`font-semibold text-sm mb-1 ${config.playMode === 'team' ? 'text-teal-400' : 'text-[var(--pg-text-muted)]'}`}>
+                      {t('launchModal:playModeTeam')}
+                    </div>
+                    <div className="text-xs text-[var(--pg-text-dim)] leading-snug">
+                      {t('launchModal:playModeTeamDesc')}
+                    </div>
+                    {config.playMode === 'team' && (
+                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-teal-500" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfig({ ...config, playMode: 'solo' })}
+                    className={`relative p-4 rounded-[var(--pg-radius-md)] border-2 text-left transition-all ${
+                      config.playMode === 'solo'
+                        ? 'border-teal-500 bg-teal-500/10'
+                        : 'border-[var(--pg-line)] bg-[var(--pg-surface-3)] hover:border-[var(--pg-line-strong)]'
+                    }`}
+                  >
+                    <div className={`font-semibold text-sm mb-1 ${config.playMode === 'solo' ? 'text-teal-400' : 'text-[var(--pg-text-muted)]'}`}>
+                      {t('launchModal:playModeSolo')}
+                    </div>
+                    <div className="text-xs text-[var(--pg-text-dim)] leading-snug">
+                      {t('launchModal:playModeSoloDesc')}
+                    </div>
+                    {config.playMode === 'solo' && (
+                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-teal-500" />
+                    )}
+                  </button>
+                </div>
+
+                {/* Team registration - Predetermined roster (default, built on
+                    the next step) vs Self-register (players bind their chip to a
+                    team at game start on the registration screen, mirroring
+                    Clash's clashRegistrationMode='self'). The team-count controls
+                    live in this subsection. */}
+                <div className="pt-3 border-t border-[var(--pg-line)] space-y-3">
+                  <label className="pg-label">{t('launchModal:teamRegistrationHeading', { defaultValue: 'Team registration' })}</label>
+                  <div className="pg-pill-group">
+                    {([
+                      { key: false, label: t('launchModal:regPredetermined', { defaultValue: 'Predetermined teams' }) },
+                      { key: true, label: t('launchModal:regSelfRegister', { defaultValue: 'Self-register' }) },
+                    ] as const).map((opt) => (
+                      <button
+                        key={String(opt.key)}
+                        type="button"
+                        onClick={() => setConfig({ ...config, tagquestSelfRegister: opt.key })}
+                        className={`pg-pill flex-1${!!config.tagquestSelfRegister === opt.key ? ' is-active' : ''}`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-[var(--pg-text-dim)]">
+                    {t('launchModal:tagquestRegHint', { defaultValue: 'Predetermined: you assign chips to teams on the next step. Self-register: players bip their chip to join a team on the registration screen at game start - just like Clash.' })}
+                  </p>
+
+                  {/* Team-count controls (moved out of the shared grid). Number of
+                      teams shows unless solo self-register (no predefined teams);
+                      teammates/first-chip are predetermined-roster only. */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {!(config.tagquestSelfRegister && config.playMode === 'solo') && (
+                      <div className="space-y-2">
+                        <label htmlFor="numberOfTeams" className="pg-label">
+                          {t('launchModal:numberOfTeams')}
+                          {totalMaxTeams !== undefined && (
+                            <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                              {t('launchModal:maxCount', { max: totalMaxTeams })}
+                            </span>
+                          )}
+                        </label>
+                        <input
+                          type="number"
+                          id="numberOfTeams"
+                          min="1"
+                          max={config.testMode ? Math.min(maxTeams ?? 5, 5) : maxTeams}
+                          value={config.numberOfTeams}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value) || 1;
+                            const effectiveMax = config.testMode
+                              ? Math.min(maxTeams ?? 5, 5)
+                              : maxTeams;
+                            const clampedTeams = effectiveMax !== undefined ? Math.min(val, effectiveMax) : val;
+                            const clampedFirst = maxTeams !== undefined
+                              ? Math.min(config.firstChipIndex, maxTeams - clampedTeams)
+                              : config.firstChipIndex;
+                            setConfig({ ...config, numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
+                          }}
+                          className="pg-input"
+                          required
+                        />
+                        {maxTeams !== undefined && config.numberOfTeams > maxTeams && (
+                          <p className="text-xs text-red-400">{t('launchModal:exceedsAvailableCards', { max: maxTeams })}</p>
+                        )}
+                        {isTeamMode && !config.tagquestSelfRegister && (
+                          <div className="mt-3 space-y-2">
+                            <label htmlFor="teammatesPerTeam" className="pg-label">
+                              {t('launchModal:teammatesPerTeam')}
+                              {allChips.length > 0 && (
+                                <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                                  {t('launchModal:chipsNeededAvailable', { needed: totalChipsNeeded, available: allChips.length })}
+                                </span>
+                              )}
+                            </label>
+                            <input
+                              type="number"
+                              id="teammatesPerTeam"
+                              min="2"
+                              value={config.teammatesPerTeam ?? 2}
+                              onChange={(e) => {
+                                const val = Math.max(2, parseInt(e.target.value) || 2);
+                                const newMax = allChips.length > 0 ? Math.floor(allChips.length / val) : undefined;
+                                const clampedTeams = newMax !== undefined ? Math.min(config.numberOfTeams, newMax) : config.numberOfTeams;
+                                setConfig({ ...config, teammatesPerTeam: val, numberOfTeams: clampedTeams });
+                              }}
+                              className="pg-input"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {!config.tagquestSelfRegister && (
+                      <div className="space-y-2">
+                        <label htmlFor="firstChipIndex" className="pg-label">
+                          {t('launchModal:indexOfFirstChip')}
+                        </label>
+                        <input
+                          type="number"
+                          id="firstChipIndex"
+                          min="0"
+                          {...(maxFirstChipIndex !== undefined ? { max: maxFirstChipIndex } : {})}
+                          value={config.firstChipIndex}
+                          onChange={(e) => {
+                            let val = parseInt(e.target.value) || 0;
+                            if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
+                            setConfig({ ...config, firstChipIndex: val });
+                          }}
+                          className="pg-input"
+                          required
+                        />
+                      </div>
+                    )}
+
+                    {/* Self-register team mode: "Joueurs max par équipe" sits on
+                        the same line as "Nombre d'équipes" (the first-chip index
+                        column is hidden in this mode). */}
+                    {config.tagquestSelfRegister && config.playMode === 'team' && (
+                      <div className="space-y-2">
+                        <label htmlFor="tagquestMaxPerTeam" className="pg-label">
+                          {t('launchModal:maxPerTeam', { defaultValue: 'Max players per team' })}
+                        </label>
+                        <input
+                          type="number"
+                          id="tagquestMaxPerTeam"
+                          min="0"
+                          value={config.tagquestMaxPerTeam ?? 0}
+                          onChange={(e) => setConfig({ ...config, tagquestMaxPerTeam: Math.max(0, parseInt(e.target.value) || 0) })}
+                          className="pg-input"
+                        />
+                        <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:zeroUnlimited', { defaultValue: '0 = unlimited' })}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {config.tagquestSelfRegister && config.playMode === 'team' && (
+                    <div className="space-y-3 pt-1">
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <label className="pg-label !mb-0">{t('launchModal:teamNamesLabel', { defaultValue: 'Team names' })}</label>
+                          {poolNames.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={assignTagquestTeamNamesFromPool}
+                              className="pg-btn pg-btn--ghost text-sm"
+                            >
+                              🎲 {t('launchModal:fillFromNamePool')}
+                            </button>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                          {Array.from({ length: Math.max(1, config.numberOfTeams) }, (_, i) => (
+                            <input
+                              key={i}
+                              type="text"
+                              value={config.tagquestTeamNames?.[i] ?? `Équipe ${i + 1}`}
+                              onChange={(e) => {
+                                const names = Array.from({ length: Math.max(1, config.numberOfTeams) }, (_, j) =>
+                                  config.tagquestTeamNames?.[j] ?? `Équipe ${j + 1}`);
+                                names[i] = e.target.value;
+                                setConfig({ ...config, tagquestTeamNames: names });
+                              }}
+                              className="pg-input"
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {config.tagquestSelfRegister && config.playMode === 'solo' && (
+                    <p className="text-xs text-[var(--pg-text-dim)] pt-1">
+                      {t('launchModal:tagquestSoloSelfRegHint', { defaultValue: 'Each player bips their own chip on the registration screen to enrol; one team is created per chip. Start the game once everyone has joined.' })}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* TagQuest renders Duration + Language under the title (below) and its
+              team-count controls in the merged "Mode de jeu" card, with the pattern
+              in Advanced - so this whole shared grid is skipped for TagQuest. */}
+          {!isTagQuest && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {!(config.autoRegisterTeam || config.selfRegisterTeam) && (
+            {/* Mass-start Mystery/Tracks registers teams before launch, so its
+                team-count and first-chip controls live on step 2 (roster), not here. */}
+            {!(config.autoRegisterTeam || config.selfRegisterTeam || isClash || isTagQuest || ((isMystery || isTracks) && config.massStart)) && (
             <>
             <div className="space-y-2">
-              <label htmlFor="numberOfTeams" className="block text-sm font-medium text-slate-300">
-                Number of Teams
+              <label htmlFor="numberOfTeams" className="pg-label">
+                {t('launchModal:numberOfTeams')}
                 {totalMaxTeams !== undefined && (
-                  <span className="ml-2 text-xs text-slate-400">
-                    (max {totalMaxTeams})
+                  <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                    {t('launchModal:maxCount', { max: totalMaxTeams })}
                   </span>
                 )}
               </label>
@@ -857,17 +1998,42 @@ export function LaunchGameModal({
                     : config.firstChipIndex;
                   setConfig({ ...config, numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
                 }}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="pg-input"
                 required
               />
               {maxTeams !== undefined && config.numberOfTeams > maxTeams && (
-                <p className="text-xs text-red-400">Cannot exceed the number of available cards ({maxTeams})</p>
+                <p className="text-xs text-red-400">{t('launchModal:exceedsAvailableCards', { max: maxTeams })}</p>
+              )}
+              {isTeamMode && (
+                <div className="mt-3 space-y-2">
+                  <label htmlFor="teammatesPerTeam" className="pg-label">
+                    {t('launchModal:teammatesPerTeam')}
+                    {allChips.length > 0 && (
+                      <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                        {t('launchModal:chipsNeededAvailable', { needed: totalChipsNeeded, available: allChips.length })}
+                      </span>
+                    )}
+                  </label>
+                  <input
+                    type="number"
+                    id="teammatesPerTeam"
+                    min="2"
+                    value={config.teammatesPerTeam ?? 2}
+                    onChange={(e) => {
+                      const val = Math.max(2, parseInt(e.target.value) || 2);
+                      const newMax = allChips.length > 0 ? Math.floor(allChips.length / val) : undefined;
+                      const clampedTeams = newMax !== undefined ? Math.min(config.numberOfTeams, newMax) : config.numberOfTeams;
+                      setConfig({ ...config, teammatesPerTeam: val, numberOfTeams: clampedTeams });
+                    }}
+                    className="pg-input"
+                  />
+                </div>
               )}
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="firstChipIndex" className="block text-sm font-medium text-slate-300">
-                Index of First Chip
+              <label htmlFor="firstChipIndex" className="pg-label">
+                {t('launchModal:indexOfFirstChip')}
               </label>
               <input
                 type="number"
@@ -880,27 +2046,31 @@ export function LaunchGameModal({
                   if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
                   setConfig({ ...config, firstChipIndex: val });
                 }}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="pg-input"
                 required
               />
             </div>
             </>
             )}
 
+            {/* Pattern lives in the main grid for every type except Mystery,
+                Tracks and TagQuest, where it's moved into Advanced behind a
+                "Modify" toggle. */}
+            {!isMystery && !isTracks && !isTagQuest && (
             <div className="space-y-2">
-              <label htmlFor="pattern" className="block text-sm font-medium text-slate-300">
-                Pattern
+              <label htmlFor="pattern" className="pg-label">
+                {t('launchModal:pattern')}
               </label>
               <select
                 id="pattern"
                 value={config.pattern}
                 onChange={(e) => setConfig({ ...config, pattern: e.target.value })}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="pg-select"
                 required
               >
 
                 {patternFolders.length === 0 ? (
-                  <option value="">Loading patterns...</option>
+                  <option value="">{t('launchModal:loadingPatterns')}</option>
                 ) : (
                   patternFolders.map((option) => (
                     <option key={option.uniqid || option.slug} value={option.uniqid}>
@@ -916,11 +2086,12 @@ export function LaunchGameModal({
                 </p>
               )}
             </div>
+            )}
 
             <div className="space-y-2">
               <div className="flex items-center gap-1">
-                <label htmlFor="duration" className="block text-sm font-medium text-slate-300">
-                  Duration (minutes)
+                <label htmlFor="duration" className="pg-label !mb-0">
+                  {t('launchModal:durationMinutes')}
                 </label>
                 <HelpDot topic="launch.duration" />
               </div>
@@ -930,288 +2101,384 @@ export function LaunchGameModal({
                 min="1"
                 value={config.duration}
                 onChange={(e) => setConfig({ ...config, duration: parseInt(e.target.value) || 1 })}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="pg-input"
                 required
               />
             </div>
 
-            <div className="space-y-2">
-              <label htmlFor="messageDisplayDuration" className="block text-sm font-medium text-slate-300">
-                Message Display Duration (seconds)
-              </label>
-              <input
-                type="number"
-                id="messageDisplayDuration"
-                min="1"
-                value={config.messageDisplayDuration}
-                onChange={(e) => setConfig({ ...config, messageDisplayDuration: parseInt(e.target.value) || 1 })}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                required
-              />
-            </div>
+            {/* Language sits alongside duration on the same row. Only shown when
+                the scenario ships at least one language. */}
+            {scenarioLanguages.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-1">
+                  <label htmlFor="language" className="pg-label !mb-0">
+                    {t('launchModal:language')}
+                  </label>
+                  <HelpDot topic="launch.language" />
+                </div>
+                <select
+                  id="language"
+                  value={config.language || scenarioDefaultLang}
+                  onChange={(e) => setConfig({ ...config, language: e.target.value })}
+                  className="pg-select"
+                >
+                  {scenarioLanguages.map((lang) => (
+                    <option key={lang} value={lang}>
+                      {LANG_NAMES[lang] || lang} ({lang})
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-[var(--pg-text-dim)]">
+                  {t('launchModal:languageHint')}
+                </p>
+              </div>
+            )}
 
-            <div className="space-y-2">
-              <label htmlFor="enigmaImageDisplayDuration" className="block text-sm font-medium text-slate-300">
-                Image Display Duration (seconds)
-              </label>
-              <input
-                type="number"
-                id="enigmaImageDisplayDuration"
-                min="1"
-                value={config.enigmaImageDisplayDuration}
-                onChange={(e) => setConfig({ ...config, enigmaImageDisplayDuration: parseInt(e.target.value) || 1 })}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                required
-              />
-            </div>
           </div>
-
-          {scenarioLanguages.length > 0 && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-1">
-                <label htmlFor="language" className="block text-sm font-medium text-slate-300">
-                  Language
-                </label>
-                <HelpDot topic="launch.language" />
-              </div>
-              <select
-                id="language"
-                value={config.language || scenarioDefaultLang}
-                onChange={(e) => setConfig({ ...config, language: e.target.value })}
-                className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              >
-                {scenarioLanguages.map((lang) => (
-                  <option key={lang} value={lang}>
-                    {LANG_NAMES[lang] || lang} ({lang})
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-slate-500">
-                Selects in-game text translations and video subtitle track.
-              </p>
-            </div>
           )}
 
-          {(hasTutorialVideo || hasIntroVideo) && (
-            <div className="space-y-3 p-4 bg-slate-800/50 rounded-lg">
-              <div className="text-sm font-medium text-slate-300">First-bip videos</div>
-              {hasTutorialVideo && (
-                <label className="flex items-center gap-3 text-sm text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={!!config.playTutorialOnBip}
-                    onChange={(e) => setConfig({ ...config, playTutorialOnBip: e.target.checked })}
-                  />
-                  Play Taghunter tutorial video on each team's first bip
-                </label>
-              )}
-              {hasIntroVideo && (
-                <label className="flex items-center gap-3 text-sm text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={!!config.playIntroOnBip}
-                    onChange={(e) => setConfig({ ...config, playIntroOnBip: e.target.checked })}
-                  />
-                  Play scenario intro video on each team's first bip
-                </label>
-              )}
-              <p className="text-xs text-slate-500">
-                Both videos play in order (intro first, then tutorial) before the team's timer starts.
-                Returning teams (already started) skip the videos.
-              </p>
-            </div>
-          )}
+          {isClash && (
+            <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+              <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:clashSetup')}</div>
 
-          {isTagQuest && (
-            <>
-              <div className="space-y-3 p-4 bg-slate-800/50 rounded-lg">
-                <label className="block text-sm font-medium text-slate-300">
-                  Victory Type
-                </label>
-                <div className="grid grid-cols-2 gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setConfig({ ...config, victoryType: 'score' })}
-                    className={`relative p-4 rounded-lg border-2 text-left transition-all ${
-                      config.victoryType === 'score'
-                        ? 'border-blue-500 bg-blue-500/10'
-                        : 'border-slate-600 bg-slate-800 hover:border-slate-500'
-                    }`}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="pg-label">{t('launchModal:numberOfClans')}</label>
+                  <select
+                    value={config.clashNumClans ?? 2}
+                    onChange={(e) => setConfig({ ...config, clashNumClans: parseInt(e.target.value) })}
+                    className="pg-select"
                   >
-                    <div className={`font-semibold text-sm mb-1 ${config.victoryType === 'score' ? 'text-blue-400' : 'text-slate-300'}`}>
-                      Score
-                    </div>
-                    <div className="text-xs text-slate-400 leading-snug">
-                      Chaque image vaut des points (avec combos et malus). Classement au nombre de points recoltes.
-                    </div>
-                    {config.victoryType === 'score' && (
-                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-blue-500" />
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfig({ ...config, victoryType: 'speed' })}
-                    className={`relative p-4 rounded-lg border-2 text-left transition-all ${
-                      config.victoryType === 'speed'
-                        ? 'border-orange-500 bg-orange-500/10'
-                        : 'border-slate-600 bg-slate-800 hover:border-slate-500'
-                    }`}
-                  >
-                    <div className={`font-semibold text-sm mb-1 ${config.victoryType === 'speed' ? 'text-orange-400' : 'text-slate-300'}`}>
-                      Rapidite
-                    </div>
-                    <div className="text-xs text-slate-400 leading-snug">
-                      La premiere equipe a avoir recolte toutes les images gagne. Classement par heure de derniere image collectee.
-                    </div>
-                    {config.victoryType === 'speed' && (
-                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-orange-500" />
-                    )}
-                  </button>
+                    {[2, 3, 4].map((n) => (
+                      <option key={n} value={n}>{t('launchModal:clansOption', { count: n })}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="pg-label">{t('launchModal:maxPlayersPerClan')}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={config.clashMaxPerClan ?? 0}
+                    onChange={(e) => setConfig({ ...config, clashMaxPerClan: Math.max(0, parseInt(e.target.value) || 0) })}
+                    className="pg-input"
+                  />
+                  <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:zeroUnlimited')}</p>
                 </div>
               </div>
 
-              <div className="space-y-3 p-4 bg-slate-800/50 rounded-lg">
-                <label className="block text-sm font-medium text-slate-300">
-                  Play Mode
-                </label>
-                <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <TracksRadioGroup
+                  label={t('launchModal:clashRegistration')}
+                  name="clashRegMode"
+                  options={[
+                    { key: 'self', label: t('launchModal:regSelfRegister') },
+                    { key: 'bulk', label: t('launchModal:clashRegBulk') },
+                  ]}
+                  value={config.clashRegistrationMode ?? 'self'}
+                  onChange={(k) => setConfig({ ...config, clashRegistrationMode: k as 'self' | 'bulk' })}
+                />
+                <p className="text-xs text-[var(--pg-text-dim)]">
+                  {t('launchModal:clashRegHint')}
+                </p>
+              </div>
+
+              {/* Import chip→clan assignments from Excel/CSV. Clans only exist
+                  after launch, so these are stored in config and applied by
+                  GameList once the game is created (via clashRegister). */}
+              <div className="space-y-2 pt-3 border-t border-[var(--pg-line)]">
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
-                    onClick={() => setConfig({ ...config, playMode: 'team' })}
-                    className={`relative p-4 rounded-lg border-2 text-left transition-all ${
-                      config.playMode === 'team'
-                        ? 'border-teal-500 bg-teal-500/10'
-                        : 'border-slate-600 bg-slate-800 hover:border-slate-500'
-                    }`}
+                    onClick={() => clashFileInputRef.current?.click()}
+                    className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
                   >
-                    <div className={`font-semibold text-sm mb-1 ${config.playMode === 'team' ? 'text-teal-400' : 'text-slate-300'}`}>
-                      Team
-                    </div>
-                    <div className="text-xs text-slate-400 leading-snug">
-                      Several chips correspond to one team. Multiple players share a team.
-                    </div>
-                    {config.playMode === 'team' && (
-                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-teal-500" />
-                    )}
+                    <Upload size={16} />
+                    {t('launchModal:importClanAssignments')}
                   </button>
                   <button
                     type="button"
-                    onClick={() => setConfig({ ...config, playMode: 'solo' })}
-                    className={`relative p-4 rounded-lg border-2 text-left transition-all ${
-                      config.playMode === 'solo'
-                        ? 'border-teal-500 bg-teal-500/10'
-                        : 'border-slate-600 bg-slate-800 hover:border-slate-500'
-                    }`}
+                    onClick={() => downloadImportTemplate('clan')}
+                    className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
+                    title={t('launchModal:downloadTemplate')}
                   >
-                    <div className={`font-semibold text-sm mb-1 ${config.playMode === 'solo' ? 'text-teal-400' : 'text-slate-300'}`}>
-                      Solo
-                    </div>
-                    <div className="text-xs text-slate-400 leading-snug">
-                      Each chip corresponds to one team. One chip per player.
-                    </div>
-                    {config.playMode === 'solo' && (
-                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-teal-500" />
-                    )}
+                    <FileDown size={16} />
                   </button>
                 </div>
-
-                {isTeamMode && (
-                  <div className="mt-3 space-y-2">
-                    <label htmlFor="teammatesPerTeam" className="block text-sm font-medium text-slate-300">
-                      Teammates per Team
-                      {allChips.length > 0 && (
-                        <span className="ml-2 text-xs text-slate-400">
-                          ({totalChipsNeeded} chips needed, {allChips.length} available)
-                        </span>
-                      )}
-                    </label>
-                    <input
-                      type="number"
-                      id="teammatesPerTeam"
-                      min="2"
-                      value={config.teammatesPerTeam ?? 2}
-                      onChange={(e) => {
-                        const val = Math.max(2, parseInt(e.target.value) || 2);
-                        const newMax = allChips.length > 0 ? Math.floor(allChips.length / val) : undefined;
-                        const clampedTeams = newMax !== undefined ? Math.min(config.numberOfTeams, newMax) : config.numberOfTeams;
-                        setConfig({ ...config, teammatesPerTeam: val, numberOfTeams: clampedTeams });
-                      }}
-                      className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent"
-                    />
+                <input
+                  ref={clashFileInputRef}
+                  type="file"
+                  accept=".csv,.xls,.xlsx"
+                  onChange={handleClashFileChange}
+                  className="hidden"
+                />
+                {importError && (
+                  <div className="px-3 py-2 rounded-[var(--pg-radius-md)] text-sm bg-[var(--pg-danger-soft,#3d1620)] text-[var(--pg-danger,#f87171)]">
+                    {importError}
+                  </div>
+                )}
+                {(config.clashChipAssignments?.length ?? 0) > 0 && (
+                  <div className="flex items-center gap-3 text-xs text-[var(--pg-text-dim)]">
+                    <span>
+                      {t('launchModal:clashAssignmentsSummary', { count: config.clashChipAssignments!.length })}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setConfig({ ...config, clashChipAssignments: undefined })}
+                      className="text-[var(--pg-accent-bright)] hover:underline"
+                    >
+                      {t('launchModal:clashAssignmentsClear')}
+                    </button>
                   </div>
                 )}
               </div>
-            </>
+            </div>
+          )}
+
+          {/* Mystery + Tracks: chips + team-name handling. Teams always
+              auto-register on first bip - the operator only chooses HOW each team
+              is named, and whether a finished chip can start a new game. Hidden
+              for Tracks multi-route launches, which use a fixed roster instead. */}
+          {(isMystery || (isTracks && !multipleRoutes)) && (
+            <div className="space-y-3 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:chipsAndTeamNamesHeading')}</h3>
+                <HelpDot topic="launch.auto-register" />
+              </div>
+              <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:chipsAndTeamNamesIntro')}</p>
+
+              {/* Start mode - Mystery + Tracks (this card already only renders
+                  for single-route Tracks; multi-route has its own fixed-roster
+                  flow). Mass start (all teams begin together) is incompatible
+                  with self-registration, so choosing it forces selfRegisterTeam
+                  off and the team-names radio below hides its "self" option. */}
+              <TracksRadioGroup
+                label={t('launchModal:startModeHeading')}
+                name="startMode"
+                options={[
+                  { key: 'staggered', label: t('launchModal:startModeStaggered') },
+                  { key: 'mass', label: t('launchModal:startModeMass') },
+                ]}
+                value={config.massStart ? 'mass' : 'staggered'}
+                onChange={(k) =>
+                  setConfig({
+                    ...config,
+                    massStart: k === 'mass',
+                    // Mass start = all teams begin together, so the roster must be
+                    // registered before launch (fixed roster on step 2). Staggered
+                    // goes back to on-bip auto-registration. Mass start also can't
+                    // coexist with self-registration.
+                    autoRegisterTeam: k !== 'mass',
+                    ...(k === 'mass'
+                      ? { selfRegisterTeam: false, addRandomNameOption: false, allowPlayerLanguageChoice: false }
+                      : {}),
+                  })
+                }
+              />
+
+              <TracksRadioGroup
+                label={t('launchModal:teamNamesHeading')}
+                name="mysteryNameMode"
+                options={[
+                  ...(config.massStart ? [] : [{ key: 'self', label: t('launchModal:nameModeSelf') }]),
+                  { key: 'auto', label: t('launchModal:autoDetermineTeamNames') },
+                ]}
+                value={config.selfRegisterTeam ? 'self' : 'auto'}
+                onChange={(k) =>
+                  setConfig({
+                    ...config,
+                    selfRegisterTeam: k === 'self',
+                    // Entering self-register clears the auto-name source;
+                    // leaving it clears self-register's sub-options.
+                    ...(k === 'self'
+                      ? { useNamePool: false }
+                      : { addRandomNameOption: false, allowPlayerLanguageChoice: false }),
+                  })
+                }
+              />
+
+              {config.selfRegisterTeam ? (
+                <div className="ml-1 space-y-3">
+                  {/* Self-register sub-option: re-rollable random name button in the overlay. */}
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      id="addRandomNameOption"
+                      checked={!!config.addRandomNameOption}
+                      onChange={(e) => setConfig({ ...config, addRandomNameOption: e.target.checked })}
+                      className="w-5 h-5 accent-[var(--pg-accent)]"
+                    />
+                    <label htmlFor="addRandomNameOption" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                      {t('launchModal:addRandomNameOption')}
+                      <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:addRandomNameOptionHint')}</span>
+                    </label>
+                    <HelpDot topic="launch.random-name" />
+                  </div>
+
+                  {/* Per-team language via flag picker - only when the scenario ships 2+ languages. */}
+                  {scenarioLanguages.length >= 2 && (
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        id="allowPlayerLanguageChoice"
+                        checked={!!config.allowPlayerLanguageChoice}
+                        onChange={(e) => setConfig({ ...config, allowPlayerLanguageChoice: e.target.checked })}
+                        className="w-5 h-5 accent-[var(--pg-accent)]"
+                      />
+                      <label htmlFor="allowPlayerLanguageChoice" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                        {t('launchModal:allowPlayerLanguageChoice')}
+                        <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:allowPlayerLanguageChoiceHint')}</span>
+                      </label>
+                      <HelpDot topic="launch.player-language" />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="ml-1">
+                  <TracksRadioGroup
+                    label={t('launchModal:autoNameSourceLabel')}
+                    name="mysteryAutoNameSource"
+                    options={[
+                      { key: 'pool', label: t('launchModal:useNamePoolRandom') },
+                      { key: 'chip', label: t('launchModal:useChipName') },
+                    ]}
+                    value={config.useNamePool ? 'pool' : 'chip'}
+                    onChange={(k) => setConfig({ ...config, useNamePool: k === 'pool' })}
+                  />
+                </div>
+              )}
+
+              {/* Reuse finished chips - a chip that completed a game can start a
+                  fresh one after a cooldown. */}
+              <div className="flex items-center gap-3 pt-3 border-t border-[var(--pg-line)]">
+                <input
+                  type="checkbox"
+                  id="reuseCards"
+                  checked={!!config.reuseCards}
+                  onChange={(e) => setConfig({ ...config, reuseCards: e.target.checked })}
+                  className="w-5 h-5 accent-[var(--pg-accent)]"
+                />
+                <label htmlFor="reuseCards" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                  {t(isMystery ? 'launchModal:reusePuces' : 'launchModal:reuseCards')}
+                  <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t(isMystery ? 'launchModal:reusePucesHint' : 'launchModal:reuseCardsHint')}</span>
+                </label>
+                <HelpDot topic="launch.reuse-cards" />
+              </div>
+              {config.reuseCards && (
+                <div className="ml-8 space-y-2">
+                  <label htmlFor="reuseDelayMinutes" className="pg-label">
+                    {t(isMystery ? 'launchModal:reuseDelayPucesMinutes' : 'launchModal:reuseDelayMinutes')}
+                  </label>
+                  <input
+                    type="number"
+                    id="reuseDelayMinutes"
+                    min="0"
+                    value={config.reuseDelayMinutes ?? 5}
+                    onChange={(e) => setConfig({ ...config, reuseDelayMinutes: Math.max(0, parseInt(e.target.value) || 0) })}
+                    className="pg-input"
+                    required
+                  />
+                </div>
+              )}
+            </div>
           )}
 
           {isTracks && (
-            <div className="space-y-4 p-4 bg-slate-800/50 rounded-lg">
+            <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+              {/* Parcours moved into Advanced (below), styled next to the pattern. */}
               <TracksRadioGroup
-                label="Route"
-                name="tracksRoute"
-                options={tracksOptions.routes.map((k) => ({ key: k, label: TRACKS_ROUTE_LABELS[k] ?? k }))}
-                value={config.route ?? ''}
-                onChange={(k) => setConfig({ ...config, route: k })}
-              />
-              <TracksRadioGroup
-                label="Display mode"
+                label={t('launchModal:tracksDisplayMode')}
                 name="tracksDisplay"
-                options={tracksOptions.displays.map((k) => ({ key: k, label: TRACKS_DISPLAY_LABELS[k] ?? k }))}
+                options={tracksOptions.displays.map((k) => ({ key: k, label: TRACKS_DISPLAY_LABELS[k] ? t(TRACKS_DISPLAY_LABELS[k]) : k }))}
                 value={config.displayMode ?? ''}
                 onChange={(k) => setConfig({ ...config, displayMode: k })}
               />
               <TracksRadioGroup
-                label="Play mode"
+                label={t('launchModal:tracksPlayMode')}
                 name="tracksPlayMode"
-                options={tracksOptions.playModes.map((k) => ({ key: k, label: TRACKS_PLAY_MODE_LABELS[k] ?? k }))}
+                options={tracksOptions.playModes.map((k) => ({ key: k, label: TRACKS_PLAY_MODE_LABELS[k] ? t(TRACKS_PLAY_MODE_LABELS[k]) : k }))}
                 value={config.trackPlayMode ?? ''}
                 onChange={(k) => setConfig({ ...config, trackPlayMode: k as 'itinerary' | 'free' })}
               />
               <TracksRadioGroup
-                label="Score type"
+                label={t('launchModal:tracksScoreType')}
                 name="tracksScoreType"
-                options={tracksOptions.scoreTypes.map((s) => ({ key: s.key, label: TRACKS_SCORE_TYPE_LABELS[s.key] ?? s.key }))}
+                options={tracksOptions.scoreTypes.map((s) => ({ key: s.key, label: TRACKS_SCORE_TYPE_LABELS[s.key] ? t(TRACKS_SCORE_TYPE_LABELS[s.key]) : s.key }))}
                 value={config.scoreType ?? ''}
                 onChange={(k) => setConfig({ ...config, scoreType: k as 'percentage' | 'points' })}
                 helpDot={<HelpDot topic="launch.score-type" />}
               />
 
-              <div className="pt-1 border-t border-slate-700/60">
-                <button
-                  type="button"
-                  onClick={() => setShowTracksAdvanced((v) => !v)}
-                  className="text-sm text-slate-400 hover:text-slate-200 transition"
-                >
-                  {showTracksAdvanced ? '▾' : '▸'} Advanced
-                </button>
-                {showTracksAdvanced && (
-                  <div className="mt-3 space-y-2">
-                    <label htmlFor="malusPerMinute" className="block text-sm font-medium text-slate-300">
-                      Malus per minute over (points or %)
-                    </label>
-                    <input
-                      type="number"
-                      id="malusPerMinute"
-                      min={0}
-                      value={config.malusPerMinute ?? tracksOptions.defaultMalus}
-                      onChange={(e) =>
-                        setConfig({ ...config, malusPerMinute: Math.max(0, parseInt(e.target.value) || 0) })
-                      }
-                      className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    />
-                    <p className="text-xs text-slate-500">
-                      Game time is set by the Duration field above. The malus is
-                      subtracted from the final score for each minute over.
-                    </p>
+              <div className="pt-3 border-t border-[var(--pg-line)]">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={!!config.cluesPage?.enabled}
+                    onChange={(e) =>
+                      setConfig({
+                        ...config,
+                        cluesPage: {
+                          enabled: e.target.checked,
+                          show_title: config.cluesPage?.show_title ?? true,
+                          show_text: config.cluesPage?.show_text ?? true,
+                          show_image: config.cluesPage?.show_image ?? true,
+                        },
+                      })
+                    }
+                    className="mt-0.5 w-4 h-4 accent-[var(--pg-accent)]"
+                  />
+                  <span>
+                    <span className="font-medium text-[var(--pg-text)]">
+                      {t('launchModal:tracksCluesPage')}
+                    </span>
+                    <span className="block text-xs text-[var(--pg-text-dim)]">
+                      {t('launchModal:tracksCluesPageHint')}
+                    </span>
+                  </span>
+                </label>
+                {config.cluesPage?.enabled && (
+                  <div className="ml-6 mt-2 space-y-1.5">
+                    {(
+                      [
+                        ['show_title', 'tracksCluesShowTitle'],
+                        ['show_text', 'tracksCluesShowText'],
+                        ['show_image', 'tracksCluesShowImage'],
+                      ] as const
+                    ).map(([key, i18nKey]) => (
+                      <label
+                        key={key}
+                        className="flex items-center gap-2 text-sm text-[var(--pg-text-muted)]"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={config.cluesPage?.[key] !== false}
+                          onChange={(e) =>
+                            setConfig({
+                              ...config,
+                              cluesPage: {
+                                enabled: config.cluesPage?.enabled ?? true,
+                                show_title: config.cluesPage?.show_title ?? true,
+                                show_text: config.cluesPage?.show_text ?? true,
+                                show_image: config.cluesPage?.show_image ?? true,
+                                [key]: e.target.checked,
+                              },
+                            })
+                          }
+                          className="w-4 h-4 accent-[var(--pg-accent)]"
+                        />
+                        <span>{t(`launchModal:${i18nKey}`)}</span>
+                      </label>
+                    ))}
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          <div className="space-y-4 p-4 bg-slate-800/50 rounded-lg">
+          {(hasOnDemandCards || isMystery) && (
+          <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
             {hasOnDemandCards && (
-              <div className="flex items-center gap-3 pb-3 border-b border-slate-700">
+              <div className="flex items-center gap-3 pb-3 border-b border-[var(--pg-line)]">
                 <input
                   type="checkbox"
                   id="useOnDemandCards"
@@ -1229,249 +2496,520 @@ export function LaunchGameModal({
                       }
                     }
                   }}
-                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                  className="w-5 h-5 accent-[var(--pg-accent)]"
                 />
-                <label htmlFor="useOnDemandCards" className="text-sm font-medium text-slate-300">
-                  Use on-demand cards
-                  <span className="ml-2 text-xs text-slate-400">({onDemandChips.length} additional cards available)</span>
+                <label htmlFor="useOnDemandCards" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                  {t('launchModal:useOnDemandCards')}
+                  <span className="ml-2 text-xs text-[var(--pg-text-dim)]">{t('launchModal:additionalCardsAvailable', { count: onDemandChips.length })}</span>
                 </label>
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
-              <input
-                type="checkbox"
-                id="colorblindMode"
-                checked={config.colorblindMode}
-                onChange={(e) => setConfig({ ...config, colorblindMode: e.target.checked })}
-                className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-              />
-              <label htmlFor="colorblindMode" className="text-sm font-medium text-slate-300">
-                Colorblind Mode
-              </label>
-            </div>
-
-            {supportsDynamicTeams && (
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  id="autoRegisterTeam"
-                  checked={!!config.autoRegisterTeam}
-                  onChange={(e) => setConfig({ ...config, autoRegisterTeam: e.target.checked })}
-                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                />
-                <label htmlFor="autoRegisterTeam" className="text-sm font-medium text-slate-300">
-                  Auto register team
-                  <span className="ml-2 text-xs text-slate-400 font-normal">(first bip of each registered card creates and starts a team)</span>
-                </label>
-                <HelpDot topic="launch.auto-register" />
-              </div>
-            )}
-
-            {supportsDynamicTeams && (
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  id="selfRegisterTeam"
-                  checked={!!config.selfRegisterTeam}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      selfRegisterTeam: e.target.checked,
-                      // The name pool is meaningless when players type their own
-                      // name (self-register overwrites it), so clear it.
-                      useNamePool: e.target.checked ? false : config.useNamePool,
-                    })
-                  }
-                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                />
-                <label htmlFor="selfRegisterTeam" className="text-sm font-medium text-slate-300">
-                  Self-register team names
-                  <span className="ml-2 text-xs text-slate-400 font-normal">(each team types its own name on first bip — teams are created on bip)</span>
-                </label>
-              </div>
-            )}
-
-            {supportsDynamicTeams && (
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  id="reuseCards"
-                  checked={!!config.reuseCards}
-                  onChange={(e) => setConfig({ ...config, reuseCards: e.target.checked })}
-                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                />
-                <label htmlFor="reuseCards" className="text-sm font-medium text-slate-300">
-                  Reuse cards
-                  <span className="ml-2 text-xs text-slate-400 font-normal">(a finished card can start a fresh run after a delay)</span>
-                </label>
-                <HelpDot topic="launch.reuse-cards" />
-              </div>
-            )}
-
-            {supportsDynamicTeams && config.reuseCards && (
-              <div className="ml-8 space-y-2">
-                <label htmlFor="reuseDelayMinutes" className="block text-sm font-medium text-slate-300">
-                  Delay before a finished card can be reused (minutes)
-                </label>
-                <input
-                  type="number"
-                  id="reuseDelayMinutes"
-                  min="0"
-                  value={config.reuseDelayMinutes ?? 5}
-                  onChange={(e) => setConfig({ ...config, reuseDelayMinutes: Math.max(0, parseInt(e.target.value) || 0) })}
-                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  required
-                />
-              </div>
-            )}
-
-            {/* Name pool — only meaningful when teams are created dynamically and
-                the players aren't naming themselves (self-register overwrites it). */}
-            {supportsDynamicTeams && (config.autoRegisterTeam || config.reuseCards) && !config.selfRegisterTeam && (
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  id="useNamePool"
-                  checked={!!config.useNamePool}
-                  onChange={(e) => setConfig({ ...config, useNamePool: e.target.checked })}
-                  className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
-                />
-                <label htmlFor="useNamePool" className="text-sm font-medium text-slate-300">
-                  Use team-name pool
-                  <span className="ml-2 text-xs text-slate-400 font-normal">(draw a fun name instead of the card name)</span>
-                </label>
-              </div>
-            )}
-
-            {supportsDynamicTeams && (config.autoRegisterTeam || config.reuseCards) && !config.selfRegisterTeam && config.useNamePool && (
-              <div className="ml-8 space-y-2">
-                <label htmlFor="namePoolAudience" className="block text-sm font-medium text-slate-300">
-                  Audience
-                  <span className="ml-2 text-xs text-slate-400 font-normal">(defaults to the scenario's public)</span>
-                </label>
-                <select
-                  id="namePoolAudience"
-                  value={config.namePoolAudience ?? scenarioPublic}
-                  onChange={(e) => setConfig({ ...config, namePoolAudience: e.target.value as NamePoolAudience })}
-                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                >
-                  {NAME_POOL_AUDIENCES.map((a) => (
-                    <option key={a.value} value={a.value}>{a.label}</option>
-                  ))}
-                </select>
               </div>
             )}
 
             {isMystery && (
             <>
+            {/* The idle (between-teams) screen shows whenever no reveal is on
+                screen - before the first team and between teams. */}
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
-                id="autoResetTeam"
-                checked={config.autoResetTeam}
-                onChange={(e) => setConfig({ ...config, autoResetTeam: e.target.checked })}
-                className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                id="showIdleLayout"
+                checked={config.showIdleLayout ?? true}
+                onChange={(e) => setConfig({ ...config, showIdleLayout: e.target.checked })}
+                className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
               />
-              <label htmlFor="autoResetTeam" className="text-sm font-medium text-slate-300">
-                Auto-reset page
-                <span className="ml-2 text-xs text-slate-400 font-normal">(returns the display to the ready screen after results — no Enter/reset needed)</span>
+              <label htmlFor="showIdleLayout" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                {t('launchModal:showIdleLayout')}
+                <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">
+                  {t('launchModal:showIdleLayoutHint')}
+                </span>
               </label>
-              <HelpDot topic="launch.auto-reset" />
             </div>
 
-            {config.autoResetTeam && (
-              <div className="ml-8 space-y-2">
-                <label htmlFor="delayBeforeReset" className="block text-sm font-medium text-slate-300">
-                  Delay Before Reset (seconds)
-                </label>
-                <input
-                  type="number"
-                  id="delayBeforeReset"
-                  min="0"
-                  value={config.delayBeforeReset}
-                  onChange={(e) => setConfig({ ...config, delayBeforeReset: parseInt(e.target.value) || 0 })}
-                  className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  required
-                />
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
+            {(config.showIdleLayout ?? true) && (
+            <div className="ml-8 space-y-2">
+              <label htmlFor="idleSubtitle" className="pg-label">
+                {t('launchModal:idleSubtitle')}
+              </label>
               <input
-                type="checkbox"
-                id="revealResultsOnInput"
-                checked={config.revealResultsOnInput ?? true}
-                onChange={(e) => setConfig({ ...config, revealResultsOnInput: e.target.checked })}
-                className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                type="text"
+                id="idleSubtitle"
+                value={config.idleSubtitle ?? ''}
+                onChange={(e) => setConfig({ ...config, idleSubtitle: e.target.value })}
+                placeholder={t('launchModal:idleSubtitlePlaceholder')}
+                className="pg-input"
               />
-              <label htmlFor="revealResultsOnInput" className="text-sm font-medium text-slate-300">
-                Use Enter or click to reveal results
-                <span className="ml-2 text-xs text-slate-400 font-normal">(checked: an instructions screen holds until Enter/click, then plays the reveal. Unchecked: the board stays hidden and reveals automatically on the finishing bip.)</span>
-              </label>
-            </div>
-            </>
-            )}
-
-            <div className="pt-1 border-t border-slate-700/60 space-y-2">
-              <label className="block text-sm font-medium text-slate-300">
-                Keep result on screen
-              </label>
-              <div className="flex items-center gap-2 text-sm text-slate-300">
-                <input
-                  type="number"
-                  min={0}
-                  max={60}
-                  value={config.visibilityHideDelaySec ?? 10}
-                  onChange={(e) =>
-                    setConfig({
-                      ...config,
-                      visibilityHideDelaySec: Math.max(0, parseInt(e.target.value) || 0),
-                    })
-                  }
-                  className="w-16 px-2 py-0.5 text-sm bg-slate-800 border border-slate-700 rounded text-white"
-                />
-                seconds
-              </div>
-              <p className="text-xs text-slate-400">
-                After each punch animation, the full image + score stay on screen for this long, then everything hides until the next punch.
+              <p className="text-xs text-[var(--pg-text-dim)]">
+                {t('launchModal:idleSubtitleHint')}
               </p>
             </div>
-
-            <div className="flex items-center gap-3 pt-1 border-t border-slate-700/60">
-              <input
-                type="checkbox"
-                id="testMode"
-                checked={config.testMode ?? false}
-                onChange={(e) => {
-                  const enabled = e.target.checked;
-                  setConfig(prev => ({
-                    ...prev,
-                    testMode: enabled,
-                    numberOfTeams: enabled ? Math.min(prev.numberOfTeams, 5) : prev.numberOfTeams,
-                  }));
-                }}
-                className="w-5 h-5 bg-slate-700 border-slate-600 rounded text-amber-600 focus:ring-2 focus:ring-amber-500"
-              />
-              <label htmlFor="testMode" className="text-sm font-medium text-amber-400">
-                Test Mode
-                <span className="ml-2 text-xs text-slate-400 font-normal">(limits teams to 5, shows test banner)</span>
-              </label>
+            )}
+            </>
+            )}
             </div>
-          </div>
+          )}
 
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-slate-700">
-            {/* Save-configuration control — persists step-1 settings as a named,
+            {/* Advanced settings - its own collapsible card/section. */}
+            <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition"
+              >
+                {showAdvanced ? '▾' : '▸'} {t('launchModal:advanced')}
+              </button>
+              {showAdvanced && (
+                <div className="mt-4 space-y-4">
+                  {/* The Purge (Clash) - once per game, a clan can punch the purge
+                      station to reset the leading clan's strongest territory to
+                      neutral. Only offered when the scenario ships a purge image
+                      (no built-in fallback marker exists). The station must not
+                      collide with a territory balise - HARD launch gate. */}
+                  {isClash && (
+                    <div className="space-y-2">
+                      <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:thePurge')}</div>
+                      {clashHasPurgeImage ? (
+                        <>
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              id="clashPurgeEnabled"
+                              checked={!!config.clashPurgeEnabled}
+                              onChange={(e) => setConfig({ ...config, clashPurgeEnabled: e.target.checked })}
+                              className="w-5 h-5 accent-[var(--pg-accent)]"
+                            />
+                            <label htmlFor="clashPurgeEnabled" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                              {t('launchModal:enablePurge')}
+                              <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">
+                                {t('launchModal:purgeNote')}
+                              </span>
+                            </label>
+                          </div>
+                          {config.clashPurgeEnabled && (
+                            <div className="space-y-1 ml-8">
+                              <label className="pg-label" htmlFor="clashPurgeStation">{t('launchModal:purgeStation')}</label>
+                              <input
+                                type="number"
+                                id="clashPurgeStation"
+                                min="1"
+                                value={config.clashPurgeStation ?? 25}
+                                onChange={(e) =>
+                                  setConfig({
+                                    ...config,
+                                    clashPurgeStation: Math.max(1, parseInt(e.target.value) || 25),
+                                  })
+                                }
+                                className="pg-input w-28"
+                              />
+                              <p className="text-xs text-[var(--pg-text-dim)]">
+                                {t('launchModal:purgeStationHint')}
+                              </p>
+                            </div>
+                          )}
+                          {clashPurgeCollision && (
+                            <p className="text-xs text-red-400 flex items-start gap-1.5 ml-8">
+                              <span aria-hidden>⛔</span>
+                              <span>
+                                {t('launchModal:purgeCollision', {
+                                  station: clashPurgeCollision.station,
+                                  territory: clashPurgeCollision.territory,
+                                })}
+                              </span>
+                            </p>
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-xs text-[var(--pg-text-dim)]">
+                          {t('launchModal:purgeUnavailable')}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Parcours (Tracks) - the studio-enabled route set, multi-select.
+                      Selecting 2+ parcours forces a fixed roster (auto-register off)
+                      and each team is assigned a route in order on the team step.
+                      Hidden when the scenario enables ≤1 parcours (auto-selected). */}
+                  {isTracks && (
+                    <TracksCheckboxGroup
+                      label={t('launchModal:tracksRoute')}
+                      options={tracksOptions.routes.map((k) => ({ key: k, label: TRACKS_ROUTE_LABELS[k] ? t(TRACKS_ROUTE_LABELS[k]) : k }))}
+                      value={config.routes ?? (config.route ? [config.route] : [])}
+                      onChange={(keys) =>
+                        setConfig({
+                          ...config,
+                          routes: keys,
+                          // `route` stays the primary/fallback (first selected).
+                          route: keys[0] ?? config.route,
+                          // Several routes ⇒ a pre-built roster is required to assign
+                          // them in order, so auto-register (and its children) is off.
+                          // Mass start is reset too: the multi-route flow keeps its
+                          // own count fields on step 1 (the start-mode card hides).
+                          ...(keys.length > 1
+                            ? {
+                                autoRegisterTeam: false,
+                                selfRegisterTeam: false,
+                                useNamePool: false,
+                                massStart: false,
+                                addRandomNameOption: false,
+                                allowPlayerLanguageChoice: false,
+                              }
+                            : {}),
+                        })
+                      }
+                      hint={t('launchModal:tracksRoutesHint')}
+                    />
+                  )}
+
+                  {/* Pattern (Mystery + Tracks + TagQuest) - read-only with a Modify
+                      toggle so the scenario's own pattern isn't changed by accident.
+                      For Tracks it binds each checkpoint to a physical station
+                      (positional), so a row-count mismatch is surfaced below. */}
+                  {(isMystery || isTracks || isTagQuest) && (
+                    <div className="space-y-2">
+                      <label className="pg-label">{t('launchModal:pattern')}</label>
+                      {editPattern ? (
+                        <select
+                          id="pattern"
+                          value={config.pattern}
+                          onChange={(e) => setConfig({ ...config, pattern: e.target.value })}
+                          className="pg-select"
+                          required
+                        >
+                          {patternFolders.length === 0 ? (
+                            <option value="">{t('launchModal:loadingPatterns')}</option>
+                          ) : (
+                            patternFolders.map((option) => (
+                              <option key={option.uniqid || option.slug} value={option.uniqid}>
+                                {option.name}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-[var(--pg-text-muted)]">
+                            {patternFolders.find((o) => o.uniqid === config.pattern)?.name ?? t('launchModal:loadingPatterns')}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setEditPattern(true)}
+                            className="inline-flex items-center gap-1 text-xs text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition"
+                            title={t('launchModal:modify')}
+                          >
+                            ✏️ {t('launchModal:modify')}
+                          </button>
+                        </div>
+                      )}
+                      {isTracks && tracksPatternWarning && (
+                        <p className="text-xs text-amber-300/90 flex items-start gap-1.5">
+                          <span aria-hidden>⚠️</span>
+                          <span>{tracksPatternWarning}</span>
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Animation timings. */}
+                  <div className="space-y-3">
+                    {isMystery && (
+                      <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:advAnimation')}</div>
+                    )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div className="space-y-2">
+                        <label htmlFor="messageDisplayDuration" className="pg-label">
+                          {t('launchModal:messageDisplayDuration')}
+                        </label>
+                        <input
+                          type="number"
+                          id="messageDisplayDuration"
+                          min="1"
+                          value={config.messageDisplayDuration}
+                          onChange={(e) => setConfig({ ...config, messageDisplayDuration: parseInt(e.target.value) || 1 })}
+                          className="pg-input"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label htmlFor="enigmaImageDisplayDuration" className="pg-label">
+                          {t('launchModal:imageDisplayDuration')}
+                        </label>
+                        <input
+                          type="number"
+                          id="enigmaImageDisplayDuration"
+                          min="1"
+                          value={config.enigmaImageDisplayDuration}
+                          onChange={(e) => setConfig({ ...config, enigmaImageDisplayDuration: parseInt(e.target.value) || 1 })}
+                          className="pg-input"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* First-bip videos - moved into Advanced. */}
+                  {!isTagQuest && (hasTutorialVideo || hasIntroVideo) && (
+                    <div className="space-y-3 p-4 bg-[var(--pg-surface-3)] rounded-[var(--pg-radius-md)]">
+                      <div className="text-sm font-medium text-[var(--pg-text-muted)]">{t('launchModal:firstBipVideos')}</div>
+                      {hasTutorialVideo && (
+                        <label className="flex items-center gap-3 text-sm text-[var(--pg-text-muted)]">
+                          <input
+                            type="checkbox"
+                            checked={!!config.playTutorialOnBip}
+                            onChange={(e) => setConfig({ ...config, playTutorialOnBip: e.target.checked })}
+                          />
+                          {t('launchModal:playTutorialVideo')}
+                        </label>
+                      )}
+                      {hasIntroVideo && (
+                        <label className="flex items-center gap-3 text-sm text-[var(--pg-text-muted)]">
+                          <input
+                            type="checkbox"
+                            checked={!!config.playIntroOnBip}
+                            onChange={(e) => setConfig({ ...config, playIntroOnBip: e.target.checked })}
+                          />
+                          {t('launchModal:playIntroVideo')}
+                        </label>
+                      )}
+                      <p className="text-xs text-[var(--pg-text-dim)]">
+                        {t('launchModal:firstBipVideosHint')}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Réinitialisation après passage équipe - Mystery only. */}
+                  {isMystery && (
+                    <div className="space-y-3 pt-3 border-t border-[var(--pg-line)]">
+                      <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:advReset')}</div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          id="enterToReset"
+                          checked={config.enterToReset ?? false}
+                          onChange={(e) => setConfig({ ...config, enterToReset: e.target.checked })}
+                          className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                        />
+                        <label htmlFor="enterToReset" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                          {t('launchModal:enterToReset')}
+                          <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:enterToResetHint')}</span>
+                        </label>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          id="autoResetTeam"
+                          checked={config.autoResetTeam}
+                          onChange={(e) => setConfig({ ...config, autoResetTeam: e.target.checked })}
+                          className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                        />
+                        <label htmlFor="autoResetTeam" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                          {t('launchModal:autoResetPage')}
+                          <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:autoResetPageHint')}</span>
+                        </label>
+                        <HelpDot topic="launch.auto-reset" />
+                      </div>
+                      {config.autoResetTeam && (
+                        <div className="ml-8 space-y-2">
+                          <label htmlFor="delayBeforeReset" className="pg-label">
+                            {t('launchModal:delayBeforeReset')}
+                          </label>
+                          <input
+                            type="number"
+                            id="delayBeforeReset"
+                            min="0"
+                            value={config.delayBeforeReset}
+                            onChange={(e) => setConfig({ ...config, delayBeforeReset: parseInt(e.target.value) || 0 })}
+                            className="pg-input"
+                            required
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Autres - Mystery groups colourblind + malus under a heading;
+                      other game types keep these flat. */}
+                  {isMystery ? (
+                    <div className="space-y-3 pt-3 border-t border-[var(--pg-line)]">
+                      <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:advOther')}</div>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          id="colorblindMode"
+                          checked={config.colorblindMode}
+                          onChange={(e) => setConfig({ ...config, colorblindMode: e.target.checked })}
+                          className="w-5 h-5 accent-[var(--pg-accent)]"
+                        />
+                        <label htmlFor="colorblindMode" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                          {t('launchModal:colorblindMode')}
+                        </label>
+                      </div>
+                      <div className="space-y-2">
+                        <label htmlFor="mysteryMalusPerMinute" className="pg-label">
+                          {t('launchModal:malusPerMinute')}
+                        </label>
+                        <input
+                          type="number"
+                          id="mysteryMalusPerMinute"
+                          min={0}
+                          value={config.malusPerMinute ?? 0}
+                          onChange={(e) =>
+                            setConfig({ ...config, malusPerMinute: Math.max(0, parseInt(e.target.value) || 0) })
+                          }
+                          className="pg-input"
+                        />
+                        <p className="text-xs text-[var(--pg-text-dim)]">
+                          {t('launchModal:malusPerMinuteHint')}
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          id="colorblindMode"
+                          checked={config.colorblindMode}
+                          onChange={(e) => setConfig({ ...config, colorblindMode: e.target.checked })}
+                          className="w-5 h-5 accent-[var(--pg-accent)]"
+                        />
+                        <label htmlFor="colorblindMode" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                          {t('launchModal:colorblindMode')}
+                        </label>
+                      </div>
+
+                      {isTagQuest && (
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id="tagquestShowQuestPreview"
+                            checked={config.tagquestShowQuestPreview ?? true}
+                            onChange={(e) => setConfig({ ...config, tagquestShowQuestPreview: e.target.checked })}
+                            className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                          />
+                          <label htmlFor="tagquestShowQuestPreview" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                            {t('launchModal:showQuestPreview')}
+                            <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:showQuestPreviewHint')}</span>
+                          </label>
+                        </div>
+                      )}
+
+                      {/* Effectif weighting only changes anything with a score
+                          victory in team mode (speed ranks by time; solo teams
+                          all weigh 1), so it's hidden elsewhere. */}
+                      {isTagQuest && config.victoryType === 'score' && config.playMode === 'team' && (
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id="tagquestScoreWeighting"
+                            checked={config.tagquestScoreWeighting ?? true}
+                            onChange={(e) => setConfig({ ...config, tagquestScoreWeighting: e.target.checked })}
+                            className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                          />
+                          <label htmlFor="tagquestScoreWeighting" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                            {t('launchModal:scoreWeighting')}
+                            <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:scoreWeightingHint')}</span>
+                          </label>
+                        </div>
+                      )}
+
+                      {isTagQuest && (
+                        <div className="space-y-2">
+                          <label className="pg-label">
+                            {t('launchModal:keepResultOnScreen')}
+                          </label>
+                          <div className="flex items-center gap-2 text-sm text-[var(--pg-text-muted)]">
+                            <input
+                              type="number"
+                              min={0}
+                              max={60}
+                              value={config.visibilityHideDelaySec ?? 10}
+                              onChange={(e) =>
+                                setConfig({
+                                  ...config,
+                                  visibilityHideDelaySec: Math.max(0, parseInt(e.target.value) || 0),
+                                })
+                              }
+                              className="pg-input !w-16 !px-2 !py-0.5 text-sm"
+                            />
+                            {t('launchModal:seconds')}
+                          </div>
+                          <p className="text-xs text-[var(--pg-text-dim)]">
+                            {t('launchModal:keepResultOnScreenHint')}
+                          </p>
+                        </div>
+                      )}
+
+                      {isTracks && (
+                        <div className="space-y-2">
+                          <label htmlFor="malusPerMinute" className="pg-label">
+                            {t('launchModal:malusPerMinute')}
+                          </label>
+                          <input
+                            type="number"
+                            id="malusPerMinute"
+                            min={0}
+                            value={config.malusPerMinute ?? tracksOptions.defaultMalus}
+                            onChange={(e) =>
+                              setConfig({ ...config, malusPerMinute: Math.max(0, parseInt(e.target.value) || 0) })
+                            }
+                            className="pg-input"
+                          />
+                          <p className="text-xs text-[var(--pg-text-dim)]">
+                            {t('launchModal:malusPerMinuteHint')}
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  <div className="flex items-center gap-3 pt-1 border-t border-[var(--pg-line)]">
+                    <input
+                      type="checkbox"
+                      id="testMode"
+                      checked={config.testMode ?? false}
+                      onChange={(e) => {
+                        const enabled = e.target.checked;
+                        setConfig(prev => ({
+                          ...prev,
+                          testMode: enabled,
+                          numberOfTeams: enabled ? Math.min(prev.numberOfTeams, 5) : prev.numberOfTeams,
+                        }));
+                      }}
+                      className="w-5 h-5 accent-amber-500"
+                    />
+                    <label htmlFor="testMode" className="text-sm font-medium text-amber-400">
+                      {t('launchModal:testMode')}
+                      <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:testModeHint')}</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+            </div>
+
+          {/* Import a fixed team list for a dynamic-team game. Mystery (and
+              auto/self-register Tracks) normally skip the roster step, so this
+              lets the operator switch to a fixed roster and import it. */}
+          {!isClash && (config.autoRegisterTeam || config.selfRegisterTeam) && (
+            <button
+              type="button"
+              onClick={goToManualRosterStep}
+              className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5 self-start"
+            >
+              <Upload size={16} />
+              {t('launchModal:importRoster')}
+            </button>
+          )}
+
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-[var(--pg-line)]">
+            {/* Save-configuration control - persists step-1 settings as a named,
                 scenario-assigned preset. Does NOT launch or advance. */}
             <div className="flex items-center gap-2 flex-wrap">
               {!showSaveField ? (
                 <button
                   type="button"
                   onClick={() => setShowSaveField(true)}
-                  className="px-4 py-2 text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition font-medium flex items-center gap-2 text-sm"
+                  className="pg-btn pg-btn--ghost pg-btn--sm flex items-center gap-2"
                 >
                   <Save size={16} />
-                  Save configuration
+                  {t('launchModal:saveConfiguration')}
                 </button>
               ) : (
                 <>
@@ -1479,7 +3017,7 @@ export function LaunchGameModal({
                     type="text"
                     value={configName}
                     onChange={(e) => setConfigName(e.target.value)}
-                    placeholder="Configuration name"
+                    placeholder={t('launchModal:configurationName')}
                     autoFocus
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
@@ -1487,19 +3025,19 @@ export function LaunchGameModal({
                         void handleSaveConfigClick();
                       }
                     }}
-                    className="px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    className="pg-input !w-auto text-sm"
                   />
                   <button
                     type="button"
                     onClick={() => void handleSaveConfigClick()}
                     disabled={!configName.trim() || savePending}
-                    className="px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-lg transition font-medium flex items-center gap-2 text-sm"
+                    className="pg-btn pg-btn--sm flex items-center gap-2"
                   >
                     <Save size={16} />
-                    {savePending ? 'Saving…' : 'Save'}
+                    {savePending ? t('launchModal:saving') : t('launchModal:save')}
                   </button>
                   {savedFlash && (
-                    <span className="text-sm text-green-400">Saved “{savedFlash}”</span>
+                    <span className="text-sm text-green-400">{t('launchModal:savedFlash', { name: savedFlash })}</span>
                   )}
                 </>
               )}
@@ -1508,15 +3046,15 @@ export function LaunchGameModal({
               <button
                 type="button"
                 onClick={onClose}
-                className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
+                className="pg-btn pg-btn--ghost"
               >
-                Cancel
+                {t('launchModal:cancel')}
               </button>
               <button
                 type="submit"
-                className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium flex items-center gap-2"
+                className="pg-btn pg-btn--primary flex items-center gap-2"
               >
-                Next
+                {t('launchModal:next')}
                 <ChevronRight size={20} />
               </button>
             </div>
@@ -1527,39 +3065,139 @@ export function LaunchGameModal({
           {step === 2 && (
             <>
               <div className="space-y-4">
-                <h3 className="text-xl font-semibold text-white border-b border-slate-700 pb-2">Configure Teams</h3>
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--pg-line)] pb-2">
+                  <h3 className="text-xl font-semibold text-[var(--pg-text)]">{t('launchModal:configureTeams')}</h3>
+                  <div className="flex items-center gap-2">
+                    {poolNames.length > 0 && teams.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setTeams(prev => applyPoolNames(prev))}
+                        className="pg-btn pg-btn--ghost text-sm"
+                      >
+                        🎲 {t('launchModal:fillFromNamePool')}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => rosterFileInputRef.current?.click()}
+                      className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
+                    >
+                      <Upload size={16} />
+                      {t('launchModal:importRoster')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => downloadImportTemplate(teamImportMode)}
+                      className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
+                      title={t('launchModal:downloadTemplate')}
+                    >
+                      <FileDown size={16} />
+                    </button>
+                  </div>
+                </div>
+                <input
+                  ref={rosterFileInputRef}
+                  type="file"
+                  accept=".csv,.xls,.xlsx"
+                  onChange={handleRosterFileChange}
+                  className="hidden"
+                />
+                {importError && (
+                  <div className="px-4 py-3 rounded-[var(--pg-radius-md)] text-sm bg-[var(--pg-danger-soft,#3d1620)] text-[var(--pg-danger,#f87171)]">
+                    {importError}
+                  </div>
+                )}
+
+                {/* Mass-start Mystery/Tracks: register the roster before launch.
+                    The team count + first-chip index live here (not on step 1)
+                    and rebuild the roster below on change. */}
+                {(isMystery || isTracks) && config.massStart && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+                    <div className="space-y-2">
+                      <label htmlFor="massNumberOfTeams" className="pg-label">
+                        {t('launchModal:numberOfTeams')}
+                        {totalMaxTeams !== undefined && (
+                          <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                            {t('launchModal:maxCount', { max: totalMaxTeams })}
+                          </span>
+                        )}
+                      </label>
+                      <input
+                        type="number"
+                        id="massNumberOfTeams"
+                        min="1"
+                        max={config.testMode ? Math.min(maxTeams ?? 5, 5) : maxTeams}
+                        value={config.numberOfTeams}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value) || 1;
+                          const effectiveMax = config.testMode ? Math.min(maxTeams ?? 5, 5) : maxTeams;
+                          const clampedTeams = effectiveMax !== undefined ? Math.min(val, effectiveMax) : val;
+                          const clampedFirst = maxTeams !== undefined
+                            ? Math.min(config.firstChipIndex, maxTeams - clampedTeams)
+                            : config.firstChipIndex;
+                          rebuildRosterFromCounts({ numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
+                        }}
+                        className="pg-input"
+                        required
+                      />
+                      {maxTeams !== undefined && config.numberOfTeams > maxTeams && (
+                        <p className="text-xs text-red-400">{t('launchModal:exceedsAvailableCards', { max: maxTeams })}</p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <label htmlFor="massFirstChipIndex" className="pg-label">
+                        {t('launchModal:indexOfFirstChip')}
+                      </label>
+                      <input
+                        type="number"
+                        id="massFirstChipIndex"
+                        min="0"
+                        {...(maxFirstChipIndex !== undefined ? { max: maxFirstChipIndex } : {})}
+                        value={config.firstChipIndex}
+                        onChange={(e) => {
+                          let val = parseInt(e.target.value) || 0;
+                          if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
+                          rebuildRosterFromCounts({ firstChipIndex: val });
+                        }}
+                        className="pg-input"
+                        required
+                      />
+                    </div>
+                  </div>
+                )}
+
                 <div className="space-y-4">
                   {teams.map((team, teamIndex) => {
                     const usedInGame = allUsedTeammateChipIds();
 
                     if (isTeamMode && team.teammates && team.teammates.length > 0) {
                       return (
-                        <div key={teamIndex} className="bg-slate-800/50 rounded-xl border border-slate-700/60 overflow-hidden">
-                          <div className="flex items-center gap-3 px-4 py-3 bg-slate-700/40 border-b border-slate-700/60">
-                            <div className="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
+                        <div key={teamIndex} className="bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-lg)] border border-[var(--pg-line)] overflow-hidden">
+                          <div className="flex items-center gap-3 px-4 py-3 bg-[var(--pg-surface-3)] border-b border-[var(--pg-line)]">
+                            <div className="w-8 h-8 bg-[var(--pg-accent)] rounded-full flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
                               {teamIndex + 1}
                             </div>
                             <input
                               type="text"
                               value={team.name}
                               onChange={(e) => updateTeamName(teamIndex, e.target.value)}
-                              className="flex-1 px-3 py-1.5 bg-slate-800 border border-slate-600 rounded-lg text-white text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                              placeholder="Team name"
+                              className="pg-input flex-1 !py-1.5 text-sm font-semibold"
+                              placeholder={t('launchModal:teamNamePlaceholder')}
                               required
                             />
                           </div>
-                          <div className="divide-y divide-slate-700/40">
+                          <div className="divide-y divide-[var(--pg-line)]">
                             {team.teammates.map((mate, mateIndex) => {
                               return (
                                 <div key={mateIndex} className="flex items-center gap-3 px-4 py-3">
-                                  <div className="w-6 h-6 rounded-full bg-slate-600 flex items-center justify-center text-slate-300 text-xs font-medium flex-shrink-0">
+                                  <div className="w-6 h-6 rounded-full bg-[var(--pg-surface-3)] flex items-center justify-center text-[var(--pg-text-muted)] text-xs font-medium flex-shrink-0">
                                     {mateIndex + 1}
                                   </div>
                                   <div className="flex-shrink-0 min-w-[180px]">
                                     <select
                                       value={mate.chipId}
                                       onChange={(e) => updateTeammateChip(teamIndex, mateIndex, parseInt(e.target.value))}
-                                      className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                      className="pg-select !py-1.5 text-xs"
                                       required
                                     >
                                       {allChips.map(chip => {
@@ -1568,7 +3206,7 @@ export function LaunchGameModal({
                                         const isDisabled = isUsedHere || isUsedInOtherGame;
                                         return (
                                           <option key={chip.id} value={chip.id} disabled={isDisabled}>
-                                            Chip #{chip.key_number} - {chip.key_name}{isDisabled ? ' (In use)' : ''}
+                                            {t('launchModal:chipOption', { number: chip.key_number, name: chip.key_name })}{isDisabled ? t('launchModal:chipInUseSuffix') : ''}
                                           </option>
                                         );
                                       })}
@@ -1579,8 +3217,8 @@ export function LaunchGameModal({
                                       type="text"
                                       value={mate.name}
                                       onChange={(e) => updateTeammateName(teamIndex, mateIndex, e.target.value)}
-                                      className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                      placeholder={`Teammate ${mateIndex + 1} name`}
+                                      className="pg-input !py-1.5 text-sm"
+                                      placeholder={t('launchModal:teammateNamePlaceholder', { index: mateIndex + 1 })}
                                       required
                                     />
                                   </div>
@@ -1593,9 +3231,9 @@ export function LaunchGameModal({
                     }
 
                     return (
-                      <div key={teamIndex} className="flex items-center gap-4 p-4 bg-slate-800/50 rounded-lg">
+                      <div key={teamIndex} className="flex items-center gap-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
                         <div className="flex-shrink-0">
-                          <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center text-white font-bold">
+                          <div className="w-10 h-10 bg-[var(--pg-accent)] rounded-full flex items-center justify-center text-white font-bold">
                             {teamIndex + 1}
                           </div>
                         </div>
@@ -1603,7 +3241,7 @@ export function LaunchGameModal({
                           <select
                             value={team.chipId}
                             onChange={(e) => updateTeamChip(teamIndex, parseInt(e.target.value))}
-                            className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                            className="pg-select text-sm"
                             required
                           >
                             {allChips.map(chip => {
@@ -1612,7 +3250,7 @@ export function LaunchGameModal({
                               const isDisabled = isUsedInCurrentGame || isUsedInOtherGame;
                               return (
                                 <option key={chip.id} value={chip.id} disabled={isDisabled}>
-                                  Chip #{chip.key_number} - {chip.key_name}{isDisabled ? ' (In use)' : ''}
+                                  {t('launchModal:chipOption', { number: chip.key_number, name: chip.key_name })}{isDisabled ? t('launchModal:chipInUseSuffix') : ''}
                                 </option>
                               );
                             })}
@@ -1623,39 +3261,73 @@ export function LaunchGameModal({
                             type="text"
                             value={team.name}
                             onChange={(e) => updateTeamName(teamIndex, e.target.value)}
-                            className="w-full px-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                            placeholder="Team name"
+                            className="pg-input"
+                            placeholder={t('launchModal:teamNamePlaceholder')}
                             required
                           />
                         </div>
+                        {/* Per-team route - tracks multi-route launch only. Defaults
+                            to the in-order assignment (cycling), operator-overridable. */}
+                        {multipleRoutes && (
+                          <div className="flex-shrink-0 min-w-[160px]">
+                            <select
+                              value={team.route ?? (config.routes ?? [])[teamIndex % (config.routes?.length || 1)] ?? ''}
+                              onChange={(e) => updateTeamRoute(teamIndex, e.target.value)}
+                              className="pg-select text-sm"
+                              title={t('launchModal:teamRoute')}
+                            >
+                              {(config.routes ?? []).map((k) => (
+                                <option key={k} value={k}>
+                                  {TRACKS_ROUTE_LABELS[k] ? t(TRACKS_ROUTE_LABELS[k]) : k}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                        {/* Per-team display language - only when the scenario ships
+                            2+ languages (mystery/tracks). Defaults to the launch language. */}
+                        {supportsDynamicTeams && scenarioLanguages.length >= 2 && (
+                          <div className="flex-shrink-0 min-w-[140px]">
+                            <select
+                              value={team.language ?? config.language ?? scenarioDefaultLang}
+                              onChange={(e) => updateTeamLanguage(teamIndex, e.target.value)}
+                              className="pg-select text-sm"
+                              title={t('launchModal:teamLanguage')}
+                            >
+                              {scenarioLanguages.map((lng) => (
+                                <option key={lng} value={lng}>{LANG_NAMES[lng] || lng}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-700">
+              <div className="flex items-center justify-between gap-4 pt-4 border-t border-[var(--pg-line)]">
                 <button
                   type="button"
                   onClick={() => setStep(1)}
-                  className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium flex items-center gap-2"
+                  className="pg-btn pg-btn--ghost flex items-center gap-2"
                 >
                   <ChevronLeft size={20} />
-                  Back
+                  {t('launchModal:back')}
                 </button>
                 <div className="flex items-center gap-4">
                   <button
                     type="button"
                     onClick={onClose}
-                    className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
+                    className="pg-btn pg-btn--ghost"
                   >
-                    Cancel
+                    {t('launchModal:cancel')}
                   </button>
                   <button
                     type="submit"
-                    className="px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium flex items-center gap-2"
+                    className="pg-btn pg-btn--primary flex items-center gap-2"
                   >
-                    Next
+                    {t('launchModal:next')}
                     <ChevronRight size={20} />
                   </button>
                 </div>
@@ -1666,62 +3338,128 @@ export function LaunchGameModal({
           {step === 3 && (
             <>
               <div>
-                <h3 className="text-lg font-semibold text-white mb-1">
-                  Devices to launch on
+                <h3 className="text-lg font-semibold text-[var(--pg-text)] mb-1">
+                  {t('launchModal:devicesToLaunchOn')}
                 </h3>
-                <p className="text-sm text-slate-400 mb-4">
-                  Pick which paired devices should run this game. Online devices
-                  join within ~10s; offline devices receive the launch when they
-                  reconnect (within 15 minutes).
+                <p className="text-sm text-[var(--pg-text-dim)] mb-4">
+                  {t('launchModal:devicesToLaunchOnHint')}
                 </p>
+                {regAssignEnabled && regTeamDefs.length > 0 && (
+                  <div className="mb-4 p-3 rounded-[var(--pg-radius-md)] bg-[var(--pg-surface-2)] border border-[var(--pg-line)]">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="font-medium text-[var(--pg-text)]">
+                          {t('launchModal:regAssignToggleLabel')}
+                        </div>
+                        <div className="text-sm text-[var(--pg-text-dim)]">
+                          {t('launchModal:regAssignToggleDesc')}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={regAssignActive}
+                        onClick={() => setRegAssignActive((v) => !v)}
+                        className={`relative inline-flex h-7 w-14 shrink-0 items-center rounded-full transition-colors ${
+                          regAssignActive ? 'bg-[var(--pg-accent)]' : 'bg-[var(--pg-surface-3)]'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 shrink-0 transform rounded-full bg-white transition-transform ${
+                            regAssignActive ? 'translate-x-8' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                    {regAssignOn && (
+                      <p className="mt-2 text-sm text-[var(--pg-text-muted)]">
+                        {t('launchModal:regAssignHint')}
+                      </p>
+                    )}
+                  </div>
+                )}
                 {pairedLoading ? (
-                  <p className="text-slate-400 text-sm">Loading paired devices…</p>
+                  <p className="text-[var(--pg-text-dim)] text-sm">{t('launchModal:loadingPairedDevices')}</p>
                 ) : (
                   <div className="space-y-2">
-                    {/* Mother row — always rendered, defaults checked, but
-                        unchecking is allowed so the operator can launch a
-                        "server-only" mother that doesn't participate. */}
-                    <label className="flex items-center gap-3 p-3 bg-slate-800 border border-slate-700 rounded-lg cursor-pointer hover:bg-slate-700/50">
+                    {(() => {
+                      const selfRow = pairedDevices.find((r) => r.is_self);
+                      const selfBusy = !!(selfRow && busyDeviceIds.has(selfRow.id));
+                      return (
+                    /* Mother row - defaults checked so this device participates,
+                       but unchecking is allowed (launch a "server-only" mother).
+                       When this device is already running a game it can't also
+                       run this one, so participation is forced off + disabled -
+                       the operator can still launch it onto free devices. */
+                    <div className={`bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] ${selfBusy || operatorOnly ? 'opacity-70' : ''}`}>
+                    <label className={`flex items-center gap-3 p-3 ${selfBusy || operatorOnly ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'}`}>
                       <input
                         type="checkbox"
-                        checked={motherChecked}
+                        checked={motherChecked && !selfBusy && !operatorOnly}
+                        disabled={selfBusy || operatorOnly}
                         onChange={(e) => setMotherChecked(e.target.checked)}
-                        className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                        className="w-4 h-4 accent-[var(--pg-accent)] disabled:opacity-50"
                       />
-                      <span className="flex-1 text-white font-medium">
-                        This device <span className="text-xs text-slate-500">(mother)</span>
+                      <span className="flex-1 text-[var(--pg-text)] font-medium">
+                        {t('launchModal:thisDevice')} <span className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:motherTag')}</span>
                       </span>
-                      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-400">
-                        <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
-                        online
-                      </span>
-                      {!motherChecked && (
+                      {operatorOnly ? (
+                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-blue-500/10 text-blue-300">
+                          {t('launchModal:operatorOnlyTag')}
+                        </span>
+                      ) : selfBusy ? (
+                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-amber-500/10 text-amber-400">
+                          {t('launchModal:deviceBusy')}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-green-500/10 text-green-400">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                          {t('launchModal:online')}
+                        </span>
+                      )}
+                      {operatorOnly ? (
+                        <span className="text-xs text-blue-300 italic">
+                          {t('launchModal:operatorOnlyHostHint')}
+                        </span>
+                      ) : !motherChecked && !selfBusy && (
                         <span className="text-xs text-amber-400 italic">
-                          will host the game without participating
+                          {t('launchModal:motherHostOnly')}
                         </span>
                       )}
                     </label>
+                    {motherChecked && !selfBusy && !operatorOnly && selfRow &&
+                      renderRegAssignRow(selfRow.id)}
+                    </div>
+                      );
+                    })()}
 
                     {/* Paired (non-self) devices */}
                     {pairedDevices.filter(d => !d.is_self).length === 0 ? (
-                      <p className="text-sm text-slate-500 italic px-1 mt-2">
-                        No other paired devices.
+                      <p className="text-sm text-[var(--pg-text-dim)] italic px-1 mt-2">
+                        {t('launchModal:noOtherPairedDevices')}
                       </p>
                     ) : (
                       pairedDevices
                         .filter(d => !d.is_self)
                         .map(device => {
-                          const checked = selectedDeviceIds.has(device.id);
+                          const busy = busyDeviceIds.has(device.id);
+                          const checked = selectedDeviceIds.has(device.id) && !busy;
                           return (
-                            <label
+                            <div
                               key={device.id}
-                              className={`flex items-center gap-3 p-3 bg-slate-800 border rounded-lg cursor-pointer hover:bg-slate-700/50 ${
-                                device.online ? 'border-slate-700' : 'border-slate-700/50 opacity-70'
+                              className={`bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] ${
+                                busy || !device.online ? 'opacity-70' : ''
+                              }`}
+                            >
+                            <label
+                              className={`flex items-center gap-3 p-3 ${
+                                busy ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'
                               }`}
                             >
                               <input
                                 type="checkbox"
                                 checked={checked}
+                                disabled={busy}
                                 onChange={(e) => {
                                   setSelectedDeviceIds(prev => {
                                     const next = new Set(prev);
@@ -1730,41 +3468,53 @@ export function LaunchGameModal({
                                     return next;
                                   });
                                 }}
-                                className="w-4 h-4 bg-slate-700 border-slate-600 rounded text-blue-600 focus:ring-2 focus:ring-blue-500"
+                                className="w-4 h-4 accent-[var(--pg-accent)] disabled:opacity-50"
                               />
                               <div className="flex-1 min-w-0">
-                                <div className="text-white font-medium truncate">
-                                  {device.device_label}
+                                <div className="text-[var(--pg-text)] font-medium truncate">
+                                  {displayDeviceLabel(device.device_label) || t('devicesModal:unknownDevice')}
                                 </div>
                                 {device.peer_os && (
-                                  <div className="text-xs text-slate-500 truncate">{device.peer_os}</div>
+                                  <div className="text-xs text-[var(--pg-text-dim)] truncate">{device.peer_os}</div>
                                 )}
                               </div>
-                              <span
-                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${
-                                  device.has_reader
-                                    ? 'bg-green-500/10 text-green-400'
-                                    : 'bg-slate-700/50 text-slate-500'
-                                }`}
-                              >
-                                <Usb size={12} />
-                                {device.has_reader ? 'reader' : 'no reader'}
-                              </span>
+                              {busy && (
+                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-amber-500/10 text-amber-400">
+                                  {t('launchModal:deviceBusy')}
+                                </span>
+                              )}
+                              {/* Reader state is only knowable while the device
+                                  is online (it self-reports on ping) - an
+                                  offline row's flag is stale, so show nothing. */}
+                              {device.online && (
+                                <span
+                                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${
+                                    device.has_reader
+                                      ? 'bg-green-500/10 text-green-400'
+                                      : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)]'
+                                  }`}
+                                >
+                                  <Usb size={12} />
+                                  {device.has_reader ? t('launchModal:reader') : t('launchModal:noReader')}
+                                </span>
+                              )}
                               <span
                                 className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs ${
                                   device.online
                                     ? 'bg-green-500/10 text-green-400'
-                                    : 'bg-slate-700/50 text-slate-500'
+                                    : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)]'
                                 }`}
                               >
                                 <span
                                   className={`w-1.5 h-1.5 rounded-full ${
-                                    device.online ? 'bg-green-500' : 'bg-slate-500'
+                                    device.online ? 'bg-green-500' : 'bg-[var(--pg-text-dim)]'
                                   }`}
                                 />
-                                {device.online ? 'online' : 'offline'}
+                                {device.online ? t('launchModal:online') : t('launchModal:offline')}
                               </span>
                             </label>
+                            {checked && renderRegAssignRow(device.id)}
+                            </div>
                           );
                         })
                     )}
@@ -1772,29 +3522,29 @@ export function LaunchGameModal({
                 )}
               </div>
 
-              <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-700">
+              <div className="flex items-center justify-between gap-4 pt-4 border-t border-[var(--pg-line)]">
                 <button
                   type="button"
-                  onClick={() => setStep(config.autoRegisterTeam || config.selfRegisterTeam ? 1 : 2)}
-                  className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium flex items-center gap-2"
+                  onClick={() => setStep(skipsRosterStep ? 1 : 2)}
+                  className="pg-btn pg-btn--ghost flex items-center gap-2"
                 >
                   <ChevronLeft size={20} />
-                  Back
+                  {t('launchModal:back')}
                 </button>
                 <div className="flex items-center gap-4">
                   <button
                     type="button"
                     onClick={onClose}
-                    className="px-6 py-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition font-medium"
+                    className="pg-btn pg-btn--ghost"
                   >
-                    Cancel
+                    {t('launchModal:cancel')}
                   </button>
                   <button
                     type="submit"
                     disabled={!motherChecked && selectedDeviceIds.size === 0}
-                    className="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg transition font-medium"
+                    className="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-[var(--pg-surface-3)] disabled:text-[var(--pg-text-dim)] text-white rounded-[var(--pg-radius-md)] transition font-medium"
                   >
-                    Launch on {(motherChecked ? 1 : 0) + selectedDeviceIds.size} device{(motherChecked ? 1 : 0) + selectedDeviceIds.size === 1 ? '' : 's'}
+                    {t('launchModal:launchOnDevices', { count: (motherChecked ? 1 : 0) + selectedDeviceIds.size })}
                   </button>
                 </div>
               </div>
@@ -1807,11 +3557,19 @@ export function LaunchGameModal({
         isOpen={overwriteConfirm !== null}
         onConfirm={() => overwriteConfirm && void performSaveConfig(overwriteConfirm)}
         onCancel={() => setOverwriteConfirm(null)}
-        title="Replace configuration"
-        message={`A configuration named “${overwriteConfirm}” already exists for this scenario. Replace it?`}
-        confirmText="Replace"
-        cancelText="Cancel"
+        title={t('launchModal:replaceConfigTitle')}
+        message={t('launchModal:replaceConfigMessage', { name: overwriteConfirm })}
+        confirmText={t('launchModal:replace')}
+        cancelText={t('launchModal:cancel')}
         variant="warning"
+      />
+
+      <RosterImportModal
+        isOpen={importResult !== null}
+        result={importResult}
+        capacityWarnings={clashCapacityWarnings}
+        onApply={applyRosterImport}
+        onCancel={() => setImportResult(null)}
       />
     </div>
   );

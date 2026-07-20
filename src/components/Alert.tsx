@@ -1,5 +1,6 @@
 import { AlertCircle, CheckCircle, X } from 'lucide-react';
 import { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface AlertProps {
   type: 'success' | 'error';
@@ -8,6 +9,7 @@ interface AlertProps {
 }
 
 export function Alert({ type, message, onClose }: AlertProps) {
+  const { t } = useTranslation();
   useEffect(() => {
     const timer = setTimeout(() => {
       onClose();
@@ -35,7 +37,7 @@ export function Alert({ type, message, onClose }: AlertProps) {
           )}
           <div className="flex-1">
             <h4 className="font-semibold mb-1">
-              {isSuccess ? 'Success' : 'Error'}
+              {isSuccess ? t('dialogs:success') : t('dialogs:error')}
             </h4>
             <p className="text-sm opacity-90">{message}</p>
           </div>

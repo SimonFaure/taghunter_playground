@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
-import { CreditCard, RefreshCw, Package, Layers, Trash2, ChevronDown, ChevronRight } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { CreditCard, RefreshCw, Package, Layers, Trash2, ChevronDown, ChevronRight, Upload } from 'lucide-react';
 import * as patternStore from '../services/patternStore';
 import { runCycleNow, getState } from '../services/syncOrchestrator';
 import { on } from '../services/syncEvents';
 import { useAuth } from './auth/AuthProvider';
 import { CardsManager } from './cards/CardsManager';
-import { HelpButton } from '../help';
+import { ConfirmDialog } from './ConfirmDialog';
 
 // Cards & patterns overview for the currently-authenticated client. Layout
 // mirrors ConfigurationPage: a left sidebar with tab buttons + a main panel
@@ -15,13 +16,17 @@ import { HelpButton } from '../help';
 
 type CardsTab = 'cards' | 'patterns';
 
-export default function ClientCardsPage() {
+export default function ClientCardsPage({ embedded = false }: { embedded?: boolean } = {}) {
+  const { t } = useTranslation();
   const { user } = useAuth();
   const [activeTab, setActiveTab] = useState<CardsTab>('cards');
   const [defaultPatterns, setDefaultPatterns] = useState<patternStore.PatternRow[]>([]);
   const [customPatterns, setCustomPatterns] = useState<patternStore.PatternRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
     if (!user) return;
@@ -65,22 +70,55 @@ export default function ClientCardsPage() {
     [refresh]
   );
 
+  const handlePatternFile = useCallback(
+    async (file: File) => {
+      setImporting(true);
+      setImportMsg(null);
+      try {
+        const { parsePatternFile } = await import('../services/patternImport');
+        const parsed = await parsePatternFile(file);
+        await patternStore.importLocal(parsed, new Date().toISOString());
+        setImportMsg({ type: 'success', text: t('cards:importPatternOk', { name: parsed.name }) });
+        await refresh();
+      } catch (err) {
+        setImportMsg({
+          type: 'error',
+          text: err instanceof Error ? err.message : t('cards:importPatternFailed'),
+        });
+      } finally {
+        setImporting(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+    },
+    [refresh, t]
+  );
+
+  const onPatternFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) void handlePatternFile(file);
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white py-8">
-      <div className="container mx-auto px-6">
+    <div
+      className={
+        embedded
+          ? 'text-[var(--pg-text)]'
+          : 'min-h-screen pg-app-bg text-[var(--pg-text)] py-8'
+      }
+    >
+      <div className={embedded ? '' : 'container mx-auto px-6'}>
         <div className="flex items-center justify-between mb-8">
           <div className="flex items-center gap-3">
-            <CreditCard className="text-blue-400" size={32} />
-            <h1 className="text-3xl font-bold">Cards &amp; Patterns</h1>
-            <HelpButton chapter="cards" className="ml-1 text-slate-400 hover:text-slate-200" />
+            <CreditCard className="text-[var(--pg-accent-bright)]" size={32} />
+            <h1 className="text-3xl font-bold">{t('cards:title')}</h1>
           </div>
           <button
             onClick={handleSync}
             disabled={syncing || getState().cycleInFlight}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
+            className="pg-btn pg-btn--primary disabled:opacity-50"
           >
             <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
-            <span>Sync now</span>
+            <span>{t('cards:syncNow')}</span>
           </button>
         </div>
 
@@ -94,24 +132,52 @@ export default function ClientCardsPage() {
 
             {activeTab === 'patterns' && (
               <>
+                <div className="flex items-center justify-end mb-4">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,.xls,.xlsx"
+                    onChange={onPatternFileChange}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={importing}
+                    className="pg-btn pg-btn--primary disabled:opacity-50"
+                  >
+                    <Upload className={`w-4 h-4 ${importing ? 'animate-pulse' : ''}`} />
+                    <span>{importing ? t('cards:importPatternBusy') : t('cards:importPattern')}</span>
+                  </button>
+                </div>
+                {importMsg && (
+                  <div
+                    className={`mb-4 px-4 py-3 rounded-[var(--pg-radius-md)] text-sm ${
+                      importMsg.type === 'success'
+                        ? 'bg-[var(--pg-success-soft,#0f3d2e)] text-[var(--pg-success,#34d399)]'
+                        : 'bg-[var(--pg-danger-soft,#3d1620)] text-[var(--pg-danger,#f87171)]'
+                    }`}
+                  >
+                    {importMsg.text}
+                  </div>
+                )}
                 {loading ? (
-                  <Section icon={<Package className="text-blue-400" size={24} />} title="Patterns">
+                  <Section icon={<Package className="text-[var(--pg-accent-bright)]" size={24} />} title={t('cards:patterns')}>
                     <div className="flex items-center justify-center py-10">
-                      <RefreshCw className="w-8 h-8 text-slate-400 animate-spin" />
+                      <RefreshCw className="w-8 h-8 text-[var(--pg-text-dim)] animate-spin" />
                     </div>
                   </Section>
                 ) : (
                   <>
                     <PatternSection
-                      title="Default Patterns"
+                      title={t('cards:defaultPatterns')}
                       rows={defaultPatterns}
-                      icon={<Package className="text-blue-400" size={24} />}
+                      icon={<Package className="text-[var(--pg-accent-bright)]" size={24} />}
                       onDelete={handleDeletePattern}
                     />
                     <PatternSection
-                      title="Custom Patterns"
+                      title={t('cards:customPatterns')}
                       rows={customPatterns}
-                      icon={<Layers className="text-blue-400" size={24} />}
+                      icon={<Layers className="text-[var(--pg-accent-bright)]" size={24} />}
                       onDelete={handleDeletePattern}
                     />
                   </>
@@ -126,14 +192,15 @@ export default function ClientCardsPage() {
 }
 
 function CardsNav({ active, onChange }: { active: CardsTab; onChange: (tab: CardsTab) => void }) {
+  const { t } = useTranslation();
   const items: { tab: CardsTab; label: string; icon: React.ReactNode }[] = [
-    { tab: 'cards', label: 'Cards', icon: <CreditCard size={16} /> },
-    { tab: 'patterns', label: 'Patterns', icon: <Layers size={16} /> },
+    { tab: 'cards', label: t('cards:navCards'), icon: <CreditCard size={16} /> },
+    { tab: 'patterns', label: t('cards:navPatterns'), icon: <Layers size={16} /> },
   ];
   return (
     <nav className="space-y-6 sticky top-24">
       <div>
-        <div className="text-xs uppercase tracking-wider text-slate-500 px-3 mb-2">Content</div>
+        <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)] px-3 mb-2">{t('cards:content')}</div>
         <div className="space-y-1">
           {items.map((item) => {
             const isActive = active === item.tab;
@@ -141,8 +208,8 @@ function CardsNav({ active, onChange }: { active: CardsTab; onChange: (tab: Card
               <button
                 key={item.tab}
                 onClick={() => onChange(item.tab)}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg transition text-left text-sm ${
-                  isActive ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-slate-700/60'
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-[var(--pg-radius-md)] transition text-left text-sm ${
+                  isActive ? 'bg-[var(--pg-accent)] text-[var(--pg-text)]' : 'text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)]'
                 }`}
               >
                 {item.icon}
@@ -168,7 +235,7 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <div className="bg-slate-800/50 rounded-lg p-6 mb-6">
+    <div className="pg-panel p-6 mb-6">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
           {icon}
@@ -192,13 +259,14 @@ function PatternSection({
   icon: React.ReactNode;
   onDelete: (uniqid: string) => void | Promise<void>;
 }) {
+  const { t } = useTranslation();
   return (
     <Section
       icon={icon}
-      title={`${title} (${rows.length})`}
+      title={t('cards:sectionTitleWithCount', { title, count: rows.length })}
     >
       {rows.length === 0 ? (
-        <p className="text-slate-400 italic text-sm">None.</p>
+        <p className="text-[var(--pg-text-dim)] italic text-sm">{t('cards:none')}</p>
       ) : (
         <div className="space-y-3">
           {rows.map((p) => (
@@ -220,16 +288,24 @@ function PatternCard({
   pattern: patternStore.PatternRow;
   onDelete: (uniqid: string) => void | Promise<void>;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [routing, setRouting] = useState<patternStore.PatternRoutingItem[] | null>(null);
+  const [stations, setStations] = useState<Record<string, string>>({});
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const toggleDetails = async () => {
     if (!expanded && routing === null) {
       setLoadingDetails(true);
       try {
-        setRouting(await patternStore.getRouting(pattern.pattern_uniqid));
+        const [r, s] = await Promise.all([
+          patternStore.getRouting(pattern.pattern_uniqid),
+          patternStore.getStations(pattern.pattern_uniqid),
+        ]);
+        setRouting(r);
+        setStations(s);
       } finally {
         setLoadingDetails(false);
       }
@@ -237,12 +313,8 @@ function PatternCard({
     setExpanded((v) => !v);
   };
 
-  const handleDelete = async () => {
-    const ok = window.confirm(
-      `Remove "${pattern.name}" from this device?\n\n` +
-        'It will reappear on the next sync if it still exists in your account.'
-    );
-    if (!ok) return;
+  const confirmDelete = async () => {
+    setConfirmOpen(false);
     setDeleting(true);
     try {
       await onDelete(pattern.pattern_uniqid);
@@ -255,19 +327,20 @@ function PatternCard({
   const groups = routing ? groupRouting(routing, pattern.game_type) : [];
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-900/40">
+    <>
+    <div className="rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] bg-[var(--pg-surface)]">
       <div className="flex items-center justify-between gap-3 p-4">
         <div className="flex-1 min-w-0">
-          <h3 className="font-semibold text-white truncate">{pattern.name}</h3>
-          <div className="flex items-center gap-4 mt-1 text-sm text-slate-400 flex-wrap">
-            <span>Game type: {pattern.game_type}</span>
+          <h3 className="font-semibold text-[var(--pg-text)] truncate">{pattern.name}</h3>
+          <div className="flex items-center gap-4 mt-1 text-sm text-[var(--pg-text-dim)] flex-wrap">
+            <span>{t('cards:gameType', { type: pattern.game_type })}</span>
             <span>
-              Version: {pattern.local_version ?? '—'}
+              {t('cards:version', { version: formatVersion(pattern.local_version) })}
               {pattern.local_version !== pattern.remote_version && (
-                <span className="text-amber-400 ml-1">(server v{pattern.remote_version})</span>
+                <span className="text-amber-400 ml-1">{t('cards:serverVersion', { version: formatVersion(pattern.remote_version) })}</span>
               )}
             </span>
-            <span className="font-mono text-xs px-2 py-1 rounded bg-slate-800 text-slate-300">
+            <span className="font-mono text-xs px-2 py-1 rounded bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)]">
               {pattern.pattern_uniqid}
             </span>
           </div>
@@ -275,17 +348,17 @@ function PatternCard({
         <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={toggleDetails}
-            className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
+            className="pg-btn pg-btn--ghost pg-btn--sm"
             aria-expanded={expanded}
           >
             {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-            <span>Details</span>
+            <span>{t('cards:details')}</span>
           </button>
           <button
-            onClick={handleDelete}
+            onClick={() => setConfirmOpen(true)}
             disabled={deleting}
-            title="Remove from this device"
-            className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 disabled:opacity-50 transition-colors"
+            title={t('cards:removeFromDevice')}
+            className="flex items-center gap-1 px-3 py-2 rounded-[var(--pg-radius-md)] text-sm bg-red-500/10 hover:bg-red-500/20 text-red-400 disabled:opacity-50 transition-colors"
           >
             <Trash2 size={16} />
           </button>
@@ -293,36 +366,46 @@ function PatternCard({
       </div>
 
       {expanded && (
-        <div className="border-t border-slate-700 px-4 py-4">
+        <div className="border-t border-[var(--pg-line)] px-4 py-4">
           {loadingDetails ? (
-            <div className="flex items-center gap-2 text-slate-400 text-sm">
+            <div className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm">
               <RefreshCw className="w-4 h-4 animate-spin" />
-              Loading routing…
+              {t('cards:loadingRouting')}
             </div>
           ) : !downloaded ? (
-            <p className="text-slate-400 italic text-sm">
-              Routing not downloaded yet — run a sync to fetch this pattern's data.
+            <p className="text-[var(--pg-text-dim)] italic text-sm">
+              {t('cards:routingNotDownloaded')}
             </p>
           ) : groups.length === 0 ? (
-            <p className="text-slate-400 italic text-sm">This pattern has no station assignments.</p>
+            <p className="text-[var(--pg-text-dim)] italic text-sm">{t('cards:noStationAssignments')}</p>
           ) : (
             <div className="space-y-3">
               {groups.map((g) => (
-                <div key={g.itemIndex} className="rounded-md bg-slate-800/60 p-3">
-                  <div className="font-medium text-slate-200 mb-2">{g.itemLabel}</div>
+                <div key={g.itemIndex} className="rounded-md bg-[var(--pg-surface-2)] p-3">
+                  <div className="font-medium text-[var(--pg-text)] mb-2">{g.itemLabel}</div>
                   <div className="space-y-1.5">
                     {g.assignments.map((a, i) => (
                       <div key={i} className="flex items-start gap-2 text-sm flex-wrap">
-                        <span className="text-slate-400 min-w-[7rem]">{a.label}:</span>
+                        <span className="text-[var(--pg-text-dim)] min-w-[7rem]">{t('cards:assignmentLabel', { label: a.label })}</span>
                         <div className="flex items-center gap-1.5 flex-wrap">
-                          {a.stations.map((s, j) => (
-                            <span
-                              key={j}
-                              className="font-mono text-xs px-2 py-0.5 rounded bg-blue-500/15 text-blue-300"
-                            >
-                              station {s}
-                            </span>
-                          ))}
+                          {a.stations.map((s, j) => {
+                            const number = stations[String(s)];
+                            return (
+                              <span
+                                key={j}
+                                className="inline-flex items-center gap-1.5 font-mono text-xs px-2 py-0.5 rounded bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]"
+                              >
+                                {number != null ? (
+                                  <>
+                                    <span>{t('cards:stationNumber', { number })}</span>
+                                    <span className="opacity-60">{t('cards:stationId', { id: s })}</span>
+                                  </>
+                                ) : (
+                                  <span>{t('cards:station', { number: s })}</span>
+                                )}
+                              </span>
+                            );
+                          })}
                         </div>
                       </div>
                     ))}
@@ -334,7 +417,27 @@ function PatternCard({
         </div>
       )}
     </div>
+
+      <ConfirmDialog
+        isOpen={confirmOpen}
+        onConfirm={confirmDelete}
+        onCancel={() => setConfirmOpen(false)}
+        title={t('cards:removeTitle')}
+        message={t('cards:confirmRemove', { name: pattern.name })}
+        confirmText={t('cards:removeConfirm')}
+        cancelText={t('cards:cancel')}
+        variant="danger"
+      />
+    </>
   );
+}
+
+// Show the full pattern version including its minor part: studio bumps versions
+// by 0.1 on each publish, but a whole value (1.0) arrives as the integer `1`.
+// Force at least one decimal so the UI reads "1.0" / "1.1" rather than "1".
+function formatVersion(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '-';
+  return Number.isInteger(v) ? v.toFixed(1) : String(v);
 }
 
 // --- Routing detail helpers -------------------------------------------------

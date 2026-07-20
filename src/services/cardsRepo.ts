@@ -15,7 +15,7 @@
 //     the delete on studio
 //
 // `applyServerPull` reconciles a server snapshot with the local table.
-// It NEVER overwrites a row whose sync_state='pending' — those are local
+// It NEVER overwrites a row whose sync_state='pending' - those are local
 // mutations awaiting push. Use `acceptServerOverwrite` explicitly when a
 // 409 conflict tells the server's data should win.
 
@@ -75,7 +75,7 @@ export async function getById(id: number): Promise<CardRow | null> {
   return rows.length ? toCard(rows[0]) : null;
 }
 
-// Returns true if `id` is registered (visible in list — not a pending-delete).
+// Returns true if `id` is registered (visible in list - not a pending-delete).
 export async function isRegistered(id: number): Promise<boolean> {
   return (await getById(id)) !== null;
 }
@@ -100,7 +100,7 @@ export async function create(card: CardRow): Promise<void> {
 }
 
 // Local edit. If the row is still 'pending'/'create' (never synced), keep
-// operation='create' — we're still pushing it as a fresh insert. Otherwise
+// operation='create' - we're still pushing it as a fresh insert. Otherwise
 // flip to 'pending'/'update' so the sync layer issues a PUT.
 export async function update(id: number, fields: Partial<Omit<CardRow, 'id'>>): Promise<void> {
   const db = await getDb();
@@ -227,7 +227,7 @@ export async function acceptServerOverwrite(card: CardRow): Promise<void> {
 //   - Server doesn't have it, local is 'synced'          → DELETE locally
 //   - Server doesn't have it, local is 'pending'/'create' → leave alone (still queued for push)
 //   - Server doesn't have it, local is 'pending'/'delete' → DELETE locally (server already
-//     dropped it — our pending tombstone is satisfied)
+//     dropped it - our pending tombstone is satisfied)
 //   - Server doesn't have it, local is 'pending'/'update' → DELETE locally (server doesn't know
 //     about it any more; the next push of this update would 404 anyway)
 export async function applyServerPull(serverCards: CardRow[]): Promise<void> {
@@ -258,7 +258,7 @@ export async function applyServerPull(serverCards: CardRow[]): Promise<void> {
       continue;
     }
     if (local.sync_state === 'pending') continue;
-    // synced row — update if any field differs
+    // synced row - update if any field differs
     if (
       local.key_number !== card.key_number ||
       local.key_name !== card.key_name ||

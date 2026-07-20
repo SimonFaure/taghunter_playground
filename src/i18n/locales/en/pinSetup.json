@@ -1,0 +1,21 @@
+{
+  "setTitle": "Set a PIN for this device",
+  "confirmTitle": "Confirm your PIN",
+  "setSubtitle": "You’ll use this PIN to unlock the app after you lock it. No internet needed.",
+  "typeAgain": "Type it once more to make sure it matches.",
+  "signedInAs": "Signed in as {{email}}",
+  "pinsDontMatch": "PINs don’t match. Choose a PIN again.",
+  "saveFailed": "Failed to save PIN. Try again.",
+  "savingPin": "Saving PIN…",
+  "saving": "Saving…",
+  "pickDifferent": "Pick a different PIN",
+  "devicePin": "Device PIN",
+  "gatesHint": "Used by the security gates above and the nav-bar Lock button.",
+  "pinCurrentlySet": "A PIN is currently set.",
+  "noPinSet": "No PIN is set.",
+  "changePin": "Change PIN",
+  "setPin": "Set PIN",
+  "chooseTitle": "Choose a PIN",
+  "chooseSubtitle": "Pick a 4-digit PIN for this device.",
+  "cancel": "Cancel"
+}

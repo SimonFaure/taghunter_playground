@@ -34,7 +34,7 @@ use super::{BytesRx, PortInfo, SerialTransport, TransportError};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug)]
 pub struct DesktopTransport {
-    /// Carries write requests to the owner task. Bounded — back-pressures a
+    /// Carries write requests to the owner task. Bounded - back-pressures a
     /// runaway caller and lets us drop the transport without leaking
     /// memory.
     write_tx: mpsc::Sender<Vec<u8>>,
@@ -61,7 +61,7 @@ pub async fn open(
     device_id: &str,
     baud: u32,
 ) -> Result<(Arc<DesktopTransport>, BytesRx), TransportError> {
-    // 8N1 — SI master default. data_bits/stop_bits/parity are explicit even
+    // 8N1 - SI master default. data_bits/stop_bits/parity are explicit even
     // though they match tokio-serial's defaults, so the wire config is
     // documented in one place.
     let stream = tokio_serial::new(device_id, baud)
@@ -113,7 +113,7 @@ async fn owner_task(
 
             close_signal = close_rx.recv() => {
                 // Either an explicit close() or all close_tx clones dropped
-                // — both mean "wind down". No emitted Err: the consumer
+                // - both mean "wind down". No emitted Err: the consumer
                 // asked for this.
                 let _ = close_signal;
                 break;
@@ -131,7 +131,7 @@ async fn owner_task(
                             break;
                         }
                     }
-                    // All Arc<DesktopTransport> clones gone — implicit
+                    // All Arc<DesktopTransport> clones gone - implicit
                     // shutdown via Drop.
                     None => break,
                 }
@@ -147,7 +147,7 @@ async fn owner_task(
                     }
                     Ok(n) => {
                         if rx_tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
-                            // Consumer dropped the BytesRx — no point
+                            // Consumer dropped the BytesRx - no point
                             // continuing.
                             break;
                         }
@@ -184,9 +184,9 @@ impl SerialTransport for DesktopTransport {
         self.open.store(false, Ordering::SeqCst);
         // `try_send` (not `await`): the channel is bounded to 1 and one
         // pending close-signal is sufficient. If the task has already
-        // exited, the send fails silently — that's the desired idempotency.
+        // exited, the send fails silently - that's the desired idempotency.
         let _ = self.close_tx.try_send(());
-        // Wait for the owner task to actually return — at which point
+        // Wait for the owner task to actually return - at which point
         // `stream` has been dropped and the OS handle released. This is
         // the synchronisation that lets a caller `close()` then
         // immediately `open()` the same port without an "access denied"
@@ -194,7 +194,7 @@ impl SerialTransport for DesktopTransport {
         // closes find `None` and return immediately.
         let mut guard = self.task_handle.lock().await;
         if let Some(handle) = guard.take() {
-            // Errors here would mean the task panicked — log but don't
+            // Errors here would mean the task panicked - log but don't
             // propagate; the port handle is still released either way.
             if let Err(e) = handle.await {
                 eprintln!("[sportident] owner task panicked: {}", e);
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_ports_returns_ok_even_when_empty() {
-        // Doesn't matter whether ports exist on the CI/host machine — we
+        // Doesn't matter whether ports exist on the CI/host machine - we
         // only assert the enumeration succeeds and returns a (possibly
         // empty) Vec. On a dev box with a CP210x plugged in, this will
         // include the SI master station; CI typically returns nothing.

@@ -1,0 +1,18 @@
+{
+  "becomeMotherPromptTitle": "Faire de cet appareil la mère ?",
+  "becomeMotherPromptBody": "Aucun appareil mère n'est joignable sur le réseau ; cet appareil va donc devenir la mère et héberger la partie. Les autres appareils pourront ensuite le rejoindre.",
+  "becomeMotherPromptConfirm": "Devenir mère et lancer",
+  "save": "Enregistrer",
+  "cancel": "Annuler",
+  "close": "Fermer",
+  "back": "Retour",
+  "loading": "Chargement...",
+  "settings": "Paramètres",
+  "confirm": "Confirmer",
+  "delete": "Supprimer",
+  "yes": "Oui",
+  "no": "Non",
+  "dismiss": "Fermer",
+  "pinResetBanner": "Le code PIN de l'appareil a été réinitialisé avec un code de récupération. Définissez un nouveau code PIN pour réactiver les protections.",
+  "setNewPin": "Définir un nouveau code PIN"
+}

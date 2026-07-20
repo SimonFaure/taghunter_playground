@@ -1,0 +1,39 @@
+{
+  "rankings": {
+    "title": "Classements",
+    "tabTimeRange": "Période",
+    "tabActiveGames": "Parties en cours",
+    "scenario": "Scénario",
+    "noScenarios": "Aucun scénario trouvé.",
+    "selectScenario": "Sélectionner un scénario",
+    "timeRange": "Période",
+    "viewRankings": "Voir le classement",
+    "noActiveGames": "Aucune partie en cours pour le moment.",
+    "selectUpTo_one": "Sélectionnez jusqu'à {{count}} partie à comparer côte à côte.",
+    "selectUpTo_other": "Sélectionnez jusqu'à {{count}} parties à comparer côte à côte.",
+    "maximumReached": "Maximum atteint.",
+    "rangeToday": "Aujourd'hui",
+    "rangeWeek": "Cette semaine",
+    "rangeMonth": "Ce mois-ci",
+    "rangeQuarter": "Ce trimestre",
+    "rangeYear": "Cette année",
+    "rangeAll": "Tout"
+  },
+  "addTime": {
+    "title": "Ajouter du temps",
+    "minutesToAdd": "Minutes à ajouter",
+    "failed": "Échec de l'ajout de temps",
+    "adding": "Ajout en cours…",
+    "addMinutes": "Ajouter {{count}} min",
+    "cancel": "Annuler"
+  },
+  "devicePicker": {
+    "close": "Fermer"
+  },
+  "cardDetection": {
+    "detected": "Puce détectée",
+    "id": "ID : {{id}}",
+    "punches_one": "Poinçon : {{count}}",
+    "punches_other": "Poinçons : {{count}}"
+  }
+}

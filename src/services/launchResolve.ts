@@ -4,16 +4,17 @@
 // diverge.
 //
 // Import note: this module imports the modal's *types* only (`import type`),
-// which the TS compiler erases — so there is no runtime circular dependency
+// which the TS compiler erases - so there is no runtime circular dependency
 // even though the modal imports functions from here.
 
 import type { GameConfig, Team, Teammate, LaunchDeviceSelection } from '../components/LaunchGameModal';
-import { listPairedDevicesForLaunch } from './launchedGames';
+import { listPairedDevicesForLaunch, listBusyDeviceIds } from './launchedGames';
+import { isOperatorOnly } from './operatorMode';
 
 // The saved-config shape: step-1 settings without the per-instance name/teams.
 export type ResolvableConfig = Omit<GameConfig, 'name' | 'teams'>;
 
-// Minimal chip shape the roster builder needs — satisfied by both SiPuce
+// Minimal chip shape the roster builder needs - satisfied by both SiPuce
 // (the modal) and cardsRepo.CardRow (the headless path), so no mapping needed.
 export interface RosterChip {
   id: number;
@@ -26,6 +27,51 @@ export interface PatternOption {
   slug: string;
   name: string;
   uniqid: string;
+  /** patterns.is_default - the game type's designated default pattern. */
+  isDefault?: boolean;
+}
+
+/**
+ * The pattern a launch should pre-select. Order of preference:
+ *   1. the scenario's own `default_pattern_id` (when it exists in the list),
+ *   2. the pattern flagged `is_default` for the game type,
+ *   3. the first available pattern.
+ * A wrong pre-selected pattern silently breaks scoring (no station ever
+ * matches), so every launch surface must pick through here - the wizard
+ * (LaunchGameModal) and the headless Quick Launch drift fallback.
+ */
+export function resolveDefaultPattern(
+  options: PatternOption[],
+  scenarioDefaultId?: string | null,
+): string {
+  if (scenarioDefaultId && options.some((o) => o.uniqid === scenarioDefaultId)) {
+    return scenarioDefaultId;
+  }
+  return options.find((o) => o.isDefault)?.uniqid ?? options[0]?.uniqid ?? '';
+}
+
+// The on-disk game-data.json may be the raw `game_data` blob or a legacy
+// envelope with `{scenario, game_data}` siblings - depending on which sync
+// generation wrote it. The CANONICAL studio field is
+// `game_meta.scenario_default_pattern` (authored in every game-type editor's
+// PatternSection); `default_pattern_id` is a legacy key kept for older data.
+export function extractDefaultPatternId(rawGameData: unknown): string | null {
+  if (!rawGameData || typeof rawGameData !== 'object') return null;
+  const root = rawGameData as Record<string, unknown>;
+  type GmHolder = { game_meta?: { scenario_default_pattern?: unknown; default_pattern_id?: unknown } };
+  const candidates: unknown[] = [
+    (root as GmHolder).game_meta?.scenario_default_pattern,
+    (root.game_data as GmHolder | undefined)?.game_meta?.scenario_default_pattern,
+    root.default_pattern_id,
+    (root.scenario as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
+    (root.game_data as { scenario?: { default_pattern_id?: unknown }; default_pattern_id?: unknown } | undefined)?.scenario?.default_pattern_id,
+    (root.game_data as { default_pattern_id?: unknown } | undefined)?.default_pattern_id,
+    (root as GmHolder).game_meta?.default_pattern_id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------- tracks
@@ -61,7 +107,7 @@ export function extractTracksOptions(rawGameData: unknown): TracksLaunchOptions 
   const gm = extractGameMeta(rawGameData);
   if (!gm) return EMPTY_TRACKS_OPTIONS;
 
-  // Enabled keys in declaration order — `Object.entries` preserves insertion
+  // Enabled keys in declaration order - `Object.entries` preserves insertion
   // order, which matches the studio's default-config ordering.
   const enabledKeys = (obj: unknown): string[] => {
     if (!obj || typeof obj !== 'object') return [];
@@ -95,7 +141,7 @@ function teamModeOf(config: Pick<GameConfig, 'playMode'>, gameTypeName: string):
 
 /**
  * Build the team roster from `numberOfTeams` + `firstChipIndex` against the
- * given chip array — the exact logic that used to live inline in the modal's
+ * given chip array - the exact logic that used to live inline in the modal's
  * `handleNextStep`. Solo: one chip per team. TagQuest team-mode: `chipsPerTeam`
  * consecutive chips per team, the first chip naming the team. Stops early if
  * the chip array runs out.
@@ -148,15 +194,26 @@ export function chipsRequired(config: Pick<GameConfig, 'numberOfTeams' | 'playMo
 // ---------------------------------------------------------------- devices
 /**
  * The headless default device selection: the mother participates, plus every
- * currently-online satellite — mirroring the launch wizard's step-3 defaults.
+ * currently-online satellite - mirroring the launch wizard's step-3 defaults.
  * Network failure degrades to mother-only rather than throwing.
  */
 export async function resolveDefaultDeviceSelection(): Promise<LaunchDeviceSelection> {
   try {
-    const rows = await listPairedDevicesForLaunch();
+    const [rows, busy, operatorOnly] = await Promise.all([
+      listPairedDevicesForLaunch(),
+      listBusyDeviceIds(),
+      isOperatorOnly(),
+    ]);
+    const selfRow = rows.find((r) => r.is_self);
     return {
-      include_self: true,
-      satellite_targets: rows.filter((r) => !r.is_self && r.online).map((r) => r.id),
+      // This device only joins the new game if it isn't already running one -
+      // and never on an operator-only device (it manages games but never plays).
+      include_self: operatorOnly ? false : selfRow ? !busy.has(selfRow.id) : true,
+      // Skip peers already participating in another active game (a device runs
+      // at most one game at a time).
+      satellite_targets: rows
+        .filter((r) => !r.is_self && r.online && !busy.has(r.id))
+        .map((r) => r.id),
     };
   } catch (err) {
     console.error('[launchResolve] resolveDefaultDeviceSelection failed:', err);
@@ -168,6 +225,8 @@ export async function resolveDefaultDeviceSelection(): Promise<LaunchDeviceSelec
 export interface HeadlessWorld {
   /** Pattern folders available for this scenario's game type. */
   patterns: PatternOption[];
+  /** The scenario's own default_pattern_id (game-data), when authored. */
+  scenarioDefaultPatternId?: string | null;
   /** Cards NOT already in use by another active game (in roster order). */
   freeChips: RosterChip[];
   /** Enabled tracks options parsed from game_meta (EMPTY for non-tracks). */
@@ -198,14 +257,16 @@ export function validateForHeadless(config: ResolvableConfig, world: HeadlessWor
   const gt = world.gameTypeName.toLowerCase();
 
   if (!world.scenarioDownloaded) {
-    critical.push("This scenario isn't downloaded yet — open the full launch screen to sync it.");
+    critical.push("This scenario isn't downloaded yet - open the full launch screen to sync it.");
   }
 
-  // Pattern: missing entirely is critical; a stale id falls back to the first.
+  // Pattern: missing entirely is critical; a stale id falls back to the
+  // scenario/type default (NOT blindly the first - a wrong pattern silently
+  // breaks scoring since no station ever matches).
   if (world.patterns.length === 0) {
     critical.push('No pattern is available for this scenario.');
   } else if (!world.patterns.some((p) => p.uniqid === config.pattern)) {
-    resolved.pattern = world.patterns[0].uniqid;
+    resolved.pattern = resolveDefaultPattern(world.patterns, world.scenarioDefaultPatternId);
   }
 
   // Tracks: default any saved option that the scenario no longer enables.
@@ -214,6 +275,12 @@ export function validateForHeadless(config: ResolvableConfig, world: HeadlessWor
     // Carry the enabled route set for the per-team Add Team override.
     resolved.tracksRoutes = t.routes;
     if (t.routes.length && !t.routes.includes(resolved.route ?? '')) resolved.route = t.routes[0];
+    // Multi-route selection: drop any saved route the scenario no longer enables,
+    // falling back to the (now-valid) primary route when nothing survives.
+    if (t.routes.length) {
+      const prunedRoutes = (resolved.routes ?? []).filter((r) => t.routes.includes(r));
+      resolved.routes = prunedRoutes.length ? prunedRoutes : (resolved.route ? [resolved.route] : []);
+    }
     if (t.displays.length && !t.displays.includes(resolved.displayMode ?? '')) resolved.displayMode = t.displays[0];
     if (t.playModes.length && !t.playModes.includes(resolved.trackPlayMode ?? '')) {
       resolved.trackPlayMode = t.playModes[0] as 'itinerary' | 'free';

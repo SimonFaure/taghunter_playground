@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { RefreshCw } from 'lucide-react';
 import { on } from '../../services/syncEvents';
 
@@ -10,11 +11,12 @@ interface SyncStatusPillProps {
 }
 
 // Small unobtrusive corner pill shown while a content sync cycle is in flight
-// on subsequent launches (not first launch — that uses FirstLaunchProgress).
+// on subsequent launches (not first launch - that uses FirstLaunchProgress).
 // Hides 800ms after the cycle finishes. The pill stays clickable during the
 // fade-out window so a click that lands right at the end of a cycle still
 // navigates instead of silently dropping.
 export function SyncStatusPill({ onNavigate }: SyncStatusPillProps) {
+  const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
   const [completed, setCompleted] = useState(0);
   const [total, setTotal] = useState(0);
@@ -46,18 +48,18 @@ export function SyncStatusPill({ onNavigate }: SyncStatusPillProps) {
 
   if (!visible) return null;
 
-  const label = total > 0 ? `Syncing ${completed} / ${total}` : 'Syncing…';
+  const label = total > 0 ? t('sync:syncingProgress', { completed, total }) : t('sync:syncing');
 
   return (
     <button
       type="button"
       onClick={onNavigate}
-      title="Click for details"
-      aria-label={`${label}. Click for details.`}
-      className="fixed bottom-4 right-4 z-40 bg-slate-800/95 hover:bg-slate-700/95 border border-slate-700 hover:border-slate-600 rounded-full px-3 py-1.5 flex items-center gap-2 shadow-lg backdrop-blur cursor-pointer transition-colors"
+      title={t('sync:clickForDetails')}
+      aria-label={t('sync:pillAriaLabel', { label })}
+      className="fixed bottom-14 right-4 z-40 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] border border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] rounded-full px-3 py-1.5 flex items-center gap-2 shadow-lg backdrop-blur cursor-pointer transition-colors"
     >
-      <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin" />
-      <span className="text-xs text-slate-300">{label}</span>
+      <RefreshCw className="w-3.5 h-3.5 text-[var(--pg-accent-bright)] animate-spin" />
+      <span className="text-xs text-[var(--pg-text-muted)]">{label}</span>
     </button>
   );
 }

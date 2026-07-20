@@ -1,112 +1,106 @@
 // Shared in-game message vocabulary for the playground.
 //
 // All game types (Mystery, TagQuest, Tracks) render transient status messages
-// through <GameMessageOverlay>, which is typed by GameMessageType. The localized
-// status strings below are shared so the same wording/translations are used
-// everywhere (lifted from TagQuest's old inline STATUS_MESSAGES + extended with
-// Tracks-specific keys). Languages mirror the HUD-label set (fr/en/es/de/it/pt)
-// and fall back to fr, then to a raw server message where one is available.
+// through <GameMessageOverlay>, which is typed by GameMessageType. The actual
+// localized strings now live in the i18next `ingame_common` namespace (bundled
+// baselines in src/i18n/ingame.ts, overridable by the synced admin store) and
+// resolve against the *team* language. This module keeps the status vocabulary,
+// its severities, and the team-name formatting; lookups delegate to `tIngame`.
+
+import { tIngame } from '../i18n/ingame';
 
 export type GameMessageType = 'success' | 'error' | 'warning' | 'info';
 
 export type StatusKey =
   | 'chip_not_recognized'
+  | 'card_empty'
   | 'team_already_finished'
   | 'cheat_detected'
   | 'error'
   | 'card_not_registered'
   | 'track_finished'
   | 'no_checkpoints'
-  | 'reuse_cooldown';
+  | 'reuse_cooldown'
+  | 'no_fresh_punches';
 
-const STATUS_MESSAGES: Record<string, Record<StatusKey, string>> = {
-  fr: {
-    chip_not_recognized: 'Carte non reconnue',
-    team_already_finished: 'Équipe déjà terminée',
-    cheat_detected: 'Triche détectée',
-    error: 'Erreur',
-    card_not_registered: 'Carte non enregistrée',
-    track_finished: 'Parcours terminé !',
-    no_checkpoints: 'Aucun point validé',
-    reuse_cooldown: 'Carte rejouable dans {n} min',
-  },
-  en: {
-    chip_not_recognized: 'Card not recognized',
-    team_already_finished: 'Team already finished',
-    cheat_detected: 'Cheating detected',
-    error: 'Error',
-    card_not_registered: 'Card not registered',
-    track_finished: 'Route complete!',
-    no_checkpoints: 'No checkpoints found',
-    reuse_cooldown: 'Card playable again in {n} min',
-  },
-  es: {
-    chip_not_recognized: 'Tarjeta no reconocida',
-    team_already_finished: 'Equipo ya terminado',
-    cheat_detected: 'Trampa detectada',
-    error: 'Error',
-    card_not_registered: 'Tarjeta no registrada',
-    track_finished: '¡Recorrido completado!',
-    no_checkpoints: 'Ningún punto validado',
-    reuse_cooldown: 'Tarjeta disponible en {n} min',
-  },
-  de: {
-    chip_not_recognized: 'Karte nicht erkannt',
-    team_already_finished: 'Team bereits fertig',
-    cheat_detected: 'Betrug erkannt',
-    error: 'Fehler',
-    card_not_registered: 'Karte nicht registriert',
-    track_finished: 'Strecke abgeschlossen!',
-    no_checkpoints: 'Keine Posten gefunden',
-    reuse_cooldown: 'Karte in {n} Min wieder spielbar',
-  },
-  it: {
-    chip_not_recognized: 'Tessera non riconosciuta',
-    team_already_finished: 'Squadra già terminata',
-    cheat_detected: 'Imbroglio rilevato',
-    error: 'Errore',
-    card_not_registered: 'Tessera non registrata',
-    track_finished: 'Percorso completato!',
-    no_checkpoints: 'Nessun punto trovato',
-    reuse_cooldown: 'Tessera riutilizzabile tra {n} min',
-  },
-  pt: {
-    chip_not_recognized: 'Cartão não reconhecido',
-    team_already_finished: 'Equipa já terminou',
-    cheat_detected: 'Batota detetada',
-    error: 'Erro',
-    card_not_registered: 'Cartão não registado',
-    track_finished: 'Percurso concluído!',
-    no_checkpoints: 'Nenhum ponto validado',
-    reuse_cooldown: 'Cartão jogável em {n} min',
-  },
-};
+const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<StatusKey>([
+  'chip_not_recognized',
+  'card_empty',
+  'team_already_finished',
+  'cheat_detected',
+  'error',
+  'card_not_registered',
+  'track_finished',
+  'no_checkpoints',
+  'reuse_cooldown',
+  'no_fresh_punches',
+]);
 
-/** Localized text for a known status key, fr fallback. */
-export function localizedStatus(key: StatusKey, lang: string): string {
-  const table = STATUS_MESSAGES[lang] ?? STATUS_MESSAGES.fr;
-  return table[key] ?? STATUS_MESSAGES.fr[key];
+/**
+ * Replace the `%team%` placeholder (case-insensitive) in an authored UI string
+ * with the team's display name. Authors type `%team%` in the editor's "UI text
+ * strings" section to position the team name inside their own sentence. With no
+ * team name the placeholder is stripped so a literal `%team%` never reaches the
+ * screen.
+ */
+export const TEAM_PLACEHOLDER = '%team%';
+
+export function applyTeamName(text: string, teamName?: string | null): string {
+  return text.replace(/%team%/gi, (teamName ?? '').trim());
 }
 
-// TagQuest punch-status → message type. Kept here so the status vocabulary and
-// its severities live in one place.
+/** True when an authored string positions the team name itself via `%team%`. */
+export function hasTeamPlaceholder(text: string | undefined | null): boolean {
+  return !!text && /%team%/i.test(text);
+}
+
+/**
+ * Localized text for a known status key in the given (team) language. `vars`
+ * feed `{{var}}` interpolation - e.g. `localizedStatus('reuse_cooldown', lang,
+ * { n: 5 })`.
+ */
+export function localizedStatus(
+  key: StatusKey,
+  lang: string,
+  vars?: Record<string, string | number>,
+): string {
+  return tIngame('ingame_common', key, lang, vars);
+}
+
+// Punch-status → message-type severity. Kept here so the vocabulary and its
+// severities live in one place.
 const STATUS_TYPE: Partial<Record<StatusKey, GameMessageType>> = {
   chip_not_recognized: 'warning',
+  card_empty: 'warning',
   team_already_finished: 'info',
   cheat_detected: 'error',
   error: 'error',
+  no_fresh_punches: 'warning',
 };
 
-/** Build the user-facing message + type for a non-ok punch result. */
+/**
+ * Build the user-facing message + type for a non-ok punch result.
+ *
+ * `overrideText` - a per-scenario UI string (from the editor's "UI text strings"
+ * section) that, when non-empty, replaces the default localized status text.
+ */
 export function describePunchStatus(
   status: string,
   teamName: string,
   fallbackMsg: string | undefined,
   lang: string,
+  overrideText?: string,
 ): { text: string; type: GameMessageType } {
-  const key = status as StatusKey;
-  const table = STATUS_MESSAGES[lang] ?? STATUS_MESSAGES.fr;
-  const base = table[key] ?? STATUS_MESSAGES.fr[key] ?? fallbackMsg ?? STATUS_MESSAGES.fr.error;
-  const type = STATUS_TYPE[key] ?? 'warning';
-  return { text: teamName ? `${teamName} — ${base}` : base, type };
+  const override = overrideText && overrideText.trim() ? overrideText.trim() : '';
+  // When the author placed %team% themselves, they control where the name goes,
+  // so we substitute it and skip the automatic "TeamName - " prefix below.
+  const authorPlacedName = hasTeamPlaceholder(override);
+  const base = override
+    ? applyTeamName(override, teamName)
+    : KNOWN_STATUS_KEYS.has(status)
+      ? tIngame('ingame_common', status, lang)
+      : fallbackMsg ?? tIngame('ingame_common', 'error', lang);
+  const type = STATUS_TYPE[status as StatusKey] ?? 'warning';
+  const text = teamName && !authorPlacedName ? `${teamName} - ${base}` : base;
+  return { text, type };
 }

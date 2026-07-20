@@ -1,0 +1,22 @@
+{
+  "date": "FECHA",
+  "duration": "DURACIÓN",
+  "durationFormat": "{{m}} MINUTOS Y {{s}} SEGUNDOS",
+  "score": "PUNTUACIÓN",
+  "points": "PUNTOS",
+  "rank": "CLASIFICACIÓN",
+  "rankValue": "{{rank}} / {{total}}",
+  "stat_rate": "TASA DE ÉXITO",
+  "stat_success": "ACIERTOS",
+  "stat_fail": "FALLOS",
+  "stat_absent": "AUSENTES",
+  "stat_correct": "CORRECTOS",
+  "stat_wrong": "ERRORES",
+  "stat_missing": "FALTANTES",
+  "stat_quests": "MISIONES",
+  "stat_points": "PUNTOS",
+  "stat_level": "RANGO",
+  "stat_combos": "COMBOS",
+  "stat_players": "JUGADORES",
+  "stat_territories": "TERRITORIOS"
+}

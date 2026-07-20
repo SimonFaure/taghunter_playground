@@ -1,18 +1,26 @@
 // Settings → Updates. Shows the current app version, a manual "Check for
-// updates" button, and — when an update exists — the download/install flow
+// updates" button, and - when an update exists - the download/install flow
 // (desktop) or an app-store link (mobile).
 
 import { useEffect, useState } from 'react';
-import { Download, RefreshCw, CheckCircle2, AlertOctagon, ExternalLink, Loader2 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Download, RefreshCw, CheckCircle2, AlertOctagon, ExternalLink, Loader2, Trash2, WifiOff } from 'lucide-react';
 import { getVersion } from '@tauri-apps/api/app';
-import { checkForUpdate, openStoreUpdate, type UpdateStatus } from '../../services/updateService';
+import { invoke } from '@tauri-apps/api/core';
+import { checkForUpdate, openStoreUpdate, isDesktopPlatform, type UpdateStatus } from '../../services/updateService';
 import { DesktopUpdateInstaller } from '../update/UpdateProgress';
+import { ConfirmDialog } from '../ConfirmDialog';
 
 export function UpdatesScreen() {
-  const [currentVersion, setCurrentVersion] = useState('—');
+  const { t } = useTranslation();
+  const [currentVersion, setCurrentVersion] = useState('-');
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [openingStore, setOpeningStore] = useState(false);
+  const [confirmUninstall, setConfirmUninstall] = useState(false);
+  const [uninstalling, setUninstalling] = useState(false);
+  const [uninstallError, setUninstallError] = useState<string | null>(null);
+  const canUninstall = isDesktopPlatform();
 
   const runCheck = async () => {
     setChecking(true);
@@ -40,42 +48,58 @@ export function UpdatesScreen() {
     }
   };
 
+  const runUninstall = async () => {
+    setConfirmUninstall(false);
+    setUninstalling(true);
+    setUninstallError(null);
+    try {
+      // On success the app quits and the NSIS uninstaller takes over, so this
+      // call does not return. Any rejection means we never launched it.
+      await invoke('uninstall_app');
+    } catch (e) {
+      setUninstallError(e instanceof Error ? e.message : String(e));
+      setUninstalling(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      <div className="bg-slate-800/50 rounded-lg p-6">
+      <div className="pg-panel">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Download className="text-blue-400" size={24} />
+            <img src="/taghunter-logo.png" alt="Tag Hunter" className="h-8 w-auto" />
             <div>
-              <h2 className="text-xl font-semibold">App updates</h2>
-              <p className="text-sm text-slate-400">
-                Current version <span className="font-mono text-slate-300">{currentVersion}</span>
+              <h2 className="text-xl font-semibold text-[var(--pg-text)]">{t('update:appUpdatesTitle')}</h2>
+              <p className="text-sm text-[var(--pg-text-dim)]">
+                {t('update:currentVersionLabel')}{' '}
+                <span className="font-mono text-[var(--pg-text-muted)]">{currentVersion}</span>
               </p>
             </div>
           </div>
           <button
             onClick={runCheck}
             disabled={checking}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
+            className="pg-btn pg-btn--primary"
           >
             <RefreshCw size={16} className={checking ? 'animate-spin' : ''} />
-            {checking ? 'Checking…' : 'Check for updates'}
+            {checking ? t('update:checking') : t('update:checkForUpdates')}
           </button>
         </div>
       </div>
 
       {status && !checking && (
-        <div className="bg-slate-800/50 rounded-lg p-6">
+        <div className="pg-panel">
           {status.state === 'up-to-date' && (
             <div className="flex items-center gap-3 text-emerald-300">
               <CheckCircle2 size={20} />
-              <span>You're on the latest version.</span>
+              <span>{t('update:upToDate')}</span>
             </div>
           )}
 
           {status.state === 'error' && (
-            <div className="text-sm text-slate-400">
-              Couldn't reach the update server. Check your connection and try again.
+            <div className="flex items-center gap-3 text-sm text-[var(--pg-text-dim)]">
+              <WifiOff size={18} className="flex-shrink-0 text-[var(--pg-text-dim)]" />
+              <span>{t('update:serverUnreachable')}</span>
             </div>
           )}
 
@@ -85,53 +109,94 @@ export function UpdatesScreen() {
                 {status.state === 'required' ? (
                   <AlertOctagon className="text-red-400" size={20} />
                 ) : (
-                  <Download className="text-blue-400" size={20} />
+                  <Download className="text-[var(--pg-accent-bright)]" size={20} />
                 )}
                 <div>
-                  <div className="font-semibold">
-                    Version {status.latestVersion} available
+                  <div className="font-semibold text-[var(--pg-text)]">
+                    {t('update:versionAvailable', { version: status.latestVersion })}
                   </div>
                   {status.state === 'required' && (
                     <div className="text-xs text-red-300">
-                      This update is required to keep using the app.
+                      {t('update:updateRequiredHint')}
                     </div>
                   )}
                 </div>
               </div>
 
               {status.notes && (
-                <div className="rounded-lg bg-slate-900/40 border border-slate-700 px-4 py-3 max-h-48 overflow-y-auto">
-                  <div className="text-xs uppercase tracking-wider text-slate-500 mb-1">
-                    What's new
+                <div className="rounded-lg bg-[var(--pg-bg)] border border-[var(--pg-line)] px-4 py-3 max-h-48 overflow-y-auto">
+                  <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)] mb-1">
+                    {t('update:whatsNew')}
                   </div>
-                  <p className="text-sm text-slate-300 whitespace-pre-wrap">{status.notes}</p>
+                  <p className="text-sm text-[var(--pg-text-muted)] whitespace-pre-wrap">{status.notes}</p>
                 </div>
               )}
 
               {status.isDesktop ? (
-                <DesktopUpdateInstaller />
+                <DesktopUpdateInstaller version={status.latestVersion} />
               ) : status.storeUrl ? (
                 <button
                   onClick={openStore}
                   disabled={openingStore}
-                  className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition-colors disabled:opacity-60"
+                  className="pg-btn pg-btn--primary w-full !py-3"
                 >
                   {openingStore ? (
                     <Loader2 size={18} className="animate-spin" />
                   ) : (
                     <ExternalLink size={18} />
                   )}
-                  Update from the app store
+                  {t('update:updateFromStore')}
                 </button>
               ) : (
                 <p className="text-sm text-amber-300">
-                  Please update from your device's app store.
+                  {t('update:updateFromDeviceStore')}
                 </p>
               )}
             </div>
           )}
         </div>
       )}
+
+      {canUninstall && (
+        <div className="pg-panel border-red-500/20">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <Trash2 className="text-red-400 flex-shrink-0" size={24} />
+              <div>
+                <h2 className="text-xl font-semibold text-[var(--pg-text)]">{t('update:uninstallTitle')}</h2>
+                <p className="text-sm text-[var(--pg-text-dim)]">
+                  {t('update:uninstallBody')}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setConfirmUninstall(true)}
+              disabled={uninstalling}
+              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50 flex-shrink-0"
+            >
+              {uninstalling ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+              {uninstalling ? t('update:uninstalling') : t('update:uninstallButton')}
+            </button>
+          </div>
+
+          {uninstallError && (
+            <div className="mt-4 text-sm text-red-300">
+              {t('update:uninstallStartError', { error: uninstallError })}
+            </div>
+          )}
+        </div>
+      )}
+
+      <ConfirmDialog
+        isOpen={confirmUninstall}
+        onConfirm={runUninstall}
+        onCancel={() => setConfirmUninstall(false)}
+        title={t('update:uninstallConfirmTitle')}
+        message={t('update:uninstallConfirmMessage')}
+        confirmText={t('update:uninstallButton')}
+        cancelText={t('update:cancel')}
+        variant="danger"
+      />
     </div>
   );
 }

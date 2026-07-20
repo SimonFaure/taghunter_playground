@@ -1,0 +1,18 @@
+{
+  "becomeMotherPromptTitle": "¿Hacer de este dispositivo la madre?",
+  "becomeMotherPromptBody": "No hay ningún dispositivo madre accesible en la red, así que este dispositivo se convertirá en la madre y alojará la partida. Los demás dispositivos podrán unirse a él.",
+  "becomeMotherPromptConfirm": "Ser la madre y lanzar",
+  "save": "Guardar",
+  "cancel": "Cancelar",
+  "close": "Cerrar",
+  "back": "Atrás",
+  "loading": "Cargando...",
+  "settings": "Ajustes",
+  "confirm": "Confirmar",
+  "delete": "Eliminar",
+  "yes": "Sí",
+  "no": "No",
+  "dismiss": "Descartar",
+  "pinResetBanner": "El PIN del dispositivo se restableció con un código de recuperación. Establece un nuevo PIN para que las protecciones vuelvan a funcionar.",
+  "setNewPin": "Establecer un nuevo PIN"
+}

@@ -1,0 +1,2673 @@
+{
+  "common": {
+    "save": {
+      "fr": "4d2d5d68",
+      "es": "4d2d5d68"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "back": {
+      "fr": "c2954bc2",
+      "es": "c2954bc2"
+    },
+    "loading": {
+      "fr": "17b11033",
+      "es": "17b11033"
+    },
+    "settings": {
+      "fr": "4b058728",
+      "es": "4b058728"
+    },
+    "confirm": {
+      "fr": "a183c9ef",
+      "es": "a183c9ef"
+    },
+    "delete": {
+      "fr": "5797ea6a",
+      "es": "5797ea6a"
+    },
+    "yes": {
+      "fr": "b3a43630",
+      "es": "b3a43630"
+    },
+    "no": {
+      "fr": "61e6be1a",
+      "es": "61e6be1a"
+    },
+    "dismiss": {
+      "fr": "265915f3",
+      "es": "265915f3"
+    },
+    "pinResetBanner": {
+      "fr": "b55640c2",
+      "es": "b55640c2"
+    },
+    "setNewPin": {
+      "fr": "cd2068d9",
+      "es": "cd2068d9"
+    }
+  },
+  "nav": {
+    "scenarios": {
+      "fr": "abfe5074",
+      "es": "abfe5074"
+    },
+    "launchedGames": {
+      "fr": "660ff4bc",
+      "es": "660ff4bc"
+    },
+    "cardsPatterns": {
+      "fr": "550c3649",
+      "es": "550c3649"
+    },
+    "settings": {
+      "fr": "4b058728",
+      "es": "4b058728"
+    },
+    "help": {
+      "fr": "b89df01a",
+      "es": "b89df01a"
+    },
+    "database": {
+      "fr": "f09430d8",
+      "es": "f09430d8"
+    },
+    "adminConfig": {
+      "fr": "531ad5ea",
+      "es": "531ad5ea"
+    },
+    "logoScreen": {
+      "fr": "dc007d82",
+      "es": "dc007d82"
+    },
+    "lock": {
+      "fr": "71b42d62",
+      "es": "71b42d62"
+    }
+  },
+  "cards": {
+    "title": {
+      "fr": "550c3649",
+      "es": "550c3649"
+    },
+    "syncNow": {
+      "fr": "a34dd8fe",
+      "es": "a34dd8fe"
+    },
+    "content": {
+      "fr": "c1679f62",
+      "es": "c1679f62"
+    },
+    "navCards": {
+      "fr": "2a273ae4",
+      "es": "2a273ae4"
+    },
+    "navPatterns": {
+      "fr": "ba7684ce",
+      "es": "ba7684ce"
+    },
+    "patterns": {
+      "fr": "ba7684ce",
+      "es": "ba7684ce"
+    },
+    "defaultPatterns": {
+      "fr": "ea280ee9",
+      "es": "ea280ee9"
+    },
+    "customPatterns": {
+      "fr": "c7d08379",
+      "es": "c7d08379"
+    },
+    "sectionTitleWithCount": {
+      "fr": "7673c83b",
+      "es": "7673c83b"
+    },
+    "none": {
+      "fr": "e2e3244f",
+      "es": "e2e3244f"
+    },
+    "confirmRemove": {
+      "fr": "e28810d9",
+      "es": "e28810d9"
+    },
+    "gameType": {
+      "fr": "020fa857",
+      "es": "020fa857"
+    },
+    "version": {
+      "fr": "04b5a647",
+      "es": "04b5a647"
+    },
+    "serverVersion": {
+      "fr": "44aed99d",
+      "es": "44aed99d"
+    },
+    "details": {
+      "fr": "0ec24245",
+      "es": "0ec24245"
+    },
+    "removeFromDevice": {
+      "fr": "a9ea3a45",
+      "es": "a9ea3a45"
+    },
+    "loadingRouting": {
+      "fr": "f0479e8d",
+      "es": "f0479e8d"
+    },
+    "routingNotDownloaded": {
+      "fr": "6e62870d",
+      "es": "6e62870d"
+    },
+    "noStationAssignments": {
+      "fr": "721aac8a",
+      "es": "721aac8a"
+    },
+    "assignmentLabel": {
+      "fr": "486fc625",
+      "es": "486fc625"
+    },
+    "station": {
+      "fr": "9eb9c844",
+      "es": "9eb9c844"
+    }
+  },
+  "footer": {
+    "wifi": {
+      "fr": "87a46248",
+      "es": "87a46248"
+    },
+    "reader": {
+      "fr": "6d08eef6",
+      "es": "6d08eef6"
+    },
+    "ok": {
+      "fr": "85e4b82f",
+      "es": "85e4b82f"
+    },
+    "ko": {
+      "fr": "21eea81f",
+      "es": "21eea81f"
+    },
+    "idle": {
+      "fr": "c0f30393",
+      "es": "c0f30393"
+    },
+    "near": {
+      "fr": "17fb4d4f",
+      "es": "17fb4d4f"
+    },
+    "mother": {
+      "fr": "23e3d71a",
+      "es": "23e3d71a"
+    },
+    "checkingLan": {
+      "fr": "1a7f1c38",
+      "es": "1a7f1c38"
+    },
+    "hotspotActive_one": {
+      "fr": "119796cc",
+      "es": "119796cc"
+    },
+    "hotspotActive_other": {
+      "fr": "70a24ead",
+      "es": "70a24ead"
+    },
+    "hotspotUpServerNotStarted": {
+      "fr": "3b2e9bf2",
+      "es": "3b2e9bf2"
+    },
+    "motherHotspotOff": {
+      "fr": "4bd05a07",
+      "es": "4bd05a07"
+    },
+    "connectedTo": {
+      "fr": "29082d82",
+      "es": "29082d82"
+    },
+    "motherNearbyNotResponding": {
+      "fr": "2244d3b2",
+      "es": "2244d3b2"
+    },
+    "noMotherReachable": {
+      "fr": "662c3c4e",
+      "es": "662c3c4e"
+    }
+  },
+  "home": {
+    "loading": {
+      "fr": "17b11033",
+      "es": "17b11033"
+    },
+    "searchPlaceholder": {
+      "fr": "86ce2d04",
+      "es": "86ce2d04"
+    },
+    "gridView": {
+      "fr": "00c3ebe6",
+      "es": "00c3ebe6"
+    },
+    "listView": {
+      "fr": "bcd94b36",
+      "es": "bcd94b36"
+    },
+    "allDifficulties": {
+      "fr": "7d7f5f71",
+      "es": "7d7f5f71"
+    },
+    "difficultyEasy": {
+      "fr": "6c33113b",
+      "es": "6c33113b"
+    },
+    "difficultyMedium": {
+      "fr": "09be5f96",
+      "es": "09be5f96"
+    },
+    "difficultyHard": {
+      "fr": "64efa7fc",
+      "es": "64efa7fc"
+    },
+    "all": {
+      "fr": "75afe364",
+      "es": "75afe364"
+    },
+    "noScenariosFound": {
+      "fr": "18069c71",
+      "es": "18069c71"
+    },
+    "noScenariosHint": {
+      "fr": "eb28153b",
+      "es": "eb28153b"
+    },
+    "noScenariosMatchFilters": {
+      "fr": "43fe5988",
+      "es": "43fe5988"
+    },
+    "adjustFiltersHint": {
+      "fr": "d15e877c",
+      "es": "d15e877c"
+    },
+    "yourScenarios": {
+      "fr": "d4cd8bc5",
+      "es": "d4cd8bc5"
+    },
+    "yourScenariosSubtitle": {
+      "fr": "1ce646bb",
+      "es": "1ce646bb"
+    },
+    "availableForPurchase": {
+      "fr": "a85d1352",
+      "es": "a85d1352"
+    },
+    "new": {
+      "fr": "8b242db1",
+      "es": "8b242db1"
+    },
+    "availableForPurchaseSubtitle": {
+      "fr": "3bd88942",
+      "es": "3bd88942"
+    },
+    "noScenariosMatchCriteria": {
+      "fr": "6cb1ddbc",
+      "es": "6cb1ddbc"
+    },
+    "forPurchase": {
+      "fr": "94bfde6b",
+      "es": "94bfde6b"
+    },
+    "untitledScenario": {
+      "fr": "4a808902",
+      "es": "4a808902"
+    },
+    "durationMinutes": {
+      "fr": "23a3479c",
+      "es": "23a3479c"
+    },
+    "viewDetails": {
+      "fr": "fa9ddf1c",
+      "es": "fa9ddf1c"
+    },
+    "deleteScenario": {
+      "fr": "c107ef34",
+      "es": "c107ef34"
+    },
+    "join": {
+      "fr": "30025399",
+      "es": "30025399"
+    },
+    "joinActiveGame": {
+      "fr": "1909db7c",
+      "es": "1909db7c"
+    },
+    "launchFullOptions": {
+      "fr": "02940ed4",
+      "es": "02940ed4"
+    },
+    "quick": {
+      "fr": "9cf5355c",
+      "es": "9cf5355c"
+    },
+    "quickLaunchTitle": {
+      "fr": "cc809e8f",
+      "es": "cc809e8f"
+    },
+    "manageConfigs": {
+      "fr": "678dffb8",
+      "es": "678dffb8"
+    },
+    "purchase": {
+      "fr": "3afbdb82",
+      "es": "3afbdb82"
+    },
+    "configSaved": {
+      "fr": "db82aef0",
+      "es": "db82aef0"
+    },
+    "quickLaunchPrepareFailed": {
+      "fr": "2a4e13d3",
+      "es": "2a4e13d3"
+    },
+    "deleteSuccess": {
+      "fr": "4aa39504",
+      "es": "4aa39504"
+    },
+    "deleteError": {
+      "fr": "831ea365",
+      "es": "831ea365"
+    },
+    "deleteDialogTitle": {
+      "fr": "e081b914",
+      "es": "e081b914"
+    },
+    "deleteDialogMessage": {
+      "fr": "67e4015f",
+      "es": "67e4015f"
+    },
+    "delete": {
+      "fr": "5797ea6a",
+      "es": "5797ea6a"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "enterPinTitle": {
+      "fr": "1f46e58b",
+      "es": "1f46e58b"
+    },
+    "enterPinDeleteSubtitle": {
+      "fr": "924dfee1",
+      "es": "924dfee1"
+    }
+  },
+  "launched": {
+    "heading": {
+      "fr": "c054831c",
+      "es": "c054831c"
+    },
+    "rankings": {
+      "fr": "8dda8566",
+      "es": "8dda8566"
+    },
+    "archived": {
+      "fr": "af5c5293",
+      "es": "af5c5293"
+    },
+    "loading": {
+      "fr": "835014c2",
+      "es": "835014c2"
+    },
+    "loadingShort": {
+      "fr": "2e7e4ae3",
+      "es": "2e7e4ae3"
+    },
+    "noGamesYet": {
+      "fr": "6784de8f",
+      "es": "6784de8f"
+    },
+    "scenarioLabel": {
+      "fr": "f6f06d1b",
+      "es": "f6f06d1b"
+    },
+    "gameIdLabel": {
+      "fr": "ec74557f",
+      "es": "ec74557f"
+    },
+    "gameTypeTitle": {
+      "fr": "ce60138d",
+      "es": "ce60138d"
+    },
+    "statusEnded": {
+      "fr": "ec2b41db",
+      "es": "ec2b41db"
+    },
+    "statusActive": {
+      "fr": "1f89134f",
+      "es": "1f89134f"
+    },
+    "createdLabel": {
+      "fr": "55debff5",
+      "es": "55debff5"
+    },
+    "playGame": {
+      "fr": "333b7133",
+      "es": "333b7133"
+    },
+    "configure": {
+      "fr": "163e25eb",
+      "es": "163e25eb"
+    },
+    "runGameTest": {
+      "fr": "0928d3f8",
+      "es": "0928d3f8"
+    },
+    "archiveTitle": {
+      "fr": "9ef1c804",
+      "es": "9ef1c804"
+    },
+    "devices": {
+      "fr": "27acf320",
+      "es": "27acf320"
+    },
+    "rawData": {
+      "fr": "5c66a12b",
+      "es": "5c66a12b"
+    },
+    "deleteTestGame": {
+      "fr": "8cbe9620",
+      "es": "8cbe9620"
+    },
+    "deleteAdmin": {
+      "fr": "3f6f01f8",
+      "es": "3f6f01f8"
+    },
+    "endGameTitle": {
+      "fr": "873c88b4",
+      "es": "873c88b4"
+    },
+    "endGameMessage": {
+      "fr": "7e5c55cc",
+      "es": "7e5c55cc"
+    },
+    "endGameConfirm": {
+      "fr": "873c88b4",
+      "es": "873c88b4"
+    },
+    "endGameFailed": {
+      "fr": "2f13d43e",
+      "es": "2f13d43e"
+    },
+    "deleteGameTitle": {
+      "fr": "b02e2b14",
+      "es": "b02e2b14"
+    },
+    "deleteGameMessage": {
+      "fr": "80ea58ba",
+      "es": "80ea58ba"
+    },
+    "deleteGameConfirm": {
+      "fr": "b02e2b14",
+      "es": "b02e2b14"
+    },
+    "deleteGameFailed": {
+      "fr": "59bf4f4e",
+      "es": "59bf4f4e"
+    },
+    "archiveGameTitle": {
+      "fr": "590ed715",
+      "es": "590ed715"
+    },
+    "archiveGameMessage": {
+      "fr": "00730a7a",
+      "es": "00730a7a"
+    },
+    "archiveGameConfirm": {
+      "fr": "590ed715",
+      "es": "590ed715"
+    },
+    "archiveGameFailed": {
+      "fr": "5c7b75bf",
+      "es": "5c7b75bf"
+    },
+    "notStarted": {
+      "fr": "d27b474f",
+      "es": "d27b474f"
+    },
+    "notEnded": {
+      "fr": "d2e4a6da",
+      "es": "d2e4a6da"
+    },
+    "updateTeamFailed": {
+      "fr": "0c70c29b",
+      "es": "0c70c29b"
+    },
+    "removeTeammateTitle": {
+      "fr": "87c6021b",
+      "es": "87c6021b"
+    },
+    "removeTeammateMessage": {
+      "fr": "839b82cc",
+      "es": "839b82cc"
+    },
+    "removeConfirm": {
+      "fr": "21a5901d",
+      "es": "21a5901d"
+    },
+    "removeTeamTitle": {
+      "fr": "f1e84ff6",
+      "es": "f1e84ff6"
+    },
+    "removeTeamMessage": {
+      "fr": "8c260784",
+      "es": "8c260784"
+    },
+    "removeTeamConfirm": {
+      "fr": "f1e84ff6",
+      "es": "f1e84ff6"
+    },
+    "teamsCount_one": {
+      "fr": "008c7323",
+      "es": "008c7323"
+    },
+    "teamsCount_other": {
+      "fr": "008c7323",
+      "es": "008c7323"
+    },
+    "refreshTeams": {
+      "fr": "10df679a",
+      "es": "10df679a"
+    },
+    "refresh": {
+      "fr": "0815aad4",
+      "es": "0815aad4"
+    },
+    "expandAllTeams": {
+      "fr": "acf23bb0",
+      "es": "acf23bb0"
+    },
+    "minimizeAllTeams": {
+      "fr": "045f7114",
+      "es": "045f7114"
+    },
+    "expandAll": {
+      "fr": "0f3a9666",
+      "es": "0f3a9666"
+    },
+    "minimizeAll": {
+      "fr": "5c49f2e2",
+      "es": "5c49f2e2"
+    },
+    "searchTeamsPlaceholder": {
+      "fr": "a49057a1",
+      "es": "a49057a1"
+    },
+    "sortByName": {
+      "fr": "6c471b01",
+      "es": "6c471b01"
+    },
+    "sortByRanking": {
+      "fr": "8c1a3a0c",
+      "es": "8c1a3a0c"
+    },
+    "sortRanking": {
+      "fr": "56e5dcb1",
+      "es": "56e5dcb1"
+    },
+    "sortName": {
+      "fr": "0fe07306",
+      "es": "0fe07306"
+    },
+    "noTeamsInGame": {
+      "fr": "44b7dce1",
+      "es": "44b7dce1"
+    },
+    "noTeamsMatchSearch": {
+      "fr": "6d75d3fa",
+      "es": "6d75d3fa"
+    },
+    "scoreLabel": {
+      "fr": "d5f43d9d",
+      "es": "d5f43d9d"
+    },
+    "chipLabel": {
+      "fr": "3209e0cf",
+      "es": "3209e0cf"
+    },
+    "expandTeamDetails": {
+      "fr": "6992aa74",
+      "es": "6992aa74"
+    },
+    "doubleClickToRename": {
+      "fr": "a9a1f4e4",
+      "es": "a9a1f4e4"
+    },
+    "minimizeTeamDetails": {
+      "fr": "61e3cfe0",
+      "es": "61e3cfe0"
+    },
+    "teamNameLabel": {
+      "fr": "afc09dff",
+      "es": "afc09dff"
+    },
+    "scoreFieldLabel": {
+      "fr": "77eb0235",
+      "es": "77eb0235"
+    },
+    "startTimeLabel": {
+      "fr": "a6507997",
+      "es": "a6507997"
+    },
+    "endTimeLabel": {
+      "fr": "baaf7592",
+      "es": "baaf7592"
+    },
+    "saveChanges": {
+      "fr": "61efb279",
+      "es": "61efb279"
+    },
+    "save": {
+      "fr": "4d2d5d68",
+      "es": "4d2d5d68"
+    },
+    "saving": {
+      "fr": "1ee0c88f",
+      "es": "1ee0c88f"
+    },
+    "cancelEditing": {
+      "fr": "8d3c0b8b",
+      "es": "8d3c0b8b"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "startLabel": {
+      "fr": "7046979f",
+      "es": "7046979f"
+    },
+    "endLabel": {
+      "fr": "35237250",
+      "es": "35237250"
+    },
+    "teammates": {
+      "fr": "6a335dfe",
+      "es": "6a335dfe"
+    },
+    "add": {
+      "fr": "9dc3aa14",
+      "es": "9dc3aa14"
+    },
+    "teammateNamePlaceholder": {
+      "fr": "e1195a40",
+      "es": "e1195a40"
+    },
+    "selectChip": {
+      "fr": "5f3ad361",
+      "es": "5f3ad361"
+    },
+    "chipOption": {
+      "fr": "8ede0fb3",
+      "es": "8ede0fb3"
+    },
+    "noPooledNames": {
+      "fr": "bac9c2f8",
+      "es": "bac9c2f8"
+    },
+    "randomName": {
+      "fr": "e1ff3665",
+      "es": "e1ff3665"
+    },
+    "viewTeamDetails": {
+      "fr": "4b7252b3",
+      "es": "4b7252b3"
+    },
+    "details": {
+      "fr": "0ec24245",
+      "es": "0ec24245"
+    },
+    "editTeamDetails": {
+      "fr": "bbae3a24",
+      "es": "bbae3a24"
+    },
+    "edit": {
+      "fr": "c2c76cb1",
+      "es": "c2c76cb1"
+    },
+    "testThisTeam": {
+      "fr": "cda62804",
+      "es": "cda62804"
+    },
+    "test": {
+      "fr": "2ffcbe05",
+      "es": "2ffcbe05"
+    },
+    "addTeam": {
+      "fr": "3959372d",
+      "es": "3959372d"
+    },
+    "newTeam": {
+      "fr": "0f97706a",
+      "es": "0f97706a"
+    },
+    "teamNamePlaceholder": {
+      "fr": "3267531f",
+      "es": "3267531f"
+    },
+    "routeSelectTitle": {
+      "fr": "aeccc092",
+      "es": "aeccc092"
+    },
+    "languageSelectTitle": {
+      "fr": "f6d35e0f",
+      "es": "f6d35e0f"
+    },
+    "saveTeam": {
+      "fr": "87f5d481",
+      "es": "87f5d481"
+    },
+    "selectGamePrompt": {
+      "fr": "31ff40e6",
+      "es": "31ff40e6"
+    },
+    "gameRankings": {
+      "fr": "f57061a6",
+      "es": "f57061a6"
+    },
+    "openFullRankingPage": {
+      "fr": "94c65dc7",
+      "es": "94c65dc7"
+    },
+    "fullPage": {
+      "fr": "61e143cf",
+      "es": "61e143cf"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "noTeamsYet": {
+      "fr": "9815a577",
+      "es": "9815a577"
+    },
+    "teamRankingLabel": {
+      "fr": "48fde770",
+      "es": "48fde770"
+    },
+    "points": {
+      "fr": "bc9567c6",
+      "es": "bc9567c6"
+    },
+    "archivedGames": {
+      "fr": "ff88ee30",
+      "es": "ff88ee30"
+    },
+    "noArchivedGames": {
+      "fr": "9ed7d145",
+      "es": "9ed7d145"
+    },
+    "colDate": {
+      "fr": "3b527379",
+      "es": "3b527379"
+    },
+    "colName": {
+      "fr": "0fe07306",
+      "es": "0fe07306"
+    },
+    "colType": {
+      "fr": "d155d06d",
+      "es": "d155d06d"
+    },
+    "colScenario": {
+      "fr": "bb09864f",
+      "es": "bb09864f"
+    },
+    "colTeams": {
+      "fr": "b9c8008d",
+      "es": "b9c8008d"
+    },
+    "colPlayers": {
+      "fr": "18dd36a9",
+      "es": "18dd36a9"
+    },
+    "colSynced": {
+      "fr": "c691454b",
+      "es": "c691454b"
+    },
+    "trackRoute_default": {
+      "fr": "6c7303d9",
+      "es": "6c7303d9"
+    },
+    "trackRoute_first_half": {
+      "fr": "68871446",
+      "es": "68871446"
+    },
+    "trackRoute_last_half": {
+      "fr": "27780b6e",
+      "es": "27780b6e"
+    },
+    "trackRoute_odd": {
+      "fr": "6b959ffd",
+      "es": "6b959ffd"
+    },
+    "trackRoute_even": {
+      "fr": "fc47f266",
+      "es": "fc47f266"
+    }
+  },
+  "settings": {
+    "pageTitle": {
+      "fr": "1a5ee459",
+      "es": "1a5ee459"
+    },
+    "toastConfigSaved": {
+      "fr": "a66d1336",
+      "es": "a66d1336"
+    },
+    "toastConfigSaveFailed": {
+      "fr": "7b409a44",
+      "es": "7b409a44"
+    },
+    "toastUnsupportedImage": {
+      "fr": "bc75e86c",
+      "es": "bc75e86c"
+    },
+    "toastLogoTooLarge": {
+      "fr": "7d542a13",
+      "es": "7d542a13"
+    },
+    "toastCouldNotReadImage": {
+      "fr": "4758ed43",
+      "es": "4758ed43"
+    },
+    "sectionLanguage": {
+      "fr": "9a73db9b",
+      "es": "9a73db9b"
+    },
+    "languageEnglishTitle": {
+      "fr": "1b9ae0bb",
+      "es": "1b9ae0bb"
+    },
+    "languageEnglishSubtitle": {
+      "fr": "f6a07dd7",
+      "es": "f6a07dd7"
+    },
+    "languageFrenchTitle": {
+      "fr": "f8f1b0d6",
+      "es": "f8f1b0d6"
+    },
+    "languageFrenchSubtitle": {
+      "fr": "32205481",
+      "es": "32205481"
+    },
+    "sectionDisplay": {
+      "fr": "8d006582",
+      "es": "8d006582"
+    },
+    "fullscreenOnLaunchLabel": {
+      "fr": "6420a20c",
+      "es": "6420a20c"
+    },
+    "fullscreenOnLaunchDesc": {
+      "fr": "d1d0da77",
+      "es": "d1d0da77"
+    },
+    "launchOnStartupLabel": {
+      "fr": "0ea188f6",
+      "es": "0ea188f6"
+    },
+    "launchOnStartupDesc": {
+      "fr": "271f334b",
+      "es": "271f334b"
+    },
+    "sectionSecurity": {
+      "fr": "c2fe21db",
+      "es": "c2fe21db"
+    },
+    "pinExitGameLabel": {
+      "fr": "d550e142",
+      "es": "d550e142"
+    },
+    "pinExitGameDesc": {
+      "fr": "413aabb2",
+      "es": "413aabb2"
+    },
+    "pinExitLogoLabel": {
+      "fr": "2db8dc1e",
+      "es": "2db8dc1e"
+    },
+    "pinExitLogoDesc": {
+      "fr": "3c0132af",
+      "es": "3c0132af"
+    },
+    "pinExitFullscreenLabel": {
+      "fr": "f1e28d91",
+      "es": "f1e28d91"
+    },
+    "pinExitFullscreenDesc": {
+      "fr": "5389abd8",
+      "es": "5389abd8"
+    },
+    "sectionLaunchLogo": {
+      "fr": "5f67c643",
+      "es": "5f67c643"
+    },
+    "logoScreenOnLaunchLabel": {
+      "fr": "4b629dde",
+      "es": "4b629dde"
+    },
+    "logoScreenOnLaunchDesc": {
+      "fr": "4118119e",
+      "es": "4118119e"
+    },
+    "logoLabel": {
+      "fr": "6da999ba",
+      "es": "6da999ba"
+    },
+    "logoHint": {
+      "fr": "6125d195",
+      "es": "6125d195"
+    },
+    "replaceLogo": {
+      "fr": "c342889e",
+      "es": "c342889e"
+    },
+    "uploadLogo": {
+      "fr": "8e0736cb",
+      "es": "8e0736cb"
+    },
+    "removeLogo": {
+      "fr": "21a5901d",
+      "es": "21a5901d"
+    },
+    "backgroundColor": {
+      "fr": "7dfdc6f6",
+      "es": "7dfdc6f6"
+    },
+    "animation": {
+      "fr": "41e389fd",
+      "es": "41e389fd"
+    },
+    "animationHint": {
+      "fr": "5904c78c",
+      "es": "5904c78c"
+    },
+    "glowColor": {
+      "fr": "fa6ff05b",
+      "es": "fa6ff05b"
+    },
+    "preview": {
+      "fr": "fdda4cf7",
+      "es": "fdda4cf7"
+    },
+    "noCustomLogo": {
+      "fr": "7fab9d71",
+      "es": "7fab9d71"
+    },
+    "saving": {
+      "fr": "74119e7f",
+      "es": "74119e7f"
+    },
+    "saveConfiguration": {
+      "fr": "d495a0fa",
+      "es": "d495a0fa"
+    },
+    "readerSection": {
+      "fr": "6d08eef6",
+      "es": "6d08eef6"
+    },
+    "refresh": {
+      "fr": "0815aad4",
+      "es": "0815aad4"
+    },
+    "readerDetectionDesktopOnly": {
+      "fr": "6db6f053",
+      "es": "6db6f053"
+    },
+    "readerDetectedHint": {
+      "fr": "4cc24dc0",
+      "es": "4cc24dc0"
+    },
+    "driverBlockedTitle": {
+      "fr": "7c22756c",
+      "es": "7c22756c"
+    },
+    "driverBlockedDesc": {
+      "fr": "6fff83ed",
+      "es": "6fff83ed"
+    },
+    "driverBlockedCta": {
+      "fr": "0a8954a1",
+      "es": "0a8954a1"
+    },
+    "driverNotInstalledTitle": {
+      "fr": "007ebc18",
+      "es": "007ebc18"
+    },
+    "driverNotInstalledDesc": {
+      "fr": "56f8e850",
+      "es": "56f8e850"
+    },
+    "driverNotInstalledCta": {
+      "fr": "7f33d7ca",
+      "es": "7f33d7ca"
+    },
+    "noReaderTitle": {
+      "fr": "0bfb6c3d",
+      "es": "0bfb6c3d"
+    },
+    "noReaderDesc": {
+      "fr": "4d843a62",
+      "es": "4d843a62"
+    },
+    "noReaderCta": {
+      "fr": "b96d0b42",
+      "es": "b96d0b42"
+    },
+    "cardReaderTestSection": {
+      "fr": "a49b6a5a",
+      "es": "a49b6a5a"
+    },
+    "clearCount": {
+      "fr": "fdb97bc0",
+      "es": "fdb97bc0"
+    },
+    "stopTest": {
+      "fr": "275e11eb",
+      "es": "275e11eb"
+    },
+    "startTest": {
+      "fr": "a751a9cd",
+      "es": "a751a9cd"
+    },
+    "cardReaderTestDesktopOnly": {
+      "fr": "6ab4e1a0",
+      "es": "6ab4e1a0"
+    },
+    "plugInReaderToTest": {
+      "fr": "02bf3795",
+      "es": "02bf3795"
+    },
+    "statusOpeningPort": {
+      "fr": "d8624270",
+      "es": "d8624270"
+    },
+    "errorFailedToOpenPort": {
+      "fr": "8800b9b5",
+      "es": "8800b9b5"
+    },
+    "statusListening": {
+      "fr": "19c0d10f",
+      "es": "19c0d10f"
+    },
+    "errorCouldNotStart": {
+      "fr": "3679d7d9",
+      "es": "3679d7d9"
+    },
+    "statusStopped": {
+      "fr": "15558940",
+      "es": "15558940"
+    },
+    "errorStopping": {
+      "fr": "8d473625",
+      "es": "8d473625"
+    },
+    "masterStation": {
+      "fr": "e718cb5f",
+      "es": "e718cb5f"
+    },
+    "stationModePrefix": {
+      "fr": "ec6ee012",
+      "es": "ec6ee012"
+    },
+    "stationExtended": {
+      "fr": "0f8d7260",
+      "es": "0f8d7260"
+    },
+    "stationAutoSend": {
+      "fr": "3658bb93",
+      "es": "3658bb93"
+    },
+    "stationHandshake": {
+      "fr": "dbdfe526",
+      "es": "dbdfe526"
+    },
+    "waitingForCard": {
+      "fr": "a9749534",
+      "es": "a9749534"
+    },
+    "noCardsYet": {
+      "fr": "7eb0d4c2",
+      "es": "7eb0d4c2"
+    },
+    "punchCount_one": {
+      "fr": "bdb64e18",
+      "es": "bdb64e18"
+    },
+    "punchCount_other": {
+      "fr": "c927a55c",
+      "es": "c927a55c"
+    },
+    "registeredChip": {
+      "fr": "71f0a64c",
+      "es": "71f0a64c"
+    },
+    "notRegistered": {
+      "fr": "06bd81d6",
+      "es": "06bd81d6"
+    },
+    "register": {
+      "fr": "2739c9e0",
+      "es": "2739c9e0"
+    },
+    "errorKeyNumberTaken": {
+      "fr": "99370b82",
+      "es": "99370b82"
+    },
+    "keyNumberLabel": {
+      "fr": "2133b225",
+      "es": "2133b225"
+    },
+    "nameLabel": {
+      "fr": "869b948a",
+      "es": "869b948a"
+    },
+    "namePlaceholder": {
+      "fr": "cb199d47",
+      "es": "cb199d47"
+    },
+    "colorLabel": {
+      "fr": "a3eae11f",
+      "es": "a3eae11f"
+    },
+    "colorPlaceholder": {
+      "fr": "52dad1e0",
+      "es": "52dad1e0"
+    },
+    "save": {
+      "fr": "4d2d5d68",
+      "es": "4d2d5d68"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "timeSlotStart": {
+      "fr": "0ae8097f",
+      "es": "0ae8097f"
+    },
+    "timeSlotCheck": {
+      "fr": "592c8de7",
+      "es": "592c8de7"
+    },
+    "timeSlotFinish": {
+      "fr": "9f29eeb2",
+      "es": "9f29eeb2"
+    },
+    "punchesHeading": {
+      "fr": "78b84c73",
+      "es": "78b84c73"
+    },
+    "navGroupAccount": {
+      "fr": "59f8a2fc",
+      "es": "59f8a2fc"
+    },
+    "navAccount": {
+      "fr": "59f8a2fc",
+      "es": "59f8a2fc"
+    },
+    "navSync": {
+      "fr": "89a71bba",
+      "es": "89a71bba"
+    },
+    "navMyDevices": {
+      "fr": "017b9f9c",
+      "es": "017b9f9c"
+    },
+    "navGroupApp": {
+      "fr": "81f51acc",
+      "es": "81f51acc"
+    },
+    "navPreferences": {
+      "fr": "b6e5d7dd",
+      "es": "b6e5d7dd"
+    },
+    "navHardware": {
+      "fr": "d8173719",
+      "es": "d8173719"
+    },
+    "navUpdates": {
+      "fr": "483075a5",
+      "es": "483075a5"
+    },
+    "navGroupDeveloper": {
+      "fr": "34a3d9ed",
+      "es": "34a3d9ed"
+    },
+    "navApiDocs": {
+      "fr": "1316d852",
+      "es": "1316d852"
+    },
+    "navUsbDriver": {
+      "fr": "03618ec1",
+      "es": "03618ec1"
+    },
+    "languageSpanishTitle": {
+      "fr": "19f0b05e",
+      "es": "19f0b05e"
+    },
+    "languageSpanishSubtitle": {
+      "fr": "335c0277",
+      "es": "335c0277"
+    },
+    "navCardsPatterns": {
+      "fr": "550c3649",
+      "es": "550c3649"
+    }
+  },
+  "adminPassword": {
+    "heading": {
+      "fr": "bd605076",
+      "es": "bd605076"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "label": {
+      "fr": "d271b87f",
+      "es": "d271b87f"
+    },
+    "placeholder": {
+      "fr": "7d0ee362",
+      "es": "7d0ee362"
+    },
+    "incorrect": {
+      "fr": "c99da0c5",
+      "es": "c99da0c5"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "submit": {
+      "fr": "aff863ad",
+      "es": "aff863ad"
+    }
+  },
+  "devicesModal": {
+    "title": {
+      "fr": "f86f8f60",
+      "es": "f86f8f60"
+    },
+    "help": {
+      "fr": "b89df01a",
+      "es": "b89df01a"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "sectionInGame": {
+      "fr": "75a27a14",
+      "es": "75a27a14"
+    },
+    "sectionAvailable": {
+      "fr": "71f90827",
+      "es": "71f90827"
+    },
+    "sectionOffline": {
+      "fr": "5be79a73",
+      "es": "5be79a73"
+    },
+    "selectAll": {
+      "fr": "6af21072",
+      "es": "6af21072"
+    },
+    "addSatelliteHint": {
+      "fr": "c55d446d",
+      "es": "c55d446d"
+    },
+    "selectedCount_one": {
+      "fr": "76506f69",
+      "es": "76506f69"
+    },
+    "selectedCount_other": {
+      "fr": "76506f69",
+      "es": "76506f69"
+    },
+    "play": {
+      "fr": "29ab6f83",
+      "es": "29ab6f83"
+    },
+    "stop": {
+      "fr": "4b7f7705",
+      "es": "4b7f7705"
+    },
+    "playTitleNoSatellites": {
+      "fr": "1d0a73bb",
+      "es": "1d0a73bb"
+    },
+    "playTitleTickOne": {
+      "fr": "ef05f76b",
+      "es": "ef05f76b"
+    },
+    "playTitlePick": {
+      "fr": "970cdddc",
+      "es": "970cdddc"
+    },
+    "stopTitle": {
+      "fr": "a3a70f47",
+      "es": "a3a70f47"
+    },
+    "videoIntro": {
+      "fr": "d3f90251",
+      "es": "d3f90251"
+    },
+    "videoTutorial": {
+      "fr": "862a694f",
+      "es": "862a694f"
+    },
+    "videoIntroTutorial": {
+      "fr": "2d5a864a",
+      "es": "2d5a864a"
+    },
+    "emptyInGame": {
+      "fr": "5b73f468",
+      "es": "5b73f468"
+    },
+    "emptyAvailable": {
+      "fr": "c7fc3c6d",
+      "es": "c7fc3c6d"
+    },
+    "emptyOffline": {
+      "fr": "85a3e19d",
+      "es": "85a3e19d"
+    },
+    "launching": {
+      "fr": "4f056204",
+      "es": "4f056204"
+    },
+    "launchHere": {
+      "fr": "1e7aba94",
+      "es": "1e7aba94"
+    },
+    "lastSeen": {
+      "fr": "95509671",
+      "es": "95509671"
+    },
+    "thisDevice": {
+      "fr": "c0fd8b9e",
+      "es": "c0fd8b9e"
+    },
+    "readerAttached": {
+      "fr": "c8f7a39a",
+      "es": "c8f7a39a"
+    },
+    "noReaderTitle": {
+      "fr": "2efd3d71",
+      "es": "2efd3d71"
+    },
+    "reader": {
+      "fr": "26f3e1d6",
+      "es": "26f3e1d6"
+    },
+    "noReader": {
+      "fr": "f90c8c51",
+      "es": "f90c8c51"
+    },
+    "online": {
+      "fr": "8f73308a",
+      "es": "8f73308a"
+    },
+    "offline": {
+      "fr": "ec8b9928",
+      "es": "ec8b9928"
+    },
+    "stalenessNever": {
+      "fr": "0ac95089",
+      "es": "0ac95089"
+    },
+    "stalenessJustNow": {
+      "fr": "a715ef0f",
+      "es": "a715ef0f"
+    },
+    "stalenessMinutes": {
+      "fr": "80737de5",
+      "es": "80737de5"
+    },
+    "stalenessHours": {
+      "fr": "c5793c86",
+      "es": "c5793c86"
+    },
+    "stalenessDays": {
+      "fr": "b8811eaa",
+      "es": "b8811eaa"
+    },
+    "errorNoResponse": {
+      "fr": "30a491af",
+      "es": "30a491af"
+    },
+    "errorFailed": {
+      "fr": "5579c3d4",
+      "es": "5579c3d4"
+    }
+  },
+  "fullscreenHint": {
+    "hint": {
+      "fr": "98dd4510",
+      "es": "98dd4510"
+    },
+    "pinTitle": {
+      "fr": "1f46e58b",
+      "es": "1f46e58b"
+    },
+    "pinSubtitle": {
+      "fr": "01613b19",
+      "es": "01613b19"
+    }
+  },
+  "launchConfig": {
+    "title": {
+      "fr": "b690a6bf",
+      "es": "b690a6bf"
+    },
+    "emptyState": {
+      "fr": "b6e0d580",
+      "es": "b6e0d580"
+    },
+    "launch": {
+      "fr": "37cbb286",
+      "es": "37cbb286"
+    },
+    "launchTitle": {
+      "fr": "ca13d68c",
+      "es": "ca13d68c"
+    },
+    "editTitle": {
+      "fr": "a183f4db",
+      "es": "a183f4db"
+    },
+    "deleteTitle": {
+      "fr": "392cf314",
+      "es": "392cf314"
+    },
+    "deleteDialogTitle": {
+      "fr": "392cf314",
+      "es": "392cf314"
+    },
+    "deleteDialogMessage": {
+      "fr": "92e5b2e6",
+      "es": "92e5b2e6"
+    },
+    "delete": {
+      "fr": "5797ea6a",
+      "es": "5797ea6a"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "summaryAutoRegister": {
+      "fr": "1205efec",
+      "es": "1205efec"
+    },
+    "summarySelfRegister": {
+      "fr": "bbe75287",
+      "es": "bbe75287"
+    },
+    "summaryTeamCount_one": {
+      "fr": "c4aa5df9",
+      "es": "c4aa5df9"
+    },
+    "summaryTeamCount_other": {
+      "fr": "2231403e",
+      "es": "2231403e"
+    },
+    "summaryDuration": {
+      "fr": "6121e7fd",
+      "es": "6121e7fd"
+    },
+    "summaryReuseCards": {
+      "fr": "0cc4c0a8",
+      "es": "0cc4c0a8"
+    },
+    "summaryNamePool": {
+      "fr": "b9fabf20",
+      "es": "b9fabf20"
+    }
+  },
+  "launchModal": {
+    "title": {
+      "fr": "95d784f2",
+      "es": "95d784f2"
+    },
+    "help": {
+      "fr": "b89df01a",
+      "es": "b89df01a"
+    },
+    "gameName": {
+      "fr": "73cbe046",
+      "es": "73cbe046"
+    },
+    "gameNameHint": {
+      "fr": "b9b75eaf",
+      "es": "b9b75eaf"
+    },
+    "numberOfTeams": {
+      "fr": "c997bccb",
+      "es": "c997bccb"
+    },
+    "maxCount": {
+      "fr": "eb8ade34",
+      "es": "eb8ade34"
+    },
+    "exceedsAvailableCards": {
+      "fr": "87bcce3e",
+      "es": "87bcce3e"
+    },
+    "indexOfFirstChip": {
+      "fr": "b8c14d5c",
+      "es": "b8c14d5c"
+    },
+    "pattern": {
+      "fr": "f49120c9",
+      "es": "f49120c9"
+    },
+    "loadingPatterns": {
+      "fr": "a7679b5c",
+      "es": "a7679b5c"
+    },
+    "tracksPatternMismatch": {
+      "fr": "44114511",
+      "es": "44114511"
+    },
+    "durationMinutes": {
+      "fr": "c5166a6d",
+      "es": "c5166a6d"
+    },
+    "language": {
+      "fr": "9a73db9b",
+      "es": "9a73db9b"
+    },
+    "languageHint": {
+      "fr": "fb01914a",
+      "es": "fb01914a"
+    },
+    "firstBipVideos": {
+      "fr": "18a05421",
+      "es": "18a05421"
+    },
+    "playTutorialVideo": {
+      "fr": "6699ba4a",
+      "es": "6699ba4a"
+    },
+    "playIntroVideo": {
+      "fr": "b85aa256",
+      "es": "b85aa256"
+    },
+    "firstBipVideosHint": {
+      "fr": "98ff778a",
+      "es": "98ff778a"
+    },
+    "victoryType": {
+      "fr": "ed705ed7",
+      "es": "ed705ed7"
+    },
+    "victoryScore": {
+      "fr": "77eb0235",
+      "es": "77eb0235"
+    },
+    "victoryScoreDesc": {
+      "fr": "0c94b371",
+      "es": "0c94b371"
+    },
+    "victorySpeed": {
+      "fr": "0a6b8020",
+      "es": "0a6b8020"
+    },
+    "victorySpeedDesc": {
+      "fr": "446a9f46",
+      "es": "446a9f46"
+    },
+    "playMode": {
+      "fr": "43274416",
+      "es": "43274416"
+    },
+    "playModeTeam": {
+      "fr": "2329c92c",
+      "es": "2329c92c"
+    },
+    "playModeTeamDesc": {
+      "fr": "6833ef8a",
+      "es": "6833ef8a"
+    },
+    "playModeSolo": {
+      "fr": "698f976a",
+      "es": "698f976a"
+    },
+    "playModeSoloDesc": {
+      "fr": "221e6dac",
+      "es": "221e6dac"
+    },
+    "teammatesPerTeam": {
+      "fr": "56018482",
+      "es": "56018482"
+    },
+    "chipsNeededAvailable": {
+      "fr": "cf3a8329",
+      "es": "cf3a8329"
+    },
+    "tracksRoute": {
+      "fr": "d7d630be",
+      "es": "d7d630be"
+    },
+    "tracksDisplayMode": {
+      "fr": "b22e2e08",
+      "es": "b22e2e08"
+    },
+    "tracksPlayMode": {
+      "fr": "c2faf7f6",
+      "es": "c2faf7f6"
+    },
+    "tracksScoreType": {
+      "fr": "3b9987f7",
+      "es": "3b9987f7"
+    },
+    "routeDefault": {
+      "fr": "6c7303d9",
+      "es": "6c7303d9"
+    },
+    "routeFirstHalf": {
+      "fr": "68871446",
+      "es": "68871446"
+    },
+    "routeLastHalf": {
+      "fr": "27780b6e",
+      "es": "27780b6e"
+    },
+    "routeOdd": {
+      "fr": "6b959ffd",
+      "es": "6b959ffd"
+    },
+    "routeEven": {
+      "fr": "fc47f266",
+      "es": "fc47f266"
+    },
+    "displayFull": {
+      "fr": "7fa5ff5c",
+      "es": "7fa5ff5c"
+    },
+    "displayMap": {
+      "fr": "44a7f051",
+      "es": "44a7f051"
+    },
+    "displaySimple": {
+      "fr": "8b33749f",
+      "es": "8b33749f"
+    },
+    "playModeItinerary": {
+      "fr": "32412ba6",
+      "es": "32412ba6"
+    },
+    "playModeFree": {
+      "fr": "74ce77fe",
+      "es": "74ce77fe"
+    },
+    "scoreTypePercentage": {
+      "fr": "745595d5",
+      "es": "745595d5"
+    },
+    "scoreTypePoints": {
+      "fr": "a9f0a4e6",
+      "es": "a9f0a4e6"
+    },
+    "useOnDemandCards": {
+      "fr": "1d184d00",
+      "es": "1d184d00"
+    },
+    "additionalCardsAvailable_one": {
+      "fr": "957ddcdf",
+      "es": "957ddcdf"
+    },
+    "additionalCardsAvailable_other": {
+      "fr": "25c2514e",
+      "es": "25c2514e"
+    },
+    "playersAutoRegister": {
+      "fr": "3e1908d9",
+      "es": "3e1908d9"
+    },
+    "autoRegisterTeam": {
+      "fr": "6450f100",
+      "es": "6450f100"
+    },
+    "autoRegisterTeamHint": {
+      "fr": "bb122c36",
+      "es": "bb122c36"
+    },
+    "selfRegisterTeam": {
+      "fr": "9f683a24",
+      "es": "9f683a24"
+    },
+    "selfRegisterTeamHint": {
+      "fr": "d7574d60",
+      "es": "d7574d60"
+    },
+    "addRandomNameOption": {
+      "fr": "a682398b",
+      "es": "a682398b"
+    },
+    "addRandomNameOptionHint": {
+      "fr": "afabf827",
+      "es": "afabf827"
+    },
+    "allowPlayerLanguageChoice": {
+      "fr": "4f6d7a55",
+      "es": "4f6d7a55"
+    },
+    "allowPlayerLanguageChoiceHint": {
+      "fr": "f2a05ddd",
+      "es": "f2a05ddd"
+    },
+    "useNamePool": {
+      "fr": "8697e080",
+      "es": "8697e080"
+    },
+    "useNamePoolHint": {
+      "fr": "e5e7d202",
+      "es": "e5e7d202"
+    },
+    "reuseCards": {
+      "fr": "102c2048",
+      "es": "102c2048"
+    },
+    "reuseCardsHint": {
+      "fr": "85b3adeb",
+      "es": "85b3adeb"
+    },
+    "reuseDelayMinutes": {
+      "fr": "a6a5ec31",
+      "es": "a6a5ec31"
+    },
+    "autoResetPage": {
+      "fr": "ca8d6dff",
+      "es": "ca8d6dff"
+    },
+    "autoResetPageHint": {
+      "fr": "abe2c455",
+      "es": "abe2c455"
+    },
+    "delayBeforeReset": {
+      "fr": "ede556e8",
+      "es": "ede556e8"
+    },
+    "revealResultsOnInput": {
+      "fr": "c11bd907",
+      "es": "c11bd907"
+    },
+    "revealResultsOnInputHint": {
+      "fr": "be0b8675",
+      "es": "be0b8675"
+    },
+    "advanced": {
+      "fr": "60f3de7b",
+      "es": "60f3de7b"
+    },
+    "messageDisplayDuration": {
+      "fr": "7051473a",
+      "es": "7051473a"
+    },
+    "imageDisplayDuration": {
+      "fr": "3b867bc0",
+      "es": "3b867bc0"
+    },
+    "colorblindMode": {
+      "fr": "7acccf42",
+      "es": "7acccf42"
+    },
+    "keepResultOnScreen": {
+      "fr": "0469f976",
+      "es": "0469f976"
+    },
+    "seconds": {
+      "fr": "66b6cdea",
+      "es": "66b6cdea"
+    },
+    "keepResultOnScreenHint": {
+      "fr": "8e2e7b48",
+      "es": "8e2e7b48"
+    },
+    "malusPerMinute": {
+      "fr": "be8f6d72",
+      "es": "be8f6d72"
+    },
+    "malusPerMinuteHint": {
+      "fr": "191cec58",
+      "es": "191cec58"
+    },
+    "testMode": {
+      "fr": "e0204e58",
+      "es": "e0204e58"
+    },
+    "testModeHint": {
+      "fr": "08a6d88a",
+      "es": "08a6d88a"
+    },
+    "saveConfiguration": {
+      "fr": "d495a0fa",
+      "es": "d495a0fa"
+    },
+    "configurationName": {
+      "fr": "17d7a2e0",
+      "es": "17d7a2e0"
+    },
+    "saving": {
+      "fr": "74119e7f",
+      "es": "74119e7f"
+    },
+    "save": {
+      "fr": "4d2d5d68",
+      "es": "4d2d5d68"
+    },
+    "savedFlash": {
+      "fr": "b14ad6ee",
+      "es": "b14ad6ee"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    },
+    "next": {
+      "fr": "dce2da08",
+      "es": "dce2da08"
+    },
+    "back": {
+      "fr": "c2954bc2",
+      "es": "c2954bc2"
+    },
+    "configureTeams": {
+      "fr": "0d9df7b9",
+      "es": "0d9df7b9"
+    },
+    "teamNamePlaceholder": {
+      "fr": "3267531f",
+      "es": "3267531f"
+    },
+    "chipOption": {
+      "fr": "1d5ef7d3",
+      "es": "1d5ef7d3"
+    },
+    "chipInUseSuffix": {
+      "fr": "f3224262",
+      "es": "f3224262"
+    },
+    "teammateNamePlaceholder": {
+      "fr": "352c76c0",
+      "es": "352c76c0"
+    },
+    "teamLanguage": {
+      "fr": "57be374e",
+      "es": "57be374e"
+    },
+    "devicesToLaunchOn": {
+      "fr": "f13e26b5",
+      "es": "f13e26b5"
+    },
+    "devicesToLaunchOnHint": {
+      "fr": "f5edc374",
+      "es": "f5edc374"
+    },
+    "loadingPairedDevices": {
+      "fr": "cbf8fe5f",
+      "es": "cbf8fe5f"
+    },
+    "thisDevice": {
+      "fr": "8fc5c8b9",
+      "es": "8fc5c8b9"
+    },
+    "motherTag": {
+      "fr": "56b14a3f",
+      "es": "56b14a3f"
+    },
+    "online": {
+      "fr": "8f73308a",
+      "es": "8f73308a"
+    },
+    "offline": {
+      "fr": "ec8b9928",
+      "es": "ec8b9928"
+    },
+    "motherHostOnly": {
+      "fr": "5567eea3",
+      "es": "5567eea3"
+    },
+    "noOtherPairedDevices": {
+      "fr": "5887a868",
+      "es": "5887a868"
+    },
+    "reader": {
+      "fr": "26f3e1d6",
+      "es": "26f3e1d6"
+    },
+    "noReader": {
+      "fr": "f90c8c51",
+      "es": "f90c8c51"
+    },
+    "launchOnDevices_one": {
+      "fr": "ba684156",
+      "es": "ba684156"
+    },
+    "launchOnDevices_other": {
+      "fr": "971e8d3f",
+      "es": "971e8d3f"
+    },
+    "replaceConfigTitle": {
+      "fr": "edae39a5",
+      "es": "edae39a5"
+    },
+    "replaceConfigMessage": {
+      "fr": "0c3a326c",
+      "es": "0c3a326c"
+    },
+    "replace": {
+      "fr": "e4d54f63",
+      "es": "e4d54f63"
+    }
+  },
+  "launchedGameConfig": {
+    "heading": {
+      "fr": "507b3899",
+      "es": "507b3899"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "gameLabel": {
+      "fr": "3cf946a7",
+      "es": "3cf946a7"
+    },
+    "loading": {
+      "fr": "2e73472d",
+      "es": "2e73472d"
+    },
+    "fieldPattern": {
+      "fr": "f49120c9",
+      "es": "f49120c9"
+    },
+    "fieldDuration": {
+      "fr": "c5166a6d",
+      "es": "c5166a6d"
+    },
+    "fieldMessageDisplayDuration": {
+      "fr": "7051473a",
+      "es": "7051473a"
+    },
+    "fieldEnigmaImageDisplayDuration": {
+      "fr": "b1eaddbd",
+      "es": "b1eaddbd"
+    },
+    "fieldColorblindMode": {
+      "fr": "7acccf42",
+      "es": "7acccf42"
+    },
+    "fieldAutoResetTeam": {
+      "fr": "ca8d6dff",
+      "es": "ca8d6dff"
+    },
+    "fieldDelayBeforeReset": {
+      "fr": "ede556e8",
+      "es": "ede556e8"
+    },
+    "fieldRevealResultsOnInput": {
+      "fr": "35e411ed",
+      "es": "35e411ed"
+    },
+    "fieldAutoRegisterTeam": {
+      "fr": "6450f100",
+      "es": "6450f100"
+    },
+    "fieldReuseCards": {
+      "fr": "102c2048",
+      "es": "102c2048"
+    },
+    "fieldSelfRegisterTeam": {
+      "fr": "9f683a24",
+      "es": "9f683a24"
+    },
+    "fieldReuseDelayMinutes": {
+      "fr": "bf61e5e4",
+      "es": "bf61e5e4"
+    },
+    "fieldVictoryType": {
+      "fr": "ed705ed7",
+      "es": "ed705ed7"
+    },
+    "victorySpeed": {
+      "fr": "0a6b8020",
+      "es": "0a6b8020"
+    },
+    "victoryScore": {
+      "fr": "77eb0235",
+      "es": "77eb0235"
+    },
+    "enable": {
+      "fr": "8614a9ee",
+      "es": "8614a9ee"
+    },
+    "connectedDevices": {
+      "fr": "f2d051cb",
+      "es": "f2d051cb"
+    },
+    "showRawData": {
+      "fr": "55277eec",
+      "es": "55277eec"
+    },
+    "hideRawData": {
+      "fr": "08ed0b8b",
+      "es": "08ed0b8b"
+    },
+    "lastConnection": {
+      "fr": "b5e4bf05",
+      "es": "b5e4bf05"
+    },
+    "cardPunchData": {
+      "fr": "08fa9a31",
+      "es": "08fa9a31"
+    },
+    "saving": {
+      "fr": "1ee0c88f",
+      "es": "1ee0c88f"
+    },
+    "saveConfiguration": {
+      "fr": "5b7f219a",
+      "es": "5b7f219a"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    }
+  },
+  "logoScreen": {
+    "pinSubtitle": {
+      "fr": "b8652706",
+      "es": "b8652706"
+    }
+  },
+  "operatorVideo": {},
+  "pinExit": {
+    "title": {
+      "fr": "1f46e58b",
+      "es": "1f46e58b"
+    },
+    "subtitle": {
+      "fr": "391583e9",
+      "es": "391583e9"
+    },
+    "wrongPin": {
+      "fr": "dd35bb76",
+      "es": "dd35bb76"
+    },
+    "checkFailed": {
+      "fr": "b312216f",
+      "es": "b312216f"
+    },
+    "checking": {
+      "fr": "732bdad5",
+      "es": "732bdad5"
+    },
+    "forgotPin": {
+      "fr": "4d0fec0a",
+      "es": "4d0fec0a"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    }
+  },
+  "recoveryCode": {
+    "title": {
+      "fr": "2dece34a",
+      "es": "2dece34a"
+    },
+    "subtitle": {
+      "fr": "273e93a6",
+      "es": "273e93a6"
+    },
+    "wrongCode": {
+      "fr": "92e60787",
+      "es": "92e60787"
+    },
+    "checkFailed": {
+      "fr": "90d9faae",
+      "es": "90d9faae"
+    },
+    "loading": {
+      "fr": "2e7e4ae3",
+      "es": "2e7e4ae3"
+    },
+    "noCodes": {
+      "fr": "6b0ebbde",
+      "es": "6b0ebbde"
+    },
+    "checking": {
+      "fr": "732bdad5",
+      "es": "732bdad5"
+    },
+    "cancel": {
+      "fr": "35afca3b",
+      "es": "35afca3b"
+    }
+  },
+  "scenarioDetails": {
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "untitledScenario": {
+      "fr": "4a808902",
+      "es": "4a808902"
+    },
+    "loadingDetails": {
+      "fr": "b48e3fc9",
+      "es": "b48e3fc9"
+    },
+    "difficultyMedium": {
+      "fr": "09be5f96",
+      "es": "09be5f96"
+    },
+    "notDownloaded": {
+      "fr": "549ec007",
+      "es": "549ec007"
+    },
+    "updateAvailable": {
+      "fr": "676409df",
+      "es": "676409df"
+    },
+    "story": {
+      "fr": "59a30e52",
+      "es": "59a30e52"
+    },
+    "noStory": {
+      "fr": "714d025b",
+      "es": "714d025b"
+    },
+    "downloadForStory": {
+      "fr": "ad20251d",
+      "es": "ad20251d"
+    },
+    "version": {
+      "fr": "5dcdd537",
+      "es": "5dcdd537"
+    },
+    "duration": {
+      "fr": "d4c7492d",
+      "es": "d4c7492d"
+    },
+    "durationValue": {
+      "fr": "23a3479c",
+      "es": "23a3479c"
+    },
+    "quests": {
+      "fr": "07c9d1ea",
+      "es": "07c9d1ea"
+    },
+    "enigmas": {
+      "fr": "4ae5d29d",
+      "es": "4ae5d29d"
+    },
+    "audience": {
+      "fr": "d0fb1d83",
+      "es": "d0fb1d83"
+    },
+    "font": {
+      "fr": "a77a5eb0",
+      "es": "a77a5eb0"
+    },
+    "languages": {
+      "fr": "0c632e38",
+      "es": "0c632e38"
+    },
+    "installedVersion": {
+      "fr": "64486d04",
+      "es": "64486d04"
+    },
+    "latestVersionNotDownloaded": {
+      "fr": "7e699578",
+      "es": "7e699578"
+    }
+  },
+  "sync": {
+    "syncing": {
+      "fr": "431a9560",
+      "es": "431a9560"
+    },
+    "syncingProgress": {
+      "fr": "1ec65884",
+      "es": "1ec65884"
+    },
+    "clickForDetails": {
+      "fr": "75f0b7de",
+      "es": "75f0b7de"
+    },
+    "pillAriaLabel": {
+      "fr": "12f1e606",
+      "es": "12f1e606"
+    },
+    "itemsFailedToDownload_one": {
+      "fr": "32b233f7",
+      "es": "32b233f7"
+    },
+    "itemsFailedToDownload_other": {
+      "fr": "14b7805c",
+      "es": "14b7805c"
+    },
+    "syncFailedReason": {
+      "fr": "aa29354d",
+      "es": "aa29354d"
+    },
+    "viewDetails": {
+      "fr": "136a35ae",
+      "es": "136a35ae"
+    },
+    "retrying": {
+      "fr": "e80a2773",
+      "es": "e80a2773"
+    },
+    "retry": {
+      "fr": "8036af59",
+      "es": "8036af59"
+    },
+    "dismiss": {
+      "fr": "265915f3",
+      "es": "265915f3"
+    },
+    "allSet": {
+      "fr": "fff49704",
+      "es": "fff49704"
+    },
+    "couldNotFinishSetup": {
+      "fr": "eb4fad0f",
+      "es": "eb4fad0f"
+    },
+    "settingUpLibrary": {
+      "fr": "32e8a5c0",
+      "es": "32e8a5c0"
+    },
+    "sessionInvalid": {
+      "fr": "e409403e",
+      "es": "e409403e"
+    },
+    "someItemsFailed": {
+      "fr": "5bff042f",
+      "es": "5bff042f"
+    },
+    "downloadedWithFailures": {
+      "fr": "faf81d36",
+      "es": "faf81d36"
+    },
+    "libraryUpToDate": {
+      "fr": "7d64e7cc",
+      "es": "7d64e7cc"
+    },
+    "downloadedItems_one": {
+      "fr": "ffe238b8",
+      "es": "ffe238b8"
+    },
+    "downloadedItems_other": {
+      "fr": "c8a09e53",
+      "es": "c8a09e53"
+    },
+    "preparingContent": {
+      "fr": "d978a135",
+      "es": "d978a135"
+    },
+    "countOfTotal": {
+      "fr": "3bb31dad",
+      "es": "3bb31dad"
+    },
+    "countFailed_one": {
+      "fr": "327ec4d5",
+      "es": "327ec4d5"
+    },
+    "countFailed_other": {
+      "fr": "327ec4d5",
+      "es": "327ec4d5"
+    },
+    "continueToApp": {
+      "fr": "025c144a",
+      "es": "025c144a"
+    },
+    "skipFinishInBackground": {
+      "fr": "0fc8b9d0",
+      "es": "0fc8b9d0"
+    }
+  },
+  "teamDetails": {
+    "gameDetailsChip": {
+      "fr": "fe5b0f56",
+      "es": "fe5b0f56"
+    },
+    "teamDisplayLanguage": {
+      "fr": "ba157d3c",
+      "es": "ba157d3c"
+    },
+    "summaryFound": {
+      "fr": "0abaed3f",
+      "es": "0abaed3f"
+    },
+    "summaryScore": {
+      "fr": "77eb0235",
+      "es": "77eb0235"
+    },
+    "summaryLevel": {
+      "fr": "4155597d",
+      "es": "4155597d"
+    },
+    "summaryTime": {
+      "fr": "dfe4e404",
+      "es": "dfe4e404"
+    },
+    "summaryQuests": {
+      "fr": "07c9d1ea",
+      "es": "07c9d1ea"
+    },
+    "summaryQuestPts": {
+      "fr": "cf1bcac0",
+      "es": "cf1bcac0"
+    },
+    "summaryComboBonus": {
+      "fr": "9f2414c6",
+      "es": "9f2414c6"
+    },
+    "summaryTotalScore": {
+      "fr": "b83e459b",
+      "es": "b83e459b"
+    },
+    "comboBreakdown": {
+      "fr": "4f747b2e",
+      "es": "4f747b2e"
+    },
+    "comboPill6": {
+      "fr": "7f9e8f1c",
+      "es": "7f9e8f1c"
+    },
+    "comboPill4": {
+      "fr": "8ddcae36",
+      "es": "8ddcae36"
+    },
+    "comboPill2": {
+      "fr": "ff186940",
+      "es": "ff186940"
+    },
+    "tabEnigmas": {
+      "fr": "6f55ebf3",
+      "es": "6f55ebf3"
+    },
+    "tabQuests": {
+      "fr": "85662448",
+      "es": "85662448"
+    },
+    "tabQuestCount": {
+      "fr": "2421defe",
+      "es": "2421defe"
+    },
+    "tabPunches": {
+      "fr": "fdbfeee5",
+      "es": "fdbfeee5"
+    },
+    "loading": {
+      "fr": "17b11033",
+      "es": "17b11033"
+    },
+    "noEnigmas": {
+      "fr": "087be5d5",
+      "es": "087be5d5"
+    },
+    "edited": {
+      "fr": "6df599e8",
+      "es": "6df599e8"
+    },
+    "pts": {
+      "fr": "54764a76",
+      "es": "54764a76"
+    },
+    "revertToDetected": {
+      "fr": "fe005387",
+      "es": "fe005387"
+    },
+    "enigmaStatus_found": {
+      "fr": "0abaed3f",
+      "es": "0abaed3f"
+    },
+    "enigmaStatus_wrong": {
+      "fr": "8ce0a016",
+      "es": "8ce0a016"
+    },
+    "enigmaStatus_not_found": {
+      "fr": "66d1107a",
+      "es": "66d1107a"
+    },
+    "enigmaStatus_both": {
+      "fr": "01e57084",
+      "es": "01e57084"
+    },
+    "noQuestsCompleted": {
+      "fr": "a6b76c38",
+      "es": "a6b76c38"
+    },
+    "colQuest": {
+      "fr": "af8c40dd",
+      "es": "af8c40dd"
+    },
+    "colPoints": {
+      "fr": "a9f0a4e6",
+      "es": "a9f0a4e6"
+    },
+    "colTime": {
+      "fr": "dfe4e404",
+      "es": "dfe4e404"
+    },
+    "chipLabel": {
+      "fr": "ace7532f",
+      "es": "ace7532f"
+    },
+    "noQuestData": {
+      "fr": "ced4db9f",
+      "es": "ced4db9f"
+    },
+    "colPts": {
+      "fr": "b97b4b16",
+      "es": "b97b4b16"
+    },
+    "colCompletions": {
+      "fr": "30d6d75c",
+      "es": "30d6d75c"
+    },
+    "colAdjust": {
+      "fr": "d74f0a9e",
+      "es": "d74f0a9e"
+    },
+    "removeOneCompletion": {
+      "fr": "e89d6561",
+      "es": "e89d6561"
+    },
+    "addOneCompletion": {
+      "fr": "b73aa62e",
+      "es": "b73aa62e"
+    },
+    "noPunchRecords": {
+      "fr": "cc064fee",
+      "es": "cc064fee"
+    },
+    "punchCount_one": {
+      "fr": "bdb64e18",
+      "es": "bdb64e18"
+    },
+    "punchCount_other": {
+      "fr": "c927a55c",
+      "es": "c927a55c"
+    },
+    "endStation": {
+      "fr": "06c2ed02",
+      "es": "06c2ed02"
+    },
+    "colStationCode": {
+      "fr": "182865c0",
+      "es": "182865c0"
+    },
+    "colPunchTime": {
+      "fr": "b0dcdf10",
+      "es": "b0dcdf10"
+    },
+    "questFallback": {
+      "fr": "79636459",
+      "es": "79636459"
+    },
+    "enigmaFallback": {
+      "fr": "783d4341",
+      "es": "783d4341"
+    }
+  },
+  "update": {
+    "availableDesktop": {
+      "fr": "edccad70",
+      "es": "edccad70"
+    },
+    "availableStore": {
+      "fr": "1f1d27e4",
+      "es": "1f1d27e4"
+    },
+    "updateButton": {
+      "fr": "6e230e94",
+      "es": "6e230e94"
+    },
+    "openStoreButton": {
+      "fr": "a5c9d304",
+      "es": "a5c9d304"
+    },
+    "dismiss": {
+      "fr": "265915f3",
+      "es": "265915f3"
+    },
+    "downloadUpdate": {
+      "fr": "9046b11a",
+      "es": "9046b11a"
+    },
+    "downloading": {
+      "fr": "619b86b3",
+      "es": "619b86b3"
+    },
+    "restartToApply": {
+      "fr": "b57dabda",
+      "es": "b57dabda"
+    },
+    "installing": {
+      "fr": "9998ff27",
+      "es": "9998ff27"
+    },
+    "updateFailed": {
+      "fr": "a01cfebc",
+      "es": "a01cfebc"
+    },
+    "tryAgain": {
+      "fr": "213e90fa",
+      "es": "213e90fa"
+    },
+    "gameRunningTitle": {
+      "fr": "508b04a9",
+      "es": "508b04a9"
+    },
+    "gameRunningMessage": {
+      "fr": "6ba57d56",
+      "es": "6ba57d56"
+    },
+    "restartAnyway": {
+      "fr": "328232b5",
+      "es": "328232b5"
+    },
+    "notNow": {
+      "fr": "2c3d6fce",
+      "es": "2c3d6fce"
+    },
+    "requiredTitle": {
+      "fr": "825b7695",
+      "es": "825b7695"
+    },
+    "requiredBody": {
+      "fr": "f6620ea0",
+      "es": "f6620ea0"
+    },
+    "yourVersion": {
+      "fr": "de642902",
+      "es": "de642902"
+    },
+    "latestVersion": {
+      "fr": "3a578c7e",
+      "es": "3a578c7e"
+    },
+    "whatsNew": {
+      "fr": "091ebd33",
+      "es": "091ebd33"
+    },
+    "updateFromStore": {
+      "fr": "849b89dd",
+      "es": "849b89dd"
+    },
+    "updateFromDeviceStore": {
+      "fr": "f30ca37c",
+      "es": "f30ca37c"
+    }
+  },
+  "videoControl": {
+    "playVideo": {
+      "fr": "a6f720e8",
+      "es": "a6f720e8"
+    },
+    "close": {
+      "fr": "cd86acc3",
+      "es": "cd86acc3"
+    },
+    "pickVideoPrefix": {
+      "fr": "d778751e",
+      "es": "d778751e"
+    },
+    "thisDevice": {
+      "fr": "c214f319",
+      "es": "c214f319"
+    },
+    "pickVideoSuffix": {
+      "fr": "ad82d5e2",
+      "es": "ad82d5e2"
+    },
+    "intro": {
+      "fr": "d3f90251",
+      "es": "d3f90251"
+    },
+    "tutorial": {
+      "fr": "862a694f",
+      "es": "862a694f"
+    },
+    "introTutorial": {
+      "fr": "2d5a864a",
+      "es": "2d5a864a"
+    },
+    "stopVideo": {
+      "fr": "91e1f8e2",
+      "es": "91e1f8e2"
+    },
+    "resolving": {
+      "fr": "3291d626",
+      "es": "3291d626"
+    },
+    "noVideoAvailable": {
+      "fr": "fd1a2c16",
+      "es": "fd1a2c16"
+    }
+  }
+}

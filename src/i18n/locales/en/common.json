@@ -1,0 +1,18 @@
+{
+  "becomeMotherPromptTitle": "Make this device the mother?",
+  "becomeMotherPromptBody": "No mother device is reachable on the network, so this device will become the mother and host the game. Other devices can then join it.",
+  "becomeMotherPromptConfirm": "Become mother & launch",
+  "save": "Save",
+  "cancel": "Cancel",
+  "close": "Close",
+  "back": "Back",
+  "loading": "Loading...",
+  "settings": "Settings",
+  "confirm": "Confirm",
+  "delete": "Delete",
+  "yes": "Yes",
+  "no": "No",
+  "dismiss": "Dismiss",
+  "pinResetBanner": "The device PIN was reset with a recovery code. Set a new PIN so the security gates work again.",
+  "setNewPin": "Set a new PIN"
+}

@@ -26,15 +26,33 @@
         { "url": "http://localhost:*/*" },
         { "url": "http://*.local:*/*" },
         { "url": "http://192.168.*.*:*/*" },
-        { "url": "http://10.*.*.*:*/*" }
+        { "url": "http://10.*.*.*:*/*" },
+        { "url": "http://192.168.*.*/*" },
+        { "url": "http://10.*.*.*/*" },
+        { "url": "http://*.local/*" },
+        { "url": "http://192.168.8.108/*" },
+        { "url": "http://192.168.8.108:*/*" },
+        { "url": "http://172.16.*.*:*/*" },
+        { "url": "http://172.17.*.*:*/*" },
+        { "url": "http://172.18.*.*:*/*" },
+        { "url": "http://172.19.*.*:*/*" },
+        { "url": "http://172.2*.*.*:*/*" },
+        { "url": "http://172.30.*.*:*/*" },
+        { "url": "http://172.31.*.*:*/*" },
+        { "url": "http://169.254.*.*:*/*" },
+        { "url": "http://169.254.*.*/*" },
+        { "url": "http://*:*/*" },
+        { "url": "http://*/*" }
       ]
     },
     "fs:default",
     "fs:allow-mkdir",
     "fs:allow-read-text-file",
     "fs:allow-read-file",
-    "fs:allow-write-text-file",
     "fs:allow-write-file",
+    "fs:allow-write-text-file",
+    "fs:allow-open",
+    "fs:allow-write",
     "fs:allow-remove",
     "fs:allow-read-dir",
     "fs:allow-exists",
@@ -47,6 +65,12 @@
       ]
     },
     "opener:default",
-    "autostart:default"
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$APPDATA" },
+        { "path": "$APPDATA/**" }
+      ]
+    }
   ]
 }

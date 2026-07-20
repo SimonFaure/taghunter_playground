@@ -1,0 +1,22 @@
+{
+  "close": "Fermer",
+  "untitledScenario": "Scénario sans titre",
+  "loadingDetails": "Chargement des détails…",
+  "difficulty": "Difficulté",
+  "difficultyMedium": "Moyen",
+  "notDownloaded": "Non téléchargé",
+  "updateAvailable": "Mise à jour disponible",
+  "description": "Description",
+  "noDescription": "Aucune description fournie pour ce scénario.",
+  "downloadForDescription": "Téléchargez le scénario pour voir sa description.",
+  "version": "Version",
+  "duration": "Durée",
+  "durationValue": "{{count}} min",
+  "quests": "Quêtes",
+  "enigmas": "Énigmes",
+  "audience": "Public",
+  "font": "Police",
+  "languages": "Langues",
+  "installedVersion": "Version installée {{local}} · dernière {{remote}}",
+  "latestVersionNotDownloaded": "Dernière version {{remote}} - pas encore téléchargée"
+}

@@ -1,0 +1,13 @@
+{
+  "disabledTitle": "Dispositivos desactivados",
+  "disabledSubtitle": "Un administrador ha desactivado este dispositivo. Introduce un código de recuperación para realizar un evento.",
+  "billingTitle": "Pago requerido",
+  "billingSubtitle": "Esta suscripción está vencida, por lo que iniciar y unirse a partidas está desactivado. Introduce un código de recuperación para realizar un evento.",
+  "recoveryTitle": "Introducir un código de recuperación",
+  "recoverySubtitle": "Pide a tu administrador un código de recuperación de 8 dígitos.",
+  "reprieveGranted": "Desbloqueado durante {{days}} día(s).",
+  "close": "Cerrar",
+  "bannerOverdue": "Pago vencido: las partidas se desactivarán en {{days}} día(s).",
+  "bannerLocked": "Pago vencido: el inicio de partidas está desactivado. Usa un código de recuperación para realizar un evento.",
+  "bannerDisabled": "Dispositivos desactivados por tu administrador. Usa un código de recuperación para realizar un evento."
+}

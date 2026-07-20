@@ -1,13 +1,13 @@
 // Card-type-aware parsing of an assembled readout buffer.
 //
 // Scope per the plan: SI8 / SI9 / SI10 / SI11 only. SIAC, pCard, and the
-// legacy SI5/SI6 families are deliberately out of scope — adding them
+// legacy SI5/SI6 families are deliberately out of scope - adding them
 // later is purely a matter of extending CardType + the layout table.
 //
 // Offsets and block-numbering rules verified against the open-source
 // sportident-rs crate (Apache-2.0; see plans/let-s-work-on-the-flickering-leaf.md).
-// We do not depend on it — it owns the serial port and so doesn't fit our
-// transport abstraction — but its byte-level layout has been used against
+// We do not depend on it - it owns the serial port and so doesn't fit our
+// transport abstraction - but its byte-level layout has been used against
 // real hardware for years and matches what MeOS does.
 
 pub mod layout;
@@ -27,7 +27,7 @@ pub enum CardType {
 impl CardType {
     /// Map a card ID (3-byte big-endian, 0..16_777_215) to a card type.
     ///
-    /// Ranges come from the SI manufacturing scheme and are stable —
+    /// Ranges come from the SI manufacturing scheme and are stable -
     /// every card sold in a given decade has a number in exactly one of
     /// these slots. `None` means either an unknown range (SIAC, pCard, …
     /// not yet supported) or an out-of-spec value.
@@ -57,7 +57,7 @@ impl CardType {
     /// Byte offset (within the assembled readout buffer) at which the
     /// punch array starts. Per-type:
     ///   SI8:136 / SI9:56 / SI10:128 / SI11:128
-    // Convenience accessor — the parser hot path indexes `LAYOUTS` directly;
+    // Convenience accessor - the parser hot path indexes `LAYOUTS` directly;
     // currently only the layout-consistency test calls this.
     #[allow(dead_code)]
     pub fn punches_offset(self) -> usize {
@@ -67,7 +67,7 @@ impl CardType {
     /// Cap on the `punch_count` byte (data[22]) for this card type.
     /// A real card never reports more than this; if `data[22]` exceeds
     /// it, we treat the readout as corrupt rather than parse garbage.
-    // Convenience accessor — the parser checks `LAYOUTS[..].max_punches`
+    // Convenience accessor - the parser checks `LAYOUTS[..].max_punches`
     // directly; currently only the layout-consistency test calls this.
     #[allow(dead_code)]
     pub fn max_punches(self) -> usize {
@@ -93,14 +93,14 @@ impl fmt::Display for CardType {
     }
 }
 
-/// Single timing record. We don't keep subsecond precision yet — the UI
+/// Single timing record. We don't keep subsecond precision yet - the UI
 /// displays HH:MM:SS, and the JS interface only has `time: string`.
 /// Bump this to `u32` of 1/10-seconds (or add a subseconds field) the
 /// day someone needs sub-second accuracy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Punch {
     /// Control number, 0..1023 (10-bit). Beacon controls share this
-    /// space — they aren't separately flagged in the output.
+    /// space - they aren't separately flagged in the output.
     pub code: u16,
     /// Wall-clock seconds since 00:00, 0..86_399.
     pub time_seconds: u32,
@@ -132,7 +132,7 @@ pub struct Card {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// Readout buffer is shorter than the per-type minimum (i.e. fewer
-    /// blocks arrived than expected — likely a transport failure between
+    /// blocks arrived than expected - likely a transport failure between
     /// the 0xEF block reads).
     BufferTooShort { needed: usize, got: usize },
     /// `data[22]` exceeded `max_punches()` for this type. Either the

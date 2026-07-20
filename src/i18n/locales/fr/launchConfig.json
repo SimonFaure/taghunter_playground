@@ -1,0 +1,19 @@
+{
+  "title": "Lancement rapide",
+  "emptyState": "Aucune configuration enregistrée pour ce scénario pour l'instant. Utilisez « Enregistrer la configuration » sur l'écran de lancement pour en créer une.",
+  "launch": "Lancer",
+  "launchTitle": "Lancer cette configuration",
+  "editTitle": "Modifier la configuration",
+  "deleteTitle": "Supprimer la configuration",
+  "deleteDialogTitle": "Supprimer la configuration",
+  "deleteDialogMessage": "Supprimer la configuration enregistrée « {{name}} » ? Cette action est irréversible.",
+  "delete": "Supprimer",
+  "cancel": "Annuler",
+  "summaryAutoRegister": "auto-inscription",
+  "summarySelfRegister": "auto-enregistrement",
+  "summaryTeamCount_one": "{{count}} équipe",
+  "summaryTeamCount_other": "{{count}} équipes",
+  "summaryDuration": "{{duration}} min",
+  "summaryReuseCards": "réutiliser les puces",
+  "summaryNamePool": "liste de noms"
+}

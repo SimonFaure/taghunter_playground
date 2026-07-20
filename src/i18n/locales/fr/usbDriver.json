@@ -1,0 +1,72 @@
+{
+  "explainer": {
+    "title": "À quoi sert cet onglet",
+    "body": "Le lecteur de puces SportIdent se branche en USB et nécessite un pilote Windows pour que cet ordinateur puisse communiquer avec lui. Cet onglet vérifie si ce pilote est installé et fonctionnel et, si le lecteur n'est pas détecté, vous guide dans l'installation du bon pilote pour qu'il se connecte et puisse lire les puces. Il concerne uniquement le lecteur physique - pas votre contenu de jeu (Synchronisation) ni la version de l'application (Mises à jour)."
+  },
+  "detection": {
+    "recheck": "Revérifier",
+    "installTitle": "Disponible dans la prochaine version",
+    "install": "Installer le pilote signé",
+    "comingSoon": "(bientôt disponible)"
+  },
+  "variant": {
+    "healthy": {
+      "title": "Le pilote du lecteur semble correct",
+      "body": "Windows a chargé le pilote du lecteur SportIdent. Branchez votre lecteur et l'onglet Matériel affichera le port COM."
+    },
+    "blockedByPolicy": {
+      "title": "Pilote bloqué par Windows",
+      "body": "Un lecteur SportIdent est branché, mais Windows a refusé de charger son pilote - presque certainement la Liste de blocage des pilotes vulnérables qui refuse l'ancien silabser.sys (le cas 24H2 / 25H2). Installer le pilote signé ci-dessous corrige le problème ; aucune modification de l'Intégrité de la mémoire n'est nécessaire."
+    },
+    "driverNotInstalled": {
+      "title": "Pilote du lecteur non installé",
+      "body": "Un lecteur SportIdent est branché, mais Windows n'a aucun pilote pour lui (le Gestionnaire de périphériques l'affiche sous « Autres périphériques », code 28). Installez le pilote USB SportIdent ci-dessous et le lecteur se connectera."
+    },
+    "deviceAbsent": {
+      "title": "Aucun lecteur SportIdent détecté",
+      "body": "Branchez votre lecteur et cette carte s'actualisera automatiquement. Si le lecteur est branché mais que le Gestionnaire de périphériques affiche un avertissement jaune, le correctif du pilote apparaîtra ici une fois détecté."
+    },
+    "otherError": {
+      "title": "Erreur de périphérique (code {{code}})",
+      "body": "Windows a signalé une erreur inhabituelle pour le lecteur SportIdent. Le correctif du pilote ci-dessous peut tout de même aider ; sinon, les étapes de l'Observateur d'événements sous « Pourquoi cela arrive » indiquent le fichier .sys exact que Windows a refusé de charger."
+    },
+    "unknown": {
+      "title": "Inconnu",
+      "body": ""
+    }
+  },
+  "sportident": {
+    "title": "Pilote USB SportIdent",
+    "subtitle": "Requis pour que le lecteur soit détecté.",
+    "body": "Installez le pilote USB SportIdent signé actuel. Il remplace l'ancien pilote bloqué ou manquant par une version compatible HVCI - <1>vous n'avez pas besoin de désactiver l'Intégrité de la mémoire</1>.",
+    "download": "Télécharger le pilote USB SportIdent",
+    "afterInstall": "Après l'installation, débranchez et rebranchez le lecteur, puis appuyez sur le bouton de revérification de la carte de statut ci-dessus - elle devrait passer au vert."
+  },
+  "manual": {
+    "title": "Solution de contournement manuelle",
+    "subtitle": "Si l'installateur ci-dessus ne fonctionne pas.",
+    "showSteps": "Afficher les étapes",
+    "hideSteps": "Masquer les étapes",
+    "warning": "<1>Solution temporaire.</1> Remplacer manuellement le pilote USB SportIdent fourni par le pilote signé Silicon Labs CP210x rétablit le port COM jusqu'à ce que SportIdent publie un correctif permanent.",
+    "downloadSilabs": "Télécharger le pilote Silicon Labs CP210x",
+    "openGuide": "Ouvrir le guide complet de contournement",
+    "stepsHeading": "Remplacer le pilote manuellement",
+    "step1": "Ouvrez les <1>Paramètres Windows → Applications → Applications installées</1> et désinstallez <2>« Windows Driver Package – SPORTident (sliabenm) Ports »</2>.",
+    "step2": "Téléchargez le pilote VCP Silicon Labs CP210x (bouton ci-dessus) et extrayez le ZIP. Sur les PC ARM / Snapdragon, choisissez le <2>CP210x Universal Windows Driver</2>.",
+    "step3": "Branchez le lecteur SportIdent, puis ouvrez le <1>Gestionnaire de périphériques</1>.",
+    "step4": "Trouvez le périphérique (répertorié comme <1>« SPORTident USB to UART Bridge Controller »</1>, souvent avec un avertissement jaune). Faites un clic droit dessus → <1>Mettre à jour le pilote</1>.",
+    "step5": "Choisissez <1>Parcourir mon ordinateur à la recherche de pilotes → Me laisser choisir dans une liste → Afficher tous les périphériques</1>.",
+    "step6": "Cliquez sur <1>Disque fourni… → Parcourir…</1>, ouvrez le dossier extrait et sélectionnez <code>silabser.inf</code>.",
+    "step7": "Sélectionnez <1>« Silicon Labs CP210x USB to UART Bridge »</1> et confirmez malgré les avertissements.",
+    "step8": "Le lecteur apparaît maintenant comme un port COM. <2>Répétez les étapes 3 à 7 pour chaque lecteur ou dongle supplémentaire.</2>"
+  },
+  "why": {
+    "title": "Pourquoi cela arrive",
+    "subtitle": "L'Intégrité de la mémoire et les récentes mises à jour de fonctionnalités de Windows 11.",
+    "body": "Les récentes mises à jour de fonctionnalités de Windows 11 (<2>24H2</2>, <2>25H2</2>) renforcent la politique d'intégrité du code des pilotes du noyau et activent l'<2>Intégrité de la mémoire</2> (Isolation du noyau) par défaut. Les anciens pilotes USB-série - dont celui précédemment fourni avec le lecteur SportIdent - ne se chargent plus sous la nouvelle politique, si bien que le lecteur n'est plus détecté. Le pilote signé ci-dessus le remplace par une version actuelle compatible HVCI.",
+    "verifyHeading": "Comment vérifier sur votre machine",
+    "verify1": "Sécurité Windows → <1>Sécurité de l'appareil → Isolation du noyau</1> - si l'Intégrité de la mémoire est <2>Activée</2>, c'est le blocage.",
+    "verify2": "Windows Update → <1>Historique des mises à jour</1> - recherchez une mise à jour de fonctionnalités récente vers 24H2 ou 25H2.",
+    "verify3": "Observateur d'événements → <1>Journaux Windows → Système</1>, filtrez par source <code>Microsoft-Windows-CodeIntegrity</code> - l'entrée de blocage indique le fichier <mono>.sys</mono> exact que Windows a refusé de charger (pour un diagnostic avancé)."
+  }
+}

@@ -1,7 +1,7 @@
-// SportIdent service — sole entrypoint to the SI card reader. Delegates
+// SportIdent service - sole entrypoint to the SI card reader. Delegates
 // the protocol entirely to the Rust side (src-tauri/src/sportident).
 //
-// Replaces the legacy ./usbReader.ts (deleted at step 7 of the rewrite —
+// Replaces the legacy ./usbReader.ts (deleted at step 7 of the rewrite -
 // see plans/let-s-work-on-the-flickering-leaf.md). The type definitions
 // below are deliberately structurally identical to the legacy
 // CardData/StationData/USBPort interfaces so consumers' typed callbacks
@@ -11,14 +11,14 @@
 //   - isAvailable() / getAvailablePorts() / closePort() / initializePort(path)
 //   - setCardDetectedCallback / setCardRemovedCallback / setStationsDetectedCallback
 //   - start() / stop()
-//   - isReaderConnected() — fast "is a SI dongle plugged in?" probe
+//   - isReaderConnected() - fast "is a SI dongle plugged in?" probe
 //
 // Key behavioural notes (all improvements over the legacy path):
 //   - No more `console.log` monkey-patching to extract card data. The
 //     Rust reader publishes typed `si://card-read` events; we just
 //     listen.
 //   - `setCardRemovedCallback` is an explicit no-op. The SI extended
-//     protocol has no "card removed" frame — the legacy code's removal
+//     protocol has no "card removed" frame - the legacy code's removal
 //     detection was a buggy heuristic that consumed the *next* card's
 //     bytes (root cause #4 in the rewrite plan). UI code that needs
 //     auto-dismissal uses its own setTimeout.
@@ -56,7 +56,7 @@ export interface CardData {
    */
   cardType: SICardType;
   start?: { code: number; time: string };
-  /** Legacy name for "finish" punch — kept to avoid touching consumers. */
+  /** Legacy name for "finish" punch - kept to avoid touching consumers. */
   end?: { code: number; time: string };
   check?: { code: number; time: string };
   nbPunch: number;
@@ -145,7 +145,7 @@ class SportIdentService {
   private onStationsDetected?: (stations: StationData[]) => void;
   /**
    * Per-card-id last-seen-at timestamps. Same card scanned within
-   * `CARD_DEBOUNCE_MS` is silently coalesced — matches the legacy
+   * `CARD_DEBOUNCE_MS` is silently coalesced - matches the legacy
    * behaviour where a child tapping their card three times in a row
    * was treated as one read.
    */
@@ -185,7 +185,7 @@ class SportIdentService {
   }
 
   /**
-   * Opens the port AND starts the reader in one shot — the Rust
+   * Opens the port AND starts the reader in one shot - the Rust
    * `si_start` command does both. Returns true on success, false on
    * any failure (port not openable, reader already running, transport
    * error). On failure, listeners are detached and state is reset so
@@ -215,7 +215,7 @@ class SportIdentService {
           // chain means nothing else is mid-flight here, so it's safe to stop
           // whatever's running and start once more.
           if (String(err).includes('already running')) {
-            console.warn('[si] reader already running — stopping stale reader and retrying');
+            console.warn('[si] reader already running - stopping stale reader and retrying');
             await invoke('si_stop').catch(() => {});
             await invoke('si_start', { deviceId: portPath });
           } else {
@@ -307,7 +307,7 @@ class SportIdentService {
   }
 
   private async attachListeners() {
-    // Defensive — in normal flow the listener list is already empty.
+    // Defensive - in normal flow the listener list is already empty.
     await this.detachListeners();
 
     this.unlisteners.push(
@@ -375,7 +375,7 @@ class SportIdentService {
       extended: p.extended,
       handShake: p.handshake,
       autoSend: p.autoSend,
-      // Not surfaced by the new payload — legacy default was `false`
+      // Not surfaced by the new payload - legacy default was `false`
       // for USB dongles and a number for radio relay setups. Keeping
       // `false` matches the dongle path which is the only one in
       // production right now.
@@ -390,7 +390,7 @@ export const sportidentService = new SportIdentService();
 //
 // Footer.tsx polls this every 10 s for its green/red status dot. Lives
 // here rather than as a `SportIdentService` method because it
-// deliberately doesn't open the port — just enumerates and looks for the
+// deliberately doesn't open the port - just enumerates and looks for the
 // SI BSF7/BSF8/BSM8 USB descriptor.
 
 /** SiLabs CP210x USB-to-UART bridge with SportIdent's custom PID, used

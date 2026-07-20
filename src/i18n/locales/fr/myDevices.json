@@ -1,0 +1,21 @@
+{
+  "title": "Mes appareils",
+  "refresh": "Actualiser",
+  "signOut": "Se déconnecter",
+  "noDevices": "Aucun appareil trouvé.",
+  "deviceNamePlaceholder": "Nom de l'appareil",
+  "deviceNameFallback": "Appareil {{os}}",
+  "unknownOs": "Inconnu",
+  "save": "Enregistrer",
+  "cancel": "Annuler",
+  "rename": "Renommer",
+  "thisDevice": "Cet appareil",
+  "loggedOut": "Déconnecté",
+  "appVersion": "app {{version}}",
+  "lastSeen": "vu pour la dernière fois {{time}}",
+  "signOutThisDevice": "Déconnecter cet appareil",
+  "revokeDevice": "Révoquer l'appareil",
+  "nameTooLong": "Le nom ne doit pas dépasser {{max}} caractères",
+  "requestFailed": "Échec de la requête ({{status}})",
+  "genericError": "Une erreur s'est produite."
+}

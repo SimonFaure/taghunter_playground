@@ -1,0 +1,19 @@
+{
+  "title": "Lanzamiento rápido",
+  "emptyState": "Aún no hay configuraciones guardadas para este escenario. Usa «Guardar configuración» en la pantalla de lanzamiento para crear una.",
+  "launch": "Lanzar",
+  "launchTitle": "Lanzar esta configuración",
+  "editTitle": "Editar configuración",
+  "deleteTitle": "Eliminar configuración",
+  "deleteDialogTitle": "Eliminar configuración",
+  "deleteDialogMessage": "¿Eliminar la configuración guardada «{{name}}»? Esta acción no se puede deshacer.",
+  "delete": "Eliminar",
+  "cancel": "Cancelar",
+  "summaryAutoRegister": "registro automático",
+  "summarySelfRegister": "autorregistro",
+  "summaryTeamCount_one": "{{count}} equipo",
+  "summaryTeamCount_other": "{{count}} equipos",
+  "summaryDuration": "{{duration}} min",
+  "summaryReuseCards": "reutilizar tarjetas",
+  "summaryNamePool": "lista de nombres"
+}

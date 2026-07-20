@@ -1,0 +1,162 @@
+// Tracks what THIS device is currently showing - its top-most visible layer -
+// and reports it up to every paired mother so the mother's Devices modal can
+// render a live "what's it showing" pill per peer.
+//
+// Two-layer model (overlay wins):
+//   base    - 'home' (not in a game) or 'in_game' (a game page is mounted).
+//             Set by App / GamePage.
+//   overlay - 'ranking' or 'video', a full-screen layer floating over the base.
+//             Pushed/popped by the leaderboard pages and the operator video
+//             overlay. The most-recently-pushed overlay is the effective state;
+//             when none are mounted the base shows through.
+//
+// On every effective-state change we (1) cache the value in-process via the
+// `client_set_screen_state` Tauri command so the satellite's regular ~10s ping
+// always carries the current state, and (2) fire a debounced out-of-band ping
+// to every paired mother so the change is reflected within ~1s rather than
+// waiting for the next scheduled heartbeat. The mother reads its OWN row from
+// this store directly (it never pings itself) - see GameDevicesModal.
+
+import { invoke } from '@tauri-apps/api/core';
+import { getActiveLaunchedGameId } from './activeGameStore';
+
+export type ScreenState =
+  | { kind: 'home' }
+  | {
+      kind: 'in_game';
+      launchedGameId: number | null;
+      gameName: string | null;
+      // Within-game refinements (Q11: wired incrementally; absent in v1 wrapper
+      // publishing, so the pill renders a plain "In game").
+      boardHidden?: boolean;
+      sub?: 'instructions' | 'reveal';
+    }
+  | { kind: 'ranking' }
+  | { kind: 'video' };
+
+type BaseState = Extract<ScreenState, { kind: 'home' | 'in_game' }>;
+type OverlayKind = 'ranking' | 'video';
+
+let base: BaseState = { kind: 'home' };
+// Stack of mounted overlays; the top (last) wins. A stack rather than a single
+// flag so an unmounting overlay cleanly reveals whatever is still beneath it.
+const overlays: OverlayKind[] = [];
+let current: ScreenState = { kind: 'home' };
+
+const listeners = new Set<(s: ScreenState) => void>();
+
+function resolveEffective(): ScreenState {
+  if (overlays.length > 0) return { kind: overlays[overlays.length - 1] };
+  return base;
+}
+
+function sameState(a: ScreenState, b: ScreenState): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'in_game' && b.kind === 'in_game') {
+    return (
+      a.launchedGameId === b.launchedGameId &&
+      a.gameName === b.gameName &&
+      Boolean(a.boardHidden) === Boolean(b.boardHidden) &&
+      a.sub === b.sub
+    );
+  }
+  return true;
+}
+
+let pingTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function pingMothersNow(): Promise<void> {
+  try {
+    const mothers = await invoke<Array<{ mother_uuid: string }>>(
+      'client_list_paired_mothers'
+    );
+    const launchedGameId = getActiveLaunchedGameId();
+    await Promise.all(
+      mothers.map((m) =>
+        invoke('client_ping_mother', {
+          motherUuid: m.mother_uuid,
+          launchedGameId,
+        }).catch(() => {})
+      )
+    );
+  } catch {
+    // Not paired to any mother (we ARE the mother, or web build) - nothing to
+    // push. The mother reads its own state from this store directly.
+  }
+}
+
+function publish(state: ScreenState): void {
+  // Cache in-process immediately so the next scheduled ping carries it even if
+  // the debounced out-of-band ping is still pending.
+  void invoke('client_set_screen_state', { json: JSON.stringify(state) }).catch(
+    () => {}
+  );
+  // Debounce the network burst: rapid transitions (e.g. ranking opening over a
+  // game) collapse into a single ping ~500ms after they settle.
+  if (pingTimer) clearTimeout(pingTimer);
+  pingTimer = setTimeout(() => {
+    pingTimer = null;
+    void pingMothersNow();
+  }, 500);
+}
+
+function recompute(): void {
+  const next = resolveEffective();
+  if (sameState(next, current)) return;
+  current = next;
+  for (const l of listeners) l(current);
+  publish(current);
+}
+
+// ---------- base setters (App / GamePage) ----------
+
+export function setBaseHome(): void {
+  base = { kind: 'home' };
+  recompute();
+}
+
+export function setBaseInGame(launchedGameId: number | null, gameName: string | null): void {
+  base = { kind: 'in_game', launchedGameId, gameName };
+  recompute();
+}
+
+/** Refine the in-game base with within-game detail (Q11 incremental). No-op
+ *  while the base isn't in_game, so a stray late call can't resurrect a game
+ *  pill after the page unmounted. */
+export function refineInGame(detail: { boardHidden?: boolean; sub?: 'instructions' | 'reveal' }): void {
+  if (base.kind !== 'in_game') return;
+  base = { ...base, ...detail };
+  recompute();
+}
+
+// ---------- overlay push/pop (leaderboard / video) ----------
+
+export function pushOverlay(kind: OverlayKind): void {
+  // De-dupe: a re-mount shouldn't stack two copies. Move-to-top so the newest
+  // mount wins even if an older same-kind entry lingers.
+  const i = overlays.indexOf(kind);
+  if (i !== -1) overlays.splice(i, 1);
+  overlays.push(kind);
+  recompute();
+}
+
+export function popOverlay(kind: OverlayKind): void {
+  const i = overlays.indexOf(kind);
+  if (i === -1) return;
+  overlays.splice(i, 1);
+  recompute();
+}
+
+// ---------- read / subscribe (modal self row) ----------
+
+export function getCurrentScreenState(): ScreenState {
+  return current;
+}
+
+export function subscribeScreenState(fn: (s: ScreenState) => void): () => void {
+  listeners.add(fn);
+  fn(current);
+  return () => {
+    listeners.delete(fn);
+  };
+}

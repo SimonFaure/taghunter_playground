@@ -8,7 +8,7 @@
 //   - retry on: network errors (no response), timeouts, 429, 5xx
 //   - permanent on: 4xx other than 429
 //   - 401/403 are not retried (a re-request won't change the verdict); they
-//     bubble immediately for the caller to interpret — 401 is fatal to the
+//     bubble immediately for the caller to interpret - 401 is fatal to the
 //     whole operation, 403 is a per-resource "forbidden" the caller may skip.
 
 import { ApiError } from './api';
@@ -36,7 +36,7 @@ function shouldRetry(err: unknown): boolean {
     if (err.status === 429 || err.status >= 500) return true;
     return false;
   }
-  // An intentional abort (cycle teardown / hard cap) must not be retried —
+  // An intentional abort (cycle teardown / hard cap) must not be retried -
   // retrying just delays cycle termination. A TimeoutError (a genuine request
   // stall) is a different DOMException name; it falls through and IS retried.
   if (err instanceof DOMException && err.name === 'AbortError') return false;

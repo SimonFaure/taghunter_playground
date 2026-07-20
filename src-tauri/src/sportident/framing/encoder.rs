@@ -1,4 +1,4 @@
-// Frame encoder. Stateless — every command builder in commands.rs (step 4)
+// Frame encoder. Stateless - every command builder in commands.rs (step 4)
 // ultimately funnels through here.
 
 use crate::sportident::config::{ETX, STX, WAKEUP};
@@ -7,11 +7,11 @@ use super::crc::{calc_crc, crc_bytes};
 /// Build a wire-format SI extended frame.
 ///
 /// `payload.len()` must fit in a u8 (≤ 255). All commands we care about
-/// (SI8-11 era) stay well below that — the longest is `0xEF` block read
+/// (SI8-11 era) stay well below that - the longest is `0xEF` block read
 /// at 128 payload bytes per block.
 ///
 /// Layout: `[STX | cmd | len | payload | CRC_HI | CRC_LO | ETX]`
-/// (no DLE byte-stuffing — extended protocol uses the length byte to bound
+/// (no DLE byte-stuffing - extended protocol uses the length byte to bound
 /// the payload, avoiding the need to escape STX/ETX bytes that appear in
 /// data.)
 pub fn build_frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn read_system_data_frame_matches_legacy_wire_bytes() {
         // [STX, 0x83, 0x02, 0x00, 0x80, CRC_H, CRC_L, ETX].
-        // The exact wire bytes the legacy `SendReadRequest()` sends — and
+        // The exact wire bytes the legacy `SendReadRequest()` sends - and
         // since the legacy code does successfully read station config in
         // the field today, this is a known-good golden vector.
         let f = build_frame(CMD_GET_SYSTEM_DATA, &[0x00, 0x80]);

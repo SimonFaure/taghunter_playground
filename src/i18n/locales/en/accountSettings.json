@@ -1,0 +1,22 @@
+{
+  "title": "Account",
+  "name": "Name",
+  "notSet": "Not set",
+  "email": "Email",
+  "license": "License",
+  "unknown": "unknown",
+  "billing": "Billing",
+  "billingUpToDate": "Up to date",
+  "billingPaymentNeeded": "Payment needed",
+  "offlineAccess": "Offline access",
+  "daysLeft_one": "{{count}} day left <dim>of {{total}}</dim>",
+  "daysLeft_other": "{{count}} days left <dim>of {{total}}</dim>",
+  "offlineExpired": "Expired - reconnect required",
+  "signOutDevice": "Sign out of this device",
+  "signOutOfflineTitle": "Connect to the internet to sign out",
+  "signOutOfflineHint": "Connect to the internet to sign out.",
+  "confirmTitle": "Sign out of this device?",
+  "confirmBody": "You're signed in as <strong>{{email}}</strong>. Signing out revokes this device, clears the PIN, and removes the local account data. You'll need internet to sign back in.",
+  "cancel": "Cancel",
+  "signOut": "Sign out"
+}

@@ -1,0 +1,14 @@
+{
+  "scenarios": "Scenarios",
+  "launchedGames": "Launched games",
+  "cardsPatterns": "Cards & Patterns",
+  "settings": "Settings",
+  "help": "Help",
+  "database": "Database",
+  "adminConfig": "Admin Config",
+  "exitAdmin": "Exit admin",
+  "logoScreen": "Logo screen",
+  "lock": "Lock",
+  "testChannelBadge": "TEST",
+  "testChannelHint": "This device is a tester: it downloads app updates from the test release channel."
+}

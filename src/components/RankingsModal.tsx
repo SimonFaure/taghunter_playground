@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Trophy, X, Calendar, Gamepad2, ChevronRight, ChevronDown } from 'lucide-react';
 import * as scenarioStore from '../services/scenarioStore';
 import { listActiveLaunchedGames } from '../services/launchedGames';
@@ -23,16 +25,17 @@ interface RankingsModalProps {
   onOpenActiveGames: (games: ActiveGameOption[]) => void;
 }
 
-const TIME_RANGES: { value: TimeRange; label: string }[] = [
-  { value: 'day', label: 'Today' },
-  { value: 'week', label: 'This Week' },
-  { value: 'month', label: 'This Month' },
-  { value: 'trimester', label: 'This Quarter' },
-  { value: 'year', label: 'This Year' },
-  { value: 'all', label: 'All Time' },
+const timeRanges = (t: TFunction): { value: TimeRange; label: string }[] => [
+  { value: 'day', label: t('operatorControls:rankings.rangeToday') },
+  { value: 'week', label: t('operatorControls:rankings.rangeWeek') },
+  { value: 'month', label: t('operatorControls:rankings.rangeMonth') },
+  { value: 'trimester', label: t('operatorControls:rankings.rangeQuarter') },
+  { value: 'year', label: t('operatorControls:rankings.rangeYear') },
+  { value: 'all', label: t('operatorControls:rankings.rangeAll') },
 ];
 
 export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: RankingsModalProps) {
+  const { t } = useTranslation();
   const [scenarios, setScenarios] = useState<ScenarioOption[]>([]);
   const [activeGames, setActiveGames] = useState<ActiveGameOption[]>([]);
   const [loadingScenarios, setLoadingScenarios] = useState(true);
@@ -102,50 +105,50 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
 
   return (
     <div
-      className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+      className="pg-overlay p-4"
       onClick={onClose}
     >
       <div
-        className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden"
+        className="pg-modal max-w-lg"
         onClick={e => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-6 pt-5 pb-4 border-b border-slate-700/60">
+        <div className="pg-modal-head">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-yellow-400/15 flex items-center justify-center">
               <Trophy size={16} className="text-yellow-400" />
             </div>
-            <h2 className="text-lg font-bold text-white">Rankings</h2>
+            <h2 className="pg-modal-title">{t('operatorControls:rankings.title')}</h2>
           </div>
           <button
             onClick={onClose}
-            className="text-slate-500 hover:text-white transition-colors w-7 h-7 flex items-center justify-center rounded-lg hover:bg-slate-700"
+            className="pg-modal-close"
           >
             <X size={16} />
           </button>
         </div>
 
-        <div className="flex border-b border-slate-700/60">
+        <div className="flex border-b border-[var(--pg-line)]">
           <button
             onClick={() => setTab('timerange')}
             className={`flex-1 flex items-center justify-center gap-2 py-3 text-sm font-medium transition-colors ${
               tab === 'timerange'
-                ? 'text-white border-b-2 border-blue-500 bg-blue-500/5'
-                : 'text-slate-400 hover:text-slate-300'
+                ? 'text-[var(--pg-text)] border-b-2 border-[var(--pg-accent)] bg-[var(--pg-accent-tint)]'
+                : 'text-[var(--pg-text-dim)] hover:text-[var(--pg-text-muted)]'
             }`}
           >
             <Calendar size={15} />
-            Time Range
+            {t('operatorControls:rankings.tabTimeRange')}
           </button>
           <button
             onClick={() => setTab('active')}
             className={`flex-1 flex items-center justify-center gap-2 py-3 text-sm font-medium transition-colors ${
               tab === 'active'
-                ? 'text-white border-b-2 border-emerald-500 bg-emerald-500/5'
-                : 'text-slate-400 hover:text-slate-300'
+                ? 'text-[var(--pg-text)] border-b-2 border-emerald-500 bg-emerald-500/5'
+                : 'text-[var(--pg-text-dim)] hover:text-[var(--pg-text-muted)]'
             }`}
           >
             <Gamepad2 size={15} />
-            Active Games
+            {t('operatorControls:rankings.tabActiveGames')}
             {!loadingActive && activeGames.length > 0 && (
               <span className="ml-1 px-1.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 text-xs font-bold">
                 {activeGames.length}
@@ -158,30 +161,30 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
           {tab === 'timerange' ? (
             <div className="space-y-5">
               <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                  Scenario
+                <label className="block text-xs font-semibold text-[var(--pg-text-dim)] uppercase tracking-wider mb-2">
+                  {t('operatorControls:rankings.scenario')}
                 </label>
                 {loadingScenarios ? (
-                  <div className="h-10 bg-slate-800 rounded-lg animate-pulse" />
+                  <div className="h-10 bg-[var(--pg-surface-2)] rounded-lg animate-pulse" />
                 ) : scenarios.length === 0 ? (
-                  <p className="text-slate-500 text-sm">No scenarios found.</p>
+                  <p className="text-[var(--pg-text-dim)] text-sm">{t('operatorControls:rankings.noScenarios')}</p>
                 ) : (
                   <div className="relative">
                     <button
                       onClick={() => setScenarioOpen(v => !v)}
-                      className="w-full flex items-center justify-between px-4 py-2.5 bg-slate-800 border border-slate-600 hover:border-slate-500 rounded-lg text-sm text-white transition-colors"
+                      className="w-full flex items-center justify-between px-4 py-2.5 bg-[var(--pg-surface-2)] border border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] rounded-lg text-sm text-[var(--pg-text)] transition-colors"
                     >
-                      <span className="truncate">{selectedScenario?.title ?? 'Select a scenario'}</span>
-                      <ChevronDown size={15} className={`text-slate-400 shrink-0 ml-2 transition-transform ${scenarioOpen ? 'rotate-180' : ''}`} />
+                      <span className="truncate">{selectedScenario?.title ?? t('operatorControls:rankings.selectScenario')}</span>
+                      <ChevronDown size={15} className={`text-[var(--pg-text-dim)] shrink-0 ml-2 transition-transform ${scenarioOpen ? 'rotate-180' : ''}`} />
                     </button>
                     {scenarioOpen && (
-                      <div className="absolute z-10 mt-1 w-full bg-slate-800 border border-slate-600 rounded-lg shadow-xl max-h-52 overflow-y-auto">
+                      <div className="absolute z-10 mt-1 w-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-lg shadow-xl max-h-52 overflow-y-auto">
                         {scenarios.map(s => (
                           <button
                             key={s.uniqid}
                             onClick={() => { setSelectedScenario(s); setScenarioOpen(false); }}
-                            className={`w-full text-left px-4 py-2.5 text-sm transition-colors hover:bg-slate-700 ${
-                              selectedScenario?.uniqid === s.uniqid ? 'text-blue-400 bg-blue-500/10' : 'text-white'
+                            className={`w-full text-left px-4 py-2.5 text-sm transition-colors hover:bg-[var(--pg-surface-3)] ${
+                              selectedScenario?.uniqid === s.uniqid ? 'text-[var(--pg-accent-bright)] bg-[var(--pg-accent-tint)]' : 'text-[var(--pg-text)]'
                             }`}
                           >
                             {s.title}
@@ -194,18 +197,18 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                  Time Range
+                <label className="block text-xs font-semibold text-[var(--pg-text-dim)] uppercase tracking-wider mb-2">
+                  {t('operatorControls:rankings.timeRange')}
                 </label>
                 <div className="grid grid-cols-3 gap-2">
-                  {TIME_RANGES.map(range => (
+                  {timeRanges(t).map(range => (
                     <button
                       key={range.value}
                       onClick={() => setSelectedTimeRange(range.value)}
                       className={`py-2 px-3 rounded-lg text-sm font-medium transition-all ${
                         selectedTimeRange === range.value
-                          ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/20'
-                          : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white border border-slate-700'
+                          ? 'bg-[var(--pg-accent)] text-[var(--pg-text)]'
+                          : 'bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)] hover:bg-[var(--pg-surface-3)] hover:text-[var(--pg-text)] border border-[var(--pg-line)]'
                       }`}
                     >
                       {range.label}
@@ -217,9 +220,9 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
               <button
                 disabled={!selectedScenario}
                 onClick={() => selectedScenario && onOpenTimeRange(selectedScenario, selectedTimeRange)}
-                className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold transition-colors"
+                className="pg-btn pg-btn--primary w-full justify-center"
               >
-                View Rankings
+                {t('operatorControls:rankings.viewRankings')}
                 <ChevronRight size={16} />
               </button>
             </div>
@@ -228,20 +231,20 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
               {loadingActive ? (
                 <div className="space-y-2">
                   {[1, 2].map(i => (
-                    <div key={i} className="h-16 bg-slate-800 rounded-xl animate-pulse" />
+                    <div key={i} className="h-16 bg-[var(--pg-surface-2)] rounded-xl animate-pulse" />
                   ))}
                 </div>
               ) : activeGames.length === 0 ? (
                 <div className="text-center py-8">
-                  <Gamepad2 size={32} className="text-slate-600 mx-auto mb-3" />
-                  <p className="text-slate-400 text-sm">No active games running right now.</p>
+                  <Gamepad2 size={32} className="text-[var(--pg-text-dim)] mx-auto mb-3" />
+                  <p className="text-[var(--pg-text-dim)] text-sm">{t('operatorControls:rankings.noActiveGames')}</p>
                 </div>
               ) : (
                 <>
-                  <p className="text-xs text-slate-500">
-                    Select up to {MAX_SELECTION} games to compare side by side.
+                  <p className="text-xs text-[var(--pg-text-dim)]">
+                    {t('operatorControls:rankings.selectUpTo', { count: MAX_SELECTION })}
                     {selectedGameIds.size === MAX_SELECTION && (
-                      <span className="text-amber-400 ml-1">Maximum reached.</span>
+                      <span className="text-amber-400 ml-1">{t('operatorControls:rankings.maximumReached')}</span>
                     )}
                   </p>
                   <div className="space-y-2">
@@ -257,12 +260,12 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
                             selected
                               ? 'bg-emerald-500/10 border-emerald-500/50'
                               : disabled
-                              ? 'bg-slate-800/40 border-slate-700/40 opacity-40 cursor-not-allowed'
-                              : 'bg-slate-800 border-slate-700 hover:border-slate-500'
+                              ? 'bg-[var(--pg-surface)] border-[var(--pg-line)] opacity-40 cursor-not-allowed'
+                              : 'bg-[var(--pg-surface-2)] border-[var(--pg-line)] hover:border-[var(--pg-line-strong)]'
                           }`}
                         >
                           <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center shrink-0 transition-all ${
-                            selected ? 'bg-emerald-500 border-emerald-500' : 'border-slate-600'
+                            selected ? 'bg-emerald-500 border-emerald-500' : 'border-[var(--pg-line-strong)]'
                           }`}>
                             {selected && (
                               <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
@@ -276,8 +279,8 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
                           </div>
 
                           <div className="flex-1 min-w-0">
-                            <div className="text-white font-semibold text-sm leading-tight truncate">{game.name}</div>
-                            <div className="text-slate-500 text-xs mt-0.5">{game.scenarioTitle}</div>
+                            <div className="text-[var(--pg-text)] font-semibold text-sm leading-tight truncate">{game.name}</div>
+                            <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">{game.scenarioTitle}</div>
                           </div>
                         </button>
                       );
@@ -292,7 +295,7 @@ export function RankingsModal({ onClose, onOpenTimeRange, onOpenActiveGames }: R
                     }}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold transition-colors mt-1"
                   >
-                    View Rankings
+                    {t('operatorControls:rankings.viewRankings')}
                     {selectedGameIds.size > 0 && (
                       <span className="px-1.5 py-0.5 bg-white/20 rounded-md text-xs font-bold">
                         {selectedGameIds.size}

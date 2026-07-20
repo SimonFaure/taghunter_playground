@@ -2,12 +2,13 @@
 //
 // Reads from cardsRepo. Writes also go through cardsRepo, which marks rows
 // `sync_state='pending'` so syncOrchestrator's push step replays them to
-// studio on the next cycle. CSV import bypasses the local table — it hits
+// studio on the next cycle. CSV import bypasses the local table - it hits
 // studio's import_csv endpoint directly and then triggers a manual sync
 // cycle so the resulting rows flow back as if they came from any other
 // device.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation, Trans } from 'react-i18next';
 import {
   CreditCard,
   Plus,
@@ -34,6 +35,7 @@ type EditState =
 type ImportState = { open: false } | { open: true; busy: boolean; dragActive: boolean };
 
 export function CardsManager() {
+  const { t } = useTranslation();
   const { user } = useAuth();
   const [cards, setCards] = useState<cardsRepo.CardRow[]>([]);
   const [version, setVersion] = useState<number>(0);
@@ -117,23 +119,23 @@ export function CardsManager() {
     const id = parseInt(editState.idStr, 10);
     const keyNumber = parseInt(editState.keyNumberStr, 10);
     if (!Number.isFinite(id) || id <= 0) {
-      flashMessage('error', 'Chip ID must be a positive integer');
+      flashMessage('error', t('cardsManager:errChipIdPositive'));
       return;
     }
     if (!Number.isFinite(keyNumber) || keyNumber <= 0) {
-      flashMessage('error', 'Key number must be a positive integer');
+      flashMessage('error', t('cardsManager:errKeyNumberPositive'));
       return;
     }
     if (editState.keyName.trim() === '') {
-      flashMessage('error', 'Name is required');
+      flashMessage('error', t('cardsManager:errNameRequired'));
       return;
     }
     if (cards.some((c) => c.id === id)) {
-      flashMessage('error', `Chip ${id} is already registered locally`);
+      flashMessage('error', t('cardsManager:errChipAlreadyRegistered', { id }));
       return;
     }
     if (cards.some((c) => c.key_number === keyNumber)) {
-      setKeyNumberError('This key number is already taken by another card');
+      setKeyNumberError(t('cardsManager:errKeyNumberTaken'));
       return;
     }
 
@@ -145,14 +147,17 @@ export function CardsManager() {
         key_name: editState.keyName.trim(),
         color: editState.color.trim() === '' ? null : editState.color.trim(),
       });
-      flashMessage('success', `Registered ${editState.keyName} (#${keyNumber})`);
+      flashMessage(
+        'success',
+        t('cardsManager:registeredSuccess', { name: editState.keyName, keyNumber })
+      );
       setEditState({ kind: 'none' });
       await reload();
       // Best-effort: trigger an immediate sync cycle so the studio sees it
-      // soon. If offline / sync busy, no-op — next normal cycle handles it.
+      // soon. If offline / sync busy, no-op - next normal cycle handles it.
       void runCycleNow('manual').catch(() => undefined);
     } catch (err) {
-      flashMessage('error', err instanceof Error ? err.message : 'Register failed');
+      flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errRegisterFailed'));
     } finally {
       setBusy(false);
     }
@@ -163,15 +168,15 @@ export function CardsManager() {
     setKeyNumberError(null);
     const keyNumber = parseInt(editState.keyNumberStr, 10);
     if (!Number.isFinite(keyNumber) || keyNumber <= 0) {
-      flashMessage('error', 'Key number must be a positive integer');
+      flashMessage('error', t('cardsManager:errKeyNumberPositive'));
       return;
     }
     if (editState.keyName.trim() === '') {
-      flashMessage('error', 'Name is required');
+      flashMessage('error', t('cardsManager:errNameRequired'));
       return;
     }
     if (cards.some((c) => c.id !== editState.id && c.key_number === keyNumber)) {
-      setKeyNumberError('This key number is already taken by another card');
+      setKeyNumberError(t('cardsManager:errKeyNumberTaken'));
       return;
     }
     setBusy(true);
@@ -181,12 +186,12 @@ export function CardsManager() {
         key_name: editState.keyName.trim(),
         color: editState.color.trim() === '' ? null : editState.color.trim(),
       });
-      flashMessage('success', 'Card updated');
+      flashMessage('success', t('cardsManager:cardUpdated'));
       setEditState({ kind: 'none' });
       await reload();
       void runCycleNow('manual').catch(() => undefined);
     } catch (err) {
-      flashMessage('error', err instanceof Error ? err.message : 'Update failed');
+      flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errUpdateFailed'));
     } finally {
       setBusy(false);
     }
@@ -202,12 +207,12 @@ export function CardsManager() {
     setBusy(true);
     try {
       await cardsRepo.remove(card.id);
-      flashMessage('success', 'Card deleted');
+      flashMessage('success', t('cardsManager:cardDeleted'));
       setConfirmDelete(null);
       await reload();
       void runCycleNow('manual').catch(() => undefined);
     } catch (err) {
-      flashMessage('error', err instanceof Error ? err.message : 'Delete failed');
+      flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errDeleteFailed'));
     } finally {
       setBusy(false);
     }
@@ -218,7 +223,7 @@ export function CardsManager() {
 
   const handleImport = async (file: File) => {
     if (!file.name.toLowerCase().endsWith('.csv')) {
-      flashMessage('error', 'Only CSV files are allowed');
+      flashMessage('error', t('cardsManager:errOnlyCsv'));
       return;
     }
     setImportState({ open: true, busy: true, dragActive: false });
@@ -231,7 +236,7 @@ export function CardsManager() {
 
       const { loadJwt } = await import('../../services/strongholdStore');
       const token = await loadJwt();
-      if (!token) throw new Error('Not authenticated');
+      if (!token) throw new Error(t('cardsManager:errNotAuthenticated'));
 
       const apiBase =
         (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -243,17 +248,18 @@ export function CardsManager() {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(body.error || `Import failed (${res.status})`);
+        throw new Error(body.error || t('cardsManager:errImportFailedStatus', { status: res.status }));
       }
       flashMessage(
         body.skipped > 0 ? 'info' : 'success',
-        `Import: ${body.inserted ?? 0} inserted, ${body.updated ?? 0} updated${body.skipped ? `, ${body.skipped} skipped` : ''}`
+        t('cardsManager:importResult', { inserted: body.inserted ?? 0, updated: body.updated ?? 0 }) +
+          (body.skipped ? t('cardsManager:importResultSkipped', { skipped: body.skipped }) : '')
       );
       await runCycleNow('manual').catch(() => undefined);
       closeImport();
       await reload();
     } catch (err) {
-      flashMessage('error', err instanceof Error ? err.message : 'Import failed');
+      flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errImportFailed'));
       setImportState({ open: true, busy: false, dragActive: false });
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -267,15 +273,15 @@ export function CardsManager() {
   };
 
   return (
-    <div className="bg-slate-800/50 rounded-lg p-6">
+    <div className="pg-panel p-6">
       <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
         <div>
-          <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-            <CreditCard className="text-blue-400" size={24} />
-            <span>Cards</span>
+          <h2 className="text-xl font-semibold text-[var(--pg-text)] flex items-center gap-2">
+            <CreditCard className="text-[var(--pg-accent-bright)]" size={24} />
+            <span>{t('cardsManager:title')}</span>
           </h2>
-          <p className="text-sm text-slate-400 mt-1">
-            {cards.length} card{cards.length === 1 ? '' : 's'} · version {version.toFixed(2)}
+          <p className="text-sm text-[var(--pg-text-dim)] mt-1">
+            {t('cardsManager:cardCount', { count: cards.length, version: version.toFixed(2) })}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -289,27 +295,27 @@ export function CardsManager() {
           <button
             onClick={() => runCycleNow('manual')}
             disabled={busy || getState().cycleInFlight}
-            className="inline-flex items-center gap-2 px-3 py-2 border border-slate-600 text-slate-300 rounded-lg hover:bg-slate-700 transition-colors text-sm disabled:opacity-50"
-            title="Sync cards with studio"
+            className="pg-btn pg-btn--ghost pg-btn--sm disabled:opacity-50"
+            title={t('cardsManager:refreshTitle')}
           >
             <RefreshCw className="w-4 h-4" />
-            <span>Refresh</span>
+            <span>{t('cardsManager:refresh')}</span>
           </button>
           <button
             onClick={openImport}
             disabled={busy}
-            className="inline-flex items-center gap-2 px-3 py-2 border border-slate-600 text-slate-300 rounded-lg hover:bg-slate-700 transition-colors text-sm disabled:opacity-50"
+            className="pg-btn pg-btn--ghost pg-btn--sm disabled:opacity-50"
           >
             <Upload className="w-4 h-4" />
-            <span>Import CSV</span>
+            <span>{t('cardsManager:importCsv')}</span>
           </button>
           <button
             onClick={openRegister}
             disabled={busy || editState.kind !== 'none'}
-            className="inline-flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors text-sm disabled:opacity-50"
+            className="pg-btn pg-btn--primary pg-btn--sm disabled:opacity-50"
           >
             <Plus className="w-4 h-4" />
-            <span>Register card</span>
+            <span>{t('cardsManager:registerCard')}</span>
           </button>
         </div>
       </div>
@@ -329,47 +335,47 @@ export function CardsManager() {
       )}
 
       {editState.kind === 'register' && (
-        <div className="mb-4 p-4 border border-slate-700 rounded-lg bg-slate-900/40">
-          <h3 className="text-sm font-semibold text-white mb-3">Register a new card</h3>
+        <div className="mb-4 p-4 border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] bg-[var(--pg-surface)]">
+          <h3 className="text-sm font-semibold text-[var(--pg-text)] mb-3">{t('cardsManager:registerFormTitle')}</h3>
           <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-            <Field label="Chip ID" hint="from the chip itself">
+            <Field label={t('cardsManager:fieldChipId')} hint={t('cardsManager:fieldChipIdHint')}>
               <input
                 type="number"
                 min={1}
                 value={editState.idStr}
                 onChange={(e) => setEditState({ ...editState, idStr: e.target.value })}
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="e.g. 2145811"
+                className="pg-input !py-2 text-sm"
+                placeholder={t('cardsManager:placeholderChipId')}
                 autoFocus
               />
             </Field>
-            <Field label="Key #" hint="display number" error={keyNumberError ?? undefined}>
+            <Field label={t('cardsManager:fieldKeyNumber')} hint={t('cardsManager:fieldKeyNumberHint')} error={keyNumberError ?? undefined}>
               <input
                 type="number"
                 min={1}
                 value={editState.keyNumberStr}
                 onChange={(e) => setEditState({ ...editState, keyNumberStr: e.target.value })}
-                className={`w-full px-3 py-2 bg-slate-800 border rounded-lg text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                  keyNumberError ? 'border-red-500' : 'border-slate-600'
+                className={`pg-input !py-2 text-sm ${
+                  keyNumberError ? '!border-red-500' : ''
                 }`}
               />
             </Field>
-            <Field label="Name" hint="required">
+            <Field label={t('cardsManager:fieldName')} hint={t('cardsManager:fieldNameHint')}>
               <input
                 type="text"
                 value={editState.keyName}
                 onChange={(e) => setEditState({ ...editState, keyName: e.target.value })}
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="e.g. Alpha"
+                className="pg-input !py-2 text-sm"
+                placeholder={t('cardsManager:placeholderName')}
               />
             </Field>
-            <Field label="Color" hint="optional">
+            <Field label={t('cardsManager:fieldColor')} hint={t('cardsManager:fieldColorHint')}>
               <input
                 type="text"
                 value={editState.color}
                 onChange={(e) => setEditState({ ...editState, color: e.target.value })}
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="e.g. red"
+                className="pg-input !py-2 text-sm"
+                placeholder={t('cardsManager:placeholderColor')}
               />
             </Field>
           </div>
@@ -377,18 +383,18 @@ export function CardsManager() {
             <button
               onClick={submitRegister}
               disabled={busy}
-              className="inline-flex items-center gap-2 px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm disabled:opacity-50"
+              className="inline-flex items-center gap-2 px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded-[var(--pg-radius-md)] text-sm disabled:opacity-50"
             >
               <Save className="w-4 h-4" />
-              <span>Save</span>
+              <span>{t('cardsManager:save')}</span>
             </button>
             <button
               onClick={cancelEdit}
               disabled={busy}
-              className="inline-flex items-center gap-2 px-3 py-2 border border-slate-600 text-slate-300 hover:bg-slate-700 rounded-lg text-sm disabled:opacity-50"
+              className="pg-btn pg-btn--ghost pg-btn--sm disabled:opacity-50"
             >
               <X className="w-4 h-4" />
-              <span>Cancel</span>
+              <span>{t('cardsManager:cancel')}</span>
             </button>
           </div>
         </div>
@@ -396,34 +402,34 @@ export function CardsManager() {
 
       {loading ? (
         <div className="flex items-center justify-center py-10">
-          <RefreshCw className="w-8 h-8 text-slate-500 animate-spin" />
+          <RefreshCw className="w-8 h-8 text-[var(--pg-text-dim)] animate-spin" />
         </div>
       ) : sorted.length === 0 ? (
-        <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-10 text-center">
-          <CreditCard className="w-12 h-12 text-slate-500 mx-auto mb-3" />
-          <h3 className="text-base font-semibold text-white mb-1">No cards registered yet</h3>
-          <p className="text-slate-400 text-sm">
-            Click <strong>Register card</strong> to add one, or use <strong>Import CSV</strong> for bulk import.
+        <div className="rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] bg-[var(--pg-surface)] p-10 text-center">
+          <CreditCard className="w-12 h-12 text-[var(--pg-text-dim)] mx-auto mb-3" />
+          <h3 className="text-base font-semibold text-[var(--pg-text)] mb-1">{t('cardsManager:emptyTitle')}</h3>
+          <p className="text-[var(--pg-text-dim)] text-sm">
+            <Trans i18nKey="cardsManager:emptyBody" components={{ 1: <strong />, 3: <strong /> }} />
           </p>
         </div>
       ) : (
-        <div className="overflow-x-auto border border-slate-700 rounded-lg">
-          <table className="min-w-full divide-y divide-slate-700">
-            <thead className="bg-slate-900/60">
+        <div className="overflow-x-auto border border-[var(--pg-line)] rounded-[var(--pg-radius-md)]">
+          <table className="min-w-full divide-y divide-[var(--pg-line)]">
+            <thead className="bg-[var(--pg-bg)]">
               <tr>
-                <Th>Key #</Th>
-                <Th>Name</Th>
-                <Th>Color</Th>
-                <Th>Chip ID</Th>
-                <Th className="text-right">Actions</Th>
+                <Th>{t('cardsManager:thKeyNumber')}</Th>
+                <Th>{t('cardsManager:thName')}</Th>
+                <Th>{t('cardsManager:thColor')}</Th>
+                <Th>{t('cardsManager:thChipId')}</Th>
+                <Th className="text-right">{t('cardsManager:thActions')}</Th>
               </tr>
             </thead>
-            <tbody className="bg-slate-900/20 divide-y divide-slate-700/60">
+            <tbody className="divide-y divide-[var(--pg-line)]">
               {sorted.map((card) => {
                 const isEditing = editState.kind === 'edit' && editState.id === card.id;
                 if (isEditing) {
                   return (
-                    <tr key={card.id} className="bg-slate-900/50">
+                    <tr key={card.id} className="bg-[var(--pg-surface-2)]">
                       <td className="px-4 py-2">
                         <input
                           type="number"
@@ -432,8 +438,8 @@ export function CardsManager() {
                           onChange={(e) =>
                             setEditState({ ...editState, keyNumberStr: e.target.value })
                           }
-                          className={`w-24 px-2 py-1 bg-slate-800 border rounded text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500 ${
-                            keyNumberError ? 'border-red-500' : 'border-slate-600'
+                          className={`pg-input !w-24 !py-1 text-sm ${
+                            keyNumberError ? '!border-red-500' : ''
                           }`}
                         />
                         {keyNumberError && (
@@ -447,7 +453,7 @@ export function CardsManager() {
                           onChange={(e) =>
                             setEditState({ ...editState, keyName: e.target.value })
                           }
-                          className="w-full px-2 py-1 bg-slate-800 border border-slate-600 rounded text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          className="pg-input !py-1 text-sm"
                         />
                       </td>
                       <td className="px-4 py-2">
@@ -457,10 +463,10 @@ export function CardsManager() {
                           onChange={(e) =>
                             setEditState({ ...editState, color: e.target.value })
                           }
-                          className="w-full px-2 py-1 bg-slate-800 border border-slate-600 rounded text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          className="pg-input !py-1 text-sm"
                         />
                       </td>
-                      <td className="px-4 py-2 text-sm text-slate-400 font-mono">{card.id}</td>
+                      <td className="px-4 py-2 text-sm text-[var(--pg-text-dim)] font-mono">{card.id}</td>
                       <td className="px-4 py-2 text-right">
                         <div className="inline-flex items-center gap-1">
                           <button
@@ -469,12 +475,12 @@ export function CardsManager() {
                             className="inline-flex items-center gap-1 px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-xs disabled:opacity-50"
                           >
                             <Save className="w-3 h-3" />
-                            <span>Save</span>
+                            <span>{t('cardsManager:save')}</span>
                           </button>
                           <button
                             onClick={cancelEdit}
                             disabled={busy}
-                            className="inline-flex items-center gap-1 px-2 py-1 border border-slate-600 text-slate-300 hover:bg-slate-700 rounded text-xs disabled:opacity-50"
+                            className="inline-flex items-center gap-1 px-2 py-1 border border-[var(--pg-line)] text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)] rounded text-xs disabled:opacity-50"
                           >
                             <X className="w-3 h-3" />
                           </button>
@@ -484,22 +490,22 @@ export function CardsManager() {
                   );
                 }
                 return (
-                  <tr key={card.id} className="hover:bg-slate-800/40 transition-colors">
-                    <td className="px-4 py-2 text-sm font-medium text-white">
+                  <tr key={card.id} className="hover:bg-[var(--pg-surface-2)] transition-colors">
+                    <td className="px-4 py-2 text-sm font-medium text-[var(--pg-text)]">
                       #{card.key_number}
                     </td>
-                    <td className="px-4 py-2 text-sm text-white">{card.key_name}</td>
-                    <td className="px-4 py-2 text-sm text-slate-300">
-                      {card.color || <span className="text-slate-600">—</span>}
+                    <td className="px-4 py-2 text-sm text-[var(--pg-text)]">{card.key_name}</td>
+                    <td className="px-4 py-2 text-sm text-[var(--pg-text-muted)]">
+                      {card.color || <span className="text-[var(--pg-text-dim)]">-</span>}
                     </td>
-                    <td className="px-4 py-2 text-sm text-slate-400 font-mono">{card.id}</td>
+                    <td className="px-4 py-2 text-sm text-[var(--pg-text-dim)] font-mono">{card.id}</td>
                     <td className="px-4 py-2 text-right">
                       <div className="inline-flex items-center gap-1">
                         <button
                           onClick={() => openEdit(card)}
                           disabled={busy || editState.kind !== 'none'}
-                          className="inline-flex items-center gap-1 px-2 py-1 text-slate-400 hover:text-white hover:bg-slate-700 rounded text-xs disabled:opacity-30 disabled:cursor-not-allowed"
-                          title="Edit"
+                          className="inline-flex items-center gap-1 px-2 py-1 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] hover:bg-[var(--pg-surface-3)] rounded text-xs disabled:opacity-30 disabled:cursor-not-allowed"
+                          title={t('cardsManager:editTitle')}
                         >
                           <Pencil className="w-3 h-3" />
                         </button>
@@ -507,7 +513,7 @@ export function CardsManager() {
                           onClick={() => handleDelete(card)}
                           disabled={busy || editState.kind !== 'none'}
                           className="inline-flex items-center gap-1 px-2 py-1 text-red-400 hover:text-red-300 hover:bg-red-500/20 rounded text-xs disabled:opacity-30 disabled:cursor-not-allowed"
-                          title="Delete"
+                          title={t('cardsManager:deleteTitle')}
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -563,6 +569,7 @@ function ImportCsvModal({
   onPick,
   onDrop,
 }: ImportCsvModalProps) {
+  const { t } = useTranslation();
   const handleDragEvent = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -580,14 +587,14 @@ function ImportCsvModal({
     if (file) onDrop(file);
   };
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-lg p-6">
+    <div className="pg-overlay">
+      <div className="pg-modal max-w-lg p-6">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-bold text-white">Import cards from CSV</h3>
+          <h3 className="text-lg font-bold text-[var(--pg-text)]">{t('cardsManager:importModalTitle')}</h3>
           <button
             onClick={onCancel}
             disabled={busy}
-            className="p-1 text-slate-400 hover:text-white disabled:opacity-50"
+            className="pg-modal-close disabled:opacity-50"
           >
             <X className="w-5 h-5" />
           </button>
@@ -598,32 +605,37 @@ function ImportCsvModal({
           onDragOver={handleDragEvent}
           onDragLeave={handleDragEvent}
           onDrop={busy ? undefined : handleDrop}
-          className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+          className={`border-2 border-dashed rounded-[var(--pg-radius-md)] p-8 text-center transition-colors ${
             busy
-              ? 'border-slate-700 bg-slate-800/40 cursor-wait'
+              ? 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] cursor-wait'
               : dragActive
-                ? 'border-blue-400 bg-blue-500/10 cursor-pointer'
-                : 'border-slate-700 hover:border-slate-500 hover:bg-slate-800/40 cursor-pointer'
+                ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] cursor-pointer'
+                : 'border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] hover:bg-[var(--pg-surface-2)] cursor-pointer'
           }`}
         >
-          <Upload className="w-10 h-10 text-slate-400 mx-auto mb-3" />
-          <p className="font-semibold text-white mb-1">
-            {busy ? 'Importing…' : 'Drop CSV here or click to browse'}
+          <Upload className="w-10 h-10 text-[var(--pg-text-dim)] mx-auto mb-3" />
+          <p className="font-semibold text-[var(--pg-text)] mb-1">
+            {busy ? t('cardsManager:importing') : t('cardsManager:importDropPrompt')}
           </p>
-          <p className="text-xs text-slate-400">
-            Expected headers: <code className="bg-slate-800 text-slate-200 px-1 rounded">key_name, color, key_number, id</code>
+          <p className="text-xs text-[var(--pg-text-dim)]">
+            <Trans
+              i18nKey="cardsManager:importExpectedHeaders"
+              components={{
+                1: <code className="bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] px-1 rounded" />,
+              }}
+            />
           </p>
-          <p className="text-xs text-slate-400 mt-1">
-            Existing rows are upserted by chip ID. Upload pushes to studio, then re-syncs locally.
+          <p className="text-xs text-[var(--pg-text-dim)] mt-1">
+            {t('cardsManager:importUpsertNote')}
           </p>
         </div>
         <div className="mt-4 flex justify-end">
           <button
             onClick={onCancel}
             disabled={busy}
-            className="px-4 py-2 text-sm text-slate-300 hover:bg-slate-800 rounded-lg disabled:opacity-50"
+            className="pg-btn pg-btn--ghost disabled:opacity-50"
           >
-            Cancel
+            {t('cardsManager:cancel')}
           </button>
         </div>
       </div>
@@ -639,30 +651,38 @@ interface ConfirmDeleteModalProps {
 }
 
 function ConfirmDeleteModal({ card, busy, onCancel, onConfirm }: ConfirmDeleteModalProps) {
+  const { t } = useTranslation();
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4">
-      <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-full max-w-md p-6">
-        <h3 className="text-lg font-bold text-white mb-2">Delete card?</h3>
-        <p className="text-sm text-slate-300 mb-1">
-          <strong className="text-white">{card.key_name}</strong> (chip <code className="font-mono text-slate-400">{card.id}</code>, key #{card.key_number})
+    <div className="pg-overlay">
+      <div className="pg-modal max-w-md p-6">
+        <h3 className="text-lg font-bold text-[var(--pg-text)] mb-2">{t('cardsManager:deleteModalTitle')}</h3>
+        <p className="text-sm text-[var(--pg-text-muted)] mb-1">
+          <Trans
+            i18nKey="cardsManager:deleteModalBody"
+            values={{ name: card.key_name, id: card.id, keyNumber: card.key_number }}
+            components={{
+              0: <strong className="text-[var(--pg-text)]" />,
+              2: <code className="font-mono text-[var(--pg-text-dim)]" />,
+            }}
+          />
         </p>
-        <p className="text-xs text-slate-400 mb-6">
-          This deletes the card on studio and on every device on the next sync. It cannot be undone.
+        <p className="text-xs text-[var(--pg-text-dim)] mb-6">
+          {t('cardsManager:deleteModalWarning')}
         </p>
         <div className="flex justify-end gap-2">
           <button
             onClick={onCancel}
             disabled={busy}
-            className="px-4 py-2 text-sm text-slate-300 hover:bg-slate-800 rounded-lg disabled:opacity-50"
+            className="pg-btn pg-btn--ghost disabled:opacity-50"
           >
-            Cancel
+            {t('cardsManager:cancel')}
           </button>
           <button
             onClick={onConfirm}
             disabled={busy}
-            className="px-4 py-2 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50"
+            className="pg-btn pg-btn--danger disabled:opacity-50"
           >
-            {busy ? 'Deleting…' : 'Delete'}
+            {busy ? t('cardsManager:deleting') : t('cardsManager:delete')}
           </button>
         </div>
       </div>
@@ -673,7 +693,7 @@ function ConfirmDeleteModal({ card, busy, onCancel, onConfirm }: ConfirmDeleteMo
 function Th({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return (
     <th
-      className={`px-4 py-2 text-left text-xs font-medium text-slate-400 uppercase tracking-wider ${className}`}
+      className={`px-4 py-2 text-left text-xs font-medium text-[var(--pg-text-dim)] uppercase tracking-wider ${className}`}
     >
       {children}
     </th>
@@ -693,19 +713,26 @@ function Field({
 }) {
   return (
     <label className="block">
-      <span className="block text-xs font-medium text-slate-300">{label}</span>
-      {hint && <span className="block text-xs text-slate-500 mb-1">{hint}</span>}
+      <span className="block text-xs font-medium text-[var(--pg-text-muted)]">{label}</span>
+      {hint && <span className="block text-xs text-[var(--pg-text-dim)] mb-1">{hint}</span>}
       {children}
       {error && <span className="block text-xs text-red-400 mt-1">{error}</span>}
     </label>
   );
 }
 
-// Re-export the warning icon to keep an import alive — used in callers that
+// Re-export the warning icon to keep an import alive - used in callers that
 // embed a pending-sync indicator.
-export const SyncPendingBadge = ({ operation }: { operation: cardsRepo.CardOperation }) => (
-  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded-full border border-amber-500/30">
-    {operation === 'delete' ? <AlertCircle className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
-    {operation === 'delete' ? 'pending delete' : operation === 'update' ? 'pending edit' : 'pending'}
-  </span>
-);
+export const SyncPendingBadge = ({ operation }: { operation: cardsRepo.CardOperation }) => {
+  const { t } = useTranslation();
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded-full border border-amber-500/30">
+      {operation === 'delete' ? <AlertCircle className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
+      {operation === 'delete'
+        ? t('cardsManager:pendingDelete')
+        : operation === 'update'
+          ? t('cardsManager:pendingEdit')
+          : t('cardsManager:pending')}
+    </span>
+  );
+};

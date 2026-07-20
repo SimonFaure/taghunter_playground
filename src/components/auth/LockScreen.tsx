@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Loader2, Lock, Mail, KeyRound } from 'lucide-react';
 import { OtpInput } from './OtpInput';
 import { verifyPin, getLockoutEnd, clearPin, type VerifyOutcome } from '../../services/pinStore';
@@ -10,7 +12,7 @@ import { RecoveryCodePrompt } from '../RecoveryCodePrompt';
 import type { AuthUser } from '../../services/authStore';
 
 // Manual-lock PIN gate. Rendered as a full-screen overlay when the user
-// taps "Lock" in the nav bar — the app shell stays mounted and live
+// taps "Lock" in the nav bar - the app shell stays mounted and live
 // underneath. It is not a cold-start gate. JWT + auth_user are already on
 // disk; this screen never touches the server unless the user explicitly
 // taps "Forgot PIN".
@@ -22,7 +24,7 @@ import type { AuthUser } from '../../services/authStore';
 //     validated locally. On success the device PIN is cleared and the app
 //     unlocks; the operator sets a new PIN via the banner / Settings. This is
 //     the only path that works at an offline event when the email is out of
-//     reach — see RecoveryCodePrompt / recoveryCodesStore.
+//     reach - see RecoveryCodePrompt / recoveryCodesStore.
 
 type Phase =
   | 'enter_pin'
@@ -38,6 +40,7 @@ interface LockScreenProps {
 }
 
 export function LockScreen({ user, onUnlocked }: LockScreenProps) {
+  const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>('enter_pin');
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
@@ -78,14 +81,14 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
         return;
       }
       if (outcome.reason === 'no_pin') {
-        // Shouldn't happen — AuthProvider routes to SetPinScreen in that case.
+        // Shouldn't happen - AuthProvider routes to SetPinScreen in that case.
         // Surface clearly so the user can recover.
-        setError('No PIN set on this device. Restart the app to continue.');
+        setError(t('authChrome:lock.noPin'));
         return;
       }
       if (outcome.reason === 'locked_out') {
         setLockoutEnd(outcome.lockedUntilAt);
-        setError('Too many wrong attempts. Try again shortly.');
+        setError(t('authChrome:lock.tooManyAttempts'));
         setPin('');
         return;
       }
@@ -94,12 +97,12 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
       setPin('');
       setError(
         outcome.lockedUntilAt > Math.floor(Date.now() / 1000)
-          ? 'Too many wrong attempts. Try again shortly.'
-          : 'Wrong PIN. Try again.'
+          ? t('authChrome:lock.tooManyAttempts')
+          : t('authChrome:lock.wrongPin')
       );
     } catch (err) {
       console.error('[LockScreen] verify failed:', err);
-      setError('Could not check PIN. Try again.');
+      setError(t('authChrome:lock.couldNotCheck'));
       setPin('');
     } finally {
       setBusy(false);
@@ -115,7 +118,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
       setPhase('forgot_verify');
       setOtp('');
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setBusy(false);
     }
@@ -138,7 +141,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
   async function handleConfirmNewPinComplete(value: string) {
     setError(null);
     if (value !== newPin) {
-      setError('PINs don’t match. Choose a PIN again.');
+      setError(t('authChrome:lock.pinsDontMatch'));
       setNewPin('');
       setConfirmNewPin('');
       return;
@@ -147,14 +150,14 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
     try {
       await verifyPinResetOtpAndSet(otp, value);
       // PIN persisted server-side bootstrap will be re-run by AuthProvider
-      // after onUnlocked() — same gate as a successful PIN entry.
+      // after onUnlocked() - same gate as a successful PIN entry.
       setPhase('forgot_done');
       setPin('');
       setError(null);
       // Briefly show success, then route to the app.
       setTimeout(onUnlocked, 600);
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
       // Stay on this phase but reset the entry boxes so the user retries.
       setNewPin('');
       setConfirmNewPin('');
@@ -188,7 +191,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
 
   if (phase === 'recovery_code') {
     return (
-      <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 pg-app-bg">
         <RecoveryCodePrompt
           onSuccess={handleRecoveryUnlock}
           onCancel={() => {
@@ -202,31 +205,33 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-6 pg-app-bg">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-500/20 border border-blue-500/40 mb-4">
-            <Lock className="w-7 h-7 text-blue-300" />
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--pg-accent-tint)] border border-[var(--pg-accent-line)] mb-4">
+            <Lock className="w-7 h-7 text-[var(--pg-accent-bright)]" />
           </div>
-          <h1 className="text-2xl font-bold text-white mb-1">
-            {phase === 'enter_pin' && 'Enter your PIN'}
-            {phase === 'forgot_verify' && 'Check your email'}
-            {phase === 'forgot_set_pin' &&
-              (newPin === '' ? 'Choose a new PIN' : 'Confirm your new PIN')}
-            {phase === 'forgot_done' && 'PIN updated'}
-          </h1>
-          <p className="text-slate-400 text-sm">
-            {phase === 'enter_pin' && `Signed in as ${user.email}`}
-            {phase === 'forgot_verify' && `We sent a 6-digit code to ${user.email}`}
+          <h1 className="text-2xl font-bold text-[var(--pg-text)] mb-1">
+            {phase === 'enter_pin' && t('authChrome:lock.enterPinTitle')}
+            {phase === 'forgot_verify' && t('authChrome:lock.checkEmailTitle')}
             {phase === 'forgot_set_pin' &&
               (newPin === ''
-                ? 'Pick a new 4-digit PIN for this device.'
-                : 'Type it once more to make sure it matches.')}
-            {phase === 'forgot_done' && 'Unlocking…'}
+                ? t('authChrome:lock.chooseNewPinTitle')
+                : t('authChrome:lock.confirmNewPinTitle'))}
+            {phase === 'forgot_done' && t('authChrome:lock.pinUpdatedTitle')}
+          </h1>
+          <p className="text-[var(--pg-text-dim)] text-sm">
+            {phase === 'enter_pin' && t('authChrome:lock.signedInAs', { email: user.email })}
+            {phase === 'forgot_verify' && t('authChrome:lock.codeSentTo', { email: user.email })}
+            {phase === 'forgot_set_pin' &&
+              (newPin === ''
+                ? t('authChrome:lock.pickNewPin')
+                : t('authChrome:lock.typeOnceMore'))}
+            {phase === 'forgot_done' && t('authChrome:lock.unlocking')}
           </p>
         </div>
 
-        <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+        <div className="pg-panel p-6 space-y-4">
           {phase === 'enter_pin' && (
             <>
               <OtpInput
@@ -239,16 +244,16 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
 
               {lockedOut && (
                 <div className="text-amber-300 text-sm text-center">
-                  Too many wrong attempts. Try again in {formatRemaining(remainingSeconds)}.
+                  {t('authChrome:lock.lockedOut', { time: formatRemaining(remainingSeconds, t) })}
                 </div>
               )}
               {!lockedOut && error && (
                 <div className="text-sm text-red-400 text-center">{error}</div>
               )}
               {busy && (
-                <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+                <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Checking…
+                  {t('authChrome:lock.checking')}
                 </div>
               )}
 
@@ -257,16 +262,16 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
                   type="button"
                   onClick={handleForgotPin}
                   disabled={busy || !online}
-                  className="text-sm text-blue-400 hover:text-blue-300 disabled:opacity-50 disabled:hover:text-blue-400"
-                  title={online ? undefined : 'Connect to the internet to reset your PIN'}
+                  className="text-sm text-[var(--pg-accent-bright)] hover:text-[var(--pg-accent-hover)] disabled:opacity-50 disabled:hover:text-[var(--pg-accent-bright)]"
+                  title={online ? undefined : t('authChrome:lock.connectToResetTitle')}
                 >
                   <Mail className="w-4 h-4 inline mr-1.5 align-text-bottom" />
-                  Forgot PIN?
+                  {t('authChrome:lock.forgotPin')}
                 </button>
               </div>
               {!online && (
-                <p className="text-xs text-slate-500 text-center">
-                  Connect to the internet to reset your PIN.
+                <p className="text-xs text-[var(--pg-text-dim)] text-center">
+                  {t('authChrome:lock.connectToReset')}
                 </p>
               )}
 
@@ -279,11 +284,11 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
                     setPin('');
                   }}
                   disabled={busy}
-                  className="text-sm text-slate-400 hover:text-white disabled:opacity-50"
-                  title="Works offline — ask your administrator for a recovery code"
+                  className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
+                  title={t('authChrome:lock.recoveryHint')}
                 >
                   <KeyRound className="w-4 h-4 inline mr-1.5 align-text-bottom" />
-                  Use a recovery code
+                  {t('authChrome:lock.useRecoveryCode')}
                 </button>
               </div>
             </>
@@ -300,9 +305,9 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
               />
               {error && <div className="text-sm text-red-400 text-center">{error}</div>}
               {busy && (
-                <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+                <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Sending code…
+                  {t('authChrome:lock.sendingCode')}
                 </div>
               )}
               <div className="flex justify-between items-center text-sm">
@@ -310,17 +315,17 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
                   type="button"
                   onClick={handleCancelForgot}
                   disabled={busy}
-                  className="text-slate-400 hover:text-white disabled:opacity-50"
+                  className="text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
                 >
-                  ← Back to PIN
+                  {t('authChrome:lock.backToPin')}
                 </button>
                 <button
                   type="button"
                   onClick={handleForgotPin}
                   disabled={busy || !online}
-                  className="text-blue-400 hover:text-blue-300 disabled:opacity-50"
+                  className="text-[var(--pg-accent-bright)] hover:text-[var(--pg-accent-hover)] disabled:opacity-50"
                 >
-                  Resend code
+                  {t('authChrome:lock.resendCode')}
                 </button>
               </div>
             </>
@@ -347,9 +352,9 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
               )}
               {error && <div className="text-sm text-red-400 text-center">{error}</div>}
               {busy && (
-                <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
+                <div className="flex items-center justify-center gap-2 text-[var(--pg-text-dim)] text-sm">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Saving…
+                  {t('authChrome:lock.saving')}
                 </div>
               )}
               <div className="flex justify-center">
@@ -357,9 +362,9 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
                   type="button"
                   onClick={handleCancelForgot}
                   disabled={busy}
-                  className="text-sm text-slate-400 hover:text-white disabled:opacity-50"
+                  className="text-sm text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] disabled:opacity-50"
                 >
-                  Cancel
+                  {t('authChrome:lock.cancel')}
                 </button>
               </div>
             </>
@@ -368,7 +373,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
           {phase === 'forgot_done' && (
             <div className="flex items-center justify-center gap-2 text-emerald-300 text-sm py-4">
               <Loader2 className="w-4 h-4 animate-spin" />
-              Unlocking…
+              {t('authChrome:lock.unlocking')}
             </div>
           )}
         </div>
@@ -377,21 +382,21 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
   );
 }
 
-function formatRemaining(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
+function formatRemaining(seconds: number, t: TFunction): string {
+  if (seconds < 60) return t('authChrome:lock.remainingSeconds', { count: seconds });
   const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) return `${minutes} min`;
+  if (minutes < 60) return t('authChrome:lock.remainingMinutes', { count: minutes });
   const hours = Math.ceil(minutes / 60);
-  return `${hours}h`;
+  return t('authChrome:lock.remainingHours', { count: hours });
 }
 
-function extractErrorMessage(err: unknown): string {
+function extractErrorMessage(err: unknown, t: TFunction): string {
   console.error('[LockScreen] error:', err);
   if (err instanceof ApiError) {
     const body = err.body as { error?: string } | null;
     if (body?.error) return body.error;
-    return `Request failed (${err.status})`;
+    return t('authChrome:errors.requestFailed', { status: err.status });
   }
   if (err instanceof Error) return err.message;
-  return 'Something went wrong. Please try again.';
+  return t('authChrome:errors.generic');
 }

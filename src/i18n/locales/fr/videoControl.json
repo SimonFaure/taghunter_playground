@@ -1,0 +1,13 @@
+{
+  "playVideo": "Lire la vidéo",
+  "close": "Fermer",
+  "pickVideoPrefix": "Choisissez une vidéo à lire sur",
+  "thisDevice": "cet appareil",
+  "pickVideoSuffix": ". (Pour l'envoyer aux satellites, utilisez la fenêtre Appareils.)",
+  "intro": "Intro",
+  "tutorial": "Tutoriel",
+  "introTutorial": "Intro + Tutoriel",
+  "stopVideo": "Arrêter la vidéo",
+  "resolving": "Résolution…",
+  "noVideoAvailable": "Aucune vidéo {{kinds}} disponible pour ce scénario."
+}

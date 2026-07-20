@@ -1,0 +1,14 @@
+{
+  "title": "Nombres de equipo",
+  "intro": "Estas son las listas de nombres de equipo que se usan cuando un equipo recibe un nombre automático (autorregistro o reutilización de tarjetas). Se gestionan en el estudio.",
+  "loading": "Cargando nombres de equipo…",
+  "ownOnlyLabel": "Usar solo mis listas",
+  "ownOnlyDesc": "Extraer nombres únicamente de tus listas personalizadas. Si no tienes lista para una edad, se usan las listas predeterminadas.",
+  "saveError": "No se pudo guardar el cambio. Comprueba tu conexión e inténtalo de nuevo.",
+  "defaultListsTitle": "Listas predeterminadas",
+  "defaultListsSubtitle": "El catálogo de nombres compartido, disponible para todos.",
+  "defaultListsEmpty": "Aún no hay listas predeterminadas.",
+  "customListsTitle": "Mis listas personalizadas",
+  "customListsSubtitle": "Nombres añadidos para tu cuenta en el estudio.",
+  "customListsEmpty": "Aún no tienes listas personalizadas - se usan las listas predeterminadas."
+}

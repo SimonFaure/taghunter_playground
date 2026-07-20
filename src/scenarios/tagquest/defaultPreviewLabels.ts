@@ -2,7 +2,7 @@
  * Bundled defaults for the four global tagquest HUD chrome labels.
  *
  * MIRROR of studio-taghunter/src/scenarios/preview/previewLabels.ts
- * `DEFAULT_PREVIEW_LABELS`. Kept in sync by hand — both copies must move
+ * `DEFAULT_PREVIEW_LABELS`. Kept in sync by hand - both copies must move
  * together when defaults change. Used when the admin_translations cache is
  * empty (first launch with no sync) or missing the player's language.
  */

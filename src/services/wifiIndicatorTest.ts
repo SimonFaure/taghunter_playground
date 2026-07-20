@@ -5,7 +5,7 @@
 //
 // Reports: the LocalRole the footer is branching on, the cached endpoints,
 // each paired mother's ping result, and a mDNS refresh round-trip. Use this
-// to inspect why the footer is showing the state it is — every input the
+// to inspect why the footer is showing the state it is - every input the
 // state machine sees is reproduced here.
 
 import { invoke } from '@tauri-apps/api/core';

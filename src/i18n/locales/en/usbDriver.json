@@ -1,0 +1,72 @@
+{
+  "explainer": {
+    "title": "What this tab is for",
+    "body": "The SportIdent card reader plugs in over USB and needs a Windows driver before this computer can talk to it. This tab checks whether that driver is installed and working and, if the reader isn't being detected, walks you through installing the right driver so it comes online and can read cards. It only concerns the physical reader - not your game content (Sync) or the app version (Updates)."
+  },
+  "detection": {
+    "recheck": "Re-check",
+    "installTitle": "Coming in the next build",
+    "install": "Install signed driver",
+    "comingSoon": "(coming soon)"
+  },
+  "variant": {
+    "healthy": {
+      "title": "Reader driver looks good",
+      "body": "Windows loaded the SportIdent reader driver. Plug in your reader and the Hardware tab will show the COM port."
+    },
+    "blockedByPolicy": {
+      "title": "Driver blocked by Windows",
+      "body": "A SportIdent reader is plugged in, but Windows refused to load its driver - almost certainly the Vulnerable Driver Blocklist refusing the legacy silabser.sys (the 24H2 / 25H2 case). Installing the signed driver below fixes it; no Memory Integrity change needed."
+    },
+    "driverNotInstalled": {
+      "title": "Reader driver not installed",
+      "body": "A SportIdent reader is plugged in, but Windows has no driver for it (Device Manager shows it under \"Other devices\", code 28). Install the SportIdent USB driver below and the reader will come online."
+    },
+    "deviceAbsent": {
+      "title": "No SportIdent reader detected",
+      "body": "Plug in your reader and this card will refresh automatically. If the reader is plugged in but Device Manager shows a yellow warning, the driver fix will appear here once detected."
+    },
+    "otherError": {
+      "title": "Device error (code {{code}})",
+      "body": "Windows reported an unusual error for the SportIdent reader. The driver fix below may still help; if not, the Event Viewer steps under \"Why this happens\" name the exact .sys file Windows refused to load."
+    },
+    "unknown": {
+      "title": "Unknown",
+      "body": ""
+    }
+  },
+  "sportident": {
+    "title": "SportIdent USB driver",
+    "subtitle": "Required for the reader to be detected.",
+    "body": "Install the current signed SportIdent USB driver. It replaces the blocked/missing legacy driver with an HVCI-compatible build - <1>you don't need to disable Memory Integrity</1>.",
+    "download": "Download SportIdent USB driver",
+    "afterInstall": "After installing, unplug and replug the reader, then hit the re-check button on the status card above - it should turn green."
+  },
+  "manual": {
+    "title": "Manual workaround",
+    "subtitle": "If the installer above doesn't take.",
+    "showSteps": "Show steps",
+    "hideSteps": "Hide steps",
+    "warning": "<1>Temporary workaround.</1> Replacing the bundled SportIdent USB driver by hand with the signed Silicon Labs CP210x driver restores the COM port until SportIdent ships a permanent fix.",
+    "downloadSilabs": "Download Silicon Labs CP210x driver",
+    "openGuide": "Open full workaround guide",
+    "stepsHeading": "Replace the driver by hand",
+    "step1": "Open Windows <1>Settings → Apps → Installed apps</1> and uninstall <2>\"Windows Driver Package – SPORTident (sliabenm) Ports\"</2>.",
+    "step2": "Download the Silicon Labs CP210x VCP driver (button above) and extract the ZIP. On ARM / Snapdragon PCs, pick the <2>CP210x Universal Windows Driver</2>.",
+    "step3": "Plug in the SportIdent reader, then open <1>Device Manager</1>.",
+    "step4": "Find the device (listed as <1>\"SPORTident USB to UART Bridge Controller\"</1>, often with a yellow warning). Right-click it → <1>Update driver</1>.",
+    "step5": "Choose <1>Browse my computer for drivers → Let me pick from a list → Show All Devices</1>.",
+    "step6": "Click <1>Have Disk… → Browse…</1>, open the extracted folder and select <code>silabser.inf</code>.",
+    "step7": "Select <1>\"Silicon Labs CP210x USB to UART Bridge\"</1> and confirm through any warnings.",
+    "step8": "The reader now appears as a COM port. <2>Repeat steps 3–7 for every additional reader or dongle.</2>"
+  },
+  "why": {
+    "title": "Why this happens",
+    "subtitle": "Memory Integrity and recent Windows 11 feature updates.",
+    "body": "Recent Windows 11 feature updates (<2>24H2</2>, <2>25H2</2>) tighten the kernel driver code-integrity policy and turn <2>Memory Integrity</2> (Core Isolation) on by default. Older USB-serial drivers - including the one previously bundled with the SportIdent reader - no longer load under the new policy, so the reader stops being detected. The signed driver above replaces it with a current HVCI-compatible build.",
+    "verifyHeading": "How to verify on your machine",
+    "verify1": "Windows Security → <1>Device Security → Core Isolation</1> - if Memory Integrity is <2>On</2>, that's the block.",
+    "verify2": "Windows Update → <1>Update history</1> - look for a recent feature update to 24H2 or 25H2.",
+    "verify3": "Event Viewer → <1>Windows Logs → System</1>, filter by source <code>Microsoft-Windows-CodeIntegrity</code> - the blocking entry names the exact <mono>.sys</mono> file Windows refused to load (for advanced diagnosis)."
+  }
+}

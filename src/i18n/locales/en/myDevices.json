@@ -1,0 +1,21 @@
+{
+  "title": "My Devices",
+  "refresh": "Refresh",
+  "signOut": "Sign out",
+  "noDevices": "No devices found.",
+  "deviceNamePlaceholder": "Device name",
+  "deviceNameFallback": "{{os}} device",
+  "unknownOs": "Unknown",
+  "save": "Save",
+  "cancel": "Cancel",
+  "rename": "Rename",
+  "thisDevice": "This device",
+  "loggedOut": "Logged out",
+  "appVersion": "app {{version}}",
+  "lastSeen": "last seen {{time}}",
+  "signOutThisDevice": "Sign out this device",
+  "revokeDevice": "Revoke device",
+  "nameTooLong": "Name must be {{max}} characters or fewer",
+  "requestFailed": "Request failed ({{status}})",
+  "genericError": "Something went wrong."
+}

@@ -1,19 +1,19 @@
-// CRC-16/SportIdent — word-oriented, polynomial 0x8005.
+// CRC-16/SportIdent - word-oriented, polynomial 0x8005.
 //
 // Bit-for-bit port of `SportIdent::calcCRC` in MeOS SportIdent.cpp. The
 // legacy JS (src/lib/lib.js calcCRC) is also a faithful port of the same
-// algorithm — so frames produced here CRC-match what the existing app
+// algorithm - so frames produced here CRC-match what the existing app
 // already sends on the wire. Verified by cross-checking the MeOS source
 // via WebFetch on 2026-05-12.
 //
 // Quirks worth knowing:
 //   - Inputs < 2 bytes return 0 (per spec).
 //   - Inputs of exactly 2 bytes return the bytes as a big-endian u16 with
-//     no mixing — there is no polynomial pass.
+//     no mixing - there is no polynomial pass.
 //   - Even-length inputs (> 2) get an implicit trailing zero word in the
 //     last mix iteration: `count >> 1` iterations are run; the last one
 //     uses `value = 0` when `count` is even. This is intentional, not a
-//     bug — every SI implementation in the wild does this.
+//     bug - every SI implementation in the wild does this.
 //   - Odd-length inputs > 2 pack the trailing byte into the high byte of
 //     the last `value` word (low byte = 0).
 
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn wakeup_payload_matches_meos_jsoutput() {
-        // [0xF0, 0x01, 0x4D] — the "set MS mode" payload that wakes the
+        // [0xF0, 0x01, 0x4D] - the "set MS mode" payload that wakes the
         // SI master. Odd length, exercises the last-byte-in-high-half
         // branch. The legacy JS calcCRC produces this exact value on the
         // same input (hand-traced 2026-05-12) and the resulting wakeup
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn even_length_input_matches_meos() {
-        // [0x83, 0x02, 0x00, 0x80] — the "read system data" command frame
+        // [0x83, 0x02, 0x00, 0x80] - the "read system data" command frame
         // (CMD + LEN + 2-byte payload). Even length, exercises the
         // implicit-trailing-zero-word branch. Lock-in regression test:
         // if this value changes, the decoder will mismatch real SI master

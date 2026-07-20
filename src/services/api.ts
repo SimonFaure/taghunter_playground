@@ -30,7 +30,7 @@ let lanOverride: LanOverride | null = null;
 
 // Endpoints that are ALWAYS served by the in-process mother (never studio).
 // A call to one of these before the override is installed must wait for it
-// rather than fall through to studio — studio has no mother-local launched
+// rather than fall through to studio - studio has no mother-local launched
 // game, so it answers 404. See waitForLanOverride below.
 const LOCAL_ONLY_ENDPOINTS: ReadonlySet<string> = new Set(['launched_games']);
 const LAN_READY_TIMEOUT_MS = 4000;
@@ -59,6 +59,45 @@ export function setLanOverride(o: LanOverride | null): void {
 
 export function getLanOverride(): LanOverride | null {
   return lanOverride;
+}
+
+// This device's OWN local launched_games server (127.0.0.1). Recorded by
+// lanMotherBoot once the local axum server is up, and kept independent of
+// `lanOverride` so it survives the override being re-pointed at a MOTHER.
+//
+// On a child paired to a mother, `lanOverride` points at the mother (so the
+// launched-games page lists and operates the mother's games). The "This device"
+// section still needs to read the child's own historical games from its local
+// SQLite - callers pass `forceLocal: true` to bypass the override and hit this
+// route instead. Read-only in practice (children launch onto the mother now).
+let localLaunchedGamesRoute: { baseUrl: string; token: string } | null = null;
+export function setLocalLaunchedGamesRoute(
+  r: { baseUrl: string; token: string } | null,
+): void {
+  localLaunchedGamesRoute = r;
+}
+export function getLocalLaunchedGamesRoute(): { baseUrl: string; token: string } | null {
+  return localLaunchedGamesRoute;
+}
+
+// Slice 5 (mother failover): when a LOCAL_ONLY (launched_games) call can't REACH
+// its LAN override - the mother died mid-game - this handler tries to discover
+// the promoted mother over mDNS and re-point the override. Returns true if it
+// installed a new override worth retrying. Registered by services/motherFailover.
+let lanRepointHandler: (() => Promise<boolean>) | null = null;
+export function setLanRepointHandler(fn: (() => Promise<boolean>) | null): void {
+  lanRepointHandler = fn;
+}
+
+// When a mother-local (launched_games) call is REJECTED with 401/403 - the
+// mother rebuilt its paired_devices and no longer honours our stored secret -
+// this handler re-pairs (same-client auto-approve) and re-points the override
+// with the fresh secret. Returns true if it re-established a working route worth
+// retrying. Registered by services/childControlLink. Avoids the old footgun
+// where a stale pairing forced the operator to manually unpair to reconnect.
+let lanReauthHandler: (() => Promise<boolean>) | null = null;
+export function setLanReauthHandler(fn: (() => Promise<boolean>) | null): void {
+  lanReauthHandler = fn;
 }
 
 // Wait up to `timeoutMs` for the LAN override to be installed. Resolves
@@ -108,9 +147,14 @@ interface ApiCallOptions {
   query?: Record<string, string | number | undefined>;
   signal?: AbortSignal;
   // Per-request timeout in ms. Defaults to DEFAULT_REQUEST_TIMEOUT_MS. Pass a
-  // number to override, or `null` to disable (rare — e.g. a deliberately
+  // number to override, or `null` to disable (rare - e.g. a deliberately
   // long-running upload/long-poll).
   timeoutMs?: number | null;
+  // Force a launched_games call to this device's OWN local server, bypassing any
+  // mother-pointing override. Used by the "This device" section of the launched
+  // games page on a child whose override points at the mother. No-op for other
+  // endpoints or when no local route is recorded yet.
+  forceLocal?: boolean;
 }
 
 // Single fetch wrapper for studio API calls.
@@ -121,15 +165,49 @@ interface ApiCallOptions {
 export async function apiCall<T = unknown>(
   endpoint: string,
   action: string,
-  options: ApiCallOptions = {}
+  options: ApiCallOptions = {},
+  // Internal: set on the single auto-retry after a mother re-point so we don't
+  // loop. Callers never pass this.
+  _isRepointRetry = false,
+  // Internal: set on the single auto-retry after a re-pair (401 from a mother
+  // whose secret we no longer hold). Callers never pass this.
+  _isReauthRetry = false
 ): Promise<T> {
+  // forceLocal: route this launched_games call at our OWN local server,
+  // ignoring any mother-pointing override (used by the "This device" section).
+  const forceLocalRoute =
+    options.forceLocal && LOCAL_ONLY_ENDPOINTS.has(endpoint) && localLaunchedGamesRoute
+      ? {
+          baseUrl: localLaunchedGamesRoute.baseUrl,
+          token: localLaunchedGamesRoute.token,
+          endpoints: LOCAL_ONLY_ENDPOINTS,
+        }
+      : null;
+
   // For mother-local endpoints, give the override a moment to install before
-  // routing — otherwise a boot/reload race sends the request to studio, which
+  // routing - otherwise a boot/reload race sends the request to studio, which
   // 404s for a launched game that only exists in the mother's local SQLite.
-  if (lanOverride == null && LOCAL_ONLY_ENDPOINTS.has(endpoint)) {
+  // (Skip the wait for forceLocal calls - they use the local route, which is
+  // recorded at boot independently of the override.)
+  if (lanOverride == null && !forceLocalRoute && LOCAL_ONLY_ENDPOINTS.has(endpoint)) {
     await waitForLanOverride(LAN_READY_TIMEOUT_MS);
+    // Still no LAN route after waiting. In the LAN model launched games live
+    // ONLY on a mother - never on studio - so do NOT fall through to the studio
+    // base (which would 404 or return the wrong data, confusing operators).
+    // Fail clearly instead: this device simply has no mother to talk to yet
+    // (not hosting, not routed). childControlLink keeps trying to discover +
+    // auto-pair one, so callers (list page, nav badge) recover on a later tick.
+    if (lanOverride == null) {
+      throw new ApiError(
+        503,
+        null,
+        'No mother reachable for launched_games - this device is not hosting and not routed to a mother yet.',
+      );
+    }
   }
-  const lanRoute = lanOverride && lanOverride.endpoints.has(endpoint) ? lanOverride : null;
+  const lanRoute =
+    forceLocalRoute ??
+    (lanOverride && lanOverride.endpoints.has(endpoint) ? lanOverride : null);
   const url = lanRoute
     ? buildUrlWithBase(lanRoute.baseUrl, endpoint, action, options.query)
     : buildUrl(endpoint, action, options.query);
@@ -193,6 +271,28 @@ export async function apiCall<T = unknown>(
       timeoutMs != null
         ? await withDeadline(res.text(), timeoutMs, `${label} body`)
         : await res.text();
+  } catch (err) {
+    // A throw HERE is a transport failure (connection refused / timeout). An
+    // HTTP 404 does NOT land here - it returns a response and is thrown later
+    // from `!res.ok`. So if this was a mother-local call whose mother just
+    // died, ask the failover handler to re-point to the promoted mother and
+    // retry exactly once. (Slice 5.)
+    if (
+      !_isRepointRetry &&
+      lanRoute &&
+      !forceLocalRoute &&
+      LOCAL_ONLY_ENDPOINTS.has(endpoint) &&
+      lanRepointHandler
+    ) {
+      const repointed = await lanRepointHandler();
+      if (repointed) {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        // Recurse so the retry builds a fresh timeout/abort controller and
+        // recomputes the route from the newly-installed override.
+        return apiCall<T>(endpoint, action, options, true, _isReauthRetry);
+      }
+    }
+    throw err;
   } finally {
     if (timeoutHandle !== null) clearTimeout(timeoutHandle);
   }
@@ -206,6 +306,24 @@ export async function apiCall<T = unknown>(
   }
 
   if (!res.ok) {
+    // Auth rejected by a REMOTE mother for a launched_games call: our stored
+    // peer_secret is stale (the mother rebuilt its pairing table). Re-pair once
+    // (same-client auto-approve) + re-point at the fresh secret, then retry -
+    // so a stale pairing self-heals instead of needing a manual unpair.
+    if (
+      (res.status === 401 || res.status === 403) &&
+      !_isReauthRetry &&
+      lanRoute &&
+      !forceLocalRoute &&
+      LOCAL_ONLY_ENDPOINTS.has(endpoint) &&
+      !lanRoute.baseUrl.includes('127.0.0.1') &&
+      lanReauthHandler
+    ) {
+      const reauthed = await lanReauthHandler();
+      if (reauthed) {
+        return apiCall<T>(endpoint, action, options, _isRepointRetry, true);
+      }
+    }
     throw new ApiError(res.status, parsed);
   }
 
@@ -278,22 +396,28 @@ export interface DownloadProgress {
 // body stream (the standard Web Streams API guarantees `.body` is a
 // ReadableStream<Uint8Array> | null; Tauri's plugin-http returns null for
 // 101/103/204/205/304, which we never hit for downloads).
-export async function apiDownloadBytesStream(
+export type DownloadStreamOptions = Omit<ApiCallOptions, 'body' | 'method' | 'timeoutMs'> & {
+  signal?: AbortSignal;
+  onProgress?: (p: DownloadProgress) => void;
+  // Connect → response-headers timeout (a bounded operation).
+  // Default DOWNLOAD_TTFB_TIMEOUT_MS. `null` disables.
+  ttfbTimeoutMs?: number | null;
+  // Per-chunk IDLE timeout: max gap between body chunks. Reset on every
+  // chunk, so a large file downloading slow-but-steady is never wrongly
+  // aborted - only a genuine mid-stream stall is.
+  // Default DOWNLOAD_STALL_TIMEOUT_MS. `null` disables.
+  stallTimeoutMs?: number | null;
+};
+
+// Core download driver: streams the response body, invoking `onChunk` for each
+// chunk as it arrives. Never buffers the whole body itself - buffering vs.
+// streaming-to-disk is the caller's choice. Returns the total bytes streamed.
+async function runDownload(
   endpoint: string,
   action: string,
-  options: Omit<ApiCallOptions, 'body' | 'method' | 'timeoutMs'> & {
-    signal?: AbortSignal;
-    onProgress?: (p: DownloadProgress) => void;
-    // Connect → response-headers timeout (a bounded operation).
-    // Default DOWNLOAD_TTFB_TIMEOUT_MS. `null` disables.
-    ttfbTimeoutMs?: number | null;
-    // Per-chunk IDLE timeout: max gap between body chunks. Reset on every
-    // chunk, so a large file downloading slow-but-steady is never wrongly
-    // aborted — only a genuine mid-stream stall is.
-    // Default DOWNLOAD_STALL_TIMEOUT_MS. `null` disables.
-    stallTimeoutMs?: number | null;
-  } = {}
-): Promise<Uint8Array> {
+  options: DownloadStreamOptions,
+  onChunk: (chunk: Uint8Array) => void | Promise<void>,
+): Promise<number> {
   const url = buildUrl(endpoint, action, options.query);
   const headers: Record<string, string> = {};
   if (options.bearer !== false) {
@@ -360,11 +484,11 @@ export async function apiDownloadBytesStream(
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf);
     options.onProgress?.({ loaded: bytes.byteLength, total: totalOrNull });
-    return bytes;
+    await onChunk(bytes);
+    return bytes.byteLength;
   }
 
   const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
   let loaded = 0;
 
   // Emit an initial progress so the UI shows the item immediately, even
@@ -376,7 +500,7 @@ export async function apiDownloadBytesStream(
       // Idle (per-chunk) timeout, not a flat total timeout: a large file
       // downloading slow-but-steady must not be killed, but no chunk at all
       // for stallMs means the stream is dead. withDeadline() is what actually
-      // unsticks a parked reader.read() — Tauri's abort propagation into an
+      // unsticks a parked reader.read() - Tauri's abort propagation into an
       // in-flight bridged stream read is not reliable.
       const { done, value } =
         stallMs != null
@@ -384,25 +508,39 @@ export async function apiDownloadBytesStream(
           : await reader.read();
       if (done) break;
       if (value) {
-        chunks.push(value);
+        await onChunk(value);
         loaded += value.byteLength;
         options.onProgress?.({ loaded, total: totalOrNull });
       }
     }
   } catch (err) {
-    // Best-effort cleanup. NOT awaited — cancel() could itself hang on the
+    // Best-effort cleanup. NOT awaited - cancel() could itself hang on the
     // same dead stream; the throw below is what unblocks the caller.
     // reader.cancel() triggers plugin-http's stream cancel callback which
     // already calls fetch_cancel_body for us. We deliberately do NOT also
-    // ctrl.abort() — firing the fused signal here would invoke plugin-http's
+    // ctrl.abort() - firing the fused signal here would invoke plugin-http's
     // leaked abort listener for a second dropBody on the now-closed body rid
     // → "The resource id N is invalid" uncaught rejection.
     try { void reader.cancel(); } catch { /* ignore */ }
     throw err;
   }
 
-  // Concatenate. For large files this is the unavoidable JS-heap hit
-  // we'd already have taken in the non-streaming path; nothing extra here.
+  return loaded;
+}
+
+// Buffering variant: accumulates the whole body into one Uint8Array. Use only
+// for small payloads (JSON/CSV manifests). For media/video use
+// apiDownloadStreamed instead - a multi-hundred-MB single allocation OOMs the
+// Android WebView heap (256 MB growth limit).
+export async function apiDownloadBytesStream(
+  endpoint: string,
+  action: string,
+  options: DownloadStreamOptions = {},
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const loaded = await runDownload(endpoint, action, options, (chunk) => {
+    chunks.push(chunk);
+  });
   const out = new Uint8Array(loaded);
   let offset = 0;
   for (const chunk of chunks) {
@@ -410,4 +548,16 @@ export async function apiDownloadBytesStream(
     offset += chunk.byteLength;
   }
   return out;
+}
+
+// Streaming variant: invokes `onChunk` for each chunk without ever buffering
+// the whole body. The sink (e.g. a file handle) applies backpressure by
+// returning a promise. Returns the total bytes streamed.
+export async function apiDownloadStreamed(
+  endpoint: string,
+  action: string,
+  options: DownloadStreamOptions,
+  onChunk: (chunk: Uint8Array) => void | Promise<void>,
+): Promise<number> {
+  return runDownload(endpoint, action, options, onChunk);
 }

@@ -1,4 +1,4 @@
-SportIdent reader driver bundle — placeholder
+SportIdent reader driver bundle - placeholder
 ==============================================
 
 This folder is BUNDLED INSIDE THE PLAYGROUND APP at build time (see
@@ -19,7 +19,7 @@ ships a new build, or Microsoft's Vulnerable Driver Blocklist bumps to
 cover the currently-bundled version):
 
 1. Go to silabs.com → search "CP210x VCP Drivers".
-2. Download the CP210x **Universal Windows Driver** package — NOT the
+2. Download the CP210x **Universal Windows Driver** package - NOT the
    "Windows 7/8/10" legacy package. The version inside silabser.inf must
    be 10.x or 11.x; the legacy 6.7.x build is the one Microsoft's
    blocklist refuses.
@@ -48,7 +48,7 @@ Bundle provenance (fill in when refreshing):
   Verified by:        <name>
 
 ------------------------------------------------------------------------
-Silicon Labs Software License Agreement — redistribution clause:
+Silicon Labs Software License Agreement - redistribution clause:
 ------------------------------------------------------------------------
 
   <paste the relevant excerpt from the EULA that ships inside the

@@ -1,0 +1,21 @@
+{
+  "setTitle": "Establece un PIN para este dispositivo",
+  "confirmTitle": "Confirma tu PIN",
+  "setSubtitle": "Usarás este PIN para desbloquear la aplicación después de bloquearla. No se necesita conexión a Internet.",
+  "typeAgain": "Escríbelo una vez más para asegurarte de que coincide.",
+  "signedInAs": "Sesión iniciada como {{email}}",
+  "pinsDontMatch": "Los PIN no coinciden. Elige un PIN de nuevo.",
+  "saveFailed": "No se ha podido guardar el PIN. Inténtalo de nuevo.",
+  "savingPin": "Guardando PIN…",
+  "saving": "Guardando…",
+  "pickDifferent": "Elegir un PIN diferente",
+  "devicePin": "PIN del dispositivo",
+  "gatesHint": "Se usa en las protecciones de seguridad de arriba y en el botón Bloquear de la barra de navegación.",
+  "pinCurrentlySet": "Actualmente hay un PIN establecido.",
+  "noPinSet": "No hay ningún PIN establecido.",
+  "changePin": "Cambiar PIN",
+  "setPin": "Establecer PIN",
+  "chooseTitle": "Elige un PIN",
+  "chooseSubtitle": "Elige un PIN de 4 dígitos para este dispositivo.",
+  "cancel": "Cancelar"
+}

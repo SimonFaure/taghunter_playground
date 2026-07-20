@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react';
-import { Play, Trash2, Users, Save, Clock, CheckCircle, Flag, Trophy, Gamepad2, Search, ArrowUpDown, Import as SortAsc, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, UserPlus, PlusCircle, X, BarChart2, RefreshCw, ExternalLink, Database, Archive, Dices } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Play, Trash2, Users, Save, Clock, CheckCircle, Flag, Trophy, Gamepad2, Search, ArrowUpDown, Import as SortAsc, Minimize2, Maximize2, Monitor, MonitorPlay, StopCircle, Settings, FlaskConical, UserPlus, PlusCircle, X, Eye, RefreshCw, Database, Archive, Dices, Printer, Video } from 'lucide-react';
 import { GamePage } from './GamePage';
+import { GameTypeIcon } from './icons/GameTypeIcons';
 import { useAuth } from './auth/AuthProvider';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -23,23 +25,57 @@ import {
   deleteTeam,
   listCompletedQuests,
   registerDeviceForGame,
+  queueShowTeamSummaryBulk,
+  getLaunchedGameDevices,
+  broadcastConfigReload,
 } from '../services/launchedGames';
+import { loadLaunchedGameReports } from '../services/reportStats';
+import { printReports } from '../services/reportPrint';
 import { GameDevicesModal } from './GameDevicesModal';
+import { GameVideoModal } from './GameVideoModal';
 import { RawDataModal } from './RawDataModal';
-import { onPendingJoin } from '../services/pendingJoinStore';
-import { ApiError } from '../services/api';
+import { onPendingJoin, onPendingLeave } from '../services/pendingJoinStore';
+import { isOperatorOnly } from '../services/operatorMode';
+import { refreshLaunchedGamesRoute, onLaunchedGamesRouteChange } from '../services/childControlLink';
+import { onMotherReachability } from '../services/motherFailover';
+import { GameLockGate } from './GameLockGate';
+import { getDeviceLockState, type LockReason } from '../services/deviceLock';
+import { ApiError, getLanOverride, setLanOverride } from '../services/api';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
 import { TeamTestModal } from './TeamTestModal';
 import { TeamDetailsModal } from './TeamDetailsModal';
+import { ClashClanDetailsModal } from './ClashClanDetailsModal';
+import { AddTimeModal } from './AddTimeModal';
+import { PrePrintModal } from './PrePrintModal';
+import type { PrintPrefs } from '../services/printPrefsStore';
+import { getClashState, getClashMembers, type ClashStandings } from '../services/clash';
+import {
+  comboBonusPoints,
+  effectifWeights,
+  formatWeight,
+  isWeightingEnabled,
+  memberCounts,
+  teamHeadcounts,
+  weightedScore,
+  type RosterTeam,
+} from '../services/tagquestScoring';
 import { LeaderboardPage } from './LeaderboardPage';
 import { RankingsModal } from './RankingsModal';
+import { RankingOptionsModal, type RankingAction } from './RankingOptionsModal';
+import { RankingDevicePicker } from './RankingDevicePicker';
+import { DevicePicker } from './DevicePicker';
+import { buildTeamSummarySnapshot, gameTypeHasTeamSummary } from '../services/teamSummary';
+import { encodeTeamSummarySnapshot } from '../services/teamSummaryTarget';
 import { TimeRangeLeaderboard } from './TimeRangeLeaderboard';
 import { MultiGameLeaderboard } from './MultiGameLeaderboard';
+import { openProjector } from '../services/projectorWindow';
+import type { RankingTarget } from '../services/rankingTarget';
 import { HelpDot } from '../help';
 import type { ScenarioOption, TimeRange, ActiveGameOption } from './RankingsModal';
 import type { GameConfig, Team as ConfigTeam, Teammate } from './LaunchGameModal';
+import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
 import type { SiPuce } from '../types/database';
 
 // Tracks route keys → operator-facing labels (Add Team per-team route override).
@@ -80,6 +116,9 @@ interface Team {
   key_id: number;
   language?: string | null;
   currentLevel?: { level: number; name: string } | null;
+  /** TagQuest effectif weighting (when active): live chip count + applied weight. */
+  headcount?: number | null;
+  weight?: number | null;
 }
 
 // Game-type → display label + pill colors for the launched-game card badge.
@@ -88,7 +127,8 @@ interface Team {
 const GAME_TYPE_BADGE: Record<string, { label: string; className: string }> = {
   tagquest: { label: 'TagQuest', className: 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300' },
   mystery: { label: 'Mystery', className: 'bg-purple-500/15 border-purple-500/40 text-purple-300' },
-  tracks: { label: 'Tracks', className: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300' },
+  tracks: { label: 'Track', className: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300' },
+  clash: { label: 'Clash', className: 'bg-rose-500/15 border-rose-500/40 text-rose-300' },
 };
 
 function gameTypeBadge(raw: string): { label: string; className: string } {
@@ -111,27 +151,48 @@ function normalizeAudience(raw: unknown): string {
 }
 
 export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boolean }) {
+  const { t } = useTranslation();
   const { user } = useAuth();
   const [games, setGames] = useState<LaunchedGame[]>([]);
+  // The launched_games LAN route the current `games` list was loaded from
+  // (the mother's server for a satellite that joined a remote game, or this
+  // device's own local server). Leaving a game page restores LOCAL routing
+  // (so the list shows this device's own games), but the rows already on
+  // screen may belong to a mother - so re-apply this captured route before
+  // re-entering one, otherwise the meta/state reads hit the wrong server and
+  // the play button silently no-ops. See handlePlayGame.
+  const gamesRouteRef = useRef<ReturnType<typeof getLanOverride>>(null);
   const [selectedGameId, setSelectedGameId] = useState<number | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
   const [refreshingTeams, setRefreshingTeams] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [editingTeamId, setEditingTeamId] = useState<number | null>(null);
-  const [editedTeam, setEditedTeam] = useState<Partial<Team>>({});
   const [renamingTeamId, setRenamingTeamId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [gameDataMap, setGameDataMap] = useState<Record<string, GameData>>({});
-  const [showRankings, setShowRankings] = useState<number | null>(null);
-  const [rankingsGameName, setRankingsGameName] = useState<string>('');
-  const [rankingsConfig, setRankingsConfig] = useState<GameConfig | null>(null);
-  const [rankings, setRankings] = useState<Team[]>([]);
-  const [rankingPageGame, setRankingPageGame] = useState<{ launchedGameId: number; gameName: string; config: GameConfig } | null>(null);
+  // Per-game ranking flow: the Trophy button opens RankingOptionsModal (3
+  // actions → only-this-game / time-range step); the chosen action resolves
+  // to a RankingTarget that drives the full page, projector, or device push.
+  const [rankingOptions, setRankingOptions] = useState<{
+    launchedGameId: number;
+    gameName: string;
+    config: GameConfig;
+    scenarioUniqid: string;
+    scenarioTitle: string;
+  } | null>(null);
+  const [rankingDeviceTarget, setRankingDeviceTarget] = useState<RankingTarget | null>(null);
+  // Per-team "show final summary on a device" flow (mystery + tracks): the
+  // chosen team + its game; the DevicePicker builds the snapshot on send.
+  const [summaryDeviceTarget, setSummaryDeviceTarget] = useState<{ game: LaunchedGame; teamId: number } | null>(null);
+  const [rankingPageGame, setRankingPageGame] = useState<{ launchedGameId: number; gameName: string; config: GameConfig; autoScroll: boolean } | null>(null);
   const [playingGame, setPlayingGame] = useState<{ config: GameConfig; uniqid: string; launchedGameId: number } | null>(null);
   const [teamSearch, setTeamSearch] = useState('');
   const [teamSortBy, setTeamSortBy] = useState<'ranking' | 'name'>('ranking');
   const [minimizedTeams, setMinimizedTeams] = useState<Set<number>>(new Set());
   const [showDevices, setShowDevices] = useState<number | null>(null);
+  const [showVideo, setShowVideo] = useState<number | null>(null);
+  const [printing, setPrinting] = useState(false);
+  // Pre-print modal (paper size + orientation) - printing goes through it.
+  const [printTarget, setPrintTarget] = useState<{ game: LaunchedGame; teamId: number | null; subject: string } | null>(null);
   const [showRawData, setShowRawData] = useState<{ id: number; name: string } | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
@@ -149,6 +210,10 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   });
   const [configGameId, setConfigGameId] = useState<number | null>(null);
   const [configGameName, setConfigGameName] = useState<string>('');
+  // Game type + scenario uniqid drive the config modal's per-type field set
+  // (and the tracks options section). Captured when the modal is opened.
+  const [configGameType, setConfigGameType] = useState<string>('');
+  const [configGameUniqid, setConfigGameUniqid] = useState<string>('');
   const [testGameId, setTestGameId] = useState<number | null>(null);
   const [testGameName, setTestGameName] = useState<string>('');
   const [testTeam, setTestTeam] = useState<{ gameId: number; gameName: string; team: Team } | null>(null);
@@ -161,23 +226,92 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   // Add Team form can offer a per-team route override (manual assignment only).
   const [tracksRouteOptions, setTracksRouteOptions] = useState<string[]>([]);
   const [tracksDefaultRoute, setTracksDefaultRoute] = useState<string>('default');
+  // Mystery/tracks "Départ groupé": the whole roster was stamped started at
+  // launch, so a manually added team must start immediately too - otherwise
+  // its return bip would START it instead of scoring it.
+  const [selectedGameMassStart, setSelectedGameMassStart] = useState(false);
   // Name-pool draw context for the manual "Random name" button: the scenario's
   // audience + language (from launch meta) and the resolved candidate names.
   const [nameDrawAudience, setNameDrawAudience] = useState<string>('kids');
   const [nameDrawLang, setNameDrawLang] = useState<string>('en');
   const [namePoolNames, setNamePoolNames] = useState<string[]>([]);
-  // The scenario's available languages (from launch meta) — drives the Add-Team
+  // The scenario's available languages (from launch meta) - drives the Add-Team
   // and team-details per-team language selects. Empty ⇒ no language picker shown.
   const [selectedGameLanguages, setSelectedGameLanguages] = useState<string[]>([]);
   const [savingTeammate, setSavingTeammate] = useState(false);
   const [savingTeam, setSavingTeam] = useState(false);
   const [teamDetails, setTeamDetails] = useState<{ team: Team; gameUniqid: string; gameType: string } | null>(null);
+  // Clash: the clan-details modal target + per-clan member counts for the
+  // currently-selected clash game (team_id → member_count).
+  const [clashClan, setClashClan] = useState<{ id: number; team_number: number; team_name: string | null } | null>(null);
+  const [clashCounts, setClashCounts] = useState<Map<number, number>>(new Map());
+  // Clash: live standings (points + per-territory validation counts) and the
+  // chips bound to each clan, polled alongside the counts so the team rows show
+  // live scores/status and the clan members inline (team_id → chip_id[]).
+  const [clashStandings, setClashStandings] = useState<ClashStandings | null>(null);
+  const [clashMembers, setClashMembers] = useState<Map<number, number[]>>(new Map());
+  // Operator "add time" modal target.
+  const [addTimeGame, setAddTimeGame] = useState<{ id: number; name: string } | null>(null);
   const [showRankingsModal, setShowRankingsModal] = useState(false);
   const [timeRangePage, setTimeRangePage] = useState<{ scenario: ScenarioOption; timeRange: TimeRange } | null>(null);
   const [activeGamesPage, setActiveGamesPage] = useState<ActiveGameOption[] | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [archivedSummaries, setArchivedSummaries] = useState<GameSummaryRow[]>([]);
   const [archivedLoading, setArchivedLoading] = useState(false);
+  // When true, the launched-game cards collapse to a compact list. The selected
+  // game keeps its full card so the operator never loses sight of it.
+  const [gamesMinimized, setGamesMinimized] = useState(true);
+  // True when this device is a CHILD viewing a mother's games (the launched_games
+  // override points at a remote mother, not our own 127.0.0.1 server). Drives the
+  // two-section layout: the mother's games (active by default, "Load more" for
+  // ended) plus a read-only "This device" section for our own local history.
+  const [isChildView, setIsChildView] = useState(false);
+  // Child view only: reveal the mother's ENDED games (hidden behind "Load more").
+  const [showEndedMother, setShowEndedMother] = useState(false);
+  // Child view only: this device's OWN local launched games (read-only history),
+  // loaded via the api.ts forceLocal bypass so they survive the override pointing
+  // at the mother. Fetched with mine=1 so it lists only games this device launched
+  // or participated in - never games it merely hosted for other satellites when it
+  // was itself a mother (those local rows carry another device's peer, is_self=0).
+  const [localGames, setLocalGames] = useState<LaunchedGame[]>([]);
+  // Operator-only devices manage games but never play, so the self-join "Play"
+  // button is hidden on them (they keep every other control action).
+  const [operatorOnly, setOperatorOnly] = useState(false);
+  // Device-lock gate (emergency-disabled / past billing grace). When a privileged
+  // game action is attempted on a locked device we stash it and show the
+  // recovery-code gate; a reprieve re-runs the action. Same model as GameList.
+  const [lockGate, setLockGate] = useState<{ reason: Exclude<LockReason, null>; run: () => void } | null>(null);
+  // True when the mother a child is pointed at is currently unreachable (driven
+  // by the shared reachability signal). Surfaces a banner; the list auto-recovers
+  // when the mother returns and the route resolves again.
+  const [motherUnreachable, setMotherUnreachable] = useState(false);
+
+  useEffect(() => {
+    void isOperatorOnly().then(setOperatorOnly).catch(() => setOperatorOnly(false));
+    const onOpChange = () => void isOperatorOnly().then(setOperatorOnly).catch(() => {});
+    window.addEventListener('operator-mode:changed', onOpChange);
+    return () => window.removeEventListener('operator-mode:changed', onOpChange);
+  }, []);
+
+  // Mother-reachability banner: when a child's mother drops, the shared signal
+  // flips; reload the list when it recovers so the games reappear automatically.
+  useEffect(() => {
+    return onMotherReachability((unreachable) => {
+      setMotherUnreachable((was) => {
+        if (was && !unreachable) void loadGames();
+        return unreachable;
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reload when the launched_games route converges (e.g. a satellite that just
+  // auto-paired flips local→mother) so the list populates without a manual
+  // refresh. childControlLink emits only on an actual route change.
+  useEffect(() => {
+    return onLaunchedGamesRouteChange(() => void loadGames());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     loadGames();
@@ -229,11 +363,13 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       setNameDrawLang('en');
       setTracksRouteOptions([]);
       setTracksDefaultRoute('default');
+      setSelectedGameMassStart(false);
       getLaunchedGameMeta(selectedGameId)
         .then(async (map) => {
           if (map.playMode === 'solo' || map.playMode === 'team') {
             setSelectedGamePlayMode(map.playMode);
           }
+          setSelectedGameMassStart(map.massStart === 'true');
           // Tracks per-team route options (persisted at launch).
           if (map.tracks_routes) {
             setTracksRouteOptions(map.tracks_routes.split(',').map((s) => s.trim()).filter(Boolean));
@@ -253,7 +389,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
               try {
                 const gd = (await scenarioStore.getGameData(game.game_uniqid)) as any;
                 audienceRaw = (gd?.game_data?.game_meta ?? gd?.game_meta)?.game_public;
-              } catch { /* swallow — defaults to 'kids' */ }
+              } catch { /* swallow - defaults to 'kids' */ }
             }
           }
           setNameDrawAudience(normalizeAudience(audienceRaw));
@@ -263,6 +399,60 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         .catch((err) => console.error('[LaunchedGamesList] meta load failed:', err));
     }
   }, [selectedGameId]);
+
+  // Clash + TagQuest self-register: poll per-team member counts/chips for the
+  // selected game so the team rows show who joined. TagQuest self-register
+  // binds chips via the same lg_clash_members rows as Clash (no teamsConfig
+  // roster exists for those games); a predetermined TagQuest game simply has
+  // no member rows, so the fetch is a harmless empty set.
+  useEffect(() => {
+    if (selectedGameId === null) {
+      setClashCounts(new Map());
+      setClashStandings(null);
+      setClashMembers(new Map());
+      return;
+    }
+    const game = games.find((g) => g.id === selectedGameId);
+    const gameType = (game?.game_type || '').toLowerCase();
+    const wantsClashState = gameType === 'clash';
+    const wantsMembers = wantsClashState || gameType === 'tagquest';
+    if (!game || !wantsMembers) {
+      setClashCounts(new Map());
+      setClashStandings(null);
+      setClashMembers(new Map());
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const [st, members] = await Promise.all([
+          // Standings only exist for Clash (territories/points); TagQuest just
+          // needs the member bindings.
+          wantsClashState ? getClashState(selectedGameId) : Promise.resolve(null),
+          getClashMembers(selectedGameId),
+        ]);
+        if (cancelled) return;
+        const byTeam = new Map<number, number[]>();
+        for (const mem of members) {
+          const arr = byTeam.get(mem.team_id);
+          if (arr) arr.push(mem.chip_id);
+          else byTeam.set(mem.team_id, [mem.chip_id]);
+        }
+        setClashMembers(byTeam);
+        const m = new Map<number, number>();
+        if (st) {
+          for (const c of st.clans) m.set(c.team_id, c.member_count);
+        } else {
+          for (const [teamId, chips] of byTeam) m.set(teamId, chips.length);
+        }
+        setClashCounts(m);
+        setClashStandings(st);
+      } catch { /* ignore - next tick retries */ }
+    };
+    void tick();
+    const h = setInterval(tick, 3000);
+    return () => { cancelled = true; clearInterval(h); };
+  }, [selectedGameId, games]);
 
   // Resolve the candidate names for the current audience/language so the
   // "Random name" button can draw instantly (and stay disabled when empty).
@@ -275,10 +465,44 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     return () => { cancelled = true; };
   }, [nameDrawAudience, nameDrawLang]);
 
+  // If this device is locked (emergency-disabled / past billing grace), stash the
+  // attempted action behind the recovery-code gate and return true. A reprieve
+  // re-runs `run`. Used to gate the privileged game-control actions a child can
+  // now perform on the mother (self-join, add team, stop/delete/archive, launch
+  // on another device). Running games are never interrupted - only new actions.
+  const blockedByLock = async (run: () => void): Promise<boolean> => {
+    const lock = await getDeviceLockState();
+    if (lock.locked && lock.reason) {
+      setLockGate({ reason: lock.reason, run });
+      return true;
+    }
+    return false;
+  };
+
+  // Count devices currently joined to a game. Used to warn before a destructive
+  // action (stop/delete/archive) when other devices are playing - a child
+  // operator can't see the other rooms, so the count is cheap insurance.
+  const countJoinedDevices = async (gameId: number): Promise<number> => {
+    try {
+      return (await getLaunchedGameDevices(gameId)).length;
+    } catch {
+      return 0;
+    }
+  };
+
+  // Append a "(N devices are in this game)" warning to a destructive-action
+  // confirmation message when joined devices > 0.
+  const withDeviceWarning = (message: string, joined: number): string =>
+    joined > 0
+      ? `${message} ${t('launched:devicesInGameWarning', { count: joined })}`
+      : message;
+
   const loadGames = async () => {
     setLoading(true);
     try {
       const rows = await listLaunchedGames();
+      // Remember which server these rows came from so re-entry routes correctly.
+      gamesRouteRef.current = getLanOverride();
       // Server returns ended as 0/1 int; LaunchedGame interface expects boolean.
       const normalized = rows.map((g) => ({
         id: g.id,
@@ -291,6 +515,35 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         is_test: Boolean(g.is_test),
       }));
       setGames(normalized);
+
+      // Child view detection: the rows above came from a MOTHER (the override
+      // points at a remote server, not our own 127.0.0.1). When so, also load
+      // this device's OWN local games for the read-only "This device" section.
+      const route = gamesRouteRef.current;
+      const childView = !!route && !route.baseUrl.includes('127.0.0.1');
+      setIsChildView(childView);
+      if (childView) {
+        try {
+          const localRows = await listLaunchedGames({ forceLocal: true, mine: true });
+          setLocalGames(
+            localRows.map((g) => ({
+              id: g.id,
+              game_uniqid: g.game_uniqid,
+              name: g.name,
+              number_of_teams: g.number_of_teams ?? 0,
+              game_type: g.game_type,
+              ended: Boolean(g.ended),
+              created_at: g.created_at ?? '',
+              is_test: Boolean(g.is_test),
+            })),
+          );
+        } catch (err) {
+          console.error('[LaunchedGamesList] local games load failed:', err);
+          setLocalGames([]);
+        }
+      } else {
+        setLocalGames([]);
+      }
     } catch (err) {
       console.error('Error loading launched games:', err);
     } finally {
@@ -349,7 +602,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         pts4 = parseVal(gameMeta?.combo_4_quests);
         pts2 = parseVal(gameMeta?.combo_2_quests);
         gameLevels = gameMeta?.levels ?? null;
-      } catch { /* swallow — combos default to 0 */ }
+      } catch { /* swallow - combos default to 0 */ }
     }
 
     const computeLevelForScore = (score: number): { level: number; name: string } | null => {
@@ -368,38 +621,44 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       return best;
     };
 
-    const computeCombosForTeam = (countMap: Record<string, number>): number => {
-      if (pts6 === 0 && pts4 === 0 && pts2 === 0) return 0;
-      const counts = new Map(Object.entries(countMap));
-      let bonus = 0;
+    // Only the quest system (TagQuest) derives its score from completed_quests.
+    // Tracks / Mystery / Clash store the authoritative score on the team row
+    // (set by the runtime + by TeamDetailsModal overrides) - recomputing from
+    // quests would zero it out, so use the row score as-is for those types.
+    const isTagQuest = (game?.game_type || '').toLowerCase() === 'tagquest';
 
-      while ([...counts.values()].every(v => v > 0) && counts.size >= 6) {
-        bonus += pts6;
-        for (const key of counts.keys()) counts.set(key, counts.get(key)! - 1);
-      }
-
-      while (true) {
-        const nonZero = [...counts.entries()].filter(([, v]) => v > 0);
-        if (nonZero.length < 4) break;
-        bonus += pts4;
-        for (const [key] of nonZero.slice(0, 4)) counts.set(key, counts.get(key)! - 1);
-      }
-
-      while (true) {
-        const nonZero = [...counts.entries()].filter(([, v]) => v > 0);
-        if (nonZero.length < 2) break;
-        bonus += pts2;
-        for (const [key] of nonZero.slice(0, 2)) counts.set(key, counts.get(key)! - 1);
-      }
-
-      return bonus;
-    };
+    // Effectif weighting (launch option): mirror the punch logic's weighted
+    // score so this list matches lg_teams.score. Headcounts come from the
+    // self-register bindings (lg_clash_members) or the pre-built roster.
+    let headcounts: Map<number, number> | null = null;
+    let weights: Map<number, number> | null = null;
+    if (isTagQuest) {
+      try {
+        const meta = await getLaunchedGameMeta(gameId);
+        if (isWeightingEnabled(meta)) {
+          let roster: RosterTeam[] = [];
+          try { roster = JSON.parse(meta.teamsConfig || '[]'); } catch { /* swallow */ }
+          const members = await getClashMembers(gameId).catch(() => []);
+          headcounts = teamHeadcounts(teamsData, roster, memberCounts(members));
+          weights = effectifWeights(headcounts);
+        }
+      } catch { /* weighting unavailable - fall back to raw scores */ }
+    }
 
     const enriched = teamsData.map(t => {
+      if (!isTagQuest) {
+        return { ...t, currentLevel: computeLevelForScore(t.score) };
+      }
       const questScore = scoreByTeam[t.id] ?? 0;
-      const comboBonus = computeCombosForTeam(questCountByTeam[t.id] ?? {});
-      const totalScore = questScore + comboBonus;
-      return { ...t, score: totalScore, currentLevel: computeLevelForScore(totalScore) };
+      const comboBonus = comboBonusPoints(questCountByTeam[t.id] ?? {}, pts6, pts4, pts2);
+      const totalScore = weightedScore(questScore + comboBonus, weights?.get(t.id) ?? 1);
+      return {
+        ...t,
+        score: totalScore,
+        currentLevel: computeLevelForScore(totalScore),
+        headcount: headcounts?.get(t.id) ?? null,
+        weight: weights?.get(t.id) ?? null,
+      };
     });
 
     setTeams(enriched);
@@ -409,7 +668,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     // Slice 3: game-data.json now comes from slice-2's local FS for any
     // scenario the user has downloaded. For game_uniqids we never downloaded
     // (e.g., a scenario referenced by a historical launched_game that was
-    // since removed), fall back to the row title from scenarioStore — there's
+    // since removed), fall back to the row title from scenarioStore - there's
     // no longer a remote scenarios endpoint to query.
     try {
       const uniqueUniqids = [...new Set(games.map((g) => g.game_uniqid))];
@@ -438,12 +697,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   };
 
   const handleEndGame = async (gameId: number) => {
+    if (await blockedByLock(() => void handleEndGame(gameId))) return;
+    const joined = await countJoinedDevices(gameId);
     setConfirmDialog({
       isOpen: true,
-      title: 'End Game',
-      message: 'Are you sure you want to end this game? This action will mark the game as completed.',
+      title: t('launched:endGameTitle'),
+      message: withDeviceWarning(t('launched:endGameMessage'), joined),
       variant: 'warning',
-      confirmText: 'End Game',
+      confirmText: t('launched:endGameConfirm'),
       onConfirm: () => {
         // Close the dialog and flip the optimistic ended flag synchronously
         // so the badge + button set update immediately. end_game on the
@@ -463,7 +724,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
             }
             console.error('Error ending game:', err);
             setGames(snapshot);
-            alert('Failed to end game');
+            alert(t('launched:endGameFailed'));
           }
         })();
       },
@@ -471,12 +732,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   };
 
   const handleDeleteGame = async (gameId: number) => {
+    if (await blockedByLock(() => void handleDeleteGame(gameId))) return;
+    const joined = await countJoinedDevices(gameId);
     setConfirmDialog({
       isOpen: true,
-      title: 'Delete Game',
-      message: 'Are you sure you want to delete this game? This will permanently remove the game and all associated data (teams, devices, configuration). This action cannot be undone.',
+      title: t('launched:deleteGameTitle'),
+      message: withDeviceWarning(t('launched:deleteGameMessage'), joined),
       variant: 'danger',
-      confirmText: 'Delete Game',
+      confirmText: t('launched:deleteGameConfirm'),
       onConfirm: () => {
         // Close the dialog and update local state synchronously so the UI
         // doesn't sit on a spinner during the cascade DELETE + any retries.
@@ -491,7 +754,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         // Fire and forget. Server-side FK ON DELETE CASCADE handles meta +
         // devices + teams + raw_data. If withRetry's first attempt succeeded
         // but the response was slow/5xx, the second attempt sees a 404 (row
-        // already gone) — that's the desired end state, not an error.
+        // already gone) - that's the desired end state, not an error.
         (async () => {
           try {
             await deleteLaunchedGame(gameId);
@@ -501,7 +764,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
             }
             console.error('Error deleting game:', err);
             setGames(snapshot);
-            alert('Failed to delete game');
+            alert(t('launched:deleteGameFailed'));
           }
         })();
       },
@@ -509,12 +772,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   };
 
   const handleArchiveGame = async (gameId: number) => {
+    if (await blockedByLock(() => void handleArchiveGame(gameId))) return;
+    const joined = await countJoinedDevices(gameId);
     setConfirmDialog({
       isOpen: true,
-      title: 'Archive Game',
-      message: 'Archiving keeps only this game’s statistics summary and permanently deletes its detailed data (teams, punches, devices, configuration). The summary stays available in the Archived view and in Studio. Continue?',
+      title: t('launched:archiveGameTitle'),
+      message: withDeviceWarning(t('launched:archiveGameMessage'), joined),
       variant: 'warning',
-      confirmText: 'Archive Game',
+      confirmText: t('launched:archiveGameConfirm'),
       onConfirm: () => {
         setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
         const snapshot = games;
@@ -532,7 +797,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
             }
             console.error('Error archiving game:', err);
             setGames(snapshot);
-            alert('Failed to archive game');
+            alert(t('launched:archiveGameFailed'));
           }
         })();
       },
@@ -552,64 +817,62 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     }
   };
 
+  // Archive every ended, non-test game in one pass. Active games (not ended) are
+  // intentionally excluded so a running game is never collapsed to a summary.
+  const handleArchiveAllEnded = () => {
+    const eligible = games.filter((g) => g.ended && !g.is_test);
+    if (eligible.length === 0) return;
+    setConfirmDialog({
+      isOpen: true,
+      title: t('launched:archiveAllTitle'),
+      message: t('launched:archiveAllMessage', { count: eligible.length }),
+      variant: 'warning',
+      confirmText: t('launched:archiveAllConfirm'),
+      onConfirm: () => {
+        setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
+        void (async () => {
+          setArchivedLoading(true);
+          let failed = 0;
+          for (const g of eligible) {
+            try {
+              await archiveLaunchedGame(g.id);
+            } catch (err) {
+              if (err instanceof ApiError && err.status === 404) continue;
+              console.error('Error archiving game:', g.id, err);
+              failed += 1;
+            }
+          }
+          if (selectedGameId != null && eligible.some((g) => g.id === selectedGameId)) {
+            setSelectedGameId(null);
+            setTeams([]);
+          }
+          await loadGames();
+          try {
+            setArchivedSummaries(await listArchivedSummaries());
+          } catch (err) {
+            console.error('[LaunchedGamesList] failed to reload archived summaries:', err);
+          } finally {
+            setArchivedLoading(false);
+          }
+          if (failed > 0) alert(t('launched:archiveAllFailed', { count: failed }));
+        })();
+      },
+    });
+  };
+
   const formatDate = (dateString: string) => {
     const date = new Date(dateString);
     return date.toLocaleString();
   };
 
+  // Team start_time / end_time are stored as unix SECONDS (see TagQuestGamePage:
+  // start is `Math.floor(startMs / 1000)`, end via endTimeToCommit). The Date
+  // ctor expects milliseconds, so scale by 1000 here - otherwise every team's
+  // start time renders as a 1970 timestamp.
   const formatTime = (timestamp: number | null) => {
-    if (!timestamp) return 'Not started';
-    const date = new Date(timestamp);
+    if (!timestamp) return t('launched:notStarted');
+    const date = new Date(timestamp * 1000);
     return date.toLocaleTimeString();
-  };
-
-  const formatTimeForInput = (timestamp: number | null) => {
-    if (!timestamp) return '';
-    const date = new Date(timestamp);
-    const hours = String(date.getHours()).padStart(2, '0');
-    const minutes = String(date.getMinutes()).padStart(2, '0');
-    const seconds = String(date.getSeconds()).padStart(2, '0');
-    return `${hours}:${minutes}:${seconds}`;
-  };
-
-  const parseTimeInput = (timeString: string): number | null => {
-    if (!timeString) return null;
-    const [hours, minutes, seconds] = timeString.split(':').map(Number);
-    const now = new Date();
-    now.setHours(hours, minutes, seconds || 0, 0);
-    return now.getTime();
-  };
-
-  const handleEditTeam = (team: Team) => {
-    setEditingTeamId(team.id);
-    setEditedTeam({
-      team_name: team.team_name,
-      score: team.score,
-      start_time: team.start_time,
-      end_time: team.end_time,
-    });
-  };
-
-  const handleCancelEdit = () => {
-    setEditingTeamId(null);
-    setEditedTeam({});
-  };
-
-  const handleSaveTeam = async (teamId: number) => {
-    try {
-      const fields: Parameters<typeof updateTeam>[1] = {};
-      if (editedTeam.team_name !== undefined) fields.team_name = editedTeam.team_name ?? null;
-      if (editedTeam.score !== undefined) fields.score = editedTeam.score;
-      if (editedTeam.start_time !== undefined) fields.start_time = editedTeam.start_time ?? null;
-      if (editedTeam.end_time !== undefined) fields.end_time = editedTeam.end_time ?? null;
-      await updateTeam(teamId, fields);
-      setEditingTeamId(null);
-      setEditedTeam({});
-      if (selectedGameId !== null) loadTeams(selectedGameId);
-    } catch (err) {
-      console.error('Error updating team:', err);
-      alert('Failed to update team');
-    }
   };
 
   const handleRenameTeam = async (teamId: number) => {
@@ -625,7 +888,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     setRenameValue('');
   };
 
-  // All chips on a team (leader + teammates) from the launch config — the
+  // All chips on a team (leader + teammates) from the launch config - the
   // Team Details punch tab needs them all, since in team mode members punch
   // with their own chip, not the leader's key_id.
   const chipIdsForTeam = (t: Team): number[] => {
@@ -644,7 +907,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     return used;
   };
 
-  // The first card not already assigned to a team/teammate — used to preselect
+  // The first card not already assigned to a team/teammate - used to preselect
   // a chip (and seed the name from its key_name) when opening an add form.
   const firstFreeChip = (): SiPuce | undefined => {
     const used = getUsedChipIds();
@@ -699,6 +962,10 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       const current = await getLaunchedGameMeta(selectedGameId);
       const next = { ...current, teamsConfig: JSON.stringify(updated) };
       await updateLaunchedGameMeta(selectedGameId, next);
+      // Teammates live only in meta.teamsConfig (no DB row), so peers won't see
+      // a roster change unless we push a reload - same broadcast every other
+      // config-edit path performs. Covers add-team / add-teammate / remove.
+      await broadcastConfigReload(selectedGameId);
     } catch (err) {
       console.error('[LaunchedGamesList] persistTeamsConfig failed:', err);
     }
@@ -730,6 +997,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
 
   const handleAddTeam = async () => {
     if (!addTeamState || addTeamState.chipId === null || !addTeamState.name.trim() || !selectedGameId) return;
+    if (await blockedByLock(() => void handleAddTeam())) return;
     setSavingTeam(true);
     const chip = allChips.find(c => c.id === addTeamState.chipId);
     if (!chip) { setSavingTeam(false); return; }
@@ -746,6 +1014,11 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         key_id: chip.id,
         language: addTeamState.language ?? nameDrawLang ?? null,
       });
+      // Mass-start game: the roster started together at launch, so a late-added
+      // team starts now - its first (return) bip must score it, not start it.
+      if (selectedGameMassStart) {
+        await updateTeam(newTeamId, { start_time: Math.floor(Date.now() / 1000) });
+      }
       // Persist a per-team route override only when it differs from the launch
       // default (the runtime falls back to the default when no override exists).
       if (chosenRoute && chosenRoute !== tracksDefaultRoute && tracksRouteOptions.length > 1) {
@@ -772,14 +1045,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   };
 
   // Remove one (non-leader) teammate from a team. Teammates live only in
-  // meta.teamsConfig, so this is a config edit — no DB team row involved.
+  // meta.teamsConfig, so this is a config edit - no DB team row involved.
   const handleRemoveTeammate = (teamId: number, teammateChipId: number, teammateName: string) => {
     setConfirmDialog({
       isOpen: true,
-      title: 'Remove Teammate',
-      message: `Remove "${teammateName}" from this team?`,
+      title: t('launched:removeTeammateTitle'),
+      message: t('launched:removeTeammateMessage', { name: teammateName }),
       variant: 'warning',
-      confirmText: 'Remove',
+      confirmText: t('launched:removeConfirm'),
       onConfirm: async () => {
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         const t = teams.find(tm => tm.id === teamId);
@@ -799,10 +1072,10 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   const handleRemoveTeam = (team: Team) => {
     setConfirmDialog({
       isOpen: true,
-      title: 'Remove Team',
-      message: `Remove "${team.team_name}" from this game? Its completions will be permanently deleted. This cannot be undone.`,
+      title: t('launched:removeTeamTitle'),
+      message: t('launched:removeTeamMessage', { name: team.team_name }),
       variant: 'danger',
-      confirmText: 'Remove Team',
+      confirmText: t('launched:removeTeamConfirm'),
       onConfirm: async () => {
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         try {
@@ -819,53 +1092,82 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     });
   };
 
-  const handleShowRankings = async (gameId: number, gameName: string) => {
-    let teamsForRankings: Team[] = [];
+  // Stamp a team's end_time = now (unix seconds) so their clock stops and they
+  // count as finished. If they never started, also backfill start_time = now so
+  // the recorded duration is 0 rather than a bogus negative value. Works for
+  // every game type. No-op if already ended.
+  const handleEndTeam = (team: Team) => {
+    if (team.end_time) return;
+    setConfirmDialog({
+      isOpen: true,
+      title: t('launched:endTeamTitle'),
+      message: t('launched:endTeamMessage', { name: team.team_name || `#${team.team_number}` }),
+      variant: 'warning',
+      confirmText: t('launched:endTeamConfirm'),
+      onConfirm: async () => {
+        setConfirmDialog(d => ({ ...d, isOpen: false }));
+        const nowSec = Math.floor(Date.now() / 1000);
+        try {
+          await updateTeam(team.id, {
+            end_time: nowSec,
+            ...(team.start_time ? {} : { start_time: nowSec }),
+          });
+        } catch (err) {
+          console.error('[LaunchedGamesList] endTeam failed:', err);
+        }
+        if (selectedGameId !== null) loadTeams(selectedGameId);
+      },
+    });
+  };
+
+  // Trophy button: open the ranking options modal for a game (3 actions).
+  const handleOpenRankingOptions = async (game: LaunchedGame) => {
+    // Same routing fix as handlePlayGame: on a satellite the rows on screen
+    // belong to the mother, but routing may have drifted back to LOCAL (e.g.
+    // after leaving a game). Re-point at the server these rows came from first,
+    // or the meta read below 404s and this button silently no-ops.
+    if (gamesRouteRef.current) setLanOverride(gamesRouteRef.current);
     let metaMap: Record<string, string> = {};
     try {
-      const [state, meta] = await Promise.all([
-        getLaunchedGameState(gameId, 0),
-        getLaunchedGameMeta(gameId),
-      ]);
-      teamsForRankings = state.teams.map((t) => ({
-        id: t.id,
-        team_number: t.team_number,
-        team_name: t.team_name ?? '',
-        score: t.score,
-        start_time: t.start_time,
-        end_time: t.end_time,
-        key_id: t.key_id ?? 0,
-      })).sort((a, b) => b.score - a.score);
-      metaMap = meta;
+      metaMap = await getLaunchedGameMeta(game.id);
     } catch (err) {
-      console.error('Error loading rankings:', err);
+      console.error('Error loading rankings config:', err);
+      alert(t('launched:actionFailed'));
       return;
     }
+    const config = gameConfigFromMeta(metaMap, { name: game.name, numberOfTeams: game.number_of_teams });
+    const scenarioTitle = gameDataMap[game.game_uniqid]?.game?.title ?? game.name;
+    setRankingOptions({
+      launchedGameId: game.id,
+      gameName: game.name,
+      config,
+      scenarioUniqid: game.game_uniqid,
+      scenarioTitle,
+    });
+  };
 
-    const config: GameConfig = {
-      name: gameName,
-      numberOfTeams: parseInt(metaMap.numberOfTeams || '0'),
-      firstChipIndex: parseInt(metaMap.firstChipIndex || '1'),
-      pattern: metaMap.pattern || '',
-      duration: parseInt(metaMap.duration || '0'),
-      messageDisplayDuration: parseInt(metaMap.messageDisplayDuration || '5'),
-      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '1'),
-      colorblindMode: metaMap.colorblindMode === 'true',
-      autoResetTeam: metaMap.autoResetTeam === 'true',
-      delayBeforeReset: parseInt(metaMap.delayBeforeReset || '2'),
-      autoRegisterTeam: metaMap.autoRegisterTeam === 'true',
-      reuseCards: metaMap.reuseCards === 'true',
-      selfRegisterTeam: metaMap.selfRegisterTeam === 'true',
-      reuseDelayMinutes: parseInt(metaMap.reuseDelayMinutes || '5'),
-      testMode: metaMap.testMode === 'true',
-      victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
-      playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
-    };
-
-    setRankings(teamsForRankings);
-    setRankingsGameName(gameName);
-    setRankingsConfig(config);
-    setShowRankings(gameId);
+  // Perform the action chosen in RankingOptionsModal against the resolved target.
+  const handleRankingAction = (action: RankingAction, target: RankingTarget) => {
+    if (action === 'device') {
+      // Hand off to the device picker (keeps the resolved target).
+      setRankingOptions(null);
+      setRankingDeviceTarget(target);
+      return;
+    }
+    if (action === 'second_screen') {
+      void openProjector(target).catch((err) =>
+        console.error('[LaunchedGamesList] projector open failed:', err)
+      );
+      setRankingOptions(null);
+      return;
+    }
+    // 'show' - full page in this window.
+    if (target.mode === 'game') {
+      setRankingPageGame({ launchedGameId: target.launchedGameId, gameName: target.gameName, config: target.config, autoScroll: target.autoScroll !== false });
+    } else {
+      setTimeRangePage({ scenario: { uniqid: target.scenarioUniqid, title: target.scenarioTitle }, timeRange: target.timeRange });
+    }
+    setRankingOptions(null);
   };
 
   const handleShowDevices = (gameId: number) => {
@@ -874,46 +1176,48 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     setShowDevices(gameId);
   };
 
+  // Print the mission report for one team (single page) or every team in the
+  // game (one page each, ranked). Layout + per-team stats come from
+  // loadLaunchedGameReports; printReports renders to a hidden iframe → OS dialog.
+  const runPrint = async (game: LaunchedGame, teamId: number | null, prefs: PrintPrefs) => {
+    if (printing) return;
+    setPrinting(true);
+    try {
+      const { layout, teams } = await loadLaunchedGameReports(game);
+      const toPrint = teamId === null ? teams : teams.filter((d) => d.teamId === teamId);
+      if (!toPrint.length) {
+        alert(t('launched:printNoTeams'));
+        return;
+      }
+      await printReports(layout, toPrint, prefs);
+    } catch (err) {
+      console.error('[LaunchedGamesList] print failed:', err);
+      alert(t('launched:printFailed'));
+    } finally {
+      setPrinting(false);
+    }
+  };
+
   const handlePlayGame = async (game: LaunchedGame) => {
+    // Align launched_games routing with the server these rows were loaded from.
+    // Leaving a game restores LOCAL routing; a satellite re-entering a mother's
+    // game must re-point at the mother first, or every read below 404s and the
+    // button appears dead.
+    if (gamesRouteRef.current) setLanOverride(gamesRouteRef.current);
     let metaMap: Record<string, string> = {};
     try {
       metaMap = await getLaunchedGameMeta(game.id);
     } catch (err) {
       console.error('Error loading game meta:', err);
+      alert(t('launched:actionFailed'));
       return;
     }
-    const config: GameConfig = {
-      name: game.name,
-      numberOfTeams: game.number_of_teams,
-      firstChipIndex: parseInt(metaMap.firstChipIndex || '1'),
-      pattern: metaMap.pattern || '',
-      duration: parseInt(metaMap.duration || '0'),
-      messageDisplayDuration: parseInt(metaMap.messageDisplayDuration || '5'),
-      enigmaImageDisplayDuration: parseInt(metaMap.enigmaImageDisplayDuration || '1'),
-      colorblindMode: metaMap.colorblindMode === 'true',
-      autoResetTeam: metaMap.autoResetTeam === 'true',
-      delayBeforeReset: parseInt(metaMap.delayBeforeReset || '2'),
-      revealResultsOnInput: metaMap.revealResultsOnInput !== 'false',
-      autoRegisterTeam: metaMap.autoRegisterTeam === 'true',
-      reuseCards: metaMap.reuseCards === 'true',
-      selfRegisterTeam: metaMap.selfRegisterTeam === 'true',
-      reuseDelayMinutes: parseInt(metaMap.reuseDelayMinutes || '5'),
-      useNamePool: metaMap.useNamePool === 'true',
-      namePoolAudience: (metaMap.namePoolAudience as GameConfig['namePoolAudience']) || undefined,
-      addRandomNameOption: metaMap.addRandomNameOption === 'true',
-      allowPlayerLanguageChoice: metaMap.allowPlayerLanguageChoice === 'true',
-      scenarioLanguages: metaMap.availableLanguages ? metaMap.availableLanguages.split(',') : undefined,
-      language: metaMap.language || undefined,
-      visibilityHideDelaySec: parseInt(metaMap.visibilityHideDelaySec || '10'),
-      testMode: metaMap.testMode === 'true',
-      victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
-      playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
-    };
+    const config = gameConfigFromMeta(metaMap, { name: game.name, numberOfTeams: game.number_of_teams });
 
     setPlayingGame({ config, uniqid: game.game_uniqid, launchedGameId: game.id });
   };
 
-  // Drive into a launched game by id alone — used by the mother → satellite
+  // Drive into a launched game by id alone - used by the mother → satellite
   // join_game push. Looks the game up in the cached list (refetching if not
   // present), registers the satellite with the mother, then mounts GamePage.
   const playGameById = async (launchedGameId: number) => {
@@ -922,8 +1226,11 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       // The active list may be stale (e.g. mother created the game seconds ago).
       try {
         const fresh = await listLaunchedGames({ ended: false });
+        // Remember the route these rows came from (typically the mother, since
+        // this refresh runs right after the join_game push repointed us there).
+        gamesRouteRef.current = getLanOverride();
         // Normalize to the local LaunchedGame shape (boolean ended, defaulted
-        // number_of_teams) — same as the initial loadGames() path.
+        // number_of_teams) - same as the initial loadGames() path.
         const normalized: LaunchedGame[] = fresh.map((g) => ({
           id: g.id,
           game_uniqid: g.game_uniqid,
@@ -932,6 +1239,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           game_type: g.game_type,
           ended: Boolean(g.ended),
           created_at: g.created_at ?? '',
+          is_test: Boolean(g.is_test),
         }));
         setGames(normalized);
         game = normalized.find(g => g.id === launchedGameId);
@@ -944,6 +1252,12 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       console.warn('[LaunchedGamesList] playGameById: launched_game not found', launchedGameId);
       return;
     }
+    // The join_game push (App-level) has already repointed launched_games at the
+    // mother for this game. That route is authoritative here - capture it so the
+    // handlePlayGame re-apply below doesn't clobber it with a stale (e.g. local)
+    // value left over from a prior load. Without this, reconnecting a device
+    // that's already in the game reads meta from the wrong server and no-ops.
+    gamesRouteRef.current = getLanOverride();
     // Register the satellite as a participating device BEFORE entering
     // GamePage, so the mother's modal sees the row migrate B → A on its
     // next 2s poll without waiting for the satellite to take any action.
@@ -962,6 +1276,17 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [games]);
 
+  // Mother-issued "Disconnect": leave the in-game page (if mounted) and return
+  // to the launched-games list. refreshLaunchedGamesRoute mirrors the normal
+  // Back path so the list re-reads from the right server after dropping out.
+  useEffect(() => {
+    return onPendingLeave(() => {
+      void refreshLaunchedGamesRoute();
+      setPlayingGame(null);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const getFilteredAndSortedTeams = () => {
     let filtered = teams;
 
@@ -978,9 +1303,15 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       });
     }
 
+    // Clash clans never carry a per-team quest score; rank them by live clan points.
+    const selectedGame = games.find(g => g.id === selectedGameId);
+    const isClashGame = selectedGame?.game_type?.toLowerCase() === 'clash';
+    const effectiveScore = (team: Team) =>
+      isClashGame ? (clashStandings?.clans.find(c => c.team_id === team.id)?.points ?? 0) : team.score;
+
     const sorted = [...filtered].sort((a, b) => {
       if (teamSortBy === 'ranking') {
-        return b.score - a.score;
+        return effectiveScore(b) - effectiveScore(a);
       } else {
         return a.team_name.localeCompare(b.team_name);
       }
@@ -1007,7 +1338,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         config={playingGame.config}
         gameUniqid={playingGame.uniqid}
         launchedGameId={playingGame.launchedGameId}
-        onBack={() => setPlayingGame(null)}
+        onBack={() => { void refreshLaunchedGamesRoute(); setPlayingGame(null); }}
       />
     );
   }
@@ -1015,203 +1346,361 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <div className="text-white text-xl">Loading launched games...</div>
+        <div className="text-[var(--pg-text)] text-xl">{t('launched:loading')}</div>
       </div>
     );
   }
 
 
+  // Child view: default to the mother's ACTIVE games; ended ones hide behind
+  // "Load more". Mother/standalone keeps the existing single list (all games).
+  const visibleGames = isChildView
+    ? showEndedMother
+      ? games
+      : games.filter((g) => !g.ended)
+    : games;
+  const motherEndedCount = isChildView ? games.filter((g) => g.ended).length : 0;
+
   return (
     <div className="container mx-auto px-6 py-8">
       <div className="flex items-center justify-between mb-6">
-        <h2 className="text-3xl font-bold text-white">Launched Games</h2>
+        <h2 className="text-3xl font-bold text-[var(--pg-text)]">{t('launched:heading')}</h2>
         <div className="flex items-center gap-2">
+          {games.length > 0 && (
+            <button
+              onClick={() => setGamesMinimized((v) => !v)}
+              className="pg-btn"
+              title={gamesMinimized ? t('launched:expandGames') : t('launched:minimizeGames')}
+            >
+              {gamesMinimized ? <Maximize2 size={16} /> : <Minimize2 size={16} />}
+              {gamesMinimized ? t('launched:expandGames') : t('launched:minimizeGames')}
+            </button>
+          )}
           <button
             onClick={() => setShowRankingsModal(true)}
             className="flex items-center gap-2 px-4 py-2 bg-yellow-500/15 hover:bg-yellow-500/25 border border-yellow-500/30 hover:border-yellow-400/50 text-yellow-400 font-semibold text-sm rounded-xl transition-all"
           >
             <Trophy size={16} />
-            Rankings
+            {t('launched:rankings')}
           </button>
           <button
             onClick={() => void openArchived()}
             className="flex items-center gap-2 px-4 py-2 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 hover:border-indigo-400/50 text-indigo-300 font-semibold text-sm rounded-xl transition-all"
           >
             <Archive size={16} />
-            Archived
+            {t('launched:archived')}
           </button>
         </div>
       </div>
 
-      {games.length === 0 ? (
+      {isChildView && motherUnreachable && (
+        <div className="mb-4 px-4 py-3 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 text-sm font-semibold">
+          {t('launched:motherOffline')}
+        </div>
+      )}
+
+      {games.length === 0 && localGames.length === 0 ? (
         <div className="text-center py-12">
-          <p className="text-slate-400 text-lg">No games have been launched yet.</p>
+          <p className="text-[var(--pg-text-dim)] text-lg">{t('launched:noGamesYet')}</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="space-y-4">
-            {games.map((game) => {
-              const typeBadge = gameTypeBadge(game.game_type || gameDataMap[game.game_uniqid]?.game?.type || '');
+            {isChildView && (
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--pg-text-dim)]">
+                {t('launched:gamesOnMother')}
+              </h3>
+            )}
+            {visibleGames.map((game) => {
+              const typeSlug = game.game_type || gameDataMap[game.game_uniqid]?.game?.type || '';
+              const typeBadge = gameTypeBadge(typeSlug);
+              // Compact list row: shown when the list is minimized and this game
+              // isn't the selected one (the selected game keeps its full card).
+              if (gamesMinimized && selectedGameId !== game.id) {
+                return (
+                  <div
+                    key={game.id}
+                    className={`flex items-center gap-3 px-4 py-2.5 rounded-lg border transition cursor-pointer ${
+                      'bg-[var(--pg-surface)] border-[var(--pg-line)] hover:border-[var(--pg-line-strong)]'
+                    } ${!game.ended ? 'ring-1 ring-green-500/40' : ''}`}
+                    onClick={() => setSelectedGameId(game.id)}
+                  >
+                    <span
+                      className={`shrink-0 px-2 py-0.5 rounded-full text-[11px] font-semibold border flex items-center gap-1 ${typeBadge.className}`}
+                      title={t('launched:gameTypeTitle')}
+                    >
+                      <GameTypeIcon type={typeSlug} size={12} />
+                      {typeBadge.label}
+                    </span>
+                    <span className="flex-1 min-w-0 truncate text-[var(--pg-text)] font-semibold text-sm">{game.name}</span>
+                    {game.ended ? (
+                      <StopCircle size={14} className="shrink-0 text-[var(--pg-text-dim)]" />
+                    ) : (
+                      <Play size={14} className="shrink-0 text-green-400" />
+                    )}
+                  </div>
+                );
+              }
               return (
               <div
                 key={game.id}
                 className={`p-6 rounded-lg border-2 transition cursor-pointer ${
                   selectedGameId === game.id
-                    ? 'bg-blue-900/30 border-blue-500'
-                    : 'bg-slate-800/50 border-slate-700 hover:border-slate-600'
+                    ? 'bg-[var(--pg-accent-tint)] border-[var(--pg-accent)]'
+                    : 'bg-[var(--pg-surface)] border-[var(--pg-line)] hover:border-[var(--pg-line-strong)]'
                 } ${!game.ended ? 'ring-2 ring-green-500/50' : ''}`}
                 onClick={() => setSelectedGameId(game.id)}
               >
                 <div className="flex items-start justify-between mb-3">
                   <div>
-                    <h3 className="text-xl font-bold text-white mb-1">{game.name}</h3>
+                    <h3 className="text-xl font-bold text-[var(--pg-text)] mb-1">{game.name}</h3>
                     {gameDataMap[game.game_uniqid] ? (
-                      <p className="text-sm text-blue-400 mb-1">Scenario: {gameDataMap[game.game_uniqid].game.title}</p>
+                      <p className="text-sm text-[var(--pg-accent-bright)] mb-1">{t('launched:scenarioLabel', { scenario: gameDataMap[game.game_uniqid].game.title })}</p>
                     ) : (
-                      <p className="text-sm text-slate-400 mb-1">Scenario: {game.game_uniqid}</p>
+                      <p className="text-sm text-[var(--pg-text-dim)] mb-1">{t('launched:scenarioLabel', { scenario: game.game_uniqid })}</p>
                     )}
-                    <p className="text-sm text-slate-400">Game ID: {game.id}</p>
+                    <p className="text-sm text-[var(--pg-text-dim)]">{t('launched:gameIdLabel', { id: game.id })}</p>
                   </div>
                   <div className="flex items-center gap-2">
                     <span
-                      className={`px-3 py-1 rounded-full text-xs font-semibold border ${typeBadge.className}`}
-                      title="Game type"
+                      className={`px-3 py-1 rounded-full text-xs font-semibold border flex items-center gap-1.5 ${typeBadge.className}`}
+                      title={t('launched:gameTypeTitle')}
                     >
+                      <GameTypeIcon type={typeSlug} size={13} />
                       {typeBadge.label}
                     </span>
                     {game.ended ? (
-                      <span className="px-3 py-1 bg-slate-700 text-slate-300 rounded-full text-xs font-semibold flex items-center gap-1">
+                      <span className="px-3 py-1 bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] rounded-full text-xs font-semibold flex items-center gap-1">
                         <StopCircle size={12} />
-                        Ended
+                        {t('launched:statusEnded')}
                       </span>
                     ) : (
                       <span className="px-3 py-1 bg-green-600 text-white rounded-full text-xs font-semibold flex items-center gap-1">
                         <Play size={12} />
-                        Active
+                        {t('launched:statusActive')}
                       </span>
                     )}
                   </div>
                 </div>
 
-                <div className="text-sm text-slate-400 mb-4">
-                  Created: {formatDate(game.created_at)}
+                <div className="text-sm text-[var(--pg-text-dim)] mb-4">
+                  {t('launched:createdLabel', { date: formatDate(game.created_at) })}
                 </div>
 
-                <div className="flex gap-2 flex-wrap">
-                  {!game.ended && (
+                {/* Action buttons on a single line, split into two clusters:
+                    Left: Play (when active), Rankings, Devices, Videos, Print
+                    Right: Config, Test, Raw data, Stop/Archive (+ clash add-time, delete) */}
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  {/* Left cluster */}
+                  <div className="flex items-center gap-2">
+                    {!game.ended && !operatorOnly && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // playGameById registers this device into the game
+                          // (self-join) before mounting GamePage, so a child can
+                          // join a mother-hosted game it hasn't joined yet. For
+                          // the mother's own game the register is a harmless
+                          // upsert.
+                          void (async () => {
+                            if (await blockedByLock(() => void playGameById(game.id))) return;
+                            await playGameById(game.id);
+                          })();
+                        }}
+                        className="p-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition"
+                        title={t('launched:playGame')}
+                      >
+                        <Gamepad2 size={18} />
+                      </button>
+                    )}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handlePlayGame(game);
+                        void handleOpenRankingOptions(game);
                       }}
-                      className="p-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition"
-                      title="Play Game"
+                      className="p-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
+                      title={t('launched:rankings')}
                     >
-                      <Gamepad2 size={18} />
+                      <Trophy size={18} />
                     </button>
-                  )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setConfigGameId(game.id);
-                      setConfigGameName(game.name);
-                    }}
-                    className="p-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition"
-                    title="Configure"
-                  >
-                    <Settings size={18} />
-                  </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setTestGameId(game.id);
-                      setTestGameName(game.name);
-                    }}
-                    className="p-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition"
-                    title="Run Game Test"
-                  >
-                    <FlaskConical size={18} />
-                  </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleShowRankings(game.id, game.name);
-                    }}
-                    className="p-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition"
-                    title="Rankings"
-                  >
-                    <Trophy size={18} />
-                  </button>
-                  {game.ended && !game.is_test && (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleArchiveGame(game.id);
+                        handleShowDevices(game.id);
                       }}
-                      className="p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition"
-                      title="Archive (keep summary, delete game data)"
+                      className="p-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition"
+                      title={t('launched:devices')}
                     >
-                      <Archive size={18} />
+                      <Monitor size={18} />
                     </button>
-                  )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleShowDevices(game.id);
-                    }}
-                    className="p-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition"
-                    title="Devices"
-                  >
-                    <Monitor size={18} />
-                  </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowRawData({ id: game.id, name: game.name });
-                    }}
-                    className="p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition"
-                    title="Raw Data"
-                  >
-                    <Database size={18} />
-                  </button>
-                  {!game.ended && (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleEndGame(game.id);
+                        setShowVideo(game.id);
                       }}
-                      className="p-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg transition"
-                      title="End Game"
+                      className="p-2 bg-pink-600 hover:bg-pink-500 text-white rounded-lg transition"
+                      title={t('launched:video')}
                     >
-                      <StopCircle size={18} />
+                      <Video size={18} />
                     </button>
-                  )}
-                  {(game.is_test || isAdminMode) && (
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDeleteGame(game.id);
+                        setPrintTarget({ game, teamId: null, subject: game.name });
                       }}
-                      className="p-2 bg-red-600 hover:bg-red-500 text-white rounded-lg transition"
-                      title={game.is_test ? 'Delete test game' : 'Delete (admin)'}
+                      disabled={printing}
+                      className="p-2 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded-lg transition disabled:opacity-50"
+                      title={t('launched:printAll')}
                     >
-                      <Trash2 size={18} />
+                      <Printer size={18} />
                     </button>
-                  )}
+                  </div>
+
+                  {/* Right cluster */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfigGameId(game.id);
+                        setConfigGameName(game.name);
+                        setConfigGameType(game.game_type || gameDataMap[game.game_uniqid]?.game?.type || '');
+                        setConfigGameUniqid(game.game_uniqid);
+                      }}
+                      className="p-2 bg-[var(--pg-accent)] hover:bg-[var(--pg-accent-hover)] text-white rounded-lg transition"
+                      title={t('launched:configure')}
+                    >
+                      <Settings size={18} />
+                    </button>
+                    {isAdminMode && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setTestGameId(game.id);
+                          setTestGameName(game.name);
+                        }}
+                        className="p-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition"
+                        title={t('launched:runGameTest')}
+                      >
+                        <FlaskConical size={18} />
+                      </button>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setShowRawData({ id: game.id, name: game.name });
+                      }}
+                      className="p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition"
+                      title={t('launched:rawData')}
+                    >
+                      <Database size={18} />
+                    </button>
+                    {!game.ended && (game.game_type || '').toLowerCase() === 'clash' && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setAddTimeGame({ id: game.id, name: game.name });
+                        }}
+                        className="p-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg transition"
+                        title="Add time"
+                      >
+                        <Clock size={18} />
+                      </button>
+                    )}
+                    {!game.ended ? (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleEndGame(game.id);
+                        }}
+                        className="p-2 bg-orange-600 hover:bg-orange-500 text-white rounded-lg transition"
+                        title={t('launched:endGameTitle')}
+                      >
+                        <StopCircle size={18} />
+                      </button>
+                    ) : !game.is_test ? (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleArchiveGame(game.id);
+                        }}
+                        className="p-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition"
+                        title={t('launched:archiveTitle')}
+                      >
+                        <Archive size={18} />
+                      </button>
+                    ) : null}
+                    {(game.is_test || isAdminMode) && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteGame(game.id);
+                        }}
+                        className="p-2 bg-red-600 hover:bg-red-500 text-white rounded-lg transition"
+                        title={game.is_test ? t('launched:deleteTestGame') : t('launched:deleteAdmin')}
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
               );
             })}
+
+            {/* Child view: reveal the mother's ended games on demand. */}
+            {isChildView && !showEndedMother && motherEndedCount > 0 && (
+              <button
+                onClick={() => setShowEndedMother(true)}
+                className="pg-btn w-full justify-center"
+              >
+                {t('launched:loadMoreEnded', { count: motherEndedCount })}
+              </button>
+            )}
+
+            {/* Child view: this device's OWN local games - read-only history,
+                kept separate from the mother's games. */}
+            {isChildView && localGames.length > 0 && (
+              <div className="pt-4 mt-2 border-t border-[var(--pg-line)]">
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-[var(--pg-text-dim)] mb-2">
+                  {t('launched:thisDeviceSection')}
+                </h3>
+                <div className="space-y-2">
+                  {localGames.map((g) => {
+                    const slug = g.game_type || gameDataMap[g.game_uniqid]?.game?.type || '';
+                    const badge = gameTypeBadge(slug);
+                    return (
+                      <div
+                        key={g.id}
+                        className="flex items-center gap-3 px-4 py-2 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface)] opacity-80"
+                      >
+                        <span
+                          className={`shrink-0 px-2 py-0.5 rounded-full text-[11px] font-semibold border flex items-center gap-1 ${badge.className}`}
+                        >
+                          <GameTypeIcon type={slug} size={12} />
+                          {badge.label}
+                        </span>
+                        <span className="flex-1 min-w-0 truncate text-[var(--pg-text)] text-sm">{g.name}</span>
+                        {g.ended ? (
+                          <StopCircle size={14} className="shrink-0 text-[var(--pg-text-dim)]" />
+                        ) : (
+                          <Play size={14} className="shrink-0 text-green-400" />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           <div>
             {selectedGameId !== null ? (
               <div className="sticky top-24">
-                <div className="bg-slate-800/50 border-2 border-slate-700 rounded-lg p-6">
+                <div className="bg-[var(--pg-surface)] border-2 border-[var(--pg-line)] rounded-lg p-6">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                    <h3 className="text-xl font-bold text-[var(--pg-text)] flex items-center gap-2">
                       <Users size={20} />
-                      Teams ({teams.length})
+                      {t('launched:teamsCount', { count: teams.length })}
                     </h3>
                     <div className="flex items-center gap-2">
                       <button
@@ -1221,12 +1710,12 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                           await loadTeams(selectedGameId);
                           setRefreshingTeams(false);
                         }}
-                        className="px-3 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm transition flex items-center gap-1"
-                        title="Refresh teams"
+                        className="pg-btn pg-btn--sm"
+                        title={t('launched:refreshTeams')}
                         disabled={refreshingTeams}
                       >
                         <RefreshCw size={14} className={refreshingTeams ? 'animate-spin' : ''} />
-                        Refresh
+                        {t('launched:refresh')}
                       </button>
                       {teams.length > 0 && (
                         <button
@@ -1238,18 +1727,18 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                               setMinimizedTeams(allTeamIds);
                             }
                           }}
-                          className="px-3 py-1 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm transition flex items-center gap-1"
-                          title={minimizedTeams.size === teams.length ? "Expand all teams" : "Minimize all teams"}
+                          className="pg-btn pg-btn--sm"
+                          title={minimizedTeams.size === teams.length ? t('launched:expandAllTeams') : t('launched:minimizeAllTeams')}
                         >
                           {minimizedTeams.size === teams.length ? (
                             <>
                               <Maximize2 size={14} />
-                              Expand All
+                              {t('launched:expandAll')}
                             </>
                           ) : (
                             <>
                               <Minimize2 size={14} />
-                              Minimize All
+                              {t('launched:minimizeAll')}
                             </>
                           )}
                         </button>
@@ -1261,29 +1750,29 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                     <div className="space-y-3 mb-4">
                       <div className="flex gap-2">
                         <div className="relative flex-1">
-                          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] z-10" />
                           <input
                             type="text"
-                            placeholder="Search by name or chip #..."
+                            placeholder={t('launched:searchTeamsPlaceholder')}
                             value={teamSearch}
                             onChange={(e) => setTeamSearch(e.target.value)}
-                            className="w-full pl-9 pr-3 py-2 bg-slate-700 border border-slate-600 rounded text-white placeholder-slate-400 text-sm focus:outline-none focus:border-blue-500"
+                            className="pg-input !pl-9"
                           />
                         </div>
                         <button
                           onClick={() => setTeamSortBy(teamSortBy === 'ranking' ? 'name' : 'ranking')}
-                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm transition flex items-center gap-2"
-                          title={teamSortBy === 'ranking' ? 'Sort by name' : 'Sort by ranking'}
+                          className="pg-btn"
+                          title={teamSortBy === 'ranking' ? t('launched:sortByName') : t('launched:sortByRanking')}
                         >
                           {teamSortBy === 'ranking' ? (
                             <>
                               <ArrowUpDown size={16} />
-                              Ranking
+                              {t('launched:sortRanking')}
                             </>
                           ) : (
                             <>
                               <SortAsc size={16} />
-                              Name
+                              {t('launched:sortName')}
                             </>
                           )}
                         </button>
@@ -1292,10 +1781,10 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                   )}
 
                   {teams.length === 0 ? (
-                    <p className="text-slate-400">No teams in this game.</p>
+                    <p className="text-[var(--pg-text-dim)]">{t('launched:noTeamsInGame')}</p>
                   ) : (
                     getFilteredAndSortedTeams().length === 0 ? (
-                      <p className="text-slate-400 text-sm">No teams match your search.</p>
+                      <p className="text-[var(--pg-text-dim)] text-sm">{t('launched:noTeamsMatchSearch')}</p>
                     ) : (
                     <div className="space-y-3">
                       {getFilteredAndSortedTeams().map((team, index) => {
@@ -1308,30 +1797,70 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                         // depending on the async gameDataMap fallback.
                         const isTagQuest = selectedGame?.game_type?.toLowerCase() === 'tagquest' ||
                           gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'tagquest';
+                        const isClash = selectedGame?.game_type?.toLowerCase() === 'clash';
+                        const isMystery = selectedGame?.game_type?.toLowerCase() === 'mystery' ||
+                          gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'mystery';
+                        // Mystery teams: the operator also wants the physical card
+                        // number (key_number) alongside the chip id (key_id).
+                        const teamCardNumber = isMystery
+                          ? (allChips.find(c => c.id === team.key_id)?.key_number ?? null)
+                          : null;
+                        const clanMemberCount = clashCounts.get(team.id) ?? 0;
                         const showTeammates = isTagQuest && selectedGamePlayMode === 'team';
                         const configTeam = showTeammates
                           ? selectedGameTeamsConfig.find(t => t.chipId === team.key_id || t.name === team.team_name)
                           : undefined;
                         const teammates = configTeam?.teammates ?? [];
+                        // Clash: clans share one game timeline and never set per-team
+                        // start/end, so derive the live score (clan points), validation
+                        // count (activity), member chips, and an activity-based status
+                        // from the polled standings instead of the lg_teams row.
+                        const clashStanding = isClash
+                          ? clashStandings?.clans.find(c => c.team_id === team.id)
+                          : undefined;
+                        const clashPoints = clashStanding?.points ?? 0;
+                        const clashValidations = isClash
+                          ? (clashStandings?.territories ?? []).reduce(
+                              (n, terr) => n + (terr.counts[String(team.id)] ?? 0), 0)
+                          : 0;
+                        const clashMemberChips = isClash ? (clashMembers.get(team.id) ?? []) : [];
+                        // TagQuest self-register: members bound via lg_clash_members
+                        // (no teamsConfig roster). Shown whenever the config roster
+                        // has no teammates for this team.
+                        const tagquestMemberChips =
+                          isTagQuest && teammates.length === 0 ? (clashMembers.get(team.id) ?? []) : [];
+                        const displayScore = isClash ? clashPoints : team.score;
+                        // Status: ended game ⇒ done; live + scored ⇒ playing; else waiting.
+                        const clashStatus: 'ended' | 'playing' | 'waiting' = selectedGame?.ended
+                          ? 'ended'
+                          : clashValidations > 0 ? 'playing' : 'waiting';
+                        const renderStatusIcon = (size: number, extraClass = '') => {
+                          if (isClash) {
+                            if (clashStatus === 'ended') return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
+                            if (clashStatus === 'playing') return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
+                            return <Clock size={size} className={`text-[var(--pg-text-dim)] ${extraClass}`} />;
+                          }
+                          if (team.end_time) return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
+                          if (team.start_time) return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
+                          return <Clock size={size} className={`text-[var(--pg-text-dim)] ${extraClass}`} />;
+                        };
+                        const clanChipLabel = (chipId: number) => {
+                          const c = allChips.find(x => x.id === chipId);
+                          return c ? { number: c.key_number, name: c.key_name } : { number: chipId, name: '' };
+                        };
 
                         return (
                         <div
                           key={team.id}
-                          className="bg-slate-800 border border-slate-700 rounded-lg overflow-hidden"
+                          className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-lg overflow-hidden"
                         >
                           {isMinimized ? (
-                            <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-slate-700/50 transition" onClick={() => toggleMinimizeTeam(team.id)}>
+                            <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-[var(--pg-surface-3)] transition" onClick={() => toggleMinimizeTeam(team.id)}>
                               <div className="flex items-center gap-3 flex-1 min-w-0">
-                                <span className="text-slate-400 text-sm font-medium">#{ranking}</span>
+                                <span className="text-[var(--pg-text-dim)] text-sm font-medium">#{ranking}</span>
                                 <div className="flex items-center gap-2 min-w-0">
-                                  {team.end_time ? (
-                                    <CheckCircle size={16} className="text-green-500 shrink-0" />
-                                  ) : team.start_time ? (
-                                    <Play size={16} className="text-blue-500 shrink-0" />
-                                  ) : (
-                                    <Clock size={16} className="text-slate-500 shrink-0" />
-                                  )}
-                                  <span className="text-white font-semibold truncate">{team.team_name}</span>
+                                  {renderStatusIcon(16, 'shrink-0')}
+                                  <span className="text-[var(--pg-text)] font-semibold truncate">{team.team_name}</span>
                                 </div>
                                 {showTeammates && teammates.length > 1 && (
                                   <span className="flex items-center gap-1 text-teal-400 text-xs shrink-0">
@@ -1339,8 +1868,23 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                     {teammates.length}
                                   </span>
                                 )}
-                                <span className="flex items-center gap-2 text-slate-400 text-sm ml-auto mr-4 shrink-0">
-                                  Score: <span className="text-white font-medium">{team.score}</span>
+                                {(isClash || tagquestMemberChips.length > 0) && (
+                                  <span className="flex items-center gap-1 text-blue-400 text-xs shrink-0" title="Chips in this team">
+                                    <Users size={12} />
+                                    {clanMemberCount}
+                                  </span>
+                                )}
+                                <span className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm ml-auto mr-4 shrink-0">
+                                  {t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span>
+                                  {team.weight != null && (
+                                    <span
+                                      title={t('launched:effectifWeightTitle')}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
+                                    >
+                                      <Users size={12} />
+                                      {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
+                                    </span>
+                                  )}
                                   {team.currentLevel && (
                                     <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
                                       <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
@@ -1348,14 +1892,17 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                     </span>
                                   )}
                                 </span>
-                                {!showTeammates && (
-                                  <span className="text-slate-400 text-sm shrink-0">
-                                    Chip #{team.key_id}
+                                {!showTeammates && !isClash && (
+                                  <span className="text-[var(--pg-text-dim)] text-sm shrink-0 flex items-center gap-2">
+                                    <span>{t('launched:chipLabel', { id: team.key_id })}</span>
+                                    {isMystery && teamCardNumber != null && (
+                                      <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
+                                    )}
                                   </span>
                                 )}
                               </div>
-                              <button className="p-1 hover:bg-slate-600 rounded transition ml-2 shrink-0" title="Expand team details">
-                                <Maximize2 size={16} className="text-slate-400" />
+                              <button className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition ml-2 shrink-0" title={t('launched:expandTeamDetails')}>
+                                <Maximize2 size={16} className="text-[var(--pg-text-dim)]" />
                               </button>
                             </div>
                           ) : (
@@ -1363,13 +1910,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                             <div className="flex items-center justify-between mb-3">
                               <div className="flex items-center gap-3">
                                 <div className="flex items-center gap-2">
-                                  {team.end_time ? (
-                                    <CheckCircle size={18} className="text-green-500" />
-                                  ) : team.start_time ? (
-                                    <Play size={18} className="text-blue-500" />
-                                  ) : (
-                                    <Clock size={18} className="text-slate-500" />
-                                  )}
+                                  {renderStatusIcon(18)}
                                   {renamingTeamId === team.id ? (
                                     <input
                                       autoFocus
@@ -1380,115 +1921,110 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                         if (e.key === 'Enter') handleRenameTeam(team.id);
                                         if (e.key === 'Escape') { setRenamingTeamId(null); setRenameValue(''); }
                                       }}
-                                      className="bg-slate-700 border border-blue-500 rounded px-2 py-0.5 text-white font-semibold text-sm focus:outline-none w-36"
+                                      className="bg-[var(--pg-surface-3)] border border-[var(--pg-accent-line)] rounded px-2 py-0.5 text-[var(--pg-text)] font-semibold text-sm focus:outline-none w-36"
                                     />
                                   ) : (
                                     <span
-                                      className="text-white font-semibold cursor-pointer hover:text-blue-300 transition-colors"
-                                      title="Double-click to rename"
+                                      className="text-[var(--pg-text)] font-semibold cursor-pointer hover:text-[var(--pg-accent-bright)] transition-colors"
+                                      title={t('launched:doubleClickToRename')}
                                       onDoubleClick={() => { setRenamingTeamId(team.id); setRenameValue(team.team_name); }}
                                     >
                                       {team.team_name}
                                     </span>
                                   )}
-                                  <span className="text-slate-500 text-xs font-mono">#{team.team_number}</span>
+                                  <span className="text-[var(--pg-text-dim)] text-xs font-mono">#{team.team_number}</span>
                                 </div>
                               </div>
                               <div className="flex items-center gap-2">
-                                {!showTeammates && (
-                                  <span className="text-slate-400 text-sm">
-                                    Chip #{team.key_id}
+                                {!showTeammates && !isClash && (
+                                  <span className="text-[var(--pg-text-dim)] text-sm flex items-center gap-2">
+                                    <span>{t('launched:chipLabel', { id: team.key_id })}</span>
+                                    {isMystery && teamCardNumber != null && (
+                                      <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
+                                    )}
+                                  </span>
+                                )}
+                                {isClash && (
+                                  <span className="flex items-center gap-1 text-blue-400 text-sm" title="Chips in this clan">
+                                    <Users size={13} />
+                                    {clanMemberCount}
                                   </span>
                                 )}
                                 <button
                                   onClick={() => toggleMinimizeTeam(team.id)}
-                                  className="p-1 hover:bg-slate-700 rounded transition"
-                                  title="Minimize team details"
+                                  className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition"
+                                  title={t('launched:minimizeTeamDetails')}
                                 >
-                                  <Minimize2 size={16} className="text-slate-400" />
+                                  <Minimize2 size={16} className="text-[var(--pg-text-dim)]" />
                                 </button>
                               </div>
                             </div>
 
-                          {editingTeamId === team.id ? (
-                            <div className="space-y-3">
-                              <div>
-                                <label className="text-xs text-slate-400 mb-1 block">Team Name</label>
-                                <input
-                                  type="text"
-                                  value={editedTeam.team_name || ''}
-                                  onChange={(e) => setEditedTeam({ ...editedTeam, team_name: e.target.value })}
-                                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="text-xs text-slate-400 mb-1 block">Score</label>
-                                <input
-                                  type="number"
-                                  value={editedTeam.score ?? 0}
-                                  onChange={(e) => setEditedTeam({ ...editedTeam, score: parseInt(e.target.value) || 0 })}
-                                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="text-xs text-slate-400 mb-1 block">Start Time (HH:MM:SS)</label>
-                                <input
-                                  type="time"
-                                  step="1"
-                                  value={formatTimeForInput(editedTeam.start_time ?? team.start_time)}
-                                  onChange={(e) => setEditedTeam({ ...editedTeam, start_time: parseTimeInput(e.target.value) })}
-                                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                />
-                              </div>
-                              <div>
-                                <label className="text-xs text-slate-400 mb-1 block">End Time (HH:MM:SS)</label>
-                                <input
-                                  type="time"
-                                  step="1"
-                                  value={formatTimeForInput(editedTeam.end_time ?? team.end_time)}
-                                  onChange={(e) => setEditedTeam({ ...editedTeam, end_time: parseTimeInput(e.target.value) })}
-                                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                />
-                              </div>
-                              <div className="flex gap-2 pt-2">
-                                <button
-                                  onClick={() => handleSaveTeam(team.id)}
-                                  className="flex-1 px-3 py-2 bg-green-600 hover:bg-green-500 text-white rounded text-sm font-medium flex items-center justify-center gap-2"
-                                  title="Save changes"
-                                >
-                                  <Save size={14} />
-                                  Save
-                                </button>
-                                <button
-                                  onClick={handleCancelEdit}
-                                  className="flex-1 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm font-medium"
-                                  title="Cancel editing"
-                                >
-                                  Cancel
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <>
-                              <div className="text-sm text-slate-400 space-y-1 mb-3">
+                          <>
+                              <div className="text-sm text-[var(--pg-text-dim)] space-y-1 mb-3">
                                 <div className="flex items-center gap-2 flex-wrap">
-                                  <span>Score: <span className="text-white font-medium">{team.score}</span></span>
+                                  <span>{t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span></span>
+                                  {team.weight != null && (
+                                    <span
+                                      title={t('launched:effectifWeightTitle')}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
+                                    >
+                                      <Users size={12} />
+                                      {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
+                                    </span>
+                                  )}
                                   {team.currentLevel && (
                                     <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
                                       <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
                                       {team.currentLevel.name}
                                     </span>
                                   )}
+                                  {isClash && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-500/15 border border-blue-500/30 rounded-full text-blue-300 text-xs font-semibold">
+                                      <Flag size={11} />
+                                      {t('launched:validationsBadge', { count: clashValidations })}
+                                    </span>
+                                  )}
                                 </div>
-                                <div>Start: <span className="text-white">{formatTime(team.start_time)}</span></div>
-                                <div>End: <span className="text-white">{team.end_time ? formatTime(team.end_time) : 'Not ended'}</span></div>
+                                {!isClash && (
+                                  <>
+                                    <div>{t('launched:startLabel')} <span className="text-[var(--pg-text)]">{formatTime(team.start_time)}</span></div>
+                                    <div>{t('launched:endLabel')} <span className="text-[var(--pg-text)]">{team.end_time ? formatTime(team.end_time) : t('launched:notEnded')}</span></div>
+                                  </>
+                                )}
                               </div>
+                              {(isClash || tagquestMemberChips.length > 0) && (
+                                <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
+                                  <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)] mb-2">
+                                    <Users size={12} />
+                                    <span className="font-medium uppercase tracking-wide">
+                                      {t('launched:membersHeading', { count: (isClash ? clashMemberChips : tagquestMemberChips).length })}
+                                    </span>
+                                  </div>
+                                  {(isClash ? clashMemberChips : tagquestMemberChips).length === 0 ? (
+                                    <p className="text-xs text-[var(--pg-text-dim)]">{t('launched:noChipsBound')}</p>
+                                  ) : (
+                                    <div className="flex flex-wrap gap-2">
+                                      {(isClash ? clashMemberChips : tagquestMemberChips).map((chipId) => {
+                                        const label = clanChipLabel(chipId);
+                                        return (
+                                          <span key={chipId} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
+                                            {label.name || `Chip ${chipId}`}
+                                            <span className="text-[var(--pg-text-dim)] font-mono">#{label.number}</span>
+                                          </span>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
                               {showTeammates && (
-                                <div className="mb-3 pt-2 border-t border-slate-700">
+                                <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
                                   <div className="flex items-center justify-between mb-2">
-                                    <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                                    <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)]">
                                       <Users size={12} />
-                                      <span className="font-medium uppercase tracking-wide">Teammates</span>
+                                      <span className="font-medium uppercase tracking-wide">{t('launched:teammates')}</span>
                                     </div>
                                     {addTeammateState?.teamId !== team.id && (
                                       <button
@@ -1496,22 +2032,22 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                         className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300 transition"
                                       >
                                         <UserPlus size={12} />
-                                        Add
+                                        {t('launched:add')}
                                       </button>
                                     )}
                                   </div>
                                   <div className="flex flex-wrap gap-2">
                                     {teammates.map((mate, mi) => (
-                                      <span key={mi} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-700 rounded-full text-xs text-slate-300">
+                                      <span key={mi} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
                                         <span className="w-1.5 h-1.5 rounded-full bg-teal-400 shrink-0" />
                                         {mate.name}
-                                        <span className="text-slate-500 font-mono">#{mate.chipNumber}</span>
-                                        <span className="text-slate-600 font-mono text-[10px]">{mate.chipId}</span>
+                                        <span className="text-[var(--pg-text-dim)] font-mono">#{mate.chipNumber}</span>
+                                        <span className="text-[var(--pg-text-dim)] font-mono text-[10px]">{mate.chipId}</span>
                                         {mate.chipId !== team.key_id && (
                                           <button
                                             onClick={() => handleRemoveTeammate(team.id, mate.chipId, mate.name)}
-                                            className="ml-0.5 -mr-0.5 text-slate-500 hover:text-red-400 transition"
-                                            title="Remove teammate"
+                                            className="ml-0.5 -mr-0.5 text-[var(--pg-text-dim)] hover:text-red-400 transition"
+                                            title={t('launched:removeTeammateTitle')}
                                           >
                                             <X size={12} />
                                           </button>
@@ -1520,13 +2056,13 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                     ))}
                                   </div>
                                   {addTeammateState?.teamId === team.id && (
-                                    <div className="mt-2 p-2 bg-slate-900/60 rounded-lg space-y-2">
+                                    <div className="mt-2 p-2 bg-[var(--pg-bg)] rounded-lg space-y-2">
                                       <input
                                         type="text"
-                                        placeholder="Teammate name"
+                                        placeholder={t('launched:teammateNamePlaceholder')}
                                         value={addTeammateState.name}
                                         onChange={e => setAddTeammateState({ ...addTeammateState, name: e.target.value })}
-                                        className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                        className="pg-input !text-xs !py-1.5"
                                       />
                                       <select
                                         value={addTeammateState.chipId ?? ''}
@@ -1535,14 +2071,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                           const chip = allChips.find(c => c.id === id);
                                           setAddTeammateState({ ...addTeammateState, chipId: id, name: chip ? chip.key_name : addTeammateState.name });
                                         }}
-                                        className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-xs focus:outline-none focus:ring-1 focus:ring-teal-500"
+                                        className="pg-select !text-xs !py-1.5"
                                       >
-                                        <option value="">Select chip...</option>
+                                        <option value="">{t('launched:selectChip')}</option>
                                         {allChips
                                           .filter(c => !getUsedChipIds().has(c.id))
                                           .map(c => (
                                             <option key={c.id} value={c.id}>
-                                              #{c.key_number} — {c.key_name} (ID: {c.id})
+                                              {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
                                             </option>
                                           ))}
                                       </select>
@@ -1553,7 +2089,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                           className="flex-1 px-2 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center justify-center gap-1"
                                         >
                                           <Save size={11} />
-                                          {savingTeammate ? 'Saving...' : 'Save'}
+                                          {savingTeammate ? t('launched:saving') : t('launched:save')}
                                         </button>
                                         <button
                                           onClick={() => {
@@ -1561,14 +2097,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                             if (name) setAddTeammateState(s => (s ? { ...s, name } : s));
                                           }}
                                           disabled={namePoolNames.length === 0}
-                                          className="px-2 py-1.5 bg-slate-700 hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-slate-700 text-white rounded text-xs flex items-center gap-1"
-                                          title={namePoolNames.length === 0 ? 'No pooled names for this scenario' : 'Random name'}
+                                          className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-xs flex items-center gap-1"
+                                          title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
                                         >
                                           <Dices size={11} />
                                         </button>
                                         <button
                                           onClick={() => setAddTeammateState(null)}
-                                          className="px-2 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded text-xs"
+                                          className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-xs"
                                         >
                                           <X size={11} />
                                         </button>
@@ -1581,46 +2117,77 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                 <button
                                   onClick={() => {
                                     const game = games.find(g => g.id === selectedGameId);
-                                    if (game) {
+                                    if (!game) return;
+                                    if ((game.game_type || '').toLowerCase() === 'clash') {
+                                      // Clash: clan-management modal (chips + territories) instead
+                                      // of the quest/enigma TeamDetailsModal.
+                                      setClashClan({ id: team.id, team_number: team.team_number, team_name: team.team_name });
+                                    } else {
                                       setTeamDetails({ team, gameUniqid: game.game_uniqid, gameType: game.game_type });
                                     }
                                   }}
-                                  className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
-                                  title="View team details"
+                                  className="flex-1 px-3 py-2 bg-[var(--pg-accent)] hover:bg-[var(--pg-accent-hover)] text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
+                                  title={t('launched:viewTeamDetails')}
                                 >
-                                  <BarChart2 size={15} />
-                                  Details
+                                  <Eye size={15} />
+                                  {t('launched:details')}
                                 </button>
                                 <button
-                                  onClick={() => handleEditTeam(team)}
-                                  className="px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded text-sm font-medium"
-                                  title="Edit team details"
+                                  onClick={() => handleEndTeam(team)}
+                                  disabled={!!team.end_time}
+                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-orange-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] disabled:hover:text-[var(--pg-text-muted)]"
+                                  title={team.end_time ? t('launched:teamAlreadyEnded') : t('launched:endTeamTitle')}
                                 >
-                                  Edit
+                                  <StopCircle size={14} />
                                 </button>
+                                {isAdminMode && (
+                                  <button
+                                    onClick={() => {
+                                      const game = games.find(g => g.id === selectedGameId);
+                                      if (game) {
+                                        setTestTeam({ gameId: game.id, gameName: game.name, team });
+                                      }
+                                    }}
+                                    className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-sm font-medium flex items-center gap-1.5"
+                                    title={t('launched:testThisTeam')}
+                                  >
+                                    <FlaskConical size={14} />
+                                    {t('launched:test')}
+                                  </button>
+                                )}
                                 <button
                                   onClick={() => {
                                     const game = games.find(g => g.id === selectedGameId);
-                                    if (game) {
-                                      setTestTeam({ gameId: game.id, gameName: game.name, team });
-                                    }
+                                    if (game) setPrintTarget({ game, teamId: team.id, subject: `${game.name} - ${team.team_name}` });
                                   }}
-                                  className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-sm font-medium flex items-center gap-1.5"
-                                  title="Test this team"
+                                  disabled={printing}
+                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] rounded text-sm font-medium flex items-center disabled:opacity-50"
+                                  title={t('launched:printTeam')}
                                 >
-                                  <FlaskConical size={14} />
-                                  Test
+                                  <Printer size={14} />
                                 </button>
+                                {(() => {
+                                  const game = games.find(g => g.id === selectedGameId);
+                                  if (!game || !gameTypeHasTeamSummary(game.game_type) || !team.end_time) return null;
+                                  return (
+                                    <button
+                                      onClick={() => setSummaryDeviceTarget({ game, teamId: team.id })}
+                                      className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-indigo-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
+                                      title={t('launched:showSummaryOnDevice')}
+                                    >
+                                      <MonitorPlay size={14} />
+                                    </button>
+                                  );
+                                })()}
                                 <button
                                   onClick={() => handleRemoveTeam(team)}
-                                  className="px-3 py-2 bg-slate-700 hover:bg-red-600 text-slate-300 hover:text-white rounded text-sm font-medium flex items-center"
-                                  title="Remove team"
+                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-red-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
+                                  title={t('launched:removeTeamTitle')}
                                 >
                                   <Trash2 size={14} />
                                 </button>
                               </div>
                             </>
-                          )}
                           </div>
                           )}
                         </div>
@@ -1634,20 +2201,20 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                       {addTeamState === null ? (
                         <button
                           onClick={openAddTeam}
-                          className="w-full flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-slate-600 hover:border-teal-500 text-slate-400 hover:text-teal-400 rounded-lg text-sm transition"
+                          className="w-full flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-[var(--pg-line-strong)] hover:border-teal-500 text-[var(--pg-text-dim)] hover:text-teal-400 rounded-lg text-sm transition"
                         >
                           <PlusCircle size={15} />
-                          Add Team
+                          {t('launched:addTeam')}
                         </button>
                       ) : (
-                        <div className="p-3 bg-slate-800 border border-slate-600 rounded-lg space-y-2">
-                          <div className="text-xs text-slate-400 font-medium uppercase tracking-wide mb-1">New Team</div>
+                        <div className="p-3 bg-[var(--pg-surface-2)] border border-[var(--pg-line-strong)] rounded-lg space-y-2">
+                          <div className="text-xs text-[var(--pg-text-dim)] font-medium uppercase tracking-wide mb-1">{t('launched:newTeam')}</div>
                           <input
                             type="text"
-                            placeholder="Team name"
+                            placeholder={t('launched:teamNamePlaceholder')}
                             value={addTeamState.name}
                             onChange={e => setAddTeamState({ ...addTeamState, name: e.target.value })}
-                            className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
+                            className="pg-input !py-1.5"
                           />
                           <select
                             value={addTeamState.chipId ?? ''}
@@ -1656,14 +2223,14 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                               const chip = allChips.find(c => c.id === id);
                               setAddTeamState({ ...addTeamState, chipId: id, name: chip ? chip.key_name : addTeamState.name });
                             }}
-                            className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
+                            className="pg-select !py-1.5"
                           >
-                            <option value="">Select chip...</option>
+                            <option value="">{t('launched:selectChip')}</option>
                             {allChips
                               .filter(c => !getUsedChipIds().has(c.id))
                               .map(c => (
                                 <option key={c.id} value={c.id}>
-                                  #{c.key_number} — {c.key_name} (ID: {c.id})
+                                  {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
                                 </option>
                               ))}
                           </select>
@@ -1671,12 +2238,12 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                             <select
                               value={addTeamState.route ?? tracksDefaultRoute}
                               onChange={e => setAddTeamState({ ...addTeamState, route: e.target.value })}
-                              className="w-full px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
-                              title="Route for this team (hand them the matching map)"
+                              className="pg-select !py-1.5"
+                              title={t('launched:routeSelectTitle')}
                             >
                               {tracksRouteOptions.map(r => (
                                 <option key={r} value={r}>
-                                  {TRACKS_ROUTE_LABELS[r] ?? r}
+                                  {t(`launched:trackRoute_${r}`, { defaultValue: TRACKS_ROUTE_LABELS[r] ?? r })}
                                 </option>
                               ))}
                             </select>
@@ -1686,8 +2253,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                               <select
                                 value={addTeamState.language ?? nameDrawLang}
                                 onChange={e => setAddTeamState({ ...addTeamState, language: e.target.value })}
-                                className="flex-1 min-w-0 px-2.5 py-1.5 bg-slate-700 border border-slate-600 rounded text-white text-sm focus:outline-none focus:ring-1 focus:ring-teal-500"
-                                title="Display language for this team"
+                                className="pg-select flex-1 min-w-0 !py-1.5"
+                                title={t('launched:languageSelectTitle')}
                               >
                                 {selectedGameLanguages.map(l => (
                                   <option key={l} value={l}>
@@ -1705,7 +2272,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                               className="flex-1 px-3 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
                             >
                               <Save size={13} />
-                              {savingTeam ? 'Saving...' : 'Save Team'}
+                              {savingTeam ? t('launched:saving') : t('launched:saveTeam')}
                             </button>
                             <button
                               onClick={() => {
@@ -1713,15 +2280,15 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                 if (name) setAddTeamState(s => (s ? { ...s, name } : s));
                               }}
                               disabled={namePoolNames.length === 0}
-                              className="px-3 py-1.5 bg-slate-700 hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-slate-700 text-white rounded text-sm flex items-center gap-1.5"
-                              title={namePoolNames.length === 0 ? 'No pooled names for this scenario' : 'Random name'}
+                              className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-sm flex items-center gap-1.5"
+                              title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
                             >
                               <Dices size={13} />
-                              Random name
+                              {t('launched:randomName')}
                             </button>
                             <button
                               onClick={() => setAddTeamState(null)}
-                              className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded text-sm"
+                              className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-sm"
                             >
                               <X size={13} />
                             </button>
@@ -1734,8 +2301,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
               </div>
             ) : (
               <div className="sticky top-24">
-                <div className="bg-slate-800/50 border-2 border-slate-700 rounded-lg p-6 text-center">
-                  <p className="text-slate-400">Select a game to view its teams</p>
+                <div className="bg-[var(--pg-surface)] border-2 border-[var(--pg-line)] rounded-lg p-6 text-center">
+                  <p className="text-[var(--pg-text-dim)]">{t('launched:selectGamePrompt')}</p>
                 </div>
               </div>
             )}
@@ -1748,7 +2315,16 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           launchedGameId={showDevices}
           gameLanguage="fr"
           isMother={true}
+          showVideoControls={false}
           onClose={() => setShowDevices(null)}
+        />
+      )}
+
+      {showVideo !== null && (
+        <GameVideoModal
+          launchedGameId={showVideo}
+          gameLanguage="fr"
+          onClose={() => setShowVideo(null)}
         />
       )}
 
@@ -1760,125 +2336,73 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         />
       )}
 
-      {showRankings !== null && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowRankings(null)}>
-          <div className="bg-slate-800 border-2 border-slate-700 rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-2xl font-bold text-white flex items-center gap-2">
-                <Trophy size={24} className="text-yellow-500" />
-                Game Rankings
-              </h3>
-              <div className="flex items-center gap-2">
-                {rankingsConfig && (
-                  <button
-                    onClick={() => {
-                      setRankingPageGame({ launchedGameId: showRankings!, gameName: rankingsGameName, config: rankingsConfig });
-                      setShowRankings(null);
-                    }}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium rounded-lg transition"
-                    title="Open full ranking page"
-                  >
-                    <ExternalLink size={14} />
-                    Full Page
-                  </button>
-                )}
-                <button
-                  onClick={() => setShowRankings(null)}
-                  className="text-slate-400 hover:text-white transition"
-                  title="Close"
-                >
-                  ✕
-                </button>
-              </div>
-            </div>
+      {rankingOptions && (
+        <RankingOptionsModal
+          launchedGameId={rankingOptions.launchedGameId}
+          gameName={rankingOptions.gameName}
+          config={rankingOptions.config}
+          scenarioUniqid={rankingOptions.scenarioUniqid}
+          scenarioTitle={rankingOptions.scenarioTitle}
+          onClose={() => setRankingOptions(null)}
+          onAction={handleRankingAction}
+        />
+      )}
 
-            {rankings.length === 0 ? (
-              <p className="text-slate-400 text-center py-8">No teams in this game yet.</p>
-            ) : (
-              <div className="space-y-3">
-                {rankings.map((team, index) => (
-                  <div
-                    key={team.id}
-                    className={`p-4 rounded-lg border-2 ${
-                      index === 0
-                        ? 'bg-yellow-900/20 border-yellow-600'
-                        : index === 1
-                        ? 'bg-slate-700/50 border-slate-500'
-                        : index === 2
-                        ? 'bg-orange-900/20 border-orange-600'
-                        : 'bg-slate-800 border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-4">
-                        <div className={`text-2xl font-bold ${
-                          index === 0
-                            ? 'text-yellow-500'
-                            : index === 1
-                            ? 'text-slate-300'
-                            : index === 2
-                            ? 'text-orange-500'
-                            : 'text-slate-400'
-                        }`}>
-                          #{index + 1}
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            {team.end_time ? (
-                              <CheckCircle size={16} className="text-green-500" />
-                            ) : team.start_time ? (
-                              <Play size={16} className="text-blue-500" />
-                            ) : (
-                              <Clock size={16} className="text-slate-500" />
-                            )}
-                            <span className="text-white font-semibold text-lg">
-                              Team {team.team_number}: {team.team_name}
-                            </span>
-                          </div>
-                          {selectedGamePlayMode !== 'team' && (
-                            <p className="text-sm text-slate-400">Chip #{team.key_id}</p>
-                          )}
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className="text-2xl font-bold text-white">{team.score}</div>
-                        <div className="text-xs text-slate-400">points</div>
-                        {team.currentLevel && (
-                          <div className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
-                            {team.currentLevel.name}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                    {(team.start_time || team.end_time) && (
-                      <div className="mt-3 pt-3 border-t border-slate-700 text-sm text-slate-400 flex gap-4">
-                        {team.start_time && (
-                          <div>Start: <span className="text-white">{formatTime(team.start_time)}</span></div>
-                        )}
-                        {team.end_time && (
-                          <div>End: <span className="text-white">{formatTime(team.end_time)}</span></div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+      {rankingDeviceTarget && (
+        <RankingDevicePicker
+          target={rankingDeviceTarget}
+          onClose={() => setRankingDeviceTarget(null)}
+          onSent={() => setRankingDeviceTarget(null)}
+        />
+      )}
+
+      {printTarget && (
+        <PrePrintModal
+          subject={printTarget.subject}
+          onCancel={() => setPrintTarget(null)}
+          onConfirm={(prefs) => {
+            const target = printTarget;
+            setPrintTarget(null);
+            void runPrint(target.game, target.teamId, prefs);
+          }}
+        />
+      )}
+
+      {summaryDeviceTarget && (
+        <DevicePicker
+          title={t('launched:summaryDevicePickTitle')}
+          hint={t('launched:summaryDevicePickHint')}
+          sendLabel={t('launched:summaryDeviceSend')}
+          emptyLabel={t('launched:rankDeviceNone')}
+          onSend={async (ids) => {
+            const { game, teamId } = summaryDeviceTarget;
+            const snapshot = await buildTeamSummarySnapshot(game, teamId);
+            if (!snapshot) return;
+            await queueShowTeamSummaryBulk(ids, encodeTeamSummarySnapshot(snapshot));
+          }}
+          onClose={() => setSummaryDeviceTarget(null)}
+          onSent={() => setSummaryDeviceTarget(null)}
+        />
       )}
 
       {configGameId !== null && (
         <LaunchedGameConfigModal
           gameId={configGameId}
           gameName={configGameName}
+          gameType={configGameType}
+          gameUniqid={configGameUniqid}
           onClose={() => {
             setConfigGameId(null);
             setConfigGameName('');
+            setConfigGameType('');
+            setConfigGameUniqid('');
           }}
           onSave={() => {
             loadGames();
+            // Propagate the edit to every device currently in this game so their
+            // running game page re-derives config live (this list is on the
+            // mother; the players are satellites).
+            void broadcastConfigReload(configGameId);
           }}
         />
       )}
@@ -1920,6 +2444,24 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         />
       )}
 
+      {clashClan && selectedGameId !== null && (
+        <ClashClanDetailsModal
+          clanTeam={clashClan}
+          launchedGameId={selectedGameId}
+          onClose={() => setClashClan(null)}
+          onChanged={() => { if (selectedGameId !== null) loadTeams(selectedGameId); }}
+        />
+      )}
+
+      {addTimeGame && (
+        <AddTimeModal
+          gameId={addTimeGame.id}
+          gameName={addTimeGame.name}
+          onClose={() => setAddTimeGame(null)}
+          onAdded={() => loadGames()}
+        />
+      )}
+
       <ConfirmDialog
         isOpen={confirmDialog.isOpen}
         onConfirm={confirmDialog.onConfirm}
@@ -1928,6 +2470,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         message={confirmDialog.message}
         variant={confirmDialog.variant}
         confirmText={confirmDialog.confirmText}
+        overlayZIndex={140}
       />
 
       {rankingPageGame && (
@@ -1935,6 +2478,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           launchedGameId={rankingPageGame.launchedGameId}
           config={rankingPageGame.config}
           gameName={rankingPageGame.gameName}
+          autoScroll={rankingPageGame.autoScroll}
           onBack={() => setRankingPageGame(null)}
         />
       )}
@@ -1970,55 +2514,71 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
 
       {showArchived && (
         <div
-          className="fixed inset-0 bg-black/70 flex items-center justify-center z-[130] p-4"
+          className="pg-overlay z-[130]"
           onClick={() => setShowArchived(false)}
         >
           <div
-            className="bg-slate-800 border-2 border-slate-700 rounded-lg w-full max-w-4xl max-h-[85vh] flex flex-col"
+            className="pg-modal max-w-4xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between p-6 border-b border-slate-700">
-              <h3 className="text-xl font-bold text-white flex items-center gap-2">
+            <div className="pg-modal-head">
+              <h3 className="pg-modal-title flex items-center gap-2">
                 <Archive size={20} className="text-indigo-300" />
-                Archived Games
+                {t('launched:archivedGames')}
               </h3>
-              <button onClick={() => setShowArchived(false)} className="text-slate-400 hover:text-white transition">
-                <X size={20} />
-              </button>
+              <div className="flex items-center gap-2">
+                {(() => {
+                  const eligibleCount = games.filter((g) => g.ended && !g.is_test).length;
+                  return (
+                    <button
+                      onClick={handleArchiveAllEnded}
+                      disabled={eligibleCount === 0}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 transition"
+                      title={t('launched:archiveAllTitle')}
+                    >
+                      <Archive size={16} />
+                      {t('launched:archiveAll', { count: eligibleCount })}
+                    </button>
+                  );
+                })()}
+                <button onClick={() => setShowArchived(false)} className="pg-modal-close">
+                  <X size={20} />
+                </button>
+              </div>
             </div>
-            <div className="p-6 overflow-y-auto">
+            <div className="pg-modal-body">
               {archivedLoading ? (
-                <p className="text-slate-400 text-center py-8">Loading…</p>
+                <p className="text-[var(--pg-text-dim)] text-center py-8">{t('launched:loadingShort')}</p>
               ) : archivedSummaries.length === 0 ? (
-                <p className="text-slate-400 text-center py-8">No archived games yet.</p>
+                <p className="text-[var(--pg-text-dim)] text-center py-8">{t('launched:noArchivedGames')}</p>
               ) : (
-                <table className="w-full text-sm">
+                <table className="pg-table">
                   <thead>
-                    <tr className="text-left text-slate-400 border-b border-slate-700">
-                      <th className="py-2 pr-3">Date</th>
-                      <th className="py-2 pr-3">Name</th>
-                      <th className="py-2 pr-3">Type</th>
-                      <th className="py-2 pr-3">Scenario</th>
-                      <th className="py-2 pr-3 text-right">Teams</th>
-                      <th className="py-2 pr-3 text-right">Players</th>
-                      <th className="py-2 text-center">Synced</th>
+                    <tr>
+                      <th>{t('launched:colDate')}</th>
+                      <th>{t('launched:colName')}</th>
+                      <th>{t('launched:colType')}</th>
+                      <th>{t('launched:colScenario')}</th>
+                      <th className="!text-right">{t('launched:colTeams')}</th>
+                      <th className="!text-right">{t('launched:colPlayers')}</th>
+                      <th className="!text-center">{t('launched:colSynced')}</th>
                     </tr>
                   </thead>
                   <tbody>
                     {archivedSummaries.map((s) => (
-                      <tr key={s.summary_uuid} className="border-b border-slate-700/50 text-slate-200">
-                        <td className="py-2 pr-3 whitespace-nowrap">{s.played_at ? formatDate(s.played_at) : '—'}</td>
-                        <td className="py-2 pr-3">{s.name || '—'}</td>
-                        <td className="py-2 pr-3 capitalize">{s.game_type}</td>
-                        <td className="py-2 pr-3">{gameDataMap[s.scenario_uniqid ?? '']?.game?.title ?? s.scenario_uniqid ?? '—'}</td>
-                        <td className="py-2 pr-3 text-right">
+                      <tr key={s.summary_uuid} className="text-[var(--pg-text-muted)]">
+                        <td className="whitespace-nowrap">{s.played_at ? formatDate(s.played_at) : '-'}</td>
+                        <td>{s.name || '-'}</td>
+                        <td className="capitalize">{s.game_type}</td>
+                        <td>{gameDataMap[s.scenario_uniqid ?? '']?.game?.title ?? s.scenario_uniqid ?? '-'}</td>
+                        <td className="text-right">
                           {s.teams_played}
                           {s.teams_launched != null && s.teams_launched !== s.teams_played && (
-                            <span className="text-slate-500"> / {s.teams_launched}</span>
+                            <span className="text-[var(--pg-text-dim)]"> / {s.teams_launched}</span>
                           )}
                         </td>
-                        <td className="py-2 pr-3 text-right">{s.players_played}</td>
-                        <td className="py-2 text-center">
+                        <td className="text-right">{s.players_played}</td>
+                        <td className="text-center">
                           {s.pushed ? (
                             <CheckCircle size={16} className="inline text-green-400" />
                           ) : (
@@ -2033,6 +2593,18 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
             </div>
           </div>
         </div>
+      )}
+
+      {lockGate && (
+        <GameLockGate
+          reason={lockGate.reason}
+          onReprieve={() => {
+            const run = lockGate.run;
+            setLockGate(null);
+            run();
+          }}
+          onClose={() => setLockGate(null)}
+        />
       )}
     </div>
   );

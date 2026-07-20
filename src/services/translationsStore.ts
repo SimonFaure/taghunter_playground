@@ -6,7 +6,15 @@ import { getDb } from './db';
  * for keys no longer present (admin deleted) without affecting unrelated
  * tables.
  */
-export const KNOWN_TRANSLATION_KEYS = ['tagquest_translations'] as const;
+export const KNOWN_TRANSLATION_KEYS = [
+  // Legacy key for the tagquest HUD labels - the playground absorbs it into the
+  // `ingame_tagquest` namespace (see i18n/ingame.ts LEGACY_STORE_KEYS).
+  'tagquest_translations',
+  // Per-namespace in-game text blobs published by the studio manifest.
+  'ingame_common',
+  'ingame_mystery',
+  'ingame_tracks',
+] as const;
 export type TranslationKey = (typeof KNOWN_TRANSLATION_KEYS)[number];
 
 export interface TranslationRow {

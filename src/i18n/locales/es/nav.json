@@ -1,0 +1,14 @@
+{
+  "scenarios": "Escenarios",
+  "launchedGames": "Partidas lanzadas",
+  "cardsPatterns": "Tarjetas y patrones",
+  "settings": "Ajustes",
+  "help": "Ayuda",
+  "database": "Base de datos",
+  "adminConfig": "Config. de admin",
+  "exitAdmin": "Salir de admin",
+  "logoScreen": "Pantalla de logo",
+  "lock": "Bloquear",
+  "testChannelBadge": "TEST",
+  "testChannelHint": "Este dispositivo es un probador: descarga las actualizaciones desde el canal de prueba."
+}

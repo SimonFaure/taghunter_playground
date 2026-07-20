@@ -1,0 +1,56 @@
+{
+  "stepOf": "Étape {{current}} sur {{total}}",
+  "back": "Retour",
+  "continue": "Continuer",
+  "finish": "Terminer la configuration",
+  "lang": {
+    "title": "Choisissez votre langue",
+    "subtitle": "Ceci définit la langue de l’application. Vous pourrez la modifier plus tard dans les Réglages."
+  },
+  "internet": {
+    "title": "Connectez-vous à Internet",
+    "subtitle": "Cet appareil doit joindre Tag Hunter pour vous connecter.",
+    "checking": "Vérification de la connexion…",
+    "offline": "Impossible de joindre Tag Hunter. Connectez cet ordinateur à Internet, puis réessayez.",
+    "retry": "Réessayer"
+  },
+  "name": {
+    "title": "Nommez cet appareil",
+    "subtitle": "Un nom clair permet de reconnaître facilement cette machine sur votre compte et auprès du support.",
+    "label": "Nom de l’appareil",
+    "placeholder": "ex. PC de l’accueil"
+  },
+  "hotspot": {
+    "title": "Point d’accès Wi-Fi par défaut ?",
+    "subtitle": "Utiliser cet ordinateur comme point d’accès Wi-Fi par défaut auquel vos autres appareils se connecteront automatiquement.",
+    "yes": "Oui, utiliser cet ordinateur comme point d’accès",
+    "no": "Non",
+    "note": "Le point d’accès s’activera au prochain démarrage de l’application - votre connexion Internet reste active pour le reste de la configuration.",
+    "conflictTitle": "Un point d’accès par défaut existe déjà",
+    "conflictBody": "Votre compte possède déjà un point d’accès par défaut ({{names}}). Ajouter cet ordinateur comme point d’accès par défaut supplémentaire ?",
+    "conflictConfirm": "Ajouter comme point d’accès supplémentaire",
+    "conflictCancel": "Ne pas l’ajouter"
+  },
+  "mother": {
+    "title": "Serveur de jeu par défaut ?",
+    "subtitle": "Utiliser cet ordinateur comme serveur de jeu par défaut (la « mère ») qui fait tourner vos jeux sur le réseau local.",
+    "yes": "Oui, utiliser cet ordinateur comme serveur de jeu",
+    "no": "Non"
+  },
+  "operatorOnly": {
+    "title": "Appareil opérateur uniquement ?",
+    "subtitle": "Utiliser cet ordinateur seulement pour gérer et lancer les jeux, jamais pour y jouer.",
+    "yes": "Oui, c'est un appareil opérateur uniquement",
+    "no": "Non, on jouera aussi sur cet appareil",
+    "explainer": "Activez ceci lorsque cet ordinateur ne servira jamais à jouer - uniquement à préparer et lancer des jeux pour d'autres appareils. Il ne télécharge alors que les données et l'image de couverture de chaque jeu (pas tous les médias ni les vidéos tutoriels), ce qui économise de l'espace disque, et n'a besoin ni de lecteur de puces ni de son pilote."
+  },
+  "appearance": {
+    "title": "Choisissez une apparence",
+    "subtitle": "Choisissez l’aspect de l’application. Vous pourrez le modifier plus tard dans les Réglages.",
+    "red": "Rouge tactique",
+    "blue": "Bleu tactique",
+    "redLight": "Rouge clair",
+    "blueLight": "Bleu clair"
+  },
+  "syncingNote": "La synchronisation avec le serveur se terminera sous peu."
+}

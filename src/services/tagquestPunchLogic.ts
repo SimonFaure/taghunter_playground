@@ -9,6 +9,13 @@ import {
   updateTeam,
 } from './launchedGames';
 import { CardData } from './sportidentService';
+import {
+  computeCombos,
+  effectifWeights,
+  isWeightingEnabled,
+  teamHeadcounts,
+  weightedScore,
+} from './tagquestScoring';
 import type { Team } from '../components/LaunchGameModal';
 
 interface GameQuest {
@@ -25,6 +32,8 @@ interface GameQuest {
 
 interface GameMeta {
   late_malus_points?: string | number;
+  // Legacy scenario key for the same value (see launchResolve.ts).
+  default_time_malus?: string | number;
   default_time?: string | number;
   levels?: Record<string, { points: string | null; name: string | null; description: string }>;
   combo_6_quests?: string | number;
@@ -92,7 +101,7 @@ interface PunchResult {
   best_partial_quest: { index: number; name: string; matched: number } | null;
   end_station_reached: boolean;
   game_ended: boolean;
-  status: 'ok' | 'chip_not_recognized' | 'team_already_finished' | 'cheat_detected' | 'error';
+  status: 'ok' | 'chip_not_recognized' | 'card_empty' | 'team_already_finished' | 'cheat_detected' | 'no_station_match' | 'no_fresh_punches' | 'error';
   message?: string;
   animationData?: PunchAnimationData;
 }
@@ -118,34 +127,6 @@ function getComboPoints(gdj: GameDataJson): { pts6: number; pts4: number; pts2: 
   };
 }
 
-function computeCombos(questCompletions: Map<string, number>): { combos6: number; combos4: number; combos2: number } {
-  const counts = new Map(questCompletions);
-
-  let combos6 = 0;
-  while ([...counts.values()].every(v => v > 0) && counts.size >= 6) {
-    combos6++;
-    for (const key of counts.keys()) counts.set(key, counts.get(key)! - 1);
-  }
-
-  let combos4 = 0;
-  while (true) {
-    const nonZero = [...counts.entries()].filter(([, v]) => v > 0);
-    if (nonZero.length < 4) break;
-    combos4++;
-    for (const [key] of nonZero.slice(0, 4)) counts.set(key, counts.get(key)! - 1);
-  }
-
-  let combos2 = 0;
-  while (true) {
-    const nonZero = [...counts.entries()].filter(([, v]) => v > 0);
-    if (nonZero.length < 2) break;
-    combos2++;
-    for (const [key] of nonZero.slice(0, 2)) counts.set(key, counts.get(key)! - 1);
-  }
-
-  return { combos6, combos4, combos2 };
-}
-
 function toMs(time: number | string): number {
   const n = typeof time === 'string' ? parseFloat(time) : time;
   if (n > 1e10) return n;
@@ -168,7 +149,7 @@ function localSecondsOfDay(ms: number): number {
   return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
 }
 
-// A punch is "pre-start" (stale — e.g. an un-wiped card still carrying a
+// A punch is "pre-start" (stale - e.g. an un-wiped card still carrying a
 // previous game's marks) when it happened comfortably before the game began.
 // The grace window absorbs SI base-station clock skew so we never drop a
 // legitimate punch over a couple of minutes of drift; the 12h ceiling avoids
@@ -186,7 +167,7 @@ function isPreStartPunch(time: string, refStartMs: number | null): boolean {
 }
 
 // Collapse double-bips: drop a punch at the same station within `windowMs` of a
-// kept one. Ordered and compared on real time-of-day seconds — a previous
+// kept one. Ordered and compared on real time-of-day seconds - a previous
 // version parsed "HH:MM:SS" with parseFloat (reading only the hour), which
 // silently merged every same-station punch within the same hour and so blocked
 // legitimate score-mode re-punches.
@@ -233,7 +214,7 @@ async function loadPatternItemsFromFile(
     // Route through patternStore.getRouting so the studio's nested
     // `[{index, assignments:{image_1:station,...}}]` pattern shape is flattened
     // into the `{item_index, assignment_type, station_key_number}` rows this
-    // scorer filters on — the same adapter Mystery (getMysteryEnigmas) and
+    // scorer filters on - the same adapter Mystery (getMysteryEnigmas) and
     // Tracks (getTracksCheckpointStations) use. Reading getData() raw here cast
     // the nested objects straight to PatternItem[], leaving every item_index /
     // station_key_number undefined, so no quest ever matched a punch and the
@@ -277,7 +258,12 @@ export async function processTagQuestPunch(
   // in score mode a quest only re-completes when its stations are genuinely
   // re-punched (new times). Owned by the game page (see TagQuestGamePage) so it
   // persists across reads of the same game; it resets if the kiosk reloads.
-  consumedByTeam: Map<number, Set<string>> = new Map()
+  consumedByTeam: Map<number, Set<string>> = new Map(),
+  // Self-register (team mode): chip_id → team_id bindings from lg_clash_members
+  // (Clash-style). Resolves a bipped chip to the team it joined at registration,
+  // since self-register teams have no leader key_id and no teamsConfig roster.
+  // Empty for predetermined rosters and solo self-register.
+  memberTeamByChip: Map<number, number> = new Map(),
 ): Promise<PunchResult> {
   const errorResult = (message: string): PunchResult => ({
     team_name: '',
@@ -309,6 +295,14 @@ export async function processTagQuestPunch(
 
     if (directTeam) {
       resolvedTeamId = directTeam.id;
+    } else if (memberTeamByChip.has(card.id)) {
+      // Self-register (team mode): the chip was bound to a team at registration.
+      const boundTeamId = memberTeamByChip.get(card.id)!;
+      const boundTeam = teamsInGame.find((tm) => tm.id === boundTeamId) ?? null;
+      if (boundTeam) {
+        resolvedTeamId = boundTeam.id;
+        teammateChipId = card.id;
+      }
     } else if (playMode === 'team') {
       for (const t of teamsConfig) {
         const match = t.teammates?.find((mate) => mate.chipId === card.id);
@@ -323,7 +317,37 @@ export async function processTagQuestPunch(
       }
     }
 
-    if (resolvedTeamId === null) {
+    // Resolve the team record up-front (may be null for an unknown chip) so the
+    // checks below can attribute messages to a team when one is known.
+    const team = resolvedTeamId !== null
+      ? teamsInGame.find((t) => t.id === resolvedTeamId) ?? null
+      : null;
+    const teamName = team?.team_name ?? '';
+
+    // Card empty takes priority: an empty card (erased/blank, no punches) on bip
+    // must always surface the "card empty" message - even when the chip isn't
+    // tied to a team - so the player is told to go punch some stations.
+    if (card.punches.length === 0) {
+      console.log('[TagQuest] Card empty for chip:', card.id, 'team:', teamName || '(none)');
+      return {
+        team_name: teamName,
+        team_id: team?.id ?? 0,
+        teammate_chip_id: teammateChipId,
+        completed_quest: null,
+        points_earned: 0,
+        combo_bonus: 0,
+        malus_applied: 0,
+        new_total_score: team?.score ?? 0,
+        level_up: null,
+        best_partial_quest: null,
+        end_station_reached: false,
+        game_ended: false,
+        status: 'card_empty',
+        message: `Card ${card.id} is empty (no punches)`,
+      };
+    }
+
+    if (resolvedTeamId === null || !team) {
       console.log('[TagQuest] Chip not recognized:', card.id);
       return {
         team_name: '',
@@ -342,11 +366,6 @@ export async function processTagQuestPunch(
         message: `Chip ${card.id} not recognized in game ${launchedGameId}`,
       };
     }
-
-    const team = teamsInGame.find((t) => t.id === resolvedTeamId) ?? null;
-    if (!team) return errorResult('Team record not found');
-
-    const teamName = team.team_name ?? '';
 
     // Step 2: Check if team already finished
     if (team.end_time) {
@@ -419,20 +438,36 @@ export async function processTagQuestPunch(
     const victoryType = (metaMap.victoryType || 'speed').toLowerCase();
     const isScoreMode = victoryType === 'score';
 
+    // Effectif weighting (launch option, score+team mode only): this team's
+    // earned points get multiplied by largest-headcount ÷ own-headcount so
+    // uneven team sizes compete fairly. Headcount is the LIVE chip count -
+    // self-register bindings when present, else the pre-built roster - so a
+    // mid-game join re-scales the team's points on its next punch. The late
+    // malus stays unweighted. See tagquestScoring.ts for the full contract.
+    let weight = 1;
+    if (isWeightingEnabled(metaMap)) {
+      const membersByTeam = new Map<number, number>();
+      for (const tid of memberTeamByChip.values()) {
+        membersByTeam.set(tid, (membersByTeam.get(tid) ?? 0) + 1);
+      }
+      const headcounts = teamHeadcounts(teamsInGame, teamsConfig, membersByTeam);
+      weight = effectifWeights(headcounts).get(team.id) ?? 1;
+    }
+
     // Step 6: Load already-scored quests for this team
     // quest_number stores the 1-based item_index (= array index + 1)
     const completedQuests = await listCompletedQuests(launchedGameId, team.id);
     const completedQuestNumbers = new Set(completedQuests.map((r) => Number(r.quest_number)));
 
-    // Step 7: Build the working set — every card punch MINUS the ones we must
+    // Step 7: Build the working set - every card punch MINUS the ones we must
     // not count. Two anti-cheat filters, both keyed on a punch's stable
     // "code@time" identity (a re-read returns the same time; a fresh physical
     // punch gets a new one):
-    //   (a) consumed — punches already used to complete a quest this game. This
+    //   (a) consumed - punches already used to complete a quest this game. This
     //       replaces the old speed-only "strip completed quests by station"
     //       pass and works in score mode too, so re-presenting a card never
     //       re-scores, and a quest only re-completes on genuinely new punches.
-    //   (b) pre-start — punches left on an un-wiped card from a previous game,
+    //   (b) pre-start - punches left on an un-wiped card from a previous game,
     //       detected by time-of-day vs the team's/game's start.
     const teamConsumed = consumedByTeam.get(team.id) ?? new Set<string>();
     consumedByTeam.set(team.id, teamConsumed);
@@ -445,11 +480,58 @@ export async function processTagQuestPunch(
         ? new Date(state.start_time).getTime()
         : null;
 
+    let consumedCount = 0;
+    let preStartCount = 0;
     let workingPunches = card.punches.filter((p) => {
-      if (teamConsumed.has(punchId(p))) return false;
-      if (isPreStartPunch(p.time, refStartMs)) return false;
+      if (teamConsumed.has(punchId(p))) { consumedCount++; return false; }
+      if (isPreStartPunch(p.time, refStartMs)) { preStartCount++; return false; }
       return true;
     });
+
+    // Every punch on the card was filtered out (consumed by an earlier quest
+    // or pre-start/stale) - nothing left to score. Without this guard the read
+    // fell through to a silent no-op "ok" (no quest, no partial, unchanged
+    // score), which the operator sees as "the bip did nothing". Most often the
+    // card wasn't cleared before the game, or a field station's clock is more
+    // than PRE_START_GRACE_SEC behind the kiosk (unset clock / winter time),
+    // which makes genuinely fresh punches look pre-start. Skipped on a finish
+    // bip (card.end) so the end-station flow below still runs.
+    if (workingPunches.length === 0 && card.end == null) {
+      const startSec = refStartMs != null ? localSecondsOfDay(refStartMs) : null;
+      console.warn('[TagQuest] Every punch on the card was filtered out:', JSON.stringify({
+        chip: card.id,
+        team: teamName,
+        gameStartLocalTimeOfDaySec: startSec,
+        preStartGraceSec: PRE_START_GRACE_SEC,
+        punches: card.punches.map((p) => ({
+          code: p.code,
+          time: p.time,
+          consumed: teamConsumed.has(punchId(p)),
+          // Positive = this many minutes before the game start (per the
+          // punch's own station clock). Large values with fresh punches ⇒
+          // that station's clock is behind the kiosk.
+          minutesBeforeStart: startSec != null && punchSecondsOfDay(p.time) != null
+            ? Math.round((startSec - punchSecondsOfDay(p.time)!) / 60)
+            : null,
+        })),
+      }));
+      return {
+        team_name: teamName,
+        team_id: team.id,
+        teammate_chip_id: teammateChipId,
+        completed_quest: null,
+        points_earned: 0,
+        combo_bonus: 0,
+        malus_applied: 0,
+        new_total_score: team.score,
+        level_up: null,
+        best_partial_quest: null,
+        end_station_reached: false,
+        game_ended: false,
+        status: 'no_fresh_punches',
+        message: `All ${card.punches.length} punch(es) on chip ${card.id} were filtered out (${consumedCount} already consumed, ${preStartCount} pre-start) - card not cleared, or a station clock is behind the kiosk`,
+      };
+    }
 
     // Step 8: Deduplicate punches (collapse same-station double-bips)
     workingPunches = deduplicatePunches(workingPunches);
@@ -487,6 +569,55 @@ export async function processTagQuestPunch(
       qp => qp.matchedSlots === qp.totalSlots && qp.totalSlots > 0
     );
 
+    // Diagnostic guard: fresh punches exist but NOT ONE matches any quest's
+    // stations - the pattern routing is missing/empty, the game data has no
+    // quests, or the pattern's station codes don't line up with the physical
+    // stations. Without this the read "succeeds" invisibly (no quest, no
+    // partial, a no-op animation), which the operator reads as "nothing
+    // happened". Surface it as a visible warning + a console dump of the two
+    // code sets so the mismatch is obvious. Skipped on a finish bip (card.end)
+    // so the end-station flow below still runs.
+    if (workingPunches.length > 0 && card.end == null) {
+      const totalMatchedSlots = [...questProgress.values()].reduce((s, qp) => s + qp.matchedSlots, 0);
+      const nothingMatches =
+        patternItems.length === 0 ||
+        quests.length === 0 ||
+        (questProgress.size > 0 && totalMatchedSlots === 0);
+      if (nothingMatches) {
+        const expectedStations = [...new Set(patternItems.map((pi) => pi.station_key_number))].sort((a, b) => a - b);
+        const punchedCodes = [...workingCodes];
+        console.warn('[TagQuest] No punched station matches the pattern:', JSON.stringify({
+          pattern: patternUniqid || '(none)',
+          patternItemCount: patternItems.length,
+          questCount: quests.length,
+          expectedStations,
+          punchedCodes,
+        }));
+        const message =
+          patternItems.length === 0
+            ? `Modèle de postes introuvable ou vide (pattern : ${patternUniqid || '-'})`
+            : quests.length === 0
+              ? 'Aucune quête dans les données du scénario'
+              : `Aucun poste bipé ne correspond au modèle (bipés : ${punchedCodes.join(', ')} / attendus : ${expectedStations.join(', ')})`;
+        return {
+          team_name: teamName,
+          team_id: team.id,
+          teammate_chip_id: teammateChipId,
+          completed_quest: null,
+          points_earned: 0,
+          combo_bonus: 0,
+          malus_applied: 0,
+          new_total_score: team.score,
+          level_up: null,
+          best_partial_quest: null,
+          end_station_reached: false,
+          game_ended: false,
+          status: 'no_station_match',
+          message,
+        };
+      }
+    }
+
     // Step 10: Late malus calculation (using game metadata from `state` above).
     let malusApplied = 0;
     if (state.start_time && lateMalusPoints > 0) {
@@ -520,7 +651,7 @@ export async function processTagQuestPunch(
     // most one quest completion. As each quest is recorded we mark the earliest
     // unused punch at each required station as used (so two quests sharing a
     // station in the same read can't both claim the same punch) and add it to
-    // the team's consumed set so it can never score again — here or later.
+    // the team's consumed set so it can never score again - here or later.
     const consumablePool = workingPunches.map((p) => ({
       code: String(p.code),
       time: p.time,
@@ -595,7 +726,10 @@ export async function processTagQuestPunch(
       beforeCombos.combos4 * pts4 +
       beforeCombos.combos2 * pts2;
     const prevScore = team.score ?? 0;
-    const prevMalus = Math.max(0, prevTotalQuestPoints + prevTotalComboBonus - prevScore);
+    // Invert the score formula to recover the malus already baked into the
+    // stored score (earned × weight − malus = score). Approximate when the
+    // weight changed since the last punch (live headcount) - display-only.
+    const prevMalus = Math.max(0, Math.round((prevTotalQuestPoints + prevTotalComboBonus) * weight) - prevScore);
 
     const comboBonus =
       (afterCombos.combos6 - beforeCombos.combos6) * pts6 +
@@ -607,7 +741,7 @@ export async function processTagQuestPunch(
       return sum + (typeof rawPts === 'string' ? parseInt(rawPts, 10) || 0 : rawPts);
     }, 0) + comboBonus;
 
-    const newScore = Math.max(0, totalQuestPoints + totalComboBonus - malusApplied);
+    const newScore = weightedScore(totalQuestPoints + totalComboBonus, weight, malusApplied);
     const scoreDelta = newScore - prevScore;
 
     // Step 12: Level up check
@@ -620,7 +754,7 @@ export async function processTagQuestPunch(
       }
     }
 
-    // Step 13: End station detection — only end_time if card.end is present
+    // Step 13: End station detection - only end_time if card.end is present
     const endStationReached = card.end != null;
 
     let gameEnded = false;

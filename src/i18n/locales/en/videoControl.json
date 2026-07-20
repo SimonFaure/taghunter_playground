@@ -1,0 +1,13 @@
+{
+  "playVideo": "Play video",
+  "close": "Close",
+  "pickVideoPrefix": "Pick a video to play on",
+  "thisDevice": "this device",
+  "pickVideoSuffix": ". (To send to satellites, use the Devices modal.)",
+  "intro": "Intro",
+  "tutorial": "Tutorial",
+  "introTutorial": "Intro + Tutorial",
+  "stopVideo": "Stop video",
+  "resolving": "Resolving…",
+  "noVideoAvailable": "No {{kinds}} video available for this scenario."
+}

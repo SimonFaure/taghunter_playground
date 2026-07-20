@@ -1,14 +1,14 @@
 /**
- * Curated font catalog — the "wide range of fonts" offered by the Typography
+ * Curated font catalog - the "wide range of fonts" offered by the Typography
  * section picker.
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ THIS FILE IS DUPLICATED VERBATIM IN BOTH PROJECTS — KEEP THEM IN SYNC:    │
+ * │ THIS FILE IS DUPLICATED VERBATIM IN BOTH PROJECTS - KEEP THEM IN SYNC:    │
  * │   studio-taghunter/src/fonts/catalog.ts                                  │
  * │   taghunter_playground/src/fonts/catalog.ts                              │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
- * `system` fonts need no file — they rely on the OS. `bundled` fonts ship as
+ * `system` fonts need no file - they rely on the OS. `bundled` fonts ship as
  * files in each project's `public/fonts/` directory (served at `/fonts/<file>`)
  * so the offline Tauri playground renders them without a network.
  *

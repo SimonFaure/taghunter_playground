@@ -4,7 +4,7 @@
 // Writes go through withRetry (3 attempts, exp backoff) for transient blips;
 // reads do too. Server-of-truth for everything: no local SQLite mirror.
 //
-// Per-client scoping is enforced server-side via the JWT — no need to pass
+// Per-client scoping is enforced server-side via the JWT - no need to pass
 // client_id in any request body. device_id for record_punch / register_device
 // is sourced from the authenticated token on the server, never trusted from
 // the client.
@@ -12,6 +12,7 @@
 import { apiCall } from './api';
 import { withRetry } from './apiRetry';
 import { captureGameSummary, type GameSummaryPayload } from './telemetry';
+import type { ScreenState } from './screenState';
 
 // ---------- types ----------
 
@@ -27,7 +28,7 @@ export interface LaunchedGameRow {
   ended?: number | boolean;
   created_at?: string;
   updated_at?: string;
-  /** True when launched with testMode — excluded from statistics; deletable. */
+  /** True when launched with testMode - excluded from statistics; deletable. */
   is_test?: boolean;
 }
 
@@ -40,6 +41,8 @@ export interface TeamRow {
   key_id: number | null;
   start_time: number | null;
   end_time: number | null;
+  /** Per-team display language (2-letter ISO). null ⇒ use the launch language. */
+  language: string | null;
 }
 
 export interface RawPunchRow {
@@ -86,8 +89,9 @@ export interface CreateLaunchedGameInput {
     team_name?: string | null;
     pattern: number;
     key_id?: number | null;
+    language?: string | null;
   }>;
-  // Optional client-supplied UUID. Required to make retries safe — without it
+  // Optional client-supplied UUID. Required to make retries safe - without it
   // a withRetry-driven second attempt after a slow/5xx first attempt would
   // create a duplicate row. Callers that don't pass one get a fresh UUID per
   // call, which only helps if the entire call (incl. all retries) shares it.
@@ -120,15 +124,22 @@ export async function createLaunchedGame(input: CreateLaunchedGameInput): Promis
   );
 }
 
-export async function listLaunchedGames(filter?: { ended?: boolean }): Promise<LaunchedGameRow[]> {
+export async function listLaunchedGames(
+  filter?: { ended?: boolean; forceLocal?: boolean; mine?: boolean },
+): Promise<LaunchedGameRow[]> {
   const query: Record<string, string> = {};
   if (filter?.ended === true) query.ended = '1';
   if (filter?.ended === false) query.ended = '0';
+  // mine=1 restricts to games this device launched or participates in - used by
+  // the "Cet appareil" section so it never surfaces games merely hosted here for
+  // other satellites (a former-mother's local rows).
+  if (filter?.mine) query.mine = '1';
   const res = await withRetry(() =>
     apiCall<{ games: LaunchedGameRow[] }>('launched_games', 'list', {
       method: 'GET',
       bearer: true,
       query,
+      forceLocal: filter?.forceLocal,
     })
   );
   return res.games;
@@ -168,7 +179,7 @@ export async function updateLaunchedGameMeta(id: number, meta: Record<string, st
 // `update_meta` REPLACES the whole KV map atomically (DELETE-then-insert on the
 // server), so adding or removing a single key means read-merge-write. These two
 // helpers wrap that gotcha once. They are last-writer-wins: only call them from
-// the single kiosk that owns a game's loop — never fan per-team writes across
+// the single kiosk that owns a game's loop - never fan per-team writes across
 // satellites.
 export async function mergeLaunchedGameMeta(
   id: number,
@@ -190,10 +201,10 @@ export async function removeLaunchedGameMetaKeys(id: number, keys: string[]): Pr
   if (changed) await updateLaunchedGameMeta(id, current);
 }
 
-// State endpoint — the 1s poll target. Returns ended flag, current teams, and
+// State endpoint - the 1s poll target. Returns ended flag, current teams, and
 // any raw_data rows newer than `sinceRawId`.
 export async function getLaunchedGameState(id: number, sinceRawId: number): Promise<LaunchedGameStatePayload> {
-  // No retry on the state poll itself — we run it once per second; if it
+  // No retry on the state poll itself - we run it once per second; if it
   // fails the next tick will re-fetch. Wrapping every poll in 21s of retries
   // would back up the queue.
   return apiCall<LaunchedGameStatePayload>('launched_games', 'state', {
@@ -231,7 +242,7 @@ export async function recordPunch(launchedGameId: number, rawData: unknown): Pro
 // Partial-field team update. Pass any subset of fields you want to change.
 export async function updateTeam(
   teamId: number,
-  fields: { score?: number; team_name?: string | null; start_time?: number | null; end_time?: number | null }
+  fields: { score?: number; team_name?: string | null; start_time?: number | null; end_time?: number | null; language?: string | null }
 ): Promise<void> {
   await withRetry(() =>
     apiCall('launched_games', 'update_team', {
@@ -268,6 +279,7 @@ export async function addTeamToLaunchedGame(input: {
   team_name?: string | null;
   pattern?: number;
   key_id?: number | null;
+  language?: string | null;
   // When true and the launch enabled a name pool, the server replaces the
   // provided team_name with a drawn pooled name (server-side for uniqueness).
   // team_name is kept as the fallback if the pool is empty/exhausted.
@@ -284,7 +296,7 @@ export async function addTeamToLaunchedGame(input: {
 
 // Record the game's start timestamp once (idempotent server-side). Pass an
 // ISO-8601 UTC string (e.g. new Date(ms).toISOString()). Returns the effective
-// start_time — the first writer wins, so re-entry never resets the clock.
+// start_time - the first writer wins, so re-entry never resets the clock.
 export async function startLaunchedGame(id: number, startTime: string): Promise<{ start_time: string | null }> {
   return withRetry(() =>
     apiCall<{ start_time: string | null }>('launched_games', 'start_game', {
@@ -304,7 +316,7 @@ export async function endLaunchedGame(id: number): Promise<void> {
     })
   );
   // A just-ended game is eligible for summarising; push it up promptly
-  // (best-effort — the periodic sync is the safety net).
+  // (best-effort - the periodic sync is the safety net).
   void syncGameSummaries();
 }
 
@@ -314,6 +326,18 @@ export async function deleteLaunchedGame(id: number): Promise<void> {
       method: 'POST',
       bearer: true,
       body: { id },
+    })
+  );
+}
+
+// Extend a running game by N minutes (operator "add time"). Bumps the server
+// duration - the source of truth every station's timer reads via the poll.
+export async function addLaunchedGameTime(id: number, minutes: number): Promise<{ duration: number }> {
+  return withRetry(() =>
+    apiCall<{ duration: number }>('launched_games', 'add_time', {
+      method: 'POST',
+      bearer: true,
+      body: { id, minutes },
     })
   );
 }
@@ -429,6 +453,30 @@ export async function getLaunchedGameDevices(id: number): Promise<LaunchedGameDe
   return res.devices;
 }
 
+// paired_devices.id of every device currently participating in an active
+// launched game. A device runs at most ONE game at a time, so these are
+// off-limits when picking devices for a new launch (the launching/host device
+// can still dispatch more games - that's a separate concern from participating).
+// Aggregated client-side across active games; best-effort (a game whose device
+// list fails to load is skipped rather than blocking the launch).
+export async function listBusyDeviceIds(): Promise<Set<number>> {
+  const busy = new Set<number>();
+  try {
+    const games = await listActiveLaunchedGames();
+    const lists = await Promise.all(
+      games.map((g) => getLaunchedGameDevices(g.id).catch(() => [] as LaunchedGameDeviceRow[]))
+    );
+    for (const devices of lists) {
+      for (const d of devices) {
+        if (typeof d.device_id === 'number') busy.add(d.device_id);
+      }
+    }
+  } catch (err) {
+    console.error('[launchedGames] listBusyDeviceIds failed:', err);
+  }
+  return busy;
+}
+
 // ---------- bucketed devices view + push-channel APIs ----------
 
 // One row in the three-bucket Devices modal AND the launch wizard's step 3.
@@ -445,6 +493,11 @@ export interface PairedDeviceStatusRow {
   // Non-null when the device is currently in the launched_game we asked
   // about; null in the launch-wizard's pre-create view.
   lgd_id: number | null;
+  // The peer's self-reported current screen (what it's showing right now), or
+  // null when it hasn't reported one yet (e.g. an older app build). Only render
+  // a pill for online rows - see GameDevicesModal. The self row uses the local
+  // screenState store instead (the mother never pings itself).
+  screen_state?: ScreenState | null;
 }
 
 export interface ListPairedWithStatusResp {
@@ -489,7 +542,7 @@ export interface QueueCommandBulkResp {
 
 async function queueCommandBulk(
   targets: number[],
-  kind: 'join_game' | 'play_video' | 'stop_video',
+  kind: 'join_game' | 'play_video' | 'stop_video' | 'open_ranking' | 'show_team_summary' | 'disconnect_device' | 'become_mother' | 'reload_config',
   payload: Record<string, unknown>
 ): Promise<QueueCommandBulkResp> {
   return withRetry(() =>
@@ -503,9 +556,15 @@ async function queueCommandBulk(
 
 export async function queueJoinGameCommandBulk(
   targets: number[],
-  launchedGameId: number
+  launchedGameId: number,
+  // `rejoin` re-pushes the navigate-to-game command to devices ALREADY in the
+  // game (the Devices-modal "Reconnect" action), bypassing the server's
+  // already-in-game guard. Omit it for "Launch here" on available devices.
+  opts?: { rejoin?: boolean }
 ): Promise<QueueCommandBulkResp> {
-  return queueCommandBulk(targets, 'join_game', { launched_game_id: launchedGameId });
+  const payload: Record<string, unknown> = { launched_game_id: launchedGameId };
+  if (opts?.rejoin) payload.rejoin = true;
+  return queueCommandBulk(targets, 'join_game', payload);
 }
 
 export async function queuePlayVideoBulk(
@@ -526,6 +585,77 @@ export async function queueStopVideoBulk(
   launchedGameId: number
 ): Promise<QueueCommandBulkResp> {
   return queueCommandBulk(targets, 'stop_video', { launched_game_id: launchedGameId });
+}
+
+// Remove device(s) from a launched game: the mother drops their participation
+// row (so they leave bucket A → become available again) and pushes a command
+// telling each satellite to leave the in-game page and return to the
+// launched-games list. Delivery is via /ping.php pickup (latency up to one
+// ping cycle, ~10s); the registration removal is immediate on the mother.
+export async function queueDisconnectDeviceBulk(
+  targets: number[],
+  launchedGameId: number
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'disconnect_device', { launched_game_id: launchedGameId });
+}
+
+// Tell paired device(s) to open a ranking page (single launched game, or a
+// scenario's cross-game leaderboard over a time range). The target descriptor
+// is carried verbatim in the payload; in game mode it includes
+// `launched_game_id` so the mother can validate ownership.
+export async function queueOpenRankingPageBulk(
+  targets: number[],
+  payload: Record<string, unknown>
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'open_ranking', payload);
+}
+
+// Tell paired device(s) to show a finished team's final summary. The payload is
+// a self-contained TeamSummarySnapshot (encodeTeamSummarySnapshot); it includes
+// `launched_game_id` so the mother can validate ownership.
+export async function queueShowTeamSummaryBulk(
+  targets: number[],
+  payload: Record<string, unknown>
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'show_team_summary', payload);
+}
+
+// Tell in-game device(s) to re-derive their running game page's config from the
+// freshly-saved launched-game meta, so a config edit made on one device applies
+// live everywhere. Same in-game-target validation as play_video.
+export async function queueReloadConfigBulk(
+  targets: number[],
+  launchedGameId: number
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'reload_config', { launched_game_id: launchedGameId });
+}
+
+// Push a reload_config command to every OTHER device currently in the game, so a
+// config edit propagates to their running game page. Best-effort: enumerates the
+// in-game bucket (excluding self) and fans out; swallows errors so a failed push
+// never blocks the local save. Offline in-game devices still get a queued command
+// (delivered when they next ping, within the mother's command TTL).
+export async function broadcastConfigReload(launchedGameId: number): Promise<void> {
+  try {
+    const buckets = await listPairedWithStatus(launchedGameId);
+    const targets = buckets.in_game.filter((r) => !r.is_self).map((r) => r.id);
+    if (targets.length === 0) return;
+    await queueReloadConfigBulk(targets, launchedGameId);
+  } catch (err) {
+    console.error('[launchedGames] broadcastConfigReload failed:', err);
+  }
+}
+
+// Planned handover: tell a paired device to take over as the mother for this
+// game. The target adopts its latest cached snapshot and promotes (epoch+1);
+// the current mother then yields. Delivery is via /ping.php pickup.
+export async function queueBecomeMotherCommand(
+  targetDeviceId: number,
+  launchedGameId: number
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk([targetDeviceId], 'become_mother', {
+    launched_game_id: launchedGameId,
+  });
 }
 
 // ---------- team_completed_quests (tagquest scoring) ----------

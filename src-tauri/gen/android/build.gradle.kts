@@ -13,6 +13,10 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        // mik3y/usb-serial-for-android is published on JitPack; required for
+        // the SportIdent reader's Android transport (CP210x driver lives in
+        // userspace on Android - see SportIdentSerial.kt).
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

@@ -16,10 +16,23 @@
 
 import { useEffect, useRef, useState } from 'react';
 import './mystery-renderer.css';
+import { resolveFontFamily } from '../fonts/resolveFontFamily';
+import {
+  IDLE_ROLES,
+  INGAME_ROLES,
+  MysteryFixedFrames,
+  MysteryIdleBox,
+  MysteryLayoutBox,
+  resolveIdleLayout,
+  resolveIngameLayout,
+  type IdleLayout,
+  type IngameLayout,
+  type IngameRoleKey,
+} from './mysteryIngameLayout';
 
 type Localized = Record<string, string>;
 
-export type MysteryScreen = 'instructions' | 'ingame' | 'endgame';
+export type MysteryScreen = 'ingame' | 'endgame';
 
 /** Semantic per-enigma scoring result. Drives the colour-blind status marks. */
 export type EnigmaStatusKind = 'correct' | 'incorrect' | 'no_answer' | 'both_answers';
@@ -40,18 +53,27 @@ export interface MysteryRendererGameMeta {
   level_font_color?: string;
   points_units?: string;
   score_full_game?: string;
-  game_instructions_image?: string;
-  game_instructions_button_image?: string;
-  game_instructions_button_hover_image?: string;
   game_refresh_button_image?: string;
   game_refresh_button_hover_image?: string;
+  /** Game-level images for the "both answers biped" / "no answer" enigma states.
+   *  Empty → fall back to the per-enigma good-answer image (status tint still applies). */
+  both_answers_image?: string;
+  no_answer_image?: string;
   levels?: Record<string, { points?: string; name?: Localized | string; description?: Localized | string }>;
+  /** Author-placed positions for the 4 in-game text roles. Absent → defaults. */
+  ingame_layout?: IngameLayout;
+  /** Author-placed styled title/subtitle for the idle (between-teams) screen. */
+  idle_layout?: IdleLayout;
 }
 
 export interface MysteryRendererEnigma {
   number: string;
   text: string;
   good_answer_image?: string;
+  /** Shown (instead of the good-answer image) when this enigma was answered
+   *  incorrectly, so the recap reflects what the team actually biped. Falls
+   *  back to the good-answer image when no wrong-answer image was authored. */
+  wrong_answer_image?: string;
 }
 
 export interface MysteryGameRendererProps {
@@ -60,7 +82,7 @@ export interface MysteryGameRendererProps {
   resolveMediaUrl: (filename: string) => string;
   /** Active screen of the gameplay flow. */
   screen: MysteryScreen;
-  /** When true on the 'ingame' screen, render only the background — every board
+  /** When true on the 'ingame' screen, render only the background - every board
    *  element (timer/score/enigmas/gauge) stays hidden until the reveal fires. */
   boardHidden?: boolean;
   /** Pre-formatted timer string (e.g. "MM:SS"). */
@@ -87,10 +109,23 @@ export interface MysteryGameRendererProps {
   selectedEnigmaIndex: number;
   /** Gauge fill in 0-100. */
   gaugePercent: number;
-  /** Click handler for the Instructions screen start button. */
-  onStartGame?: () => void;
   /** Click handler for the Endgame screen restart button. */
   onRestart?: () => void;
+  /** When set, the in-game centre column shows the end-of-run summary (final
+   *  score, level, team name + a reset button) in place of the big enigma image.
+   *  Populated once a reveal animation has finished (or instantly on a finished
+   *  card's re-bip). Null/undefined → the centre shows the featured enigma. */
+  summary?: {
+    teamName: string;
+    finalScoreText: string;
+    levelName?: string;
+    levelDescription?: string;
+    /** Optional small footnote shown at the bottom of the board (e.g. the
+     *  card-reuse cooldown notice on a finished card's re-bip). */
+    note?: string;
+  } | null;
+  /** Click handler for the summary's reset button (returns the board to idle). */
+  onReset?: () => void;
   /** Pre-formatted final-score line shown on the endgame screen. */
   finalScoreText?: string;
   /** Endgame "reached level" name + description, already localized. */
@@ -101,6 +136,13 @@ export interface MysteryGameRendererProps {
   canonicalHeight?: number;
   /** Scenario-wide font family (Typography section). */
   fontFamily?: string;
+  /** Scenario name - text of the idle screen's title element. */
+  scenarioTitle?: string;
+  /** Whether to render the author-placed idle layout (title/subtitle) between
+   *  teams. When false, the idle screen shows the background only. Defaults to true. */
+  showIdleLayout?: boolean;
+  /** Per-launch subtitle - text of the idle screen's subtitle element. */
+  idleSubtitle?: string;
 }
 
 const DEFAULT_CANONICAL_WIDTH = 1920;
@@ -193,7 +235,7 @@ function MarkGlyph({ type, px }: { type: 'check' | 'cross'; px: number }) {
  * relying on the green/red/amber background tint:
  *   • correct       → ✓ (green badge)
  *   • incorrect     → ✗ (red badge)
- *   • both_answers  → ✓✗ (amber pill — both stations were biped)
+ *   • both_answers  → ✓✗ (amber pill - both stations were biped)
  *   • no_answer     → no badge (nothing was biped)
  * Colour is kept as a secondary cue; the glyph shape carries the meaning.
  */
@@ -232,6 +274,27 @@ function StatusMark({ kind, size }: { kind: EnigmaStatusKind; size: number }) {
   );
 }
 
+/**
+ * Which image to feature for an enigma in the recap, by verdict:
+ *   • incorrect    → the per-enigma wrong-answer image (so the recap reflects
+ *                    what the team actually biped)
+ *   • both_answers → the game-level "both answers" image
+ *   • no_answer    → the game-level "no answer" image
+ *   • correct      → the per-enigma good-answer image
+ * Each state-specific image falls back to the per-enigma good-answer image when
+ * not authored; the green/red/amber/gray tint still carries the verdict either way.
+ */
+function pickEnigmaImage(
+  enigma: MysteryRendererEnigma,
+  gameMeta: MysteryRendererGameMeta,
+  kind?: EnigmaStatusKind,
+): string {
+  if (kind === 'incorrect' && enigma.wrong_answer_image) return enigma.wrong_answer_image;
+  if (kind === 'both_answers' && gameMeta.both_answers_image) return gameMeta.both_answers_image;
+  if (kind === 'no_answer' && gameMeta.no_answer_image) return gameMeta.no_answer_image;
+  return enigma.good_answer_image ?? '';
+}
+
 export function MysteryGameRenderer({
   gameMeta,
   enigmas,
@@ -247,14 +310,18 @@ export function MysteryGameRenderer({
   colorblind,
   selectedEnigmaIndex,
   gaugePercent,
-  onStartGame,
   onRestart,
+  summary,
+  onReset,
   finalScoreText,
   endLevelName,
   endLevelDescription,
   canonicalWidth = DEFAULT_CANONICAL_WIDTH,
   canonicalHeight = DEFAULT_CANONICAL_HEIGHT,
   fontFamily,
+  scenarioTitle,
+  showIdleLayout = true,
+  idleSubtitle,
 }: MysteryGameRendererProps) {
   const fitWrapperRef = useRef<HTMLDivElement>(null);
   const [stage, setStage] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
@@ -298,16 +365,6 @@ export function MysteryGameRenderer({
   const gaugeInset = gaugeIconHeight / 2 + 8;
   const gaugeInsetPx = `${gaugeInset}px`;
   const gaugeDoubleInsetPx = `${gaugeInset * 2}px`;
-
-  const cardStyle: React.CSSProperties = {
-    width: '100%',
-    position: 'relative',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    color: gameMeta.font_color || '#ffffff',
-    textShadow: '0 1px 4px rgba(0,0,0,0.7)',
-  };
 
   return (
     <div
@@ -354,9 +411,71 @@ export function MysteryGameRenderer({
             flexDirection: 'column',
           }}
         >
+          {/* Idle screen - background only (drawn at the root) plus the author-placed
+              title/subtitle. Shown between teams when the board is hidden (i.e. "reveal
+              results on Enter/click" is off and no reveal is playing). Title text =
+              scenario name, subtitle text = per-launch field.
+              When the scenario didn't author any idle element (the in-game layout editor
+              leaves both disabled by default), "Show idle layout when idle" falls back to
+              the default positions so the operator still sees the title/subtitle. */}
+          {screen === 'ingame' && boardHidden && showIdleLayout && (() => {
+            const idle = resolveIdleLayout(gameMeta.idle_layout);
+            const authored = idle.title.enabled || idle.subtitle.enabled;
+            const fallbackFont = fontFamily || 'Arial Black, Arial, sans-serif';
+            const fallbackColor = gameMeta.font_color || '#ffffff';
+            const textByRole: Record<string, string> = {
+              title: scenarioTitle ?? '',
+              subtitle: idleSubtitle ?? '',
+            };
+            return IDLE_ROLES.map((role) => {
+              const el = idle[role.key];
+              // Respect the author's per-element enable flags when they configured an
+              // idle layout; otherwise (nothing authored) render every role with text.
+              if (authored && !el.enabled) return null;
+              const text = textByRole[role.key];
+              if (!text) return null;
+              return (
+                <MysteryIdleBox
+                  key={role.key}
+                  element={el}
+                  stageHeight={stage.height}
+                  text={text}
+                  fallbackFontFamily={fallbackFont}
+                  fallbackColor={fallbackColor}
+                  resolveFont={resolveFontFamily}
+                />
+              );
+            });
+          })()}
+          {screen === 'ingame' && !boardHidden && summary?.note && (
+            <div
+              style={{
+                position: 'absolute',
+                left: 0,
+                right: 0,
+                bottom: `${stage.height * 0.02}px`,
+                textAlign: 'center',
+                fontSize: `${stage.height * 0.022}px`,
+                opacity: 0.8,
+                textShadow: '0 1px 3px rgba(0,0,0,0.8)',
+                pointerEvents: 'none',
+                padding: `0 ${stage.width * 0.05}px`,
+                boxSizing: 'border-box',
+              }}
+            >
+              {summary.note}
+            </div>
+          )}
           {screen === 'ingame' && !boardHidden && (
             <>
-              {/* Top 3-column row */}
+              {/* Top band reserved for the title elements (enigma name centre,
+                  team name right, timer/score left). The board below starts under
+                  them: enigma image under the enigma title, recap list under the
+                  team title. */}
+              <div style={{ height: `${stage.height * 0.12}px`, flexShrink: 0 }} />
+
+              {/* Board row: centre = enigma image (under enigma title),
+                  right = recap list (under team title). */}
               <div
                 style={{
                   display: 'grid',
@@ -366,37 +485,15 @@ export function MysteryGameRenderer({
                   minHeight: 0,
                 }}
               >
-                {/* Left column: timer, score */}
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: `${stage.height * 0.02}px` }}>
-                  <div style={{ ...cardStyle, aspectRatio: '4 / 1' }}>
-                    {gameMeta.time_background_image && (
-                      <img
-                        src={resolveMediaUrl(gameMeta.time_background_image)}
-                        alt=""
-                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
-                      />
-                    )}
-                    <div style={{ position: 'relative', fontSize: `${stage.height * 0.045}px`, fontWeight: 'bold' }}>
-                      {timerText}
-                    </div>
-                  </div>
+                {/* Left column: kept as an empty 1fr spacer so the centre
+                    enigma image + right recap stay in their fixed positions.
+                    Timer + score are now author-placed overlays (see below). */}
+                <div />
 
-                  <div style={{ ...cardStyle, aspectRatio: '4 / 1' }}>
-                    {gameMeta.score_background_image && (
-                      <img
-                        src={resolveMediaUrl(gameMeta.score_background_image)}
-                        alt=""
-                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
-                      />
-                    )}
-                    <div style={{ position: 'relative', fontSize: `${stage.height * 0.045}px`, fontWeight: 'bold' }}>
-                      {score}
-                      {pointsUnits === 'percentage' ? '%' : `/${scoreFullGame}`}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Centre column: ONE big enigma — text on top, image below. */}
+                {/* Centre column: ONE big enigma - text on top, image below.
+                    Once a run's reveal has finished, the end-of-run summary
+                    (final score / level / team name + reset) takes this slot
+                    instead of the featured enigma image. */}
                 <div
                   style={{
                     display: 'flex',
@@ -407,7 +504,131 @@ export function MysteryGameRenderer({
                     minHeight: 0,
                   }}
                 >
-                  {(() => {
+                  {summary ? (
+                    <div
+                      style={{
+                        flex: '1 1 0',
+                        minHeight: 0,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: `${stage.height * 0.02}px`,
+                        textAlign: 'center',
+                        padding: `${stage.height * 0.02}px`,
+                        boxSizing: 'border-box',
+                      }}
+                    >
+                      {summary.teamName && (
+                        <div
+                          style={{
+                            fontSize: `${stage.height * 0.045}px`,
+                            fontWeight: 'bold',
+                            textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+                            lineHeight: 1.1,
+                          }}
+                        >
+                          {summary.teamName}
+                        </div>
+                      )}
+                      <div
+                        style={{
+                          fontSize: `${stage.height * 0.1}px`,
+                          fontWeight: 'bold',
+                          color: '#4ade80',
+                          textShadow: '0 2px 8px rgba(0,0,0,0.8)',
+                          lineHeight: 1,
+                        }}
+                      >
+                        {summary.finalScoreText}
+                      </div>
+                      {summary.levelName && (
+                        <div
+                          style={{
+                            fontSize: `${stage.height * 0.04}px`,
+                            fontWeight: 'bold',
+                            color: gameMeta.level_font_color || '#ffffff',
+                            textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+                          }}
+                        >
+                          {summary.levelName}
+                        </div>
+                      )}
+                      {summary.levelDescription && (
+                        <div
+                          style={{
+                            fontSize: `${stage.height * 0.02}px`,
+                            maxWidth: '95%',
+                            lineHeight: 1.3,
+                            textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+                            opacity: 0.95,
+                          }}
+                        >
+                          {summary.levelDescription}
+                        </div>
+                      )}
+                      {(() => {
+                        const refreshImg = gameMeta.game_refresh_button_image
+                          ? resolveMediaUrl(gameMeta.game_refresh_button_image)
+                          : '';
+                        const refreshHoverImg = gameMeta.game_refresh_button_hover_image
+                          ? resolveMediaUrl(gameMeta.game_refresh_button_hover_image)
+                          : '';
+                        if (refreshImg || refreshHoverImg) {
+                          return (
+                            <div
+                              className="mystery-game-instructions-button"
+                              onClick={onReset}
+                              style={{
+                                position: 'relative',
+                                width: `${stage.height * 0.13}px`,
+                                height: `${stage.height * 0.13}px`,
+                                marginTop: `${stage.height * 0.01}px`,
+                                cursor: onReset ? 'pointer' : 'default',
+                              }}
+                            >
+                              {refreshImg && (
+                                <img
+                                  src={refreshImg}
+                                  alt="reset"
+                                  className="mystery-game-button-default"
+                                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
+                                />
+                              )}
+                              {refreshHoverImg && (
+                                <img
+                                  src={refreshHoverImg}
+                                  alt="reset"
+                                  className="mystery-game-button-hover"
+                                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', opacity: 0 }}
+                                />
+                              )}
+                            </div>
+                          );
+                        }
+                        return (
+                          <button
+                            type="button"
+                            onClick={onReset}
+                            style={{
+                              marginTop: `${stage.height * 0.015}px`,
+                              padding: `${stage.height * 0.012}px ${stage.width * 0.02}px`,
+                              fontSize: `${stage.height * 0.022}px`,
+                              fontWeight: 'bold',
+                              fontFamily: 'inherit',
+                              color: '#ffffff',
+                              background: 'rgba(0,0,0,0.45)',
+                              border: '2px solid rgba(255,255,255,0.7)',
+                              borderRadius: 8,
+                              cursor: onReset ? 'pointer' : 'default',
+                            }}
+                          >
+                            ↻
+                          </button>
+                        );
+                      })()}
+                    </div>
+                  ) : (() => {
                     const enigma = enigmas[selectedEnigmaIndex];
                     if (!enigma) {
                       return (
@@ -416,25 +637,16 @@ export function MysteryGameRenderer({
                         </div>
                       );
                     }
-                    const imgSrc = enigma.good_answer_image ? resolveMediaUrl(enigma.good_answer_image) : '';
                     const text = enigma.text || `Enigma ${enigma.number ?? selectedEnigmaIndex + 1}`;
                     const revealed = completedEnigmas.has(parseInt(enigma.number, 10));
                     const featuredOverlay = enigmaStatusColors?.[enigma.number];
                     const featuredKind = enigmaStatusKinds?.[enigma.number];
+                    const displayImage = pickEnigmaImage(enigma, gameMeta, featuredKind);
+                    const imgSrc = displayImage ? resolveMediaUrl(displayImage) : '';
                     return (
                       <>
-                        <div
-                          style={{
-                            fontSize: `${stage.height * 0.05}px`,
-                            fontWeight: 'bold',
-                            textAlign: 'center',
-                            textShadow: '0 1px 4px rgba(0,0,0,0.7)',
-                            padding: `0 ${stage.width * 0.01}px`,
-                            flexShrink: 0,
-                          }}
-                        >
-                          {text}
-                        </div>
+                        {/* Enigma name is now an author-placed overlay (below);
+                            the centre column shows only the featured image. */}
                         {/* Flexible area that centres a SQUARE tile so the
                             green/red/amber status tint hugs the (square) enigma
                             image instead of filling a wide rectangle. */}
@@ -473,23 +685,11 @@ export function MysteryGameRenderer({
                   })()}
                 </div>
 
-                {/* Right column: team name + enigmas header + recap grid */}
+                {/* Right column: enigmas header + recap grid. Team name is now
+                    an author-placed overlay (see below). */}
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: `${stage.height * 0.012}px`, minHeight: 0 }}>
-                  <div style={{ ...cardStyle, aspectRatio: '4 / 1' }}>
-                    {gameMeta.team_name_background_image && (
-                      <img
-                        src={resolveMediaUrl(gameMeta.team_name_background_image)}
-                        alt=""
-                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
-                      />
-                    )}
-                    <div style={{ position: 'relative', fontSize: `${stage.height * 0.04}px`, fontWeight: 'bold' }}>
-                      {teamName}
-                    </div>
-                  </div>
-
                   {gameMeta.enigmas_header_image && (
-                    <div style={{ ...cardStyle, aspectRatio: '5 / 1' }}>
+                    <div style={{ width: '100%', position: 'relative', aspectRatio: '5 / 1' }}>
                       <img
                         src={resolveMediaUrl(gameMeta.enigmas_header_image)}
                         alt=""
@@ -509,10 +709,11 @@ export function MysteryGameRenderer({
                     }}
                   >
                     {enigmas.map((enigma, idx) => {
-                      const imgSrc = enigma.good_answer_image ? resolveMediaUrl(enigma.good_answer_image) : '';
                       const revealed = completedEnigmas.has(parseInt(enigma.number, 10));
                       const overlay = enigmaStatusColors?.[enigma.number];
                       const overlayKind = enigmaStatusKinds?.[enigma.number];
+                      const recapImage = pickEnigmaImage(enigma, gameMeta, overlayKind);
+                      const imgSrc = recapImage ? resolveMediaUrl(recapImage) : '';
                       return (
                         <div
                           key={`recap-${enigma.number ?? idx}`}
@@ -614,7 +815,7 @@ export function MysteryGameRenderer({
                     entries.forEach(([key, level], idx) => {
                       const pts = parseFloat(level?.points ?? '0') || 0;
                       // Levels are hidden by default and only appear once the
-                      // team's score reaches them — during the reveal each level
+                      // team's score reaches them - during the reveal each level
                       // pops in as the running tally crosses its threshold.
                       if (score < pts) return;
                       const clamped = Math.max(0, Math.min(fullGame, pts));
@@ -732,79 +933,49 @@ export function MysteryGameRenderer({
                   })()}
                 </div>
               </div>
+
+              {/* Fixed element frame images (non-movable), drawn behind the
+                  author-placed text. */}
+              {(() => {
+                const frameUrls: Partial<Record<IngameRoleKey, string>> = {};
+                for (const role of INGAME_ROLES) {
+                  const file = role.frameImageKey ? gameMeta[role.frameImageKey] : undefined;
+                  if (file) frameUrls[role.key] = resolveMediaUrl(file);
+                }
+                return <MysteryFixedFrames frameUrls={frameUrls} />;
+              })()}
+
+              {/* Author-placed text overlays - the 4 in-game roles positioned
+                  via game_meta.ingame_layout, each auto-fitting its box. */}
+              {(() => {
+                const layout = resolveIngameLayout(gameMeta.ingame_layout);
+                const overlayFont = fontFamily || 'Arial Black, Arial, sans-serif';
+                const overlayColor = gameMeta.font_color || '#ffffff';
+                const featured = enigmas[selectedEnigmaIndex];
+                const enigmaName = featured
+                  ? featured.text || `Enigma ${featured.number ?? selectedEnigmaIndex + 1}`
+                  : '';
+                const scoreText = `${score}${pointsUnits === 'percentage' ? '%' : ''}`;
+                const textByRole: Record<string, string> = {
+                  enigma_name: enigmaName,
+                  timer: timerText,
+                  score: scoreText,
+                  team_name: teamName,
+                };
+                return INGAME_ROLES.map((role) => (
+                  <MysteryLayoutBox
+                    key={role.key}
+                    box={layout[role.key]}
+                    stageWidth={stage.width}
+                    stageHeight={stage.height}
+                    text={textByRole[role.key]}
+                    fontFamily={overlayFont}
+                    color={overlayColor}
+                  />
+                ));
+              })()}
             </>
           )}
-
-          {screen === 'instructions' && (() => {
-            const buttonImg = gameMeta.game_instructions_button_image
-              ? resolveMediaUrl(gameMeta.game_instructions_button_image)
-              : '';
-            const buttonHoverImg = gameMeta.game_instructions_button_hover_image
-              ? resolveMediaUrl(gameMeta.game_instructions_button_hover_image)
-              : '';
-            const instrImg = gameMeta.game_instructions_image
-              ? resolveMediaUrl(gameMeta.game_instructions_image)
-              : '';
-            return (
-              <div
-                style={{
-                  position: 'relative',
-                  width: '100%',
-                  height: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  overflow: 'hidden',
-                }}
-              >
-                {instrImg && (
-                  <img
-                    src={instrImg}
-                    alt=""
-                    style={{
-                      position: 'absolute',
-                      inset: 0,
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain',
-                    }}
-                  />
-                )}
-                {(buttonImg || buttonHoverImg) && (
-                  <div
-                    className="mystery-game-instructions-button"
-                    onClick={onStartGame}
-                    style={{
-                      position: 'absolute',
-                      bottom: `${stage.height * 0.05}px`,
-                      left: '50%',
-                      transform: 'translateX(-50%)',
-                      width: `${stage.height * 0.18}px`,
-                      height: `${stage.height * 0.18}px`,
-                      cursor: onStartGame ? 'pointer' : 'default',
-                    }}
-                  >
-                    {buttonImg && (
-                      <img
-                        src={buttonImg}
-                        alt="start"
-                        className="mystery-game-button-default"
-                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' }}
-                      />
-                    )}
-                    {buttonHoverImg && (
-                      <img
-                        src={buttonHoverImg}
-                        alt="start"
-                        className="mystery-game-button-hover"
-                        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', opacity: 0 }}
-                      />
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })()}
 
           {screen === 'endgame' && (() => {
             const refreshImg = gameMeta.game_refresh_button_image

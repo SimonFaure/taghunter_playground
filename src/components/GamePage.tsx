@@ -3,6 +3,7 @@ import { GameConfig } from './LaunchGameModal';
 import { MysteryGamePage } from './MysteryGamePage';
 import { TagQuestGamePage } from './TagQuestGamePage';
 import { TracksGamePage } from './TracksGamePage';
+import { ClashGamePage } from './ClashGamePage';
 import { LeaderboardPage } from './LeaderboardPage';
 import { LaunchedGameConfigModal } from './LaunchedGameConfigModal';
 import { GameTestModal } from './GameTestModal';
@@ -16,7 +17,14 @@ import {
   endLaunchedGame,
   deleteLaunchedGame,
   getLaunchedGameState,
+  getLaunchedGameMeta,
+  addLaunchedGameTime,
+  broadcastConfigReload,
 } from '../services/launchedGames';
+import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
+import { onPendingConfigReload, onPendingRejoin } from '../services/pendingJoinStore';
+import { setBaseInGame, setBaseHome } from '../services/screenState';
+import { setActiveLaunchedGameId } from '../services/activeGameStore';
 import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle, Film } from 'lucide-react';
 
 interface GamePageProps {
@@ -41,7 +49,32 @@ interface Team {
   key_id: number;
 }
 
-export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePageProps) {
+export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, onBack }: GamePageProps) {
+  // Live config: starts from the launch snapshot but is re-derived from the DB
+  // meta whenever the in-game config modal saves, so edits apply to the running
+  // page (the renderers read these fields on every render).
+  const [config, setConfig] = useState<GameConfig>(initialConfig);
+
+  const reloadConfig = useCallback(async () => {
+    if (!launchedGameId) return;
+    try {
+      const meta = await getLaunchedGameMeta(launchedGameId);
+      setConfig((prev) => gameConfigFromMeta(meta, { name: prev.name, numberOfTeams: prev.numberOfTeams }));
+    } catch (err) {
+      console.error('[GamePage] reload config after save failed:', err);
+    }
+  }, [launchedGameId]);
+
+  // A config edit made on ANOTHER device (the mother's launched-games list or a
+  // peer's operator panel) lands here as a `reload_config` push → re-derive our
+  // running config from the freshly-saved meta so the edit applies live.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingConfigReload((gid) => {
+      if (gid === launchedGameId) void reloadConfig();
+    });
+  }, [launchedGameId, reloadConfig]);
+
   const [gameMetadata, setGameMetadata] = useState<GameMetadata | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -57,6 +90,12 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
   // don't re-prompt.
   const [requirePinExit, setRequirePinExit] = useState(false);
   const [pinGate, setPinGate] = useState<{ run: () => void; subtitle?: string } | null>(null);
+
+  // Operator-only devices are the only ones that may open the 4-tap operator
+  // panel. On every other (player-facing) device the 4-tap gesture is an
+  // "I'm stuck, get me out" escape hatch instead: it leaves the game and
+  // returns to the launched-games list (still behind the exit PIN when set).
+  const [operatorOnly, setOperatorOnly] = useState(false);
 
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -74,6 +113,18 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     variant: 'danger' | 'warning' | 'info';
     confirmText?: string;
   }>({ isOpen: false, title: '', message: '', onConfirm: () => {}, variant: 'warning' });
+
+  // A "Reconnect" push from the mother's Devices modal lands here when this
+  // device is already in the game but drifted onto the in-game leaderboard /
+  // rankings overlay. Drop those overlays so we snap back to the game view.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingRejoin((gid) => {
+      if (gid !== launchedGameId) return;
+      setShowLeaderboard(false);
+      setShowRankings(false);
+    });
+  }, [launchedGameId]);
 
   useEffect(() => {
     const loadGameMetadata = async () => {
@@ -112,12 +163,35 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     loadGameMetadata();
   }, [gameUniqid]);
 
+  // Publish this device's screen state as "in this game" while a game page is
+  // mounted, so the mother's Devices modal can show what each peer is showing.
+  // Reverts to the idle/home state on unmount (back to launched-games list).
+  // Wrapper-only (v1): board-hidden / instructions / reveal refinements layer
+  // in later - see services/screenState.ts. The pushed leaderboard / operator
+  // video overlays publish their own 'ranking' / 'video' states on top.
+  useEffect(() => {
+    setBaseInGame(launchedGameId, gameMetadata?.title ?? config.name ?? null);
+    return () => setBaseHome();
+  }, [launchedGameId, gameMetadata?.title, config.name]);
+
+  // Mother-failover slice 1: tell the mother-ping path which game this device
+  // is in, so the mother ships this game's failover snapshot and the ping
+  // cadence tightens while we're playing. Cleared on unmount (back to idle).
+  useEffect(() => {
+    setActiveLaunchedGameId(launchedGameId);
+    return () => setActiveLaunchedGameId(null);
+  }, [launchedGameId]);
+
   // Read the kiosk exit-PIN pref once. Until it resolves we leave gating off;
   // config.json loads in a few ms and a player won't be hitting Back that fast.
   useEffect(() => {
     let cancelled = false;
     void loadConfig()
-      .then((c) => { if (!cancelled) setRequirePinExit(Boolean(c.requirePinToExitGame)); })
+      .then((c) => {
+        if (cancelled) return;
+        setRequirePinExit(Boolean(c.requirePinToExitGame));
+        setOperatorOnly(Boolean(c.operatorOnlyDevice));
+      })
       .catch(() => {});
     return () => { cancelled = true; };
   }, []);
@@ -145,9 +219,15 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     if (tapCountRef.current >= 4) {
       tapCountRef.current = 0;
       if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
-      runGuarded(() => setShowPanel(true), 'Enter the device PIN to open game controls.');
+      // Operator devices get the controls panel; player devices get an exit
+      // back to the launched-games list. Both stay behind the PIN when set.
+      if (operatorOnly) {
+        runGuarded(() => setShowPanel(true), 'Enter the device PIN to open game controls.');
+      } else {
+        runGuarded(onBack, 'Enter the device PIN to leave the game.');
+      }
     }
-  }, [runGuarded]);
+  }, [runGuarded, operatorOnly, onBack]);
 
   const loadRankings = async () => {
     if (!launchedGameId) return;
@@ -215,7 +295,9 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
 
   const formatTime = (ts: number | null) => {
     if (!ts) return 'Not started';
-    return new Date(ts).toLocaleTimeString();
+    // Team start_time / end_time are stored in unix SECONDS; the Date ctor wants
+    // milliseconds, so scale by 1000 to avoid a 1970 timestamp.
+    return new Date(ts * 1000).toLocaleTimeString();
   };
 
   const handleGameEnd = useCallback(() => {
@@ -249,6 +331,9 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
     }
     if (gameMetadata?.type === 'tracks') {
       return <TracksGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} />;
+    }
+    if (gameMetadata?.type === 'clash') {
+      return <ClashGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} />;
     }
     return (
       <div className="flex items-center justify-center h-full">
@@ -321,6 +406,18 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
                     <Film size={16} />
                     Play Video
                   </button>
+                  {gameMetadata?.type === 'clash' && (
+                    <button
+                      onClick={() => {
+                        void addLaunchedGameTime(launchedGameId, 5).catch(() => {});
+                        setShowPanel(false);
+                      }}
+                      className="flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition"
+                    >
+                      <Clock size={16} />
+                      +5 min
+                    </button>
+                  )}
                   <button
                     onClick={() => { setShowPanel(false); handleEndGame(); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition"
@@ -353,8 +450,13 @@ export function GamePage({ config, gameUniqid, launchedGameId, onBack }: GamePag
         <LaunchedGameConfigModal
           gameId={launchedGameId}
           gameName={config.name}
+          gameUniqid={gameUniqid}
+          gameType={gameMetadata?.type}
           onClose={() => setShowConfigModal(false)}
-          onSave={() => {}}
+          onSave={() => {
+            void reloadConfig();
+            void broadcastConfigReload(launchedGameId);
+          }}
         />
       )}
 

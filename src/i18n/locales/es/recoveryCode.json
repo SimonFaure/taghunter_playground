@@ -1,0 +1,10 @@
+{
+  "title": "Introduce un código de recuperación",
+  "subtitle": "Pide un código de recuperación a tu administrador y luego escríbelo aquí.",
+  "wrongCode": "Ese código no funcionó. Compruébalo e inténtalo de nuevo.",
+  "checkFailed": "No se pudo comprobar el código. Inténtalo de nuevo.",
+  "loading": "Cargando…",
+  "noCodes": "No hay códigos de recuperación disponibles en este dispositivo. Conéctate a Internet y restablece tu PIN por correo electrónico, o contacta con tu administrador.",
+  "checking": "Comprobando…",
+  "cancel": "Cancelar"
+}

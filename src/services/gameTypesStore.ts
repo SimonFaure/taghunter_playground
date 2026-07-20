@@ -18,7 +18,7 @@ import {
 //
 // At runtime the playground resolves the override first; falls back to the
 // admin row if the override is missing or unsynced. Both are versioned
-// independently — sync downloads each freshly when its own
+// independently - sync downloads each freshly when its own
 // `remote_version != local_version`.
 
 export interface GameTypeRow {
@@ -234,6 +234,24 @@ export async function markOverrideDownloaded(code: string, version: number): Pro
   );
 }
 
+// Reset every game-type tutorial video (admin + per-client override) to "needs
+// download": clears local_version + failed attempts and deletes the on-disk
+// video roots. Rows stay (manifest metadata preserved). Used by the
+// Operator-only toggle (services/operatorMode.ts): ON skips these on the next
+// cycle (so they stay gone), OFF re-downloads them. Returns rows reset.
+export async function resetVideosForRedownload(): Promise<number> {
+  const db = await getDb();
+  const codes = await db.select<Array<{ code: string }>>('SELECT code FROM game_types');
+  for (const c of codes) {
+    // `media/game_types/<code>` holds both the admin and client (override) video
+    // version dirs - removing the root clears both variants in one shot.
+    await removeRecursive(`media/game_types/${c.code}`);
+  }
+  await db.execute('UPDATE game_types SET local_version = NULL, failed_attempts = 0');
+  await db.execute('UPDATE game_type_overrides SET local_version = NULL, failed_attempts = 0');
+  return codes.length;
+}
+
 export async function incrementAdminFailedAttempts(code: string): Promise<void> {
   const db = await getDb();
   await db.execute(
@@ -272,7 +290,7 @@ export async function listPendingOverrideDownloads(): Promise<GameTypeOverrideRo
   return rows.map(overrideRowOut);
 }
 
-// Resolved tutorial video at runtime — override wins if present and downloaded.
+// Resolved tutorial video at runtime - override wins if present and downloaded.
 // Returns null if neither admin nor override has a downloaded video.
 export async function resolveTutorialVideoUrl(code: string): Promise<{
   videoUrl: string;
@@ -280,6 +298,12 @@ export async function resolveTutorialVideoUrl(code: string): Promise<{
   variant: 'admin' | 'override';
   version: number;
 } | null> {
+  // `game_types.code` is canonically lowercase ('mystery', 'tagquest', …), but
+  // launched games carry the DISPLAY-cased game_type ('Mystery', 'TagQuest'),
+  // and that's what the operator-video / first-bip callers pass through. The
+  // WHERE code = ? lookups are case-sensitive, so normalize here or every
+  // capitalized code silently resolves to "no tutorial video".
+  code = code.toLowerCase();
   const override = await getOverride(code);
   if (override && override.tutorial_video_filename && override.local_version !== null) {
     const dirAbs = await gameTypeClientVersionDirAbs(code, override.local_version);
@@ -314,7 +338,7 @@ export async function resolveTutorialVideoUrl(code: string): Promise<{
 }
 
 // Whether the playground has *any* tutorial video for this game type
-// downloaded — either the override or the admin default.
+// downloaded - either the override or the admin default.
 export async function hasTutorialVideo(code: string): Promise<boolean> {
   const resolved = await resolveTutorialVideoUrl(code);
   return resolved !== null;

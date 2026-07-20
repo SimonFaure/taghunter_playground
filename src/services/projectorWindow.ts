@@ -1,55 +1,36 @@
 import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { availableMonitors, primaryMonitor, type Monitor } from '@tauri-apps/api/window';
-import type { GameConfig } from '../components/LaunchGameModal';
+import type { RankingTarget } from './rankingTarget';
+import { rankingTargetKey, encodeRankingTarget, decodeRankingTarget } from './rankingTarget';
 
 const PROJECTOR_LABEL = 'projector';
-const PROJECTED_GAME_KEY = 'projector.launchedGameId';
-
-export interface ProjectorPayload {
-  launchedGameId: number;
-  gameName?: string;
-  config: GameConfig;
-}
+const PROJECTED_KEY = 'projector.targetKey';
 
 // localStorage is shared between Tauri WebviewWindows on Windows (same WebView2
 // user data folder), so the main window can read what the projector window is
 // currently showing. Cleared on close (including projector-self-close on Esc).
-function setProjectedGameId(id: number | null): void {
-  if (id === null) localStorage.removeItem(PROJECTED_GAME_KEY);
-  else localStorage.setItem(PROJECTED_GAME_KEY, String(id));
+function setProjectedKey(key: string | null): void {
+  if (key === null) localStorage.removeItem(PROJECTED_KEY);
+  else localStorage.setItem(PROJECTED_KEY, key);
 }
 
-function getStoredProjectedGameId(): number | null {
-  const raw = localStorage.getItem(PROJECTED_GAME_KEY);
-  if (!raw) return null;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : null;
+function getStoredProjectedKey(): string | null {
+  return localStorage.getItem(PROJECTED_KEY);
 }
 
 // Read projector params from the current window's URL. Returns null when the
-// `projector` flag is absent, malformed, or missing required fields — caller
+// `projector` flag is absent, malformed, or missing required fields - caller
 // should fall back to the normal app render in that case.
-export function readProjectorParamsFromUrl(): ProjectorPayload | null {
+export function readProjectorTargetFromUrl(): RankingTarget | null {
   const params = new URLSearchParams(window.location.search);
   if (params.get('projector') !== '1') return null;
-
-  const idStr = params.get('launchedGameId');
-  const configStr = params.get('config');
-  if (!idStr || !configStr) return null;
-
-  const launchedGameId = Number(idStr);
-  if (!Number.isFinite(launchedGameId) || launchedGameId <= 0) return null;
-
-  let config: GameConfig;
+  const targetStr = params.get('target');
+  if (!targetStr) return null;
   try {
-    const decoded = atob(configStr);
-    config = JSON.parse(decoded);
+    return decodeRankingTarget(JSON.parse(atob(targetStr)));
   } catch {
     return null;
   }
-
-  const gameName = params.get('gameName') ?? undefined;
-  return { launchedGameId, gameName, config };
 }
 
 async function pickProjectorMonitor(): Promise<{ monitor: Monitor; fullscreen: boolean }> {
@@ -72,12 +53,10 @@ async function pickProjectorMonitor(): Promise<{ monitor: Monitor; fullscreen: b
   return { monitor: nonPrimary ?? primary, fullscreen: !!nonPrimary };
 }
 
-function buildProjectorUrl(payload: ProjectorPayload): string {
+function buildProjectorUrl(target: RankingTarget): string {
   const params = new URLSearchParams();
   params.set('projector', '1');
-  params.set('launchedGameId', String(payload.launchedGameId));
-  if (payload.gameName) params.set('gameName', payload.gameName);
-  params.set('config', btoa(JSON.stringify(payload.config)));
+  params.set('target', btoa(JSON.stringify(encodeRankingTarget(target))));
   return `/index.html?${params.toString()}`;
 }
 
@@ -87,23 +66,23 @@ export async function isProjectorOpen(): Promise<boolean> {
 }
 
 // Returns true iff the projector window is alive AND currently showing the
-// given launched game. Used by `LeaderboardPage` to flip its toggle button
-// between "Open on second screen" and "Close projector".
-export async function isProjectorOpenFor(launchedGameId: number): Promise<boolean> {
+// given target. Used by `LeaderboardPage` to flip its toggle button between
+// "Open on second screen" and "Close projector".
+export async function isProjectorOpenForTarget(target: RankingTarget): Promise<boolean> {
   const open = await isProjectorOpen();
   if (!open) {
     // Stale localStorage cleanup if the window died without our knowledge.
-    setProjectedGameId(null);
+    setProjectedKey(null);
     return false;
   }
-  return getStoredProjectedGameId() === launchedGameId;
+  return getStoredProjectedKey() === rankingTargetKey(target);
 }
 
 // Open (or switch the content of) the projector window. Single-instance:
 // if a projector window already exists, navigate it to the new URL instead
 // of spawning a second one.
-export async function openProjector(payload: ProjectorPayload): Promise<void> {
-  const url = buildProjectorUrl(payload);
+export async function openProjector(target: RankingTarget): Promise<void> {
+  const url = buildProjectorUrl(target);
 
   const existing = await WebviewWindow.getByLabel(PROJECTOR_LABEL);
   if (existing) {
@@ -141,7 +120,7 @@ export async function openProjector(payload: ProjectorPayload): Promise<void> {
     });
   });
 
-  setProjectedGameId(payload.launchedGameId);
+  setProjectedKey(rankingTargetKey(target));
 }
 
 export async function closeProjector(): Promise<void> {
@@ -149,13 +128,13 @@ export async function closeProjector(): Promise<void> {
   if (existing) {
     await existing.close();
   }
-  setProjectedGameId(null);
+  setProjectedKey(null);
 }
 
 // Inside the projector window itself: close self. Used by the Esc key
-// handler in LeaderboardPage when projectorMode is on. Also clears the
-// shared localStorage marker so the main window's toggle button flips back.
+// handler when projectorMode is on. Also clears the shared localStorage
+// marker so the main window's toggle button flips back.
 export async function closeSelfProjectorWindow(): Promise<void> {
-  setProjectedGameId(null);
+  setProjectedKey(null);
   await getCurrentWebviewWindow().close();
 }

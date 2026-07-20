@@ -1,4 +1,4 @@
-// SerialTransport — minimal async surface so the reader state machine
+// SerialTransport - minimal async surface so the reader state machine
 // (step 4) can be written against an abstract port and tested via
 // MockTransport without hardware.
 //
@@ -6,7 +6,7 @@
 //   - The RX path is naturally a one-way producer/consumer. Returning a
 //     `Stream` from a trait method runs into ownership / `Self: Sized`
 //     awkwardness (only one consumer can take it; lifetimes infect callers).
-//     Instead, each impl's constructor returns `(Arc<Self>, BytesRx)` — the
+//     Instead, each impl's constructor returns `(Arc<Self>, BytesRx)` - the
 //     caller owns the receiver end of an mpsc channel that the impl's
 //     internal task pushes into. Closes when the impl's task drops the
 //     sender.
@@ -15,7 +15,12 @@
 //     every call site for no gain.
 
 pub mod desktop;
-// Hardware-free test transport only — referenced exclusively from
+// Android transport - JNI bridge to SportIdentSerial.kt (CP210x via
+// usb-serial-for-android in userspace, no driver install). Hot-path RX
+// callback at transport/android.rs::Java_..._nativeRxBytes.
+#[cfg(target_os = "android")]
+pub mod android;
+// Hardware-free test transport only - referenced exclusively from
 // `#[cfg(test)]` blocks (here and in reader.rs), so gate it to test
 // builds rather than shipping/​warning about it in the release binary.
 #[cfg(test)]
@@ -88,7 +93,7 @@ pub trait SerialTransport: Send + Sync + 'static {
 /// Platform-dispatched port enumeration. Desktop hits the OS via
 /// `serialport::available_ports()`; Android (step 8) will hit the Tauri 2
 /// mobile plugin. Returns an empty Vec rather than an error when no ports
-/// are visible — matches what the JS layer expects today.
+/// are visible - matches what the JS layer expects today.
 pub async fn list_ports() -> Result<Vec<PortInfo>, TransportError> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -100,9 +105,8 @@ pub async fn list_ports() -> Result<Vec<PortInfo>, TransportError> {
     }
     #[cfg(target_os = "android")]
     {
-        // Wired up in step 8 of the plan. Until then, the new reader simply
-        // can't enumerate ports on Android. Old `serialport_list` path keeps
-        // working in parallel for legacy callers.
-        Err(TransportError::Other("android transport not yet implemented".into()))
+        // Bridges to SportIdentSerial.list() in Kotlin; filters to CP210x
+        // (VID 0x10c4 / PID 0x800a) JVM-side.
+        android::list_ports().await
     }
 }

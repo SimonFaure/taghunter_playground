@@ -111,33 +111,9 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
     let cancelled = false;
     (async () => {
       try {
-        const { appDataDir, join } = await import('@tauri-apps/api/path');
-        const { exists, readDir, BaseDirectory } = await import('@tauri-apps/plugin-fs');
-        const { convertFileSrc } = await import('@tauri-apps/api/core');
-        const row = await scenarioStore.get(gameUniqid);
-        if (!row || row.local_version == null) {
-          if (!cancelled) setScenarioMediaUrls({});
-          return;
-        }
-        const versionRel = `media/scenarios/${gameUniqid}/v${row.local_version}`;
-        const root = await appDataDir();
-        const map: Record<string, string> = {};
-        const collect = async (relDir: string): Promise<void> => {
-          if (!(await exists(relDir, { baseDir: BaseDirectory.AppData }))) return;
-          const entries = await readDir(relDir, { baseDir: BaseDirectory.AppData });
-          for (const e of entries) {
-            const childRel = `${relDir}/${e.name}`;
-            if (e.isDirectory) await collect(childRel);
-            else if (e.isFile && e.name) {
-              const abs = await join(root, childRel);
-              const url = convertFileSrc(abs);
-              map[e.name] = url;
-              const tail = childRel.slice(versionRel.length + 1);
-              map[tail] = url;
-            }
-          }
-        };
-        await collect(versionRel);
+        // Media now lives in the content-addressed blob pool; resolve the
+        // scenario's active manifest into a filename -> blob URL map.
+        const map = await scenarioStore.listMediaUrlMap(gameUniqid);
         if (!cancelled) setScenarioMediaUrls(map);
       } catch (err) {
         console.warn('[TeamTestModal] media URL build failed:', err);
@@ -263,16 +239,6 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
       }
       return next;
     });
-  };
-
-  const toggleSelectAll = () => {
-    const allKeys = quests.flatMap(q => q.images.map(i => i.key));
-    const allSelected = allKeys.every(k => selectedImages.has(k));
-    if (allSelected) {
-      setSelectedImages(new Set());
-    } else {
-      setSelectedImages(new Set(allKeys));
-    }
   };
 
   const buildMockCard = (teamKeyId: string, patternEnigmas: any[], goodPct: number, badPct: number): any => {
@@ -405,15 +371,15 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
             const mins = Math.floor(duration / 60);
             const secs = duration % 60;
             const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
-            appendLog(`  Done — Score: ${totalScore}, Time: ${timeStr}`);
-            setTestResult({ teamName: selectedTeam.team_name, score: totalScore, status: 'success', message: `Score: ${totalScore} — Time: ${timeStr}` });
+            appendLog(`  Done - Score: ${totalScore}, Time: ${timeStr}`);
+            setTestResult({ teamName: selectedTeam.team_name, score: totalScore, status: 'success', message: `Score: ${totalScore} - Time: ${timeStr}` });
           } catch (endErr: any) {
             appendLog(`  Error: ${endErr?.message || endErr}`);
             setTestResult({ teamName: selectedTeam.team_name, score: 0, status: 'error', message: endErr?.message || String(endErr) });
           }
         } else {
-          appendLog(`  Card sent (no end punch) — punch logic will process this card`);
-          setTestResult({ teamName: selectedTeam.team_name, score: 0, status: 'success', message: `Card sent — no end punch` });
+          appendLog(`  Card sent (no end punch) - punch logic will process this card`);
+          setTestResult({ teamName: selectedTeam.team_name, score: 0, status: 'success', message: `Card sent - no end punch` });
         }
 
         appendLog('Simulation complete.');
@@ -471,8 +437,8 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
         const mins = Math.floor(duration / 60);
         const secs = duration % 60;
         const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
-        appendLog(`  Done — Score: ${totalScore}, Time: ${timeStr}`);
-        setTestResult({ teamName: selectedTeam.team_name, score: totalScore, status: 'success', message: `Score: ${totalScore} — Time: ${timeStr}` });
+        appendLog(`  Done - Score: ${totalScore}, Time: ${timeStr}`);
+        setTestResult({ teamName: selectedTeam.team_name, score: totalScore, status: 'success', message: `Score: ${totalScore} - Time: ${timeStr}` });
       } catch (endErr: any) {
         appendLog(`  Error: ${endErr?.message || endErr}`);
         setTestResult({ teamName: selectedTeam.team_name, score: 0, status: 'error', message: endErr?.message || String(endErr) });
@@ -486,55 +452,52 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
     }
   };
 
-  const allImageKeys = quests.flatMap(q => q.images.map(i => i.key));
-  const allSelected = allImageKeys.length > 0 && allImageKeys.every(k => selectedImages.has(k));
-
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
+    <div className="pg-overlay" onClick={onClose}>
       <div
-        className="bg-slate-800 border-2 border-slate-700 rounded-xl p-6 max-w-lg w-full max-h-[85vh] overflow-y-auto"
+        className="pg-modal max-w-lg max-h-[85vh] overflow-y-auto p-6"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-2">
-          <h3 className="text-xl font-bold text-white flex items-center gap-2">
+          <h3 className="text-xl font-bold text-[var(--pg-text)] flex items-center gap-2">
             <FlaskConical size={22} className="text-amber-400" />
             Run Team Test
           </h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition">
+          <button onClick={onClose} className="pg-modal-close">
             <X size={22} />
           </button>
         </div>
 
-        <p className="text-slate-400 text-xs mb-5">
-          Game: <span className="text-white font-medium">{gameName}</span>
+        <p className="text-[var(--pg-text-dim)] text-xs mb-5">
+          Game: <span className="text-[var(--pg-text)] font-medium">{gameName}</span>
         </p>
 
         <div className="mb-5 relative">
           <button
             type="button"
             onClick={() => setTeamDropdownOpen(v => !v)}
-            className="w-full px-4 py-3 bg-slate-700/50 rounded-lg border border-slate-600 hover:border-slate-500 flex items-center gap-3 transition text-left"
+            className="w-full px-4 py-3 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] flex items-center gap-3 transition text-left"
           >
-            <Users size={18} className="text-blue-400 shrink-0" />
+            <Users size={18} className="text-[var(--pg-accent-bright)] shrink-0" />
             <div className="flex-1 min-w-0">
-              <p className="text-white text-sm font-semibold">{selectedTeam.team_name}</p>
-              <p className="text-slate-400 text-xs">Team {selectedTeam.team_number} · Chip #{selectedTeam.key_id}</p>
+              <p className="text-[var(--pg-text)] text-sm font-semibold">{selectedTeam.team_name}</p>
+              <p className="text-[var(--pg-text-dim)] text-xs">Team {selectedTeam.team_number} · Chip #{selectedTeam.key_id}</p>
             </div>
-            <ChevronDown size={16} className={`text-slate-400 shrink-0 transition-transform ${teamDropdownOpen ? 'rotate-180' : ''}`} />
+            <ChevronDown size={16} className={`text-[var(--pg-text-dim)] shrink-0 transition-transform ${teamDropdownOpen ? 'rotate-180' : ''}`} />
           </button>
 
           {teamDropdownOpen && teamMembers.length > 0 && (
-            <div className="absolute top-full left-0 right-0 mt-1 bg-slate-800 border border-slate-600 rounded-lg shadow-xl z-10">
-              <div className="p-2 border-b border-slate-700">
+            <div className="absolute top-full left-0 right-0 mt-1 bg-[var(--pg-surface)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] shadow-xl z-10">
+              <div className="p-2 border-b border-[var(--pg-line)]">
                 <div className="relative">
-                  <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                  <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] pointer-events-none z-10" />
                   <input
                     type="text"
                     value={teamSearch}
                     onChange={e => setTeamSearch(e.target.value)}
                     placeholder="Search by name or chip #..."
                     autoFocus
-                    className="w-full pl-8 pr-3 py-1.5 bg-slate-700 border border-slate-600 rounded text-white placeholder-slate-400 text-sm focus:outline-none focus:border-blue-500"
+                    className="pg-input !pl-8 !py-1.5 text-sm"
                   />
                 </div>
               </div>
@@ -556,18 +519,18 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                         setTestResult(null);
                         setTestLog([]);
                       }}
-                      className={`w-full px-4 py-2.5 flex items-center gap-3 hover:bg-slate-700/60 transition text-left ${
-                        member.id === selectedTeam.id ? 'bg-blue-900/20' : ''
+                      className={`w-full px-4 py-2.5 flex items-center gap-3 hover:bg-[var(--pg-surface-3)] transition text-left ${
+                        member.id === selectedTeam.id ? 'bg-[var(--pg-accent-tint)]' : ''
                       }`}
                     >
-                      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${member.id === selectedTeam.id ? 'bg-blue-400' : 'bg-slate-600'}`} />
+                      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${member.id === selectedTeam.id ? 'bg-[var(--pg-accent-bright)]' : 'bg-[var(--pg-line-strong)]'}`} />
                       <div className="flex-1 min-w-0">
-                        <p className={`text-sm font-medium truncate ${member.id === selectedTeam.id ? 'text-blue-300' : 'text-white'}`}>
+                        <p className={`text-sm font-medium truncate ${member.id === selectedTeam.id ? 'text-[var(--pg-accent-bright)]' : 'text-[var(--pg-text)]'}`}>
                           {member.team_name}
                         </p>
-                        <p className="text-slate-400 text-xs">Team {member.team_number} · Chip #{member.key_id}</p>
+                        <p className="text-[var(--pg-text-dim)] text-xs">Team {member.team_number} · Chip #{member.key_id}</p>
                       </div>
-                      {member.id === selectedTeam.id && <CheckCircle size={14} className="text-blue-400 shrink-0" />}
+                      {member.id === selectedTeam.id && <CheckCircle size={14} className="text-[var(--pg-accent-bright)] shrink-0" />}
                     </button>
                   ))}
                 {teamMembers.filter(m =>
@@ -575,7 +538,7 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                   m.team_number.toString().includes(teamSearch) ||
                   m.key_id.toString().includes(teamSearch)
                 ).length === 0 && (
-                  <p className="px-4 py-3 text-slate-400 text-sm">No teams found.</p>
+                  <p className="px-4 py-3 text-[var(--pg-text-dim)] text-sm">No teams found.</p>
                 )}
               </div>
             </div>
@@ -583,35 +546,35 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
         </div>
 
         {loadingType ? (
-          <div className="flex items-center justify-center py-8 gap-2 text-slate-400">
+          <div className="flex items-center justify-center py-8 gap-2 text-[var(--pg-text-dim)]">
             <Loader size={18} className="animate-spin" />
             <span className="text-sm">Loading game configuration...</span>
           </div>
         ) : (
           <div className="space-y-5">
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-2">
+              <label className="pg-label block mb-2">
                 Connected Device
               </label>
               {loadingDevices ? (
-                <div className="flex items-center gap-2 text-slate-400 text-sm py-2">
+                <div className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm py-2">
                   <Loader size={14} className="animate-spin" />
                   Loading devices...
                 </div>
               ) : devices.length === 0 ? (
-                <div className="flex items-center gap-2 px-4 py-3 bg-slate-700/50 rounded-lg border border-slate-600">
-                  <Monitor size={16} className="text-slate-400" />
-                  <span className="text-slate-400 text-sm">No connected devices — will use simulator</span>
+                <div className="flex items-center gap-2 px-4 py-3 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)] border border-[var(--pg-line)]">
+                  <Monitor size={16} className="text-[var(--pg-text-dim)]" />
+                  <span className="text-[var(--pg-text-dim)] text-sm">No connected devices - will use simulator</span>
                 </div>
               ) : (
                 <div className="space-y-2">
                   {devices.map(device => (
                     <label
                       key={device.id}
-                      className={`flex items-center gap-3 px-4 py-3 rounded-lg border cursor-pointer transition ${
+                      className={`flex items-center gap-3 px-4 py-3 rounded-[var(--pg-radius-md)] border cursor-pointer transition ${
                         testConfig.selectedDeviceId === device.device_id
-                          ? 'border-amber-500 bg-amber-900/20'
-                          : 'border-slate-600 bg-slate-700/40 hover:border-slate-500'
+                          ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)]'
+                          : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] hover:border-[var(--pg-line-strong)]'
                       }`}
                     >
                       <input
@@ -622,15 +585,15 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                         onChange={() => handleChange('selectedDeviceId', device.device_id)}
                         className="sr-only"
                       />
-                      <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${device.connected ? 'bg-green-400' : 'bg-slate-500'}`} />
+                      <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${device.connected ? 'bg-green-400' : 'bg-[var(--pg-text-dim)]'}`} />
                       <div className="flex-1 min-w-0">
-                        <p className="text-white text-sm font-medium truncate">{device.device_id}</p>
-                        <p className="text-slate-400 text-xs">
+                        <p className="text-[var(--pg-text)] text-sm font-medium truncate">{device.device_id}</p>
+                        <p className="text-[var(--pg-text-dim)] text-xs">
                           {device.connected ? 'Connected' : 'Disconnected'} · last seen {new Date(device.last_connexion_attempt).toLocaleTimeString()}
                         </p>
                       </div>
                       {testConfig.selectedDeviceId === device.device_id && (
-                        <CheckCircle size={16} className="text-amber-400 shrink-0" />
+                        <CheckCircle size={16} className="text-[var(--pg-accent-bright)] shrink-0" />
                       )}
                     </label>
                   ))}
@@ -641,19 +604,19 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
             {gameType?.toLowerCase() === 'tagquest' ? (
               <div>
                 <div className="flex items-center mb-3">
-                  <label className="text-sm font-medium text-slate-300 flex items-center gap-2">
-                    <ImageIcon size={15} className="text-amber-400" />
+                  <label className="pg-label flex items-center gap-2">
+                    <ImageIcon size={15} className="text-[var(--pg-accent-bright)]" />
                     Quest Images Found
                   </label>
                 </div>
 
                 {loadingQuests ? (
-                  <div className="flex items-center gap-2 text-slate-400 text-sm py-3">
+                  <div className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm py-3">
                     <Loader size={14} className="animate-spin" />
                     Loading quests...
                   </div>
                 ) : quests.length === 0 ? (
-                  <div className="px-4 py-3 bg-slate-700/50 rounded-lg border border-slate-600 text-slate-400 text-sm">
+                  <div className="px-4 py-3 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-sm">
                     No quests found for this game.
                   </div>
                 ) : (
@@ -663,17 +626,17 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                       const questAllSelected = questKeys.length > 0 && questKeys.every(k => selectedImages.has(k));
                       const questSomeSelected = questKeys.some(k => selectedImages.has(k));
                       return (
-                        <div key={quest.index} className="bg-slate-700/40 rounded-lg border border-slate-600 overflow-hidden">
-                          <div className="flex items-center justify-between px-3 py-2 border-b border-slate-600/60">
+                        <div key={quest.index} className="bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] overflow-hidden">
+                          <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--pg-line)]">
                             <div className="flex items-center gap-2 min-w-0">
-                              <span className="text-xs text-slate-500 shrink-0">#{quest.index}</span>
+                              <span className="text-xs text-[var(--pg-text-dim)] shrink-0">#{quest.index}</span>
                               {quest.name ? (
-                                <span className="text-sm font-medium text-white truncate">{quest.name}</span>
+                                <span className="text-sm font-medium text-[var(--pg-text)] truncate">{quest.name}</span>
                               ) : (
-                                <span className="text-sm font-medium text-white">Quest {quest.index}</span>
+                                <span className="text-sm font-medium text-[var(--pg-text)]">Quest {quest.index}</span>
                               )}
                               {quest.points > 0 && (
-                                <span className="shrink-0 text-xs font-medium text-amber-400 bg-amber-900/30 border border-amber-700/40 px-1.5 py-0.5 rounded">
+                                <span className="shrink-0 text-xs font-medium text-[var(--pg-accent-bright)] bg-[var(--pg-accent-tint)] border border-[var(--pg-accent-line)] px-1.5 py-0.5 rounded">
                                   {quest.points} pts
                                 </span>
                               )}
@@ -681,7 +644,7 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                             <button
                               onClick={() => selectQuestAll(quest)}
                               className={`flex items-center gap-1 text-xs transition shrink-0 ml-2 ${
-                                questAllSelected ? 'text-amber-400' : questSomeSelected ? 'text-amber-400/60' : 'text-slate-400 hover:text-white'
+                                questAllSelected ? 'text-[var(--pg-accent-bright)]' : questSomeSelected ? 'text-[var(--pg-accent)]' : 'text-[var(--pg-text-dim)] hover:text-[var(--pg-text)]'
                               }`}
                             >
                               {questAllSelected ? <CheckSquare size={13} /> : <Square size={13} />}
@@ -703,13 +666,13 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                                   <button
                                     key={img.key}
                                     onClick={() => isMain ? selectQuestAll(quest) : toggleImage(img.key, quest)}
-                                    className={`relative flex flex-col items-center gap-1 rounded-lg border-2 overflow-hidden transition ${
+                                    className={`relative flex flex-col items-center gap-1 rounded-[var(--pg-radius-md)] border-2 overflow-hidden transition ${
                                       checked
-                                        ? 'border-amber-500 ring-1 ring-amber-500/50'
-                                        : 'border-slate-600 hover:border-slate-400'
+                                        ? 'border-[var(--pg-accent)] ring-1 ring-[var(--pg-accent-line)]'
+                                        : 'border-[var(--pg-line)] hover:border-[var(--pg-line-strong)]'
                                     } ${large ? 'w-full h-full' : ''}`}
                                   >
-                                    <div className={`w-full bg-slate-800 ${large ? 'flex-1' : ''}`} style={large ? { height: 148 } : { height: 60 }}>
+                                    <div className={`w-full bg-[var(--pg-bg)] ${large ? 'flex-1' : ''}`} style={large ? { height: 148 } : { height: 60 }}>
                                       <img
                                         src={imgSrc}
                                         alt={img.label}
@@ -717,12 +680,12 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                                         onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
                                       />
                                     </div>
-                                    <span className={`text-[10px] font-medium pb-1 px-1 truncate w-full text-center ${checked ? 'text-amber-300' : 'text-slate-400'}`}>
+                                    <span className={`text-[10px] font-medium pb-1 px-1 truncate w-full text-center ${checked ? 'text-[var(--pg-accent-bright)]' : 'text-[var(--pg-text-dim)]'}`}>
                                       {img.label}
                                     </span>
                                     {checked && (
-                                      <div className="absolute top-1 right-1 bg-amber-500 rounded-full p-0.5">
-                                        <CheckCircle size={9} className="text-slate-900" />
+                                      <div className="absolute top-1 right-1 bg-[var(--pg-accent)] rounded-full p-0.5">
+                                        <CheckCircle size={9} className="text-[var(--pg-text)]" />
                                       </div>
                                     )}
                                   </button>
@@ -767,8 +730,8 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                   }).length;
                   const hasAny = answerCount > 0 || completeCount > 0;
                   return (
-                    <div className={`mt-3 flex items-center justify-between text-sm px-3 py-2 rounded-lg ${
-                      hasAny ? 'bg-amber-900/25 text-amber-400' : 'bg-slate-700/50 text-slate-400'
+                    <div className={`mt-3 flex items-center justify-between text-sm px-3 py-2 rounded-[var(--pg-radius-md)] ${
+                      hasAny ? 'bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]' : 'bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)]'
                     }`}>
                       <span>
                         {answerCount} image{answerCount !== 1 ? 's' : ''} selected
@@ -783,11 +746,11 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                   <button
                     type="button"
                     onClick={() => setEndChip(v => !v)}
-                    className={`flex items-center justify-center w-4 h-4 rounded border transition ${endChip ? 'bg-amber-500 border-amber-500' : 'bg-transparent border-slate-500'}`}
+                    className={`flex items-center justify-center w-4 h-4 rounded border transition ${endChip ? 'bg-[var(--pg-accent)] border-[var(--pg-accent)]' : 'bg-transparent border-[var(--pg-line-strong)]'}`}
                   >
-                    {endChip && <CheckCircle size={10} className="text-slate-900" />}
+                    {endChip && <CheckCircle size={10} className="text-[var(--pg-text)]" />}
                   </button>
-                  <span className="text-sm text-slate-300">End chip</span>
+                  <span className="text-sm text-[var(--pg-text-muted)]">End chip</span>
                 </label>
 
                 <label className="mt-2 flex items-center gap-2.5 cursor-pointer select-none">
@@ -798,21 +761,21 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                       setKeepAnimVisible(next);
                       localStorage.setItem('tagquest_keep_anim_visible', next ? '1' : '0');
                     }}
-                    className={`flex items-center justify-center w-4 h-4 rounded border transition ${keepAnimVisible ? 'bg-amber-500 border-amber-500' : 'bg-transparent border-slate-500'}`}
+                    className={`flex items-center justify-center w-4 h-4 rounded border transition ${keepAnimVisible ? 'bg-[var(--pg-accent)] border-[var(--pg-accent)]' : 'bg-transparent border-[var(--pg-line-strong)]'}`}
                   >
-                    {keepAnimVisible && <CheckCircle size={10} className="text-slate-900" />}
+                    {keepAnimVisible && <CheckCircle size={10} className="text-[var(--pg-text)]" />}
                   </button>
-                  <span className="text-sm text-slate-300">Keep animation visible for 10s after completion</span>
+                  <span className="text-sm text-[var(--pg-text-muted)]">Keep animation visible for 10s after completion</span>
                 </label>
               </div>
             ) : (
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-3">Answer Distribution</label>
+                <label className="pg-label block mb-3">Answer Distribution</label>
                 <div className="grid grid-cols-3 gap-3">
                   <div>
                     <div className="flex items-center gap-1.5 mb-2">
                       <div className="w-2 h-2 rounded-full bg-green-400" />
-                      <span className="text-xs text-slate-300 font-medium">Good</span>
+                      <span className="text-xs text-[var(--pg-text-muted)] font-medium">Good</span>
                     </div>
                     <div className="relative">
                       <input
@@ -821,15 +784,15 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                         max={100}
                         value={testConfig.goodAnswerPercent}
                         onChange={e => handleChange('goodAnswerPercent', Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))}
-                        className="w-full px-3 py-2 pr-7 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                        className="pg-input !pr-7 !py-2 text-sm"
                       />
-                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">%</span>
+                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] text-xs pointer-events-none">%</span>
                     </div>
                   </div>
                   <div>
                     <div className="flex items-center gap-1.5 mb-2">
                       <div className="w-2 h-2 rounded-full bg-red-400" />
-                      <span className="text-xs text-slate-300 font-medium">Bad</span>
+                      <span className="text-xs text-[var(--pg-text-muted)] font-medium">Bad</span>
                     </div>
                     <div className="relative">
                       <input
@@ -838,15 +801,15 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                         max={100}
                         value={testConfig.badAnswerPercent}
                         onChange={e => handleChange('badAnswerPercent', Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))}
-                        className="w-full px-3 py-2 pr-7 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-red-500"
+                        className="pg-input !pr-7 !py-2 text-sm"
                       />
-                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">%</span>
+                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] text-xs pointer-events-none">%</span>
                     </div>
                   </div>
                   <div>
                     <div className="flex items-center gap-1.5 mb-2">
-                      <div className="w-2 h-2 rounded-full bg-slate-400" />
-                      <span className="text-xs text-slate-300 font-medium">None</span>
+                      <div className="w-2 h-2 rounded-full bg-[var(--pg-text-dim)]" />
+                      <span className="text-xs text-[var(--pg-text-muted)] font-medium">None</span>
                     </div>
                     <div className="relative">
                       <input
@@ -855,14 +818,14 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                         max={100}
                         value={testConfig.noAnswerPercent}
                         onChange={e => handleChange('noAnswerPercent', Math.min(100, Math.max(0, parseInt(e.target.value) || 0)))}
-                        className="w-full px-3 py-2 pr-7 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
+                        className="pg-input !pr-7 !py-2 text-sm"
                       />
-                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">%</span>
+                      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] text-xs pointer-events-none">%</span>
                     </div>
                   </div>
                 </div>
 
-                <div className={`mt-3 flex items-center justify-between text-sm px-3 py-2 rounded-lg ${totalPercent === 100 ? 'bg-green-900/25 text-green-400' : 'bg-red-900/25 text-red-400'}`}>
+                <div className={`mt-3 flex items-center justify-between text-sm px-3 py-2 rounded-[var(--pg-radius-md)] ${totalPercent === 100 ? 'bg-green-900/25 text-green-400' : 'bg-red-900/25 text-red-400'}`}>
                   <span>Total: <span className="font-semibold">{totalPercent}%</span></span>
                   <span className="font-medium text-xs">{totalPercent === 100 ? 'Ready' : 'Must equal 100%'}</span>
                 </div>
@@ -874,7 +837,7 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
             <button
               onClick={runTest}
               disabled={testRunning || (gameType?.toLowerCase() !== 'tagquest' && totalPercent !== 100)}
-              className="w-full px-4 py-3 bg-amber-600 hover:bg-amber-500 disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg font-semibold flex items-center justify-center gap-2 transition"
+              className="pg-btn pg-btn--primary w-full !py-3 disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {testRunning ? (
                 <>
@@ -893,8 +856,8 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
 
         {testLog.length > 0 && (
           <div className="mt-5">
-            <h5 className="text-sm font-semibold text-slate-300 mb-2">Log</h5>
-            <div className="bg-slate-900 rounded-lg p-3 max-h-36 overflow-y-auto font-mono text-xs text-slate-400 space-y-0.5">
+            <h5 className="text-sm font-semibold text-[var(--pg-text-muted)] mb-2">Log</h5>
+            <div className="bg-[var(--pg-bg)] rounded-[var(--pg-radius-md)] p-3 max-h-36 overflow-y-auto font-mono text-xs text-[var(--pg-text-dim)] space-y-0.5">
               {testLog.map((line, i) => (
                 <div key={i}>{line}</div>
               ))}
@@ -904,9 +867,9 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
 
         {testResult && (
           <div className="mt-4">
-            <h5 className="text-sm font-semibold text-slate-300 mb-2">Result</h5>
+            <h5 className="text-sm font-semibold text-[var(--pg-text-muted)] mb-2">Result</h5>
             <div
-              className={`flex items-center gap-3 px-4 py-3 rounded-lg ${
+              className={`flex items-center gap-3 px-4 py-3 rounded-[var(--pg-radius-md)] ${
                 testResult.status === 'success'
                   ? 'bg-green-900/20 border border-green-800/40'
                   : 'bg-red-900/20 border border-red-800/40'
@@ -918,8 +881,8 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                 <AlertCircle size={16} className="text-red-400 shrink-0" />
               )}
               <div className="flex-1 min-w-0">
-                <p className="text-white text-sm font-medium">{testResult.teamName}</p>
-                <p className="text-slate-400 text-xs">{testResult.message}</p>
+                <p className="text-[var(--pg-text)] text-sm font-medium">{testResult.teamName}</p>
+                <p className="text-[var(--pg-text-dim)] text-xs">{testResult.message}</p>
               </div>
             </div>
           </div>

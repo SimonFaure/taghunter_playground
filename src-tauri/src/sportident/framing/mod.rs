@@ -1,7 +1,7 @@
 // Frame-level protocol primitives. Stateless and hardware-free.
 //
 // Wire format (SportIdent extended protocol, length-prefixed; no DLE
-// stuffing because we only target SI8/9/10/11 — DLE is a legacy SI5/6
+// stuffing because we only target SI8/9/10/11 - DLE is a legacy SI5/6
 // concern).
 //
 //   [STX | CMD | LEN | payload(LEN bytes) | CRC_HI | CRC_LO | ETX]
@@ -12,7 +12,7 @@
 // The decoder is a streaming state machine: callers push raw bytes from
 // the serial port whenever they arrive (any chunking) and pull
 // `DecodeEvent`s. Resync rule on validation failure: drop the leading
-// STX and rescan — this is what the legacy reader was missing (root cause
+// STX and rescan - this is what the legacy reader was missing (root cause
 // #1 in the plan: once buffer alignment was lost, every subsequent peek
 // was garbage with no recovery path).
 

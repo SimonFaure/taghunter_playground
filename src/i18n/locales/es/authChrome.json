@@ -1,0 +1,82 @@
+{
+  "errors": {
+    "requestFailed": "La solicitud ha fallado ({{status}})",
+    "generic": "Algo ha salido mal. Inténtalo de nuevo."
+  },
+  "provider": {
+    "loading": "Cargando…"
+  },
+  "login": {
+    "title": "Tag Hunter Playground",
+    "subtitle": "Inicia sesión para continuar",
+    "emailLabel": "Correo electrónico",
+    "emailPlaceholder": "tu@ejemplo.com",
+    "sendingCode": "Enviando código…",
+    "sendCode": "Enviar código de inicio de sesión",
+    "adminNote": "Las cuentas las crea tu administrador.",
+    "codeSentTo": "Hemos enviado un código de 6 dígitos a",
+    "verifying": "Verificando…",
+    "useDifferentEmail": "← Usar otro correo electrónico",
+    "resendCode": "Reenviar código"
+  },
+  "lock": {
+    "enterPinTitle": "Introduce tu PIN",
+    "checkEmailTitle": "Revisa tu correo electrónico",
+    "chooseNewPinTitle": "Elige un nuevo PIN",
+    "confirmNewPinTitle": "Confirma tu nuevo PIN",
+    "pinUpdatedTitle": "PIN actualizado",
+    "signedInAs": "Sesión iniciada como {{email}}",
+    "codeSentTo": "Hemos enviado un código de 6 dígitos a {{email}}",
+    "pickNewPin": "Elige un nuevo PIN de 4 dígitos para este dispositivo.",
+    "typeOnceMore": "Introdúcelo una vez más para comprobar que coincide.",
+    "unlocking": "Desbloqueando…",
+    "lockedOut": "Demasiados intentos fallidos. Inténtalo de nuevo en {{time}}.",
+    "checking": "Comprobando…",
+    "connectToResetTitle": "Conéctate a internet para restablecer tu PIN",
+    "forgotPin": "¿Has olvidado el PIN?",
+    "connectToReset": "Conéctate a internet para restablecer tu PIN.",
+    "recoveryHint": "Funciona sin conexión - pide un código de recuperación a tu administrador",
+    "useRecoveryCode": "Usar un código de recuperación",
+    "sendingCode": "Enviando código…",
+    "backToPin": "← Volver al PIN",
+    "resendCode": "Reenviar código",
+    "cancel": "Cancelar",
+    "saving": "Guardando…",
+    "noPin": "No hay ningún PIN configurado en este dispositivo. Reinicia la aplicación para continuar.",
+    "tooManyAttempts": "Demasiados intentos fallidos. Inténtalo de nuevo en breve.",
+    "wrongPin": "PIN incorrecto. Inténtalo de nuevo.",
+    "couldNotCheck": "No se ha podido comprobar el PIN. Inténtalo de nuevo.",
+    "pinsDontMatch": "Los PIN no coinciden. Elige un PIN de nuevo.",
+    "remainingSeconds": "{{count}} s",
+    "remainingMinutes": "{{count}} min",
+    "remainingHours": "{{count}} h"
+  },
+  "offlineGrace": {
+    "bannerLastReached_one": "Modo sin conexión - último contacto con el servidor hace {{count}} día.",
+    "bannerLastReached_other": "Modo sin conexión - último contacto con el servidor hace {{count}} días.",
+    "bannerRemaining_one": "Queda {{count}} día de acceso sin conexión.",
+    "bannerRemaining_other": "Quedan {{count}} días de acceso sin conexión.",
+    "reconnectRequired": "Es necesario reconectar.",
+    "retryNow": "Reintentar ahora",
+    "lockTitle": "Reconéctate para continuar",
+    "lockBody": "Este dispositivo no ha contactado con el servidor en {{ageDays}} días, superando tu margen de acceso sin conexión de {{graceDays}} días. Conéctate a internet para reanudar.",
+    "retryConnection": "Reintentar conexión"
+  },
+  "capReached": {
+    "title": "Límite de dispositivos alcanzado",
+    "message_one": "Tu cuenta permite {{count}} dispositivo. Elige uno para cerrar la sesión y así poder añadir este dispositivo.",
+    "message_other": "Tu cuenta permite {{count}} dispositivos. Elige uno para cerrar la sesión y así poder añadir este dispositivo.",
+    "unknownOs": "Desconocido",
+    "deviceLabel": "Dispositivo {{os}}",
+    "lastSeen": "visto por última vez {{time}}",
+    "cancel": "Cancelar",
+    "removing": "Eliminando…",
+    "removeAndContinue": "Eliminar y continuar"
+  },
+  "appDisabled": {
+    "title": "Playground no disponible",
+    "body": "Esta cuenta ({{email}}) ya no tiene acceso a la aplicación Playground. Contacta con tu administrador para reactivarla.",
+    "checkAgain": "Volver a comprobar",
+    "signOut": "Cerrar sesión en este dispositivo"
+  }
+}

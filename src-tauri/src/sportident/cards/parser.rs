@@ -9,7 +9,7 @@
 //     same header layout)
 //
 // The header (bytes 0..56) is identical across every supported card
-// type — only `punches_offset` differs.
+// type - only `punches_offset` differs.
 
 use super::layout::{LAYOUTS, PUNCH_RECORD_LEN};
 use super::{Card, CardType, ParseError, Punch};
@@ -32,12 +32,12 @@ fn is_empty_punch(b: &[u8; PUNCH_RECORD_LEN]) -> bool {
 ///
 /// Byte layout (matches sportident-rs's `Punch::decode_punch`):
 ///   data[0] (ptd, "punch time date"):
-///     bit 0     — PM flag (12-hour pivot). If set, add 12h to seconds.
-///     bits 1-3  — day-of-week (0=Mon). We discard.
-///     bits 4-5  — week counter (0=first). We discard.
-///     bits 6-7  — high 2 bits of the control number (10-bit codes 0..1023).
-///   data[1]    — low byte of the control number.
-///   data[2..4] — 16-bit big-endian seconds within the 12-hour pivot.
+///     bit 0     - PM flag (12-hour pivot). If set, add 12h to seconds.
+///     bits 1-3  - day-of-week (0=Mon). We discard.
+///     bits 4-5  - week counter (0=first). We discard.
+///     bits 6-7  - high 2 bits of the control number (10-bit codes 0..1023).
+///   data[1]    - low byte of the control number.
+///   data[2..4] - 16-bit big-endian seconds within the 12-hour pivot.
 ///
 /// `None` for sentinel/empty slots; real punches always produce `Some`.
 fn decode_punch(data: [u8; PUNCH_RECORD_LEN]) -> Option<Punch> {
@@ -63,7 +63,7 @@ fn decode_punch(data: [u8; PUNCH_RECORD_LEN]) -> Option<Punch> {
 /// data[1] (1/256 s). We currently discard it: the legacy JS exposed it
 /// only as a fractional-tenth fudge factor and no consumer reads it. If
 /// a downstream feature ever needs subsecond timing, plumb it through
-/// `Punch` (add a field) — the data is here.
+/// `Punch` (add a field) - the data is here.
 ///
 /// `data[1]` is **not** a control-number byte for these slots, so we
 /// don't pass it into `decode_punch` directly: instead, take the time
@@ -84,7 +84,7 @@ pub fn parse_card_readout(card_type: CardType, data: &[u8]) -> Result<Card, Pars
 
     // Need at least the header + punches_offset bytes to make any sense
     // of the readout. The reader (step 4) won't hand us a short buffer
-    // in practice — every block-read completes before assembly — but
+    // in practice - every block-read completes before assembly - but
     // we'd rather error cleanly than panic-index.
     let header_end = PUNCH_COUNT_BYTE + 1;
     if data.len() < header_end.max(CARD_ID_HI_BYTE + 3) {
@@ -96,7 +96,7 @@ pub fn parse_card_readout(card_type: CardType, data: &[u8]) -> Result<Card, Pars
 
     let claimed_punches = data[PUNCH_COUNT_BYTE] as usize;
     if claimed_punches > layout.max_punches {
-        // Suspect garbage — better to refuse than emit a bogus card.
+        // Suspect garbage - better to refuse than emit a bogus card.
         return Err(ParseError::PunchCountOutOfRange {
             card_type,
             claimed: claimed_punches,
@@ -112,7 +112,7 @@ pub fn parse_card_readout(card_type: CardType, data: &[u8]) -> Result<Card, Pars
     }
 
     // Card ID: 3-byte big-endian at bytes 25..28. High byte is always
-    // 0 for SI8/9/10/11 in the readout — the ID space spec'd by SI fits
+    // 0 for SI8/9/10/11 in the readout - the ID space spec'd by SI fits
     // in 24 bits.
     let card_id = ((data[CARD_ID_HI_BYTE] as u32) << 16)
         | ((data[CARD_ID_HI_BYTE + 1] as u32) << 8)
@@ -133,7 +133,7 @@ pub fn parse_card_readout(card_type: CardType, data: &[u8]) -> Result<Card, Pars
             punches.push(p);
         }
         // Sentinel records anywhere within the claimed range are
-        // dropped silently — matches legacy behaviour.
+        // dropped silently - matches legacy behaviour.
     }
 
     Ok(Card {
@@ -196,7 +196,7 @@ mod tests {
     }
 
     /// Helper: build a 640-byte SI11 readout. Layout is identical for the
-    /// header bytes (0..56) — what differs is `punches_offset = 128`.
+    /// header bytes (0..56) - what differs is `punches_offset = 128`.
     fn make_si11_buffer(
         card_id: u32,
         punches: &[(u16, u32, bool)],
@@ -223,7 +223,7 @@ mod tests {
     fn empty_punch_sentinels_decode_to_none() {
         assert!(decode_punch([0xEE, 0xEE, 0xEE, 0xEE]).is_none());
         assert!(decode_punch([0x00, 0x00, 0x00, 0x00]).is_none());
-        // 0xEE in only some bytes does NOT count as empty — only the full
+        // 0xEE in only some bytes does NOT count as empty - only the full
         // pattern. This matches legacy behaviour.
         assert!(decode_punch([0xEE, 0x00, 0xEE, 0x00]).is_some());
     }
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(CardType::from_card_id(7_654_321), Some(CardType::Si10));
         assert_eq!(CardType::from_card_id(9_999_999), Some(CardType::Si11));
         // Out of range / unsupported types.
-        assert_eq!(CardType::from_card_id(8_500_000), None); // SIAC — not yet
+        assert_eq!(CardType::from_card_id(8_500_000), None); // SIAC - not yet
         assert_eq!(CardType::from_card_id(123), None);
         assert_eq!(CardType::from_card_id(20_000_000), None);
     }
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn parse_si11_with_many_punches() {
-        // 70 punches across the buffer — exercises the SI10/11 punches_offset=128.
+        // 70 punches across the buffer - exercises the SI10/11 punches_offset=128.
         let punches: Vec<_> = (0..70)
             .map(|i| (100 + i as u16, 36_000 + (i as u32) * 60, false))
             .collect();
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn parse_drops_sentinel_punches_within_claimed_range() {
-        // Claim 3 punches but only 2 have real data — sentinel slot in
+        // Claim 3 punches but only 2 have real data - sentinel slot in
         // the middle should be filtered out.
         let mut buf = make_si9_buffer(
             1_500_000,

@@ -2,7 +2,7 @@
 //
 // The SportIdent reader is built around a Silicon Labs CP210x USB-UART chip
 // (USB\VID_10C4&PID_800A). On Windows 11 24H2/25H2 the legacy CP210x driver
-// (silabser.sys 6.7.x) sits on Microsoft's Vulnerable Driver Blocklist —
+// (silabser.sys 6.7.x) sits on Microsoft's Vulnerable Driver Blocklist -
 // even though the .sys file is on disk and signed, the kernel refuses to
 // load it. Device Manager shows Code 39, "application control policy
 // blocked this file". The fix is the Silicon Labs Universal driver (v11.x);
@@ -15,7 +15,7 @@
 // src-tauri/resources/silabser-drivers/.
 //
 // Why DIGCF_ALLCLASSES (not DIGCF_DEVICEINTERFACE on the Ports class):
-// a CP210x stuck in Code 39 is NOT enumerated under "Ports (COM & LPT)" —
+// a CP210x stuck in Code 39 is NOT enumerated under "Ports (COM & LPT)" -
 // it sits under "Other devices" with no class assigned because the
 // driver never loaded. We have to sweep every class to find it.
 
@@ -35,12 +35,12 @@ pub enum DriverState {
     /// (driver blocked). On modern Windows 11 this almost always means the
     /// Vulnerable Driver Blocklist refused the .sys file.
     BlockedByPolicy,
-    /// Device present, CM problem code 28 (CM_PROB_FAILED_INSTALL — "the
+    /// Device present, CM problem code 28 (CM_PROB_FAILED_INSTALL - "the
     /// drivers for this device are not installed") or 18 (CM_PROB_REINSTALL).
     /// The reader is physically plugged in but Windows has never bound a
     /// working driver to it, so it sits under "Other devices". Distinct from
     /// BlockedByPolicy: there a driver exists but the kernel refused to load
-    /// it; here there is simply no driver to load — installing one fixes it.
+    /// it; here there is simply no driver to load - installing one fixes it.
     DriverNotInstalled,
     /// Device present, CM problem code is something else (uninitialized,
     /// disabled, resource conflict, etc.). Surfaced so the UI can render
@@ -75,7 +75,7 @@ pub async fn install_cp210x_driver(_app: tauri::AppHandle) -> Result<(), String>
     //      lpParameters="/add-driver \"<inf>\" /install", SW_HIDE
     //   3. WaitForSingleObject on a spawn_blocking task; GetExitCodeProcess
     //   4. caller re-runs check_cp210x_driver_state to confirm rebind
-    Err("install_cp210x_driver is a Sprint 1 stub — coming in Sprint 2".into())
+    Err("install_cp210x_driver is a Sprint 1 stub - coming in Sprint 2".into())
 }
 
 #[cfg(target_os = "windows")]
@@ -130,7 +130,7 @@ mod windows_impl {
 
                 state = if cr == CR_SUCCESS {
                     if (status.0 & DN_HAS_PROBLEM.0) == 0 {
-                        // No problem flagged — driver loaded fine.
+                        // No problem flagged - driver loaded fine.
                         DriverState::Healthy
                     } else {
                         match problem.0 {
@@ -139,12 +139,12 @@ mod windows_impl {
                             // with the policy that refused silabser.sys, this
                             // is the case we want to fix.
                             //
-                            // CM_PROB_DRIVER_BLOCKED (40) is closely related —
+                            // CM_PROB_DRIVER_BLOCKED (40) is closely related -
                             // group it under the same UI bucket so the same
                             // Install Driver action fires.
                             39 | 40 => DriverState::BlockedByPolicy,
                             // CM_PROB_FAILED_INSTALL (28) is "the drivers for
-                            // this device are not installed" — a CP210x that
+                            // this device are not installed" - a CP210x that
                             // never had a driver bound, sitting under "Other
                             // devices". CM_PROB_REINSTALL (18) is the same
                             // remedy from the operator's side (install the
@@ -165,8 +165,8 @@ mod windows_impl {
     }
 
     /// True iff this device's hardware-ID list contains a `USB\VID_10C4&PID_800A`
-    /// entry (case-insensitive). Hardware IDs come back as a REG_MULTI_SZ — a
-    /// sequence of UTF-16 strings separated by nulls — so we walk it as such.
+    /// entry (case-insensitive). Hardware IDs come back as a REG_MULTI_SZ - a
+    /// sequence of UTF-16 strings separated by nulls - so we walk it as such.
     unsafe fn device_matches_cp210x(hdevinfo: HDEVINFO, devinfo: &SP_DEVINFO_DATA) -> bool {
         let mut buf = [0u8; 4096];
         let mut required: u32 = 0;

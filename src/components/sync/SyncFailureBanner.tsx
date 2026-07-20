@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { AlertTriangle, X, ExternalLink } from 'lucide-react';
 import { on } from '../../services/syncEvents';
 import { runCycleNow } from '../../services/syncOrchestrator';
@@ -15,6 +16,7 @@ interface SyncFailureBannerProps {
 // asset, or fails altogether for a recoverable reason. Hidden until the next
 // failed cycle. Auth-invalid failures bubble to onAuthInvalid (AuthProvider).
 export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureBannerProps) {
+  const { t } = useTranslation();
   const [state, setState] = useState<{ kind: 'hidden' } | { kind: 'failed'; reason: string } | { kind: 'partial'; failed: number }>(
     { kind: 'hidden' }
   );
@@ -58,8 +60,8 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
         <AlertTriangle className="w-4 h-4" />
         <span>
           {state.kind === 'partial'
-            ? `${state.failed} item${state.failed === 1 ? '' : 's'} failed to download.`
-            : `Sync failed: ${state.reason}.`}
+            ? t('sync:itemsFailedToDownload', { count: state.failed })
+            : t('sync:syncFailedReason', { reason: state.reason })}
         </span>
       </div>
       <div className="flex items-center gap-3">
@@ -68,7 +70,7 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
             onClick={onViewDetails}
             className="text-amber-200 hover:text-white inline-flex items-center gap-1 underline"
           >
-            View details
+            {t('sync:viewDetails')}
             <ExternalLink className="w-3 h-3" />
           </button>
         )}
@@ -77,9 +79,9 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
           disabled={retrying}
           className="text-amber-200 hover:text-white underline disabled:opacity-50"
         >
-          {retrying ? 'Retrying…' : 'Retry'}
+          {retrying ? t('sync:retrying') : t('sync:retry')}
         </button>
-        <button onClick={() => setState({ kind: 'hidden' })} className="text-amber-300/70 hover:text-white">
+        <button onClick={() => setState({ kind: 'hidden' })} aria-label={t('sync:dismiss')} className="text-amber-300/70 hover:text-white">
           <X className="w-4 h-4" />
         </button>
       </div>

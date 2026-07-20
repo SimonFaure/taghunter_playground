@@ -1,0 +1,72 @@
+{
+  "explainer": {
+    "title": "Para qué sirve esta pestaña",
+    "body": "El lector de tarjetas SportIdent se conecta por USB y necesita un controlador de Windows para que este ordenador pueda comunicarse con él. Esta pestaña comprueba si ese controlador está instalado y funcionando y, si el lector no se detecta, te guía en la instalación del controlador adecuado para que se conecte y pueda leer tarjetas. Solo concierne al lector físico - no a tu contenido de juego (Sincronización) ni a la versión de la aplicación (Actualizaciones)."
+  },
+  "detection": {
+    "recheck": "Volver a comprobar",
+    "installTitle": "Disponible en la próxima versión",
+    "install": "Instalar controlador firmado",
+    "comingSoon": "(próximamente)"
+  },
+  "variant": {
+    "healthy": {
+      "title": "El controlador del lector parece correcto",
+      "body": "Windows cargó el controlador del lector SportIdent. Conecta tu lector y la pestaña Hardware mostrará el puerto COM."
+    },
+    "blockedByPolicy": {
+      "title": "Controlador bloqueado por Windows",
+      "body": "Hay un lector SportIdent conectado, pero Windows se negó a cargar su controlador - casi con toda seguridad la Lista de bloqueo de controladores vulnerables rechazando el antiguo silabser.sys (el caso 24H2 / 25H2). Instalar el controlador firmado de abajo lo soluciona; no es necesario cambiar la Integridad de memoria."
+    },
+    "driverNotInstalled": {
+      "title": "Controlador del lector no instalado",
+      "body": "Hay un lector SportIdent conectado, pero Windows no tiene ningún controlador para él (el Administrador de dispositivos lo muestra en «Otros dispositivos», código 28). Instala el controlador USB de SportIdent de abajo y el lector se conectará."
+    },
+    "deviceAbsent": {
+      "title": "No se detecta ningún lector SportIdent",
+      "body": "Conecta tu lector y esta tarjeta se actualizará automáticamente. Si el lector está conectado pero el Administrador de dispositivos muestra una advertencia amarilla, la solución del controlador aparecerá aquí una vez detectada."
+    },
+    "otherError": {
+      "title": "Error de dispositivo (código {{code}})",
+      "body": "Windows informó de un error inusual para el lector SportIdent. La solución del controlador de abajo puede ayudar de todos modos; si no, los pasos del Visor de eventos en «Por qué ocurre esto» indican el archivo .sys exacto que Windows se negó a cargar."
+    },
+    "unknown": {
+      "title": "Desconocido",
+      "body": ""
+    }
+  },
+  "sportident": {
+    "title": "Controlador USB de SportIdent",
+    "subtitle": "Necesario para que se detecte el lector.",
+    "body": "Instala el controlador USB firmado actual de SportIdent. Reemplaza el antiguo controlador bloqueado o ausente por una versión compatible con HVCI - <1>no necesitas desactivar la Integridad de memoria</1>.",
+    "download": "Descargar el controlador USB de SportIdent",
+    "afterInstall": "Tras la instalación, desconecta y vuelve a conectar el lector, luego pulsa el botón de volver a comprobar en la tarjeta de estado de arriba - debería ponerse verde."
+  },
+  "manual": {
+    "title": "Solución alternativa manual",
+    "subtitle": "Si el instalador de arriba no funciona.",
+    "showSteps": "Mostrar pasos",
+    "hideSteps": "Ocultar pasos",
+    "warning": "<1>Solución temporal.</1> Reemplazar manualmente el controlador USB de SportIdent incluido por el controlador firmado Silicon Labs CP210x restaura el puerto COM hasta que SportIdent publique una solución permanente.",
+    "downloadSilabs": "Descargar el controlador Silicon Labs CP210x",
+    "openGuide": "Abrir la guía completa de la solución",
+    "stepsHeading": "Reemplazar el controlador manualmente",
+    "step1": "Abre <1>Configuración de Windows → Aplicaciones → Aplicaciones instaladas</1> y desinstala <2>«Windows Driver Package – SPORTident (sliabenm) Ports»</2>.",
+    "step2": "Descarga el controlador VCP de Silicon Labs CP210x (botón de arriba) y extrae el ZIP. En PC ARM / Snapdragon, elige el <2>CP210x Universal Windows Driver</2>.",
+    "step3": "Conecta el lector SportIdent y luego abre el <1>Administrador de dispositivos</1>.",
+    "step4": "Encuentra el dispositivo (aparece como <1>«SPORTident USB to UART Bridge Controller»</1>, a menudo con una advertencia amarilla). Haz clic derecho sobre él → <1>Actualizar controlador</1>.",
+    "step5": "Elige <1>Buscar controladores en mi equipo → Elegir en una lista → Mostrar todos los dispositivos</1>.",
+    "step6": "Haz clic en <1>Usar disco… → Examinar…</1>, abre la carpeta extraída y selecciona <code>silabser.inf</code>.",
+    "step7": "Selecciona <1>«Silicon Labs CP210x USB to UART Bridge»</1> y confirma a pesar de las advertencias.",
+    "step8": "El lector ahora aparece como un puerto COM. <2>Repite los pasos 3 a 7 para cada lector o dongle adicional.</2>"
+  },
+  "why": {
+    "title": "Por qué ocurre esto",
+    "subtitle": "La Integridad de memoria y las actualizaciones recientes de características de Windows 11.",
+    "body": "Las actualizaciones recientes de características de Windows 11 (<2>24H2</2>, <2>25H2</2>) refuerzan la política de integridad de código de los controladores del kernel y activan la <2>Integridad de memoria</2> (Aislamiento del núcleo) de forma predeterminada. Los controladores USB-serie antiguos - incluido el que se incluía anteriormente con el lector SportIdent - ya no se cargan bajo la nueva política, por lo que el lector deja de detectarse. El controlador firmado de arriba lo reemplaza por una versión actual compatible con HVCI.",
+    "verifyHeading": "Cómo verificarlo en tu equipo",
+    "verify1": "Seguridad de Windows → <1>Seguridad del dispositivo → Aislamiento del núcleo</1> - si la Integridad de memoria está <2>Activada</2>, ese es el bloqueo.",
+    "verify2": "Windows Update → <1>Historial de actualizaciones</1> - busca una actualización de características reciente a 24H2 o 25H2.",
+    "verify3": "Visor de eventos → <1>Registros de Windows → Sistema</1>, filtra por origen <code>Microsoft-Windows-CodeIntegrity</code> - la entrada de bloqueo indica el archivo <mono>.sys</mono> exacto que Windows se negó a cargar (para diagnóstico avanzado)."
+  }
+}

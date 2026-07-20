@@ -2,7 +2,7 @@ import Database from '@tauri-apps/plugin-sql';
 
 // Shared SQLite handle for the entire app.
 //
-// All service modules (authStore, scenarioStore, patternStore, layoutStore,
+// All service modules (authStore, scenarioStore, patternStore,
 // cardsStore, contentFs, strongholdStore, telemetry, device, syncOrchestrator)
 // import `getDb` from here instead of each holding their own cached
 // `Database.load()` promise.
@@ -13,7 +13,7 @@ import Database from '@tauri-apps/plugin-sql';
 //     underlying Rust resource freed, causing "The resource id N is invalid"
 //     errors in unrelated callers that still hold the old wrapper.
 //   - Centralizing to one cache means HMR can only reset *this* module, and
-//     the next getDb() call freshly reloads — all consumers transparently
+//     the next getDb() call freshly reloads - all consumers transparently
 //     pick up the new instance.
 //   - Also tightens future schema/migration coordination to a single place.
 //
@@ -37,7 +37,7 @@ interface DbGlobals {
 const g = globalThis as unknown as DbGlobals;
 
 // The connection URL MUST match exactly what lib.rs's add_migrations()
-// registered under — tauri-plugin-sql keys migrations by URL string, and
+// registered under - tauri-plugin-sql keys migrations by URL string, and
 // a mismatch silently drops them. sqlx's SQLite URL parser only accepts
 // a small set of query params (mode, cache, immutable), so the previous
 // attempt at `?journal_mode=WAL&busy_timeout=5000` failed at parse time
@@ -60,7 +60,7 @@ export async function getDb(): Promise<Database> {
       }
       return db;
     })().catch((err) => {
-      // Don't pin a rejected promise — let the next caller try again.
+      // Don't pin a rejected promise - let the next caller try again.
       g[GLOBAL_KEY] = undefined;
       throw err;
     });
@@ -78,7 +78,7 @@ export function invalidateDb(): void {
 // Convenience wrapper: runs `fn(db)` and, if it fails with a stale-handle
 // error from the sql plugin, invalidates the cache and retries once.
 //
-// Opt-in — existing call sites that do `const db = await getDb(); await
+// Opt-in - existing call sites that do `const db = await getDb(); await
 // db.execute(...)` keep working unchanged. Wrap a call here if you want
 // self-healing on dev-mode HMR artifacts that slip past the globalThis pin
 // (e.g. the user manually called invalidateDb, or an OS-level handle drop).

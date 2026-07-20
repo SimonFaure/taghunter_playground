@@ -1,0 +1,82 @@
+{
+  "errors": {
+    "requestFailed": "Request failed ({{status}})",
+    "generic": "Something went wrong. Please try again."
+  },
+  "provider": {
+    "loading": "Loading…"
+  },
+  "login": {
+    "title": "Tag Hunter Playground",
+    "subtitle": "Sign in to continue",
+    "emailLabel": "Email address",
+    "emailPlaceholder": "you@example.com",
+    "sendingCode": "Sending code…",
+    "sendCode": "Send login code",
+    "adminNote": "Accounts are created by your administrator.",
+    "codeSentTo": "We sent a 6-digit code to",
+    "verifying": "Verifying…",
+    "useDifferentEmail": "← Use a different email",
+    "resendCode": "Resend code"
+  },
+  "lock": {
+    "enterPinTitle": "Enter your PIN",
+    "checkEmailTitle": "Check your email",
+    "chooseNewPinTitle": "Choose a new PIN",
+    "confirmNewPinTitle": "Confirm your new PIN",
+    "pinUpdatedTitle": "PIN updated",
+    "signedInAs": "Signed in as {{email}}",
+    "codeSentTo": "We sent a 6-digit code to {{email}}",
+    "pickNewPin": "Pick a new 4-digit PIN for this device.",
+    "typeOnceMore": "Type it once more to make sure it matches.",
+    "unlocking": "Unlocking…",
+    "lockedOut": "Too many wrong attempts. Try again in {{time}}.",
+    "checking": "Checking…",
+    "connectToResetTitle": "Connect to the internet to reset your PIN",
+    "forgotPin": "Forgot PIN?",
+    "connectToReset": "Connect to the internet to reset your PIN.",
+    "recoveryHint": "Works offline - ask your administrator for a recovery code",
+    "useRecoveryCode": "Use a recovery code",
+    "sendingCode": "Sending code…",
+    "backToPin": "← Back to PIN",
+    "resendCode": "Resend code",
+    "cancel": "Cancel",
+    "saving": "Saving…",
+    "noPin": "No PIN set on this device. Restart the app to continue.",
+    "tooManyAttempts": "Too many wrong attempts. Try again shortly.",
+    "wrongPin": "Wrong PIN. Try again.",
+    "couldNotCheck": "Could not check PIN. Try again.",
+    "pinsDontMatch": "PINs don’t match. Choose a PIN again.",
+    "remainingSeconds": "{{count}}s",
+    "remainingMinutes": "{{count}} min",
+    "remainingHours": "{{count}}h"
+  },
+  "offlineGrace": {
+    "bannerLastReached_one": "Offline mode - last reached the server {{count}} day ago.",
+    "bannerLastReached_other": "Offline mode - last reached the server {{count}} days ago.",
+    "bannerRemaining_one": "{{count}} day of offline access left.",
+    "bannerRemaining_other": "{{count}} days of offline access left.",
+    "reconnectRequired": "Reconnect required.",
+    "retryNow": "Retry now",
+    "lockTitle": "Reconnect to continue",
+    "lockBody": "This device hasn't reached the server in {{ageDays}} days, exceeding your {{graceDays}}-day offline allowance. Connect to the internet to resume.",
+    "retryConnection": "Retry connection"
+  },
+  "capReached": {
+    "title": "Device limit reached",
+    "message_one": "Your account allows {{count}} device. Pick one to log out so this device can be added.",
+    "message_other": "Your account allows {{count}} devices. Pick one to log out so this device can be added.",
+    "unknownOs": "Unknown",
+    "deviceLabel": "{{os}} device",
+    "lastSeen": "last seen {{time}}",
+    "cancel": "Cancel",
+    "removing": "Removing…",
+    "removeAndContinue": "Remove and continue"
+  },
+  "appDisabled": {
+    "title": "Playground unavailable",
+    "body": "This account ({{email}}) no longer has access to the Playground app. Contact your administrator to re-enable it.",
+    "checkAgain": "Check again",
+    "signOut": "Sign out of this device"
+  }
+}

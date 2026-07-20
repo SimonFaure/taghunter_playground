@@ -1,0 +1,21 @@
+{
+  "setTitle": "Définir un code PIN pour cet appareil",
+  "confirmTitle": "Confirmez votre code PIN",
+  "setSubtitle": "Vous utiliserez ce code PIN pour déverrouiller l’application après l’avoir verrouillée. Aucune connexion Internet requise.",
+  "typeAgain": "Saisissez-le une nouvelle fois pour vérifier qu’il correspond.",
+  "signedInAs": "Connecté en tant que {{email}}",
+  "pinsDontMatch": "Les codes PIN ne correspondent pas. Choisissez à nouveau un code PIN.",
+  "saveFailed": "Échec de l’enregistrement du code PIN. Réessayez.",
+  "savingPin": "Enregistrement du code PIN…",
+  "saving": "Enregistrement…",
+  "pickDifferent": "Choisir un autre code PIN",
+  "devicePin": "Code PIN de l’appareil",
+  "gatesHint": "Utilisé par les protections de sécurité ci-dessus et le bouton Verrouiller de la barre de navigation.",
+  "pinCurrentlySet": "Un code PIN est actuellement défini.",
+  "noPinSet": "Aucun code PIN n’est défini.",
+  "changePin": "Modifier le code PIN",
+  "setPin": "Définir le code PIN",
+  "chooseTitle": "Choisissez un code PIN",
+  "chooseSubtitle": "Choisissez un code PIN à 4 chiffres pour cet appareil.",
+  "cancel": "Annuler"
+}

@@ -4,6 +4,8 @@ import { sportidentService as siReader, CardData, StationData, detectReaderPort 
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
+import { PendingTeamsBar } from './PendingTeamsBar';
+import { usePresentationQueue } from '../hooks/usePresentationQueue';
 import { localizedStatus, type GameMessageType } from '../services/gameMessages';
 import {
   getLaunchedGameState,
@@ -30,6 +32,8 @@ import {
   type TracksScreen,
   type TracksDisplayMode,
   type TracksBigReveal,
+  type SceneTextElement,
+  type SceneTextCategory,
 } from './TracksGameRenderer';
 import {
   checkpointsForRoute,
@@ -49,6 +53,25 @@ interface TracksGamePageProps {
   onGameEnd?: () => void;
 }
 
+/** HUD frame position saved by the studio LayoutEditor; values are % of the
+ *  map image (same referential as checkpoint markers + text elements). */
+interface HudFrameBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** HUD frame element ids written to `scenarios.scenario_layout.elements[]` by
+ *  the studio LayoutEditor. Mirrors `TRACKS_HUD_ITEMS` in the studio's
+ *  `creator-ported/utils/layoutGroups.ts`. */
+const HUD_FRAME_IDS = [
+  'team_name_background_image',
+  'timer_background_image',
+  'score_background_image',
+  'time_background_image',
+] as const;
+
 interface TracksGameData {
   title: string;
   font?: string;
@@ -64,9 +87,55 @@ interface TracksGameData {
   // logical sound slot → filename
   sounds: Record<string, string>;
   iconSizePercent: number;
-  clues: { enabled: boolean; show_title: boolean; show_text: boolean; show_image: boolean };
   showScore: boolean;
   autoReset: boolean;
+  /** Author-defined text overlays on the map; rendered by TracksGameRenderer
+   *  when the map is showing. Plan: tracks-text-elements.md. */
+  textElements: SceneTextElement[];
+  /** Author-defined categories carrying typography defaults; per-element
+   *  fields inherit when not set. Plan: tracks-text-elements-categories.md. */
+  textCategories: SceneTextCategory[];
+  /** Saved positions for the 4 HUD frames (team_name, timer, score, time),
+   *  keyed by element id; empty map → renderer uses its default top strip. */
+  hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>>;
+  /** Author-editable run messages (text_* UI strings), each a
+   *  Localized<string> | string. Surfaced by the runtime only when the author
+   *  filled the field in; an empty/missing key keeps the built-in behaviour. */
+  texts: Record<string, unknown>;
+}
+
+/** The text_* keys the tracks runtime can surface (see TextStringsSection in
+ *  studio - tracks omits the ranking/podium/level/late-malus strings). */
+const TRACKS_TEXT_KEYS = [
+  'text_player_starts',
+  'text_team_starts_card_not_empty',
+  'text_card_not_corresponding',
+  'text_team_ended',
+  'text_scenario_ended',
+  'text_card_empty',
+  'text_if_error',
+] as const;
+
+/**
+ * Resolve one text_* string for the given language, substituting the team name
+ * ({team}/{name}/%s) and an optional count ({count}/%d). Returns '' when the
+ * author left the field blank - callers then fall back to the built-in message.
+ */
+function resolveTracksText(
+  texts: Record<string, unknown> | undefined,
+  key: (typeof TRACKS_TEXT_KEYS)[number],
+  lang: string,
+  vars?: { team?: string | null; count?: number },
+): string {
+  const raw = readLocalized(
+    (texts?.[key] ?? undefined) as Record<string, string> | string | undefined,
+    lang,
+  ).trim();
+  if (!raw) return '';
+  let out = raw;
+  if (vars?.team) out = out.replace(/\{team\}|\{name\}|%s/gi, vars.team);
+  if (vars?.count != null) out = out.replace(/\{count\}|%d/gi, String(vars.count));
+  return out;
 }
 
 const SOUND_SLOTS = [
@@ -141,8 +210,49 @@ function normalizeTracksGameData(raw: any): TracksGameData {
     }
   }
 
-  const cluesRaw = gm.clues_page ?? {};
   const iconPct = parseFloat(gm.checkpoint_image_width_percentage ?? '3');
+
+  // Authored text overlays. Pass through as-is; the renderer skips entries
+  // without `position` (the "unplaced" state from the studio LayoutEditor).
+  const textElements: SceneTextElement[] = Array.isArray(gm.text_elements)
+    ? (gm.text_elements as SceneTextElement[])
+    : [];
+
+  // Author-defined categories carrying typography defaults. Pass through;
+  // the renderer indexes them by id and resolves per-element inheritance.
+  const textCategories: SceneTextCategory[] = Array.isArray(gm.text_categories)
+    ? (gm.text_categories as SceneTextCategory[])
+    : [];
+
+  // HUD frame positions from the studio LayoutEditor. Accepts BOTH
+  // distribution shapes: cloud (playground.php splices `scenario_layout` into
+  // `gameData`) and ZIP (`buildZipPayload` puts `layout` at the top of
+  // `game-data.json`). Coords are `% of map image`, identical referential to
+  // checkpoint markers + text elements.
+  const layoutElements: unknown[] =
+    Array.isArray(raw?.scenario_layout?.elements)
+      ? raw.scenario_layout.elements
+      : Array.isArray(raw?.layout?.elements)
+        ? raw.layout.elements
+        : Array.isArray(raw?.game_data?.scenario_layout?.elements)
+          ? raw.game_data.scenario_layout.elements
+          : [];
+  const hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>> = {};
+  for (const el of layoutElements) {
+    if (
+      el &&
+      typeof el === 'object' &&
+      typeof (el as Record<string, unknown>).id === 'string' &&
+      HUD_FRAME_IDS.includes((el as { id: (typeof HUD_FRAME_IDS)[number] }).id) &&
+      typeof (el as Record<string, unknown>).x === 'number' &&
+      typeof (el as Record<string, unknown>).y === 'number' &&
+      typeof (el as Record<string, unknown>).width === 'number' &&
+      typeof (el as Record<string, unknown>).height === 'number'
+    ) {
+      const e = el as { id: (typeof HUD_FRAME_IDS)[number]; x: number; y: number; width: number; height: number };
+      hudLayout[e.id] = { x: e.x, y: e.y, width: e.width, height: e.height };
+    }
+  }
 
   return {
     title:
@@ -158,14 +268,16 @@ function normalizeTracksGameData(raw: any): TracksGameData {
     checkpointImages,
     sounds,
     iconSizePercent: Number.isFinite(iconPct) ? iconPct : 3,
-    clues: {
-      enabled: !!cluesRaw.enabled,
-      show_title: cluesRaw.show_title !== false,
-      show_text: cluesRaw.show_text !== false,
-      show_image: cluesRaw.show_image !== false,
-    },
     showScore: gm.display_score !== false,
     autoReset: gm.auto_reset !== false,
+    textElements,
+    textCategories,
+    hudLayout,
+    texts: (() => {
+      const t: Record<string, unknown> = {};
+      for (const k of TRACKS_TEXT_KEYS) if (gm[k] != null) t[k] = gm[k];
+      return t;
+    })(),
   };
 }
 
@@ -177,7 +289,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   const dataRef = useRef<TracksGameData | null>(null);
   // Punches read by THIS device's USB reader are processed immediately in
   // saveCardData; the 1s state poll then echoes those same raw_data rows back.
-  // Track the row ids handled locally so the poll skips them — otherwise each
+  // Track the row ids handled locally so the poll skips them - otherwise each
   // own-reader bip runs twice (now + ~1s later), which would start AND reveal a
   // team on its very first bip.
   const processedRawIdsRef = useRef<Set<number>>(new Set());
@@ -187,12 +299,19 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   const [gameMessage, setGameMessage] = useState('');
   const [gameMessageType, setGameMessageType] = useState<GameMessageType>('info');
   const msgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Serial presentation queue: the second-bip reveal / clues-review AND status
+  // messages share it, so a team bipping while one is on screen waits its turn
+  // (and shows in the bottom line) instead of racing the current reveal.
+  const queue = usePresentationQueue();
 
-  // Focused-team display state — driven by the most recent bip.
+  // Focused-team display state - driven by the most recent bip.
   // Default screen is the resting background image; the map only appears for the
   // second-bip reveal (see tracks-reveal-redesign.md).
   const [screen, setScreen] = useState<TracksScreen>('background');
   const [focusTeamName, setFocusTeamName] = useState('');
+  // The in-focus team's display language (their reveal/clues render in it). Empty
+  // ⇒ idle/shared screen, which falls back to the launch language below.
+  const [focusLanguage, setFocusLanguage] = useState('');
   const [focusScoreText, setFocusScoreText] = useState('');
   const [focusHitCount, setFocusHitCount] = useState(0);
   const [topRevealUrl, setTopRevealUrl] = useState('');
@@ -200,8 +319,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // URL, accumulates during the walk) + the full-mode big-center reveal.
   const [placedCheckpoints, setPlacedCheckpoints] = useState<Map<string, string>>(new Map());
   const [bigReveal, setBigReveal] = useState<TracksBigReveal | null>(null);
+  // Checkpoints the focused team reached, used by the clues page to show each
+  // checkpoint's own image (found) vs the "not found" image (unfound).
+  const [cluesFoundIds, setCluesFoundIds] = useState<Set<string>>(new Set());
   // The focused team's resolved route (per-team meta override else launch
-  // default) — drives which markers render and which checkpoints score.
+  // default) - drives which markers render and which checkpoints score.
   const [focusRoute, setFocusRoute] = useState(config.route ?? 'default');
   // HUD timer shows the focused team's frozen final run duration during the
   // reveal; blank otherwise (no HUD over the background during the run).
@@ -215,7 +337,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // any videos. `finalize(name)` persists the name + proceeds; `abort()` cancels
   // the start (and deletes the team if this bip created it).
   const [selfReg, setSelfReg] = useState<{
-    finalize: (name: string) => Promise<void>;
+    finalize: (name: string, language: string) => Promise<void>;
     abort: () => Promise<void>;
   } | null>(null);
 
@@ -229,6 +351,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   const timeLimitMin = config.duration || 60;
   const malusPerMinute = config.malusPerMinute ?? 1;
   const language = config.language ?? 'fr';
+  // "Clues page on team return" is a per-launch option (was a studio scenario
+  // setting). Off by default; sub-toggles default on when enabled.
+  const clues = {
+    enabled: !!config.cluesPage?.enabled,
+    show_title: config.cluesPage?.show_title !== false,
+    show_text: config.cluesPage?.show_text !== false,
+    show_image: config.cluesPage?.show_image !== false,
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -255,7 +385,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     void load();
   }, [gameUniqid]);
 
-  // No on-screen back button on the kiosk display — Esc exits (operator keyboard).
+  // No on-screen back button on the kiosk display - Esc exits (operator keyboard).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onBack();
@@ -289,16 +419,19 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // Transient full-screen status message (shared <GameMessageOverlay>). Used to
   // surface scored-run outcomes + the otherwise-silent failure paths below.
   const showMessage = useCallback(
-    (message: string, type: GameMessageType = 'info') => {
-      setGameMessage(message);
-      setGameMessageType(type);
-      if (msgTimerRef.current) clearTimeout(msgTimerRef.current);
-      msgTimerRef.current = setTimeout(
-        () => setGameMessage(''),
-        config.messageDisplayDuration * 1000,
-      );
+    (message: string, type: GameMessageType = 'info', label: string | null = null) => {
+      void queue.enqueue(label, () => new Promise<void>((resolve) => {
+        setGameMessage(message);
+        setGameMessageType(type);
+        if (msgTimerRef.current) clearTimeout(msgTimerRef.current);
+        msgTimerRef.current = setTimeout(() => {
+          setGameMessage('');
+          msgTimerRef.current = null;
+          resolve();
+        }, config.messageDisplayDuration * 1000);
+      }));
     },
-    [config.messageDisplayDuration],
+    [config.messageDisplayDuration, queue.enqueue],
   );
 
   const getImageUrl = (filename: string | undefined) => {
@@ -317,7 +450,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         const state = await getLaunchedGameState(launchedGameId, 0);
         const teamsForCard = state.teams.filter((t) => t.key_id === card.id);
         let team = teamsForCard.find((t) => t.end_time == null) ?? null;
-        // True when *this* bip created the team — drives the self-register abort
+        // True when *this* bip created the team - drives the self-register abort
         // cleanup (delete a just-created team, never a rostered one).
         let createdNow = false;
 
@@ -327,7 +460,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             // Card has never had a team in this game.
             if (!config.autoRegisterTeam && !config.selfRegisterTeam) {
               console.warn('[TracksGamePage] no team for card', card.id);
-              showMessage(localizedStatus('card_not_registered', language), 'warning');
+              showMessage(
+                resolveTracksText(gd.texts, 'text_card_not_corresponding', language) ||
+                  localizedStatus('card_not_registered', language),
+                'warning',
+              );
               return;
             }
             team = await ensureTeamForCard(launchedGameId, card.id, state, !!config.useNamePool);
@@ -351,15 +488,15 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             } else {
               // reuse off OR within cooldown → existing clues-review behavior:
               // show the map with every checkpoint revealed, then reset.
-              if (!gd.clues.enabled) {
-                // No clues review to show — surface why the bip did nothing.
+              if (!clues.enabled) {
+                // No clues review to show - surface why the bip did nothing.
                 if (config.reuseCards) {
                   const remainingMin = Math.max(
                     1,
                     Math.ceil((lastEnd + cooldownSec - Date.now() / 1000) / 60),
                   );
                   showMessage(
-                    localizedStatus('reuse_cooldown', language).replace('{n}', String(remainingMin)),
+                    localizedStatus('reuse_cooldown', language, { n: remainingMin }),
                     'warning',
                   );
                 } else {
@@ -369,21 +506,69 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               }
               const finishedTeam = teamsForCard[teamsForCard.length - 1];
               // Show the finished team's own route on the clues review.
+              let cluesRoute = route;
               try {
                 const m = await getLaunchedGameMeta(launchedGameId);
-                setFocusRoute(m[`route:${finishedTeam.id}`] || route);
+                cluesRoute = m[`route:${finishedTeam.id}`] || route;
               } catch {
-                setFocusRoute(route);
+                cluesRoute = route;
               }
-              setFocusTeamName(finishedTeam.team_name ?? '');
-              setScreen('clues');
-              if (gd.autoReset) {
-                await new Promise((r) => setTimeout(r, 6000));
-                resetDisplay();
-              } else {
-                await waitForEnter();
-                resetDisplay();
+              // Recompute which checkpoints this team reached (from the punches
+              // still on the re-bipped card) so the clues page can show the
+              // "not found" image for the ones they missed. Best-effort - on any
+              // failure we fall back to an empty found-set (all shown as missing).
+              let cluesFound = new Set<string>();
+              try {
+                const allCps = gd.checkpoints;
+                const routeCps = checkpointsForRoute(allCps, cluesRoute);
+                const stations = await patternStore.getTracksCheckpointStations(config.pattern);
+                const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
+                const secondsOfDay = (t: string) => {
+                  const [h, m, s] = (t ?? '').split(':').map(Number);
+                  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+                };
+                const hitTimeByCp = new Map<string, number | undefined>();
+                for (const cp of routeCps) {
+                  const cpStations = stations.get(numberOf(cp)) ?? [];
+                  let earliest: number | undefined;
+                  for (const p of card.punches ?? []) {
+                    if (p.time && p.time !== '00:00:00' && cpStations.includes(p.code)) {
+                      const ts = secondsOfDay(p.time);
+                      if (earliest === undefined || ts < earliest) earliest = ts;
+                    }
+                  }
+                  hitTimeByCp.set(cp.id, earliest);
+                }
+                if (trackPlayMode === 'itinerary') {
+                  cluesFound = orderedHitCheckpointIds(routeCps, hitTimeByCp).hitIds;
+                } else {
+                  for (const cp of routeCps) {
+                    if (hitTimeByCp.get(cp.id) !== undefined) cluesFound.add(cp.id);
+                  }
+                }
+              } catch (err) {
+                console.error('[TracksGamePage] clues found-set compute error:', err);
               }
+              const cluesFrozenSec =
+                finishedTeam.start_time && finishedTeam.end_time
+                  ? finishedTeam.end_time - finishedTeam.start_time
+                  : null;
+              // One serial slot: a bip during this clues review waits its turn.
+              await queue.enqueue(finishedTeam.team_name ?? null, async () => {
+                setFocusRoute(cluesRoute);
+                setFocusTeamName(finishedTeam.team_name ?? '');
+                setFocusLanguage(finishedTeam.language ?? '');
+                setCluesFoundIds(cluesFound);
+                setFocusScoreText(scoreText(finishedTeam.score ?? 0));
+                setFocusFrozenSec(cluesFrozenSec);
+                setScreen('clues');
+                if (gd.autoReset) {
+                  await new Promise((r) => setTimeout(r, 6000));
+                } else {
+                  await waitForEnter();
+                }
+                resetDisplay();
+              });
               return;
             }
           }
@@ -406,12 +591,18 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         if (!team.start_time) {
           // The start sequence, parameterised by the effective team name: persist
           // a self-registered rename, then gate the clock on any first-bip videos.
-          const proceedAfterName = async (effectiveName: string) => {
-            if (effectiveName && effectiveName !== teamName) {
+          const proceedAfterName = async (effectiveName: string, teamLanguage?: string) => {
+            // Effective display language: the player's overlay pick, else launch,
+            // else 'fr' (the readLocalized fallback convention).
+            const effLang = teamLanguage || config.language || 'fr';
+            if ((effectiveName && effectiveName !== teamName) || teamLanguage) {
               try {
-                await updateTeam(team.id, { team_name: effectiveName });
+                await updateTeam(team.id, {
+                  ...(effectiveName && effectiveName !== teamName ? { team_name: effectiveName } : {}),
+                  ...(teamLanguage ? { language: teamLanguage } : {}),
+                });
               } catch (err) {
-                console.error('[TracksGamePage] error saving self-registered name:', err);
+                console.error('[TracksGamePage] error saving self-registered name/language:', err);
               }
             }
 
@@ -420,7 +611,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               await updateTeam(team.id, { start_time: startSec });
               // Snapshot the punches already on the card so a forgotten wipe or a
               // card reuse does not re-score stale punches. Persisted to meta
-              // (durable across reload — tracks runs are long). Matched on
+              // (durable across reload - tracks runs are long). Matched on
               // code+time so a legit re-punch (new time) still counts at scoring.
               let staleCount = 0;
               try {
@@ -442,9 +633,21 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               // First bip → confirm the start (like mystery's "C'est parti !").
               // The resting background stays up; this transient message is the
               // only first-bip feedback the operator/team gets.
+              // Authored text_* overrides (blank → built-in message).
+              const cardNotEmptyMsg = resolveTracksText(
+                gd.texts,
+                'text_team_starts_card_not_empty',
+                effLang,
+                { team: effectiveName, count: staleCount },
+              );
               const warn =
-                staleCount > 0 ? ` — ⚠️ Carte non vide : ${staleCount} passage(s) ignoré(s)` : '';
-              showMessage(`C'est parti ! ${effectiveName}${warn}`, warn ? 'warning' : 'success');
+                staleCount > 0
+                  ? ` - ${cardNotEmptyMsg || `⚠️ Puce non vide : ${staleCount} passage(s) ignoré(s)`}`
+                  : '';
+              const startMsg =
+                resolveTracksText(gd.texts, 'text_player_starts', effLang, { team: effectiveName }) ||
+                `C'est parti ! ${effectiveName}`;
+              showMessage(`${startMsg}${warn}`, staleCount > 0 ? 'warning' : 'success', effectiveName);
               setScreen('background');
               setBigReveal(null);
               setPlacedCheckpoints(new Map());
@@ -454,7 +657,12 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             const wantsVideos = !!(config.playTutorialOnBip || config.playIntroOnBip);
             if (wantsVideos) {
               const rawForResolve = await scenarioStore.getGameData(gameUniqid);
-              const videos = await resolveFirstBipVideos(config, gameUniqid, 'tracks', rawForResolve);
+              const videos = await resolveFirstBipVideos(
+                { ...config, language: effLang },
+                gameUniqid,
+                'tracks',
+                rawForResolve
+              );
               if (videos.length > 0) {
                 pendingFirstBipFinalizeRef.current = finalizeStart;
                 setFirstBipVideos(videos);
@@ -470,7 +678,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           // the team if this bip created it.
           if (config.selfRegisterTeam) {
             setSelfReg({
-              finalize: (name: string) => proceedAfterName(name),
+              finalize: (name: string, language: string) => proceedAfterName(name, language),
               abort: async () => {
                 setSelfReg(null);
                 if (createdNow) {
@@ -496,8 +704,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         const stations = await patternStore.getTracksCheckpointStations(config.pattern);
 
         // Drop punches that were already on the card at the first bip (matched on
-        // code+time, so a station legitimately re-punched during the run — new
-        // time — still counts). Keeps a forgotten-to-wipe or reused card from
+        // code+time, so a station legitimately re-punched during the run - new
+        // time - still counts). Keeps a forgotten-to-wipe or reused card from
         // re-scoring its leftover punches. Reuses the route-resolution meta read.
         let baseline = new Set<string>();
         try {
@@ -509,6 +717,15 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         const livePunches = (card.punches ?? []).filter(
           (p) => !baseline.has(`${p.code}@${p.time}`),
         );
+
+        // Empty card on the closing bip (no new punches since start) - surface
+        // the authored "card empty" message ahead of the all-missing reveal.
+        if (livePunches.length === 0) {
+          const emptyMsg = resolveTracksText(gd.texts, 'text_card_empty', team.language || language, {
+            team: teamName,
+          });
+          if (emptyMsg) showMessage(emptyMsg, 'warning', teamName);
+        }
 
         const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
         // Parse an SI clock time "HH:MM:SS" to seconds-of-day for ordering.
@@ -523,7 +740,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           const cpStations = stations.get(numberOf(cp)) ?? [];
           if (import.meta.env.DEV && cpStations.length === 0) {
             console.warn(
-              `[TracksGamePage] checkpoint #${numberOf(cp)} resolves to NO pattern stations — it can never be scored as hit. Check the pattern row count matches the checkpoint count.`,
+              `[TracksGamePage] checkpoint #${numberOf(cp)} resolves to NO pattern stations - it can never be scored as hit. Check the pattern row count matches the checkpoint count.`,
             );
           }
           let earliest: number | undefined;
@@ -558,7 +775,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         });
 
         await updateTeam(team.id, { end_time: endTime, score: finalScore });
-        // Run scored — drop the start-time baseline so a later reuse starts clean.
+        // Run scored - drop the start-time baseline so a later reuse starts clean.
         try {
           await removeLaunchedGameMetaKeys(launchedGameId, [`baseline:${team.id}`]);
         } catch (err) {
@@ -568,9 +785,17 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         // --- Reveal -----------------------------------------------------------
         // The map is the reveal surface; per-checkpoint status images accumulate
         // on it. Free → correct/missing; itinerary → correct/wrong/missing.
+        // Wrapped as ONE serial presentation slot so a second team bipping during
+        // this reveal waits its turn (shown in the bottom line) instead of racing
+        // this one's setScreen / focus state. Scoring above already committed.
+        // Captured before the slot closure (where team.start_time is narrowed
+        // non-null) - TS loses the narrowing across the nested async fn.
+        const frozenSec = endTime - team.start_time;
+        await queue.enqueue(teamName, async () => {
         setFocusTeamName(teamName);
+        setFocusLanguage(team.language ?? '');
         setFocusRoute(teamRoute);
-        setFocusFrozenSec(endTime - team.start_time); // frozen run duration
+        setFocusFrozenSec(frozenSec); // frozen run duration
         setFocusHitCount(hitIds.size);
         setBigReveal(null);
         setPlacedCheckpoints(new Map());
@@ -599,7 +824,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               : 'checkpoint_no_answer';
 
         if (displayMode === 'simple') {
-          // No per-checkpoint walk — settle straight onto the summary HUD, then
+          // No per-checkpoint walk - settle straight onto the summary HUD, then
           // hold it long enough to read before top-X / reset (otherwise it would
           // flash past instantly).
           setFocusScoreText(scoreText(finalScore));
@@ -612,21 +837,36 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           const rawIncrement = (cp: TracksCheckpoint) =>
             scoreType === 'percentage' ? 100 / denom : typeof cp.points === 'number' ? cp.points : 1;
           let runningRaw = 0;
+          // Currently DISPLAYED integer score, used to animate one unit at a
+          // time. Kept separate from `runningRaw` (which can be fractional in
+          // percentage mode, e.g. 100/24).
+          let displayedScore = 0;
+          const SCORE_TICK_MS = 50;
+          const animateScoreTo = async (target: number) => {
+            const end = Math.max(0, Math.round(target));
+            const dir = end >= displayedScore ? 1 : -1;
+            while (displayedScore !== end) {
+              displayedScore += dir;
+              setFocusScoreText(scoreType === 'percentage' ? `${displayedScore}%` : `${displayedScore} pts`);
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise((r) => setTimeout(r, SCORE_TICK_MS));
+            }
+          };
           const placed = new Map<string, string>();
           setFocusScoreText(scoreType === 'percentage' ? '0%' : '0 pts');
           for (const cp of routeCps) {
             const status = statusOf(cp);
             const url = statusImage(cp, status);
-            const bump = () => {
+            const bump = async () => {
               if (status !== 'correct') return;
               runningRaw =
                 scoreType === 'percentage'
                   ? Math.min(100, runningRaw + rawIncrement(cp))
                   : runningRaw + rawIncrement(cp);
-              setFocusScoreText(scoreText(runningRaw));
+              await animateScoreTo(runningRaw);
             };
             if (displayMode === 'full') {
-              // Phase A — big centered status image (name/description only for correct).
+              // Phase A - big centered status image (name/description only for correct).
               setBigReveal({
                 imageUrl: url,
                 title: status === 'correct' ? readLocalized(cp.title as Record<string, string> | string | undefined, language) : '',
@@ -634,27 +874,28 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                   status === 'correct' ? readLocalized(cp.description as Record<string, string> | string | undefined, language) : '',
               });
               playSound(statusSound(status));
-              bump();
               // eslint-disable-next-line no-await-in-loop
               await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
-              // Phase B — the image lands on the map and stays.
+              // Phase B - the image lands on the map; score increments AS the
+              // checkpoint is revealed (marker lands), not at Phase-A start.
               setBigReveal(null);
               placed.set(cp.id, url);
               setPlacedCheckpoints(new Map(placed));
+              await bump();
               // eslint-disable-next-line no-await-in-loop
               await new Promise((r) => setTimeout(r, 500));
             } else {
-              // map mode — Phase B only: place each status image sequentially.
+              // map mode - Phase B only: place each status image sequentially.
               placed.set(cp.id, url);
               setPlacedCheckpoints(new Map(placed));
               playSound(statusSound(status));
-              bump();
+              await bump();
               // eslint-disable-next-line no-await-in-loop
               await new Promise((r) => setTimeout(r, REVEAL_STEP_MS));
             }
           }
-          // Apply the time malus as a visible drop to the final score.
-          setFocusScoreText(scoreText(finalScore));
+          // Apply the time malus as a visible one-by-one drop to the final score.
+          await animateScoreTo(finalScore);
         }
 
         // --- Top-X reveal: rank the team among all teams ----------------------
@@ -672,6 +913,31 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           await new Promise((r) => setTimeout(r, 4000));
         }
 
+        // --- Closing messages: team ended, then scenario ended ----------------
+        // Already inside the reveal slot, so drive the overlay directly: routing
+        // through showMessage would enqueue a nested slot and deadlock the queue.
+        const endLang = team.language || language;
+        const teamEndedMsg = resolveTracksText(gd.texts, 'text_team_ended', endLang, { team: teamName });
+        if (teamEndedMsg) {
+          setGameMessageType('info');
+          setGameMessage(teamEndedMsg);
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
+          setGameMessage('');
+        }
+        const allFinished =
+          refreshed.teams.length > 0 && refreshed.teams.every((t) => t.end_time);
+        if (allFinished) {
+          const scenarioEndedMsg = resolveTracksText(gd.texts, 'text_scenario_ended', endLang);
+          if (scenarioEndedMsg) {
+            setGameMessageType('info');
+            setGameMessage(scenarioEndedMsg);
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
+            setGameMessage('');
+          }
+        }
+
         // --- Reset back to the map -------------------------------------------
         if (gd.autoReset) {
           // eslint-disable-next-line no-await-in-loop
@@ -681,8 +947,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           await waitForEnter();
           resetDisplay();
         }
+        });
       } catch (err) {
         console.error('[TracksGamePage] punch logic error:', err);
+        const errMsg = dataRef.current
+          ? resolveTracksText(dataRef.current.texts, 'text_if_error', language)
+          : '';
+        if (errMsg) showMessage(errMsg, 'error');
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -694,12 +965,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     setScreen('background');
     setPlacedCheckpoints(new Map());
     setBigReveal(null);
+    setCluesFoundIds(new Set());
     setTopRevealUrl('');
     setGameMessage('');
     setFocusFrozenSec(null);
     setFocusScoreText('');
     setFocusHitCount(0);
     setFocusRoute(route);
+    setFocusLanguage('');
   };
 
   const waitForEnter = () =>
@@ -737,7 +1010,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     saveCardDataRef.current = saveCardData;
   }, [saveCardData]);
 
-  // Reader binding — bind once per launched game (mirrors MysteryGamePage).
+  // Reader binding - bind once per launched game (mirrors MysteryGamePage).
   useEffect(() => {
     let cancelled = false;
     const initUSB = async () => {
@@ -771,21 +1044,18 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [launchedGameId]);
 
-  // Test/simulation bips arrive through the state poll.
   const handleNewBip = useCallback(
     (row: { id?: number; raw_data: unknown }) => {
-      // Skip rows this device already processed via its own USB reader (the poll
-      // echoes them back ~1s later). Remote/test punches aren't in the set.
+      // Own punches are processed live in saveCardData (the USB-reader callback),
+      // which records the row id here; the poll echoes them back ~1s later - skip
+      // our own echo.
       if (row.id != null && processedRawIdsRef.current.has(row.id)) return;
-      const card = row.raw_data as CardData;
-      if (card && dataRef.current) {
-        setLastCardData(card);
-        setShowCardAlert(true);
-        setTimeout(() => setShowCardAlert(false), 5000);
-        void handleCardPunchLogic(card);
-      }
+      // Anything else is a punch read on ANOTHER device, reaching us through the
+      // shared state poll. Each station animates only the cards it physically
+      // read, so we must NOT replay a remote bip here - doing so was animating a
+      // single bip on every device in the game.
     },
-    [handleCardPunchLogic],
+    [],
   );
 
   useGameStatePolling({
@@ -822,10 +1092,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
       {selfReg && (
         <SelfRegisterOverlay
           language={language}
-          onSubmit={(name) => {
+          scenarioLanguages={config.scenarioLanguages ?? []}
+          scenarioAudience={config.namePoolAudience ?? 'kids'}
+          allowLanguageChoice={!!config.allowPlayerLanguageChoice}
+          addRandomName={!!config.addRandomNameOption}
+          onSubmit={(name, lang) => {
             const s = selfReg;
             setSelfReg(null);
-            void s.finalize(name);
+            void s.finalize(name, lang);
           }}
           onAbort={() => {
             void selfReg.abort();
@@ -843,7 +1117,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           }}
         />
       )}
-      {/* Dev-only punch/hardware debug indicator — removed from production builds. */}
+      {/* Dev-only punch/hardware debug indicator - removed from production builds. */}
       {import.meta.env.DEV && (
         <CardDetectionAlert cardData={lastCardData} show={showCardAlert} />
       )}
@@ -854,14 +1128,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         fontFamily={fontFamily}
       />
 
+      <PendingTeamsBar labels={queue.pending} fontFamily={fontFamily} />
+
       {/* No top nav on the in-game (kiosk) display. Exit is via Esc (operator
-          keyboard) — see the keydown handler. The reader-not-connected banner is
+          keyboard) - see the keydown handler. The reader-not-connected banner is
           kept as a thin diagnostic strip since it explains missing punches. */}
       {siReader.isAvailable() && !detectedReader.isPresent && (
         <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-center gap-3 px-4 py-1.5 bg-orange-500/20">
           <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
           <span className="text-orange-200 text-xs">
-            Reader not connected — punches start landing as soon as you plug in the dongle.
+            Reader not connected - punches start landing as soon as you plug in the dongle.
           </span>
         </div>
       )}
@@ -875,6 +1151,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         placedCheckpoints={placedCheckpoints}
         bigReveal={bigReveal}
         resolveCheckpointImage={resolveCheckpointImage}
+        foundCheckpointIds={cluesFoundIds}
+        missingCheckpointUrl={getImageUrl(data.images.missing_checkpoint_image)}
         iconSizePercent={data.iconSizePercent}
         hud={{
           teamNameFrame: getImageUrl(data.images.team_name_background_image),
@@ -887,11 +1165,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         scoreText={focusScoreText || (scoreType === 'percentage' ? '0%' : '0 pts')}
         showScore={data.showScore}
         hitCount={focusHitCount}
-        language={language}
-        clues={data.clues}
+        language={focusLanguage || language}
+        clues={clues}
         topRevealUrl={topRevealUrl}
         fontFamily={fontFamily}
         fontColor={data.font_color}
+        textElements={data.textElements}
+        textCategories={data.textCategories}
+        scenarioFontName={data.font}
+        scenarioFontColor={data.font_color}
+        hudLayout={data.hudLayout}
       />
     </div>
   );

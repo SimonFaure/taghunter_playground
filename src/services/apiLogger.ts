@@ -24,7 +24,6 @@ export async function createApiLogger(baseUrl: string = '') {
     async fetch(url: string, options?: RequestInit): Promise<Response> {
       const fullUrl = baseUrl ? `${baseUrl}${url}` : url;
       const method = options?.method || 'GET';
-      const startTime = Date.now();
 
       let response: Response | null = null;
       let error: Error | null = null;
@@ -64,7 +63,7 @@ export async function createApiLogger(baseUrl: string = '') {
           try {
             requestBody = typeof options.body === 'string'
               ? JSON.parse(options.body)
-              : options.body as Record<string, unknown>;
+              : options.body as unknown as Record<string, unknown>;
           } catch {
             requestBody = { raw: String(options.body) };
           }
@@ -102,7 +101,7 @@ export async function createApiLogger(baseUrl: string = '') {
           try {
             requestBody = typeof options.body === 'string'
               ? JSON.parse(options.body)
-              : options.body as Record<string, unknown>;
+              : options.body as unknown as Record<string, unknown>;
           } catch {
             requestBody = { raw: String(options.body) };
           }

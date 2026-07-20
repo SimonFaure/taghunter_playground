@@ -1,0 +1,10 @@
+{
+  "title": "Saisissez un code de récupération",
+  "subtitle": "Demandez un code de récupération à votre administrateur, puis saisissez-le ici.",
+  "wrongCode": "Ce code n’a pas fonctionné. Vérifiez-le et réessayez.",
+  "checkFailed": "Impossible de vérifier le code. Réessayez.",
+  "loading": "Chargement…",
+  "noCodes": "Aucun code de récupération n’est disponible sur cet appareil. Connectez-vous à Internet et réinitialisez votre code PIN par e-mail, ou contactez votre administrateur.",
+  "checking": "Vérification…",
+  "cancel": "Annuler"
+}

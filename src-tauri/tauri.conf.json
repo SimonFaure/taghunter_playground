@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tag Hunter Playground",
-  "version": "1.1.0",
+  "version": "1.1.55",
   "identifier": "com.taghunter.playground",
   "build": {
     "frontendDist": "../dist",
@@ -31,7 +31,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -43,11 +43,22 @@
     "category": "Game",
     "shortDescription": "Tag Hunter game scenario player",
     "longDescription": "Browse, download and run Tag Hunter game scenarios. Connects to studio.taghunter.fr for content sync.",
-    "resources": ["resources/silabser-drivers/**/*"]
+    "resources": ["resources/silabser-drivers/**/*"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installMode": "currentUser",
+        "languages": ["English", "French", "Spanish"],
+        "displayLanguageSelector": true,
+        "compression": "lzma"
+      }
+    }
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI3MUNGQTY5MUJDODdFNjMKUldSamZzZ2JhZm9jSjZZT3hqa1dWVlN2MkQvUnZjRGhldlRwWUpPRE1VaWRnajN1b1IwNWJpOUcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIxNUZFMzYxODNGMTc2QTEKUldTaGR2R0RZZU5mc2JsNkF6K2lpVDVKSkJTM3B1UUpxM3ZFS21SRDhOTUNvaTdRV1JCdUxKUHoK",
       "endpoints": [
         "https://studio.taghunter.fr/backend/api/playground_update.php?action=manifest&target={{target}}&arch={{arch}}&current_version={{current_version}}"
       ],

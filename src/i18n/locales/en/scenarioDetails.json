@@ -1,0 +1,22 @@
+{
+  "close": "Close",
+  "untitledScenario": "Untitled scenario",
+  "loadingDetails": "Loading details…",
+  "difficulty": "Difficulty",
+  "difficultyMedium": "Medium",
+  "notDownloaded": "Not downloaded",
+  "updateAvailable": "Update available",
+  "description": "Description",
+  "noDescription": "No description provided for this scenario.",
+  "downloadForDescription": "Download the scenario to see its description.",
+  "version": "Version",
+  "duration": "Duration",
+  "durationValue": "{{count}} min",
+  "quests": "Quests",
+  "enigmas": "Enigmas",
+  "audience": "Audience",
+  "font": "Font",
+  "languages": "Languages",
+  "installedVersion": "Installed version {{local}} · latest {{remote}}",
+  "latestVersionNotDownloaded": "Latest version {{remote}} - not yet downloaded"
+}

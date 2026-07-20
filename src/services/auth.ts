@@ -73,7 +73,7 @@ export async function bootstrap(): Promise<BootstrapOutcome> {
       return { kind: 'token_invalid' };
     }
 
-    // Network error or 5xx — fall back to local cache and grace period.
+    // Network error or 5xx - fall back to local cache and grace period.
     const cached = await getAuthUser();
     if (!cached) return { kind: 'token_invalid' };
     const inGrace = await isWithinOfflineGrace(cached);
@@ -200,7 +200,7 @@ export async function listMyDevices(): Promise<{
 }
 
 // Resolve THIS device's friendly display name from the server, cache it, and
-// return it (or null if none is set). Safe to call offline — falls back to the
+// return it (or null if none is set). Safe to call offline - falls back to the
 // last cached value. The footer uses this to show the operator-assigned name.
 export async function refreshDeviceDisplayName(): Promise<string | null> {
   const user = await getAuthUser();
@@ -238,14 +238,14 @@ export async function renameDevice(
   });
 }
 
-// "Truly sign out" — the destructive path exposed in Settings → Account.
+// "Truly sign out" - the destructive path exposed in Settings → Account.
 // Replaces the old `logout()` verb: everyday "stepping away" is the nav-bar
 // "Lock" button (PIN gate), not a sign-out. Reach this only when the user
 // explicitly chooses to release this device.
 //
 // Online-only at the call site (AccountScreen disables its button when
 // connectivity.isOnline() is false). The function itself still tolerates an
-// unreachable server — it swallows the revoke error and proceeds with local
+// unreachable server - it swallows the revoke error and proceeds with local
 // wipe so a half-broken environment can't strand the user mid-action.
 export async function signOutOfThisDevice(): Promise<void> {
   const user = await getAuthUser();
@@ -254,7 +254,7 @@ export async function signOutOfThisDevice(): Promise<void> {
       await revokeDevice(user.current_device_id);
     }
   } catch {
-    // Swallow — even if the server is unreachable, we still wipe local state.
+    // Swallow - even if the server is unreachable, we still wipe local state.
   }
 
   await clearJwt();
@@ -264,7 +264,7 @@ export async function signOutOfThisDevice(): Promise<void> {
 
 // Forgot-PIN flow. The user is on the lock screen, has internet, and asks
 // to reset their PIN. We reuse the existing OTP request/verify endpoints
-// against the email cached in auth_user — the JWT and auth_user row stay
+// against the email cached in auth_user - the JWT and auth_user row stay
 // put; only the PIN is replaced.
 //
 // `requestPinResetOtp` triggers the email. `verifyPinResetOtpAndSet` swaps
@@ -273,7 +273,7 @@ export async function signOutOfThisDevice(): Promise<void> {
 export async function requestPinResetOtp(): Promise<void> {
   const user = await getAuthUser();
   if (!user?.email) {
-    throw new Error('No cached account on this device — cannot reset PIN.');
+    throw new Error('No cached account on this device - cannot reset PIN.');
   }
   await requestOtp(user.email);
 }
@@ -281,7 +281,7 @@ export async function requestPinResetOtp(): Promise<void> {
 export async function verifyPinResetOtpAndSet(code: string, newPin: string): Promise<void> {
   const user = await getAuthUser();
   if (!user?.email) {
-    throw new Error('No cached account on this device — cannot reset PIN.');
+    throw new Error('No cached account on this device - cannot reset PIN.');
   }
 
   // Re-run the standard verify-code endpoint. The server treats this as a
@@ -321,11 +321,11 @@ export async function verifyPinResetOtpAndSet(code: string, newPin: string): Pro
     // the admin revoked us between cold-start and Forgot-PIN. Surface a
     // distinct error so the caller can decide whether to route to the full
     // CapReachedDialog or just message the user.
-    throw new Error('Device cap reached — sign out via Settings and log in again.');
+    throw new Error('Device cap reached - sign out via Settings and log in again.');
   }
 
   // Refresh the JWT + auth_user from the server (the new token replaces the
-  // old one anyway — the verify endpoint always mints a fresh token).
+  // old one anyway - the verify endpoint always mints a fresh token).
   await saveJwt(response.data.token);
   await persistAuthState(response.auth_state, {
     current_device_id: response.data.device_id,

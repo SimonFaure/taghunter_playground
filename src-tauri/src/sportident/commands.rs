@@ -1,6 +1,6 @@
 // SI command-frame builders. Every byte the reader sends to the master
-// flows through these. Kept stateless — no dependency on transport, no
-// async — so they're trivial to test in isolation and to call from
+// flows through these. Kept stateless - no dependency on transport, no
+// async - so they're trivial to test in isolation and to call from
 // anywhere in the reader.
 
 use crate::sportident::config::{
@@ -17,20 +17,20 @@ pub fn build_wakeup() -> Vec<u8> {
 }
 
 /// "Get system data" probe. Asks the master for its config block (number,
-/// mode, firmware, etc.). Payload `[block, count]` — we request block 0
+/// mode, firmware, etc.). Payload `[block, count]` - we request block 0
 /// (system config) of 128 bytes. The 0x83 response triggers
 /// `StationDetected` in the reader.
 pub fn build_get_system_data() -> Vec<u8> {
     build_frame(CMD_GET_SYSTEM_DATA, &[0x00, 0x80])
 }
 
-/// "Get SI card data" — request one 128-byte block from the inserted
+/// "Get SI card data" - request one 128-byte block from the inserted
 /// card. Block indices come from `CardType::blocks_to_read()`.
 pub fn build_get_card_block(block: u8) -> Vec<u8> {
     build_frame(CMD_GET_SI9_DATA, &[block])
 }
 
-/// ACK byte — single 0x06, not a framed message. Sent after a complete
+/// ACK byte - single 0x06, not a framed message. Sent after a complete
 /// card readout; the master beeps + lights up confirmation and accepts
 /// card removal. Without this, the master holds the card in "just read"
 /// state and may not detect the next insertion cleanly.
@@ -38,11 +38,11 @@ pub fn build_ack() -> Vec<u8> {
     vec![ACK]
 }
 
-/// "Set station time" — sync master clock. Payload format per SI manual:
+/// "Set station time" - sync master clock. Payload format per SI manual:
 ///   [year, month, day, day-of-week, hour, minute, second, fraction]
 /// Year is 2-digit (year - 2000); fraction is 1/256 s.
 ///
-/// Caller passes a (yy, mm, dd, dow, hh, mn, ss) tuple — converting from
+/// Caller passes a (yy, mm, dd, dow, hh, mn, ss) tuple - converting from
 /// a chrono DateTime is the Tauri command's job (step 5), keeping this
 /// module free of date-time deps.
 // Frame builder ready (and unit-tested) ahead of its step-5 caller, the

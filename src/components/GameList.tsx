@@ -1,12 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Clock, Search, Play, Trash2, LogIn, Eye, Zap, ChevronDown } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Clock, Search, Play, LogIn, Eye, Zap, ChevronDown, LayoutGrid, List } from 'lucide-react';
 import { Alert } from './Alert';
 import { ConfirmDialog } from './ConfirmDialog';
 import { LaunchGameModal, GameConfig, LaunchDeviceSelection } from './LaunchGameModal';
 import { LaunchConfigModal } from './LaunchConfigModal';
 import { GamePage } from './GamePage';
+import { PinExitPrompt } from './PinExitPrompt';
+import { hasPin } from '../services/pinStore';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
 import { ScenarioDetailsModal } from './ScenarioDetailsModal';
+import { GameTypeIcon } from './icons/GameTypeIcons';
+import { GameLockGate } from './GameLockGate';
+import { getDeviceLockState, type LockReason } from '../services/deviceLock';
 import { getLocalGameIds } from '../utils/localGames';
 import * as scenarioStore from '../services/scenarioStore';
 import * as patternStore from '../services/patternStore';
@@ -18,10 +24,12 @@ import {
   buildRoster,
   resolveDefaultDeviceSelection,
   extractTracksOptions,
+  extractDefaultPatternId,
   EMPTY_TRACKS_OPTIONS,
   type PatternOption,
 } from '../services/launchResolve';
 import { scenarioAssetUrl } from '../services/contentFs';
+import { gameTypeLabel, audienceLabelKey, normalizeAudience, titleCaseSlug } from '../utils/labels';
 import { on as onSyncEvent } from '../services/syncEvents';
 import { setGameActive } from '../services/activeSession';
 import {
@@ -29,11 +37,24 @@ import {
   listActiveLaunchedGames,
   getLaunchedGameMeta,
   getLaunchedGameState,
+  listPairedDevicesForLaunch,
+  mergeLaunchedGameMeta,
   queueJoinGameCommandBulk,
+  updateTeam,
 } from '../services/launchedGames';
+import {
+  computeAutoRegAssignments,
+  serializeRegAssignments,
+  REG_ASSIGNMENTS_META_KEY,
+} from '../services/regAssignments';
+import { getClashState, clashRegister } from '../services/clash';
 import { useAuth } from './auth/AuthProvider';
+import { isOperatorOnly } from '../services/operatorMode';
+import { refreshLaunchedGamesRoute } from '../services/childControlLink';
+import { ensureMotherServer, raiseMotherHotspotIfConfigured } from '../services/lanMotherBoot';
+import { getLanOverride } from '../services/api';
+import { loadConfig, saveConfig } from '../utils/config';
 import gamesData from '../../data/games.json';
-import { HelpButton } from '../help';
 
 interface GameType {
   id: string;
@@ -48,6 +69,14 @@ interface Scenario {
   description: string;
   difficulty: string | null;
   duration_minutes: number;
+  /** Normalized audience (game_meta.game_public): mini_kids | kids | ado_adultes.
+   *  Single tier - used for the server-side name-pool draw. */
+  audience: string | null;
+  /** Coarse name-pool tiers any of the scenario's age bands fall into. Drives the
+   *  three audience filter pills (a scenario shows under every tier it spans). */
+  audienceTiers: string[];
+  /** Free-text univers/theme tags (game_meta.univers). Display only. */
+  univers: string[];
   uniqid?: string;
   available_for_purchase?: boolean;
 }
@@ -68,21 +97,81 @@ interface LaunchTarget {
   gameTypeName: string;
 }
 
-export function GameList() {
+// Parse a Clash pattern's data into an ordered list of combos' station codes -
+// Difficulty is an integer 1–5 (stars). Coerce stored values: new int, numeric
+// string, or legacy enum slug (easy→1 / medium→3 / hard→5). Unset → 3.
+function coerceDifficulty(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return clampDifficulty(Math.round(raw));
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === '') return 3;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return clampDifficulty(Math.round(Number(s)));
+  if (s === 'easy' || s === 'simple' || s === 'facile') return 1;
+  if (s === 'hard' || s === 'difficult' || s === 'expert' || s === 'difficile') return 5;
+  return 3; // medium / normal / moyen / unknown
+}
+function clampDifficulty(n: number): number {
+  return n < 1 ? 1 : n > 5 ? 5 : n;
+}
+
+// Band → name-pool tier, and the set of tiers a band list spans.
+const BAND_TIER: Record<string, string> = {
+  age_4_5: 'mini_kids',
+  age_6_7: 'mini_kids',
+  age_8_10: 'kids',
+  age_11_12: 'kids',
+  age_13_plus: 'ado_adultes',
+  age_adultes: 'ado_adultes',
+};
+function bandsToTiers(bands: unknown): string[] {
+  if (!Array.isArray(bands)) return [];
+  const order = ['mini_kids', 'kids', 'ado_adultes'];
+  const tiers = new Set<string>();
+  for (const b of bands) if (typeof b === 'string' && BAND_TIER[b]) tiers.add(BAND_TIER[b]);
+  return order.filter((t_) => tiers.has(t_));
+}
+
+function DifficultyMeter({ level }: { level: number }) {
+  return (
+    <span className="pg-stars" aria-hidden style={{ display: 'inline-flex', gap: 1, lineHeight: 1 }}>
+      {[1, 2, 3, 4, 5].map((i) => (
+        <span key={i} style={{ color: '#f59e0b', opacity: i <= level ? 1 : 0.25, fontSize: '0.85em' }}>
+          ★
+        </span>
+      ))}
+    </span>
+  );
+}
+
+interface GameListProps {
+  /** Navigate to the launched-games list (App-level page switch). Used after a
+   *  launch where this device wasn't selected to run the game. */
+  onShowLaunchedGames?: () => void;
+}
+
+export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
+  const { t } = useTranslation();
   const { user } = useAuth();
   const [scenarios, setScenarios] = useState<ScenarioWithType[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGameType, setSelectedGameType] = useState<string>('all');
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>('all');
-  const [showOnlyLaunchable, setShowOnlyLaunchable] = useState(false);
+  const [selectedAudience, setSelectedAudience] = useState<string>('all');
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [alert, setAlert] = useState<AlertState>({ show: false, type: 'success', message: '' });
   const [localGameIds, setLocalGameIds] = useState<Set<string>>(new Set());
+  // Device-lock gate (project_client_device_lock): when launching/joining is
+  // blocked, we stash the attempted action and show the recovery-code gate; a
+  // successful reprieve re-runs it (the guard then passes through).
+  const [lockGate, setLockGate] = useState<{ reason: Exclude<LockReason, null>; run: () => void } | null>(null);
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
   const [selectedGame, setSelectedGame] = useState<LaunchTarget | null>(null);
   const [launchedGame, setLaunchedGame] = useState<{ config: GameConfig; uniqid: string; launchedGameId: number | null } | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [scenarioToDelete, setScenarioToDelete] = useState<{ uniqid: string; title: string } | null>(null);
+  // After the operator confirms deletion, if a device PIN is set we hold the
+  // target here and require the PIN before the scenario is actually removed.
+  const [deletePinGate, setDeletePinGate] = useState<{ uniqid: string; title: string } | null>(null);
   const [localImages, setLocalImages] = useState<Map<string, string>>(new Map());
   const [activeGames, setActiveGames] = useState<Map<string, { id: number; name: string; game_type: string; duration: number }>>(new Map());
   const [detailsScenario, setDetailsScenario] = useState<ScenarioWithType | null>(null);
@@ -93,6 +182,22 @@ export function GameList() {
   // Pre-fill payload for the launch wizard: set when Editing a config or when a
   // headless launch hit critical drift and falls back to the full screen.
   const [prefill, setPrefill] = useState<{ config: Partial<GameConfig>; name?: string; notice?: string } | null>(null);
+  // Operator-only devices never play, so the "Join" (enter the running game on
+  // this device) action is hidden.
+  const [operatorOnly, setOperatorOnly] = useState(false);
+  // F1 (mother/hotspot role rework): when "Launch" is tapped and no mother is
+  // reachable, this device must host. We surface a heads-up confirm first; the
+  // resolver bridges the dialog buttons back to the awaiting launchGame call.
+  const [motherPrompt, setMotherPrompt] = useState<{ resolve: (ok: boolean) => void } | null>(null);
+  const confirmBecomeMother = () =>
+    new Promise<boolean>((resolve) => setMotherPrompt({ resolve }));
+
+  useEffect(() => {
+    void isOperatorOnly().then(setOperatorOnly).catch(() => setOperatorOnly(false));
+    const onChange = () => void isOperatorOnly().then(setOperatorOnly).catch(() => {});
+    window.addEventListener('operator-mode:changed', onChange);
+    return () => window.removeEventListener('operator-mode:changed', onChange);
+  }, []);
 
   useEffect(() => {
     loadScenarios();
@@ -152,7 +257,20 @@ export function GameList() {
     }
   };
 
+  // Block launching/joining when the device is locked. Returns true if it
+  // opened the gate (caller should bail); false if the action may proceed.
+  const blockedByLock = async (run: () => void): Promise<boolean> => {
+    const lock = await getDeviceLockState();
+    if (lock.locked && lock.reason) {
+      setLockGate({ reason: lock.reason, run });
+      return true;
+    }
+    return false;
+  };
+
   const handleJoinGame = async (uniqid: string) => {
+    if (await blockedByLock(() => void handleJoinGame(uniqid))) return;
+
     const active = activeGames.get(uniqid);
     if (!active) return;
 
@@ -172,22 +290,32 @@ export function GameList() {
       messageDisplayDuration: parseInt(meta.messageDisplayDuration ?? '5'),
       enigmaImageDisplayDuration: parseInt(meta.enigmaImageDisplayDuration ?? '1'),
       colorblindMode: meta.colorblindMode === 'true',
-      autoResetTeam: meta.autoResetTeam === 'true',
+      autoResetTeam: meta.autoResetTeam !== 'false',
       delayBeforeReset: parseInt(meta.delayBeforeReset ?? '3'),
-      revealResultsOnInput: meta.revealResultsOnInput !== 'false',
+      enterToReset: meta.enterToReset === 'true',
+      showIdleLayout: meta.showIdleLayout !== 'false',
+      idleSubtitle: meta.idleSubtitle ?? undefined,
+      malusPerMinute: meta.malusPerMinute != null ? parseInt(meta.malusPerMinute) : undefined,
       autoRegisterTeam: meta.autoRegisterTeam === 'true',
       reuseCards: meta.reuseCards === 'true',
       selfRegisterTeam: meta.selfRegisterTeam === 'true',
       reuseDelayMinutes: parseInt(meta.reuseDelayMinutes ?? '5'),
       useNamePool: meta.useNamePool === 'true',
       namePoolAudience: (meta.namePoolAudience as GameConfig['namePoolAudience']) ?? undefined,
+      addRandomNameOption: meta.addRandomNameOption === 'true',
+      allowPlayerLanguageChoice: meta.allowPlayerLanguageChoice === 'true',
+      scenarioLanguages: meta.availableLanguages ? meta.availableLanguages.split(',') : undefined,
       language: meta.language ?? undefined,
       visibilityHideDelaySec: parseInt(meta.visibilityHideDelaySec ?? '10'),
       victoryType: (meta.victoryType as GameConfig['victoryType']) ?? undefined,
       playMode: (meta.playMode as GameConfig['playMode']) ?? undefined,
+      tagquestSelfRegister: meta.tagquestSelfRegister === 'true',
+      tagquestShowQuestPreview: meta.tagquestShowQuestPreview !== 'false',
+      tagquestScoreWeighting: meta.tagquestScoreWeighting === 'true',
       teammatesPerTeam: meta.teammatesPerTeam ? parseInt(meta.teammatesPerTeam) : undefined,
       testMode: meta.testMode === 'true' ? true : undefined,
       teams: meta.teamsConfig ? JSON.parse(meta.teamsConfig) : undefined,
+      cluesPage: meta.cluesPage ? JSON.parse(meta.cluesPage) : undefined,
     };
 
     setLaunchedGame({ config, uniqid, launchedGameId: active.id });
@@ -209,7 +337,7 @@ export function GameList() {
         const raw = mediaImages?.game_visual ?? mediaImages?.background_image;
         if (!raw) continue;
         const fileName = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
-        // Resolve to a `scenario://` URL — the custom protocol is the only one
+        // Resolve to a `scenario://` URL - the custom protocol is the only one
         // the webview can actually load (the asset protocol / convertFileSrc
         // is not enabled in tauri.conf.json). The Rust handler resolves the
         // file against the scenario's current local_version per request.
@@ -233,22 +361,54 @@ export function GameList() {
           let description = '';
           let difficulty: string | null = 'medium';
           let durationMinutes = 60;
+          let audience: string | null = null;
+          let audienceTiers: string[] = [];
+          let univers: string[] = [];
           if (row.local_version !== null) {
             try {
               const gd = (await scenarioStore.getGameData(row.uniqid)) as
                 | {
                     game?: { description?: string; difficulty?: string; duration_minutes?: number };
                     scenario?: { description?: string };
-                    game_meta?: { scenario?: string };
+                    game_meta?: {
+                      description?: string;
+                      story?: string;
+                      scenario?: string;
+                      difficulty?: string | number;
+                      game_public?: string;
+                      audience_bands?: unknown;
+                      univers?: unknown;
+                    };
                     description?: string;
-                    difficulty?: string;
+                    difficulty?: string | number;
                     duration_minutes?: number;
                   }
                 | null;
+              // Studio writes the authored description to game_meta.description
+              // (default-lang string after the cloud compat flatten); fall back
+              // to the story field, then the legacy `scenario`/top-level paths.
               description =
-                gd?.game_meta?.scenario ?? gd?.scenario?.description ?? gd?.description ?? gd?.game?.description ?? '';
-              difficulty = gd?.difficulty ?? gd?.game?.difficulty ?? 'medium';
+                gd?.game_meta?.description ??
+                gd?.game_meta?.story ??
+                gd?.game_meta?.scenario ??
+                gd?.scenario?.description ??
+                gd?.description ??
+                gd?.game?.description ??
+                '';
+              // Studio writes the authored difficulty (int 1–5) to
+              // game_meta.difficulty; fall back to the legacy top-level paths.
+              difficulty = String(gd?.game_meta?.difficulty ?? gd?.difficulty ?? gd?.game?.difficulty ?? 'medium');
               durationMinutes = gd?.duration_minutes ?? gd?.game?.duration_minutes ?? 60;
+              // Audience: game_public (single tier) feeds the server-side name
+              // draw; the age bands feed the coarse pills + display.
+              audience = gd?.game_meta?.game_public ? normalizeAudience(gd.game_meta.game_public) : null;
+              const bands = gd?.game_meta?.audience_bands;
+              audienceTiers = bandsToTiers(bands);
+              // Fallback for un-backfilled rows: derive a single tier from game_public.
+              if (audienceTiers.length === 0 && audience) audienceTiers = [audience];
+              univers = Array.isArray(gd?.game_meta?.univers)
+                ? (gd!.game_meta!.univers as unknown[]).filter((u): u is string => typeof u === 'string' && u.trim() !== '')
+                : [];
             } catch (err) {
               console.warn(`[GameList] game-data.json read failed for ${row.uniqid}:`, err);
             }
@@ -268,6 +428,9 @@ export function GameList() {
             description,
             difficulty,
             duration_minutes: durationMinutes,
+            audience,
+            audienceTiers,
+            univers,
             uniqid: row.uniqid,
             available_for_purchase: false,
             game_type: matchedType,
@@ -288,9 +451,11 @@ export function GameList() {
       const matchesSearch = scenario.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
                            scenario.description.toLowerCase().includes(searchTerm.toLowerCase());
       const matchesType = selectedGameType === 'all' || scenario.game_type.name === selectedGameType;
-      const matchesDifficulty = selectedDifficulty === 'all' || (scenario.difficulty?.toLowerCase() || 'medium') === selectedDifficulty.toLowerCase();
-      const matchesLaunchable = !showOnlyLaunchable || (scenario.uniqid && localGameIds.has(scenario.uniqid));
-      return matchesSearch && matchesType && matchesDifficulty && matchesLaunchable;
+      const matchesDifficulty =
+        selectedDifficulty === 'all' || coerceDifficulty(scenario.difficulty) === Number(selectedDifficulty);
+      // A scenario matches a coarse audience pill if any of its bands' tiers do.
+      const matchesAudience = selectedAudience === 'all' || scenario.audienceTiers.includes(selectedAudience);
+      return matchesSearch && matchesType && matchesDifficulty && matchesAudience;
     })
     .sort((a, b) => {
       const aHasLocal = localGameIds.has(a.uniqid || '');
@@ -304,18 +469,19 @@ export function GameList() {
   const availableForPurchaseScenarios = filteredScenarios.filter(s => s.available_for_purchase);
 
   const gameTypes = [...new Set(scenarios.map((s) => s.game_type.name))];
-
-  const getDifficultyColor = (difficulty: string | null) => {
-    switch (difficulty?.toLowerCase()) {
-      case 'easy':
-        return 'bg-green-900/30 text-green-400 border-green-700';
-      case 'medium':
-        return 'bg-yellow-900/30 text-yellow-400 border-yellow-700';
-      case 'hard':
-        return 'bg-red-900/30 text-red-400 border-red-700';
-      default:
-        return 'bg-slate-700 text-slate-300 border-slate-600';
+  // Audiences actually present among loaded scenarios, ordered by the canonical
+  // trio so the pills read mini → kids → teens/adults; off-list values append.
+  const audienceOrder = ['mini_kids', 'kids', 'ado_adultes'];
+  const audiences = [...new Set(scenarios.flatMap((s) => s.audienceTiers))].sort(
+    (a, b) => {
+      const ia = audienceOrder.indexOf(a);
+      const ib = audienceOrder.indexOf(b);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
     }
+  );
+  const audienceLabel = (a: string): string => {
+    const key = audienceLabelKey(a);
+    return key ? t(`home:${key}`) : titleCaseSlug(a);
   };
 
   const showAlert = (type: 'success' | 'error', message: string) => {
@@ -327,9 +493,12 @@ export function GameList() {
   };
 
   const handleLaunchGame = (uniqid: string, title: string, gameTypeName: string) => {
-    setPrefill(null);
-    setSelectedGame({ uniqid, title, gameTypeName });
-    setLaunchModalOpen(true);
+    void blockedByLock(() => handleLaunchGame(uniqid, title, gameTypeName)).then((blocked) => {
+      if (blocked) return;
+      setPrefill(null);
+      setSelectedGame({ uniqid, title, gameTypeName });
+      setLaunchModalOpen(true);
+    });
   };
 
   // Core launch: create the launched_game, fan out join_game, navigate to the
@@ -341,37 +510,97 @@ export function GameList() {
     config: GameConfig,
     deviceSelection: LaunchDeviceSelection
   ) => {
+    // F1: a launched game must live on a mother. If none is reachable and we're
+    // not already hosting, become the mother on THIS device (after a heads-up
+    // confirm) before creating the game - otherwise the create call has nowhere
+    // to go. If a mother IS reachable, this is a no-op and we launch remotely.
+    {
+      const route = await refreshLaunchedGamesRoute().catch(() => 'local' as const);
+      const override = getLanOverride();
+      const alreadyHosting = !!override && override.baseUrl.includes('127.0.0.1');
+      if (route !== 'mother' && !alreadyHosting) {
+        const ok = await confirmBecomeMother();
+        if (!ok) return;
+        const cid = user?.client_id;
+        if (cid != null) {
+          const info = await ensureMotherServer(cid);
+          if (info) {
+            await raiseMotherHotspotIfConfigured();
+            // Keep the role across restarts now that this device is the mother.
+            try {
+              const cfg = await loadConfig();
+              await saveConfig({ ...cfg, beMotherWhenAvailable: true });
+            } catch {
+              /* best-effort */
+            }
+          } else {
+            // Stood down - a mother actually exists (fence caught it). Re-point
+            // at it and launch there instead.
+            await refreshLaunchedGamesRoute().catch(() => {});
+          }
+        }
+      }
+    }
+
     let launchedGameId: number | null = null;
 
     // Build the meta KV bag. Pattern is stored as a string (the pattern's
-    // identifier), but the server's teams.pattern column expects an int —
+    // identifier), but the server's teams.pattern column expects an int -
     // it represents the pattern *index*, set per team below.
     const meta: Record<string, string | number | boolean | null> = {
       firstChipIndex: config.firstChipIndex.toString(),
       pattern: config.pattern,
+      // Stored in meta (in addition to the top-level launched_games.duration
+      // column) so re-derive paths (LaunchedGamesList) recover the time limit -
+      // used by mystery late-malus scoring.
+      duration: config.duration.toString(),
       messageDisplayDuration: config.messageDisplayDuration.toString(),
       enigmaImageDisplayDuration: config.enigmaImageDisplayDuration.toString(),
       colorblindMode: config.colorblindMode.toString(),
       autoResetTeam: config.autoResetTeam.toString(),
       delayBeforeReset: config.delayBeforeReset.toString(),
-      revealResultsOnInput: (config.revealResultsOnInput ?? true) ? 'true' : 'false',
+      enterToReset: (config.enterToReset ?? false) ? 'true' : 'false',
       autoRegisterTeam: config.autoRegisterTeam ? 'true' : 'false',
       reuseCards: config.reuseCards ? 'true' : 'false',
       selfRegisterTeam: config.selfRegisterTeam ? 'true' : 'false',
+      // Mystery/tracks "Départ groupé": the whole roster is stamped started at
+      // launch (below). Persisted so satellites / rejoin / in-game surfaces can
+      // tell a mass-start game apart from a staggered one.
+      massStart: config.massStart ? 'true' : 'false',
       reuseDelayMinutes: (config.reuseDelayMinutes ?? 5).toString(),
       useNamePool: config.useNamePool ? 'true' : 'false',
+      // Self-register sub-options: random-name button + per-team language flags
+      // in the registration overlay. Read at runtime by the self-register pages.
+      addRandomNameOption: config.addRandomNameOption ? 'true' : 'false',
+      allowPlayerLanguageChoice: config.allowPlayerLanguageChoice ? 'true' : 'false',
       visibilityHideDelaySec: (config.visibilityHideDelaySec ?? 10).toString(),
+      // TagQuest: players bind their chip to a team at game start (Clash-style)
+      // instead of the operator pre-building the roster. Read at runtime by
+      // TagQuestGamePage to show the registration screen.
+      tagquestSelfRegister: config.tagquestSelfRegister ? 'true' : 'false',
+      // TagQuest: low-opacity ghost preview of the quest images on each bip.
+      // Audience-defaulted at launch; missing key reads as true downstream.
+      tagquestShowQuestPreview: (config.tagquestShowQuestPreview ?? true) ? 'true' : 'false',
+      // TagQuest: effectif weighting of earned points (score+team mode only).
+      // Default on for new launches; a MISSING key reads as off downstream so
+      // games launched before the option existed keep their raw scores.
+      tagquestScoreWeighting: (config.tagquestScoreWeighting ?? true) ? 'true' : 'false',
     };
     // Name-pool draw needs audience + language server-side (cloud PHP / LAN
     // Rust read these from meta). language was previously meta-less.
     if (config.namePoolAudience) meta.namePoolAudience = config.namePoolAudience;
     if (config.language) meta.language = config.language;
+    // The scenario's available languages - read back at runtime so the
+    // self-register overlay can offer the player-language flag radios.
+    if (config.scenarioLanguages && config.scenarioLanguages.length > 0) {
+      meta.availableLanguages = config.scenarioLanguages.join(',');
+    }
     if (config.victoryType) meta.victoryType = config.victoryType;
     if (config.testMode) meta.testMode = 'true';
     if (config.playMode) meta.playMode = config.playMode;
     if (config.teammatesPerTeam !== undefined) meta.teammatesPerTeam = config.teammatesPerTeam.toString();
     if (config.teams && config.teams.length > 0) meta.teamsConfig = JSON.stringify(config.teams);
-    // Tracks launch selections — persisted to launched_games.meta so they
+    // Tracks launch selections - persisted to launched_games.meta so they
     // survive reload and reach satellites. Consumed by the tracks runtime
     // (Slice C). Time is carried by the top-level `duration` field below;
     // language flows via the in-memory config like mystery/tagquest.
@@ -384,6 +613,13 @@ export function GameList() {
     if (config.trackPlayMode) meta.trackPlayMode = config.trackPlayMode;
     if (config.scoreType) meta.scoreType = config.scoreType;
     if (config.malusPerMinute !== undefined) meta.malusPerMinute = config.malusPerMinute.toString();
+    // Mystery idle-screen layout: whether to show the author-placed title/subtitle
+    // on the between-teams screen, plus the per-launch subtitle text under the title.
+    if (config.showIdleLayout === false) meta.showIdleLayout = 'false';
+    if (config.idleSubtitle) meta.idleSubtitle = config.idleSubtitle;
+    // Clues page on team return - now a per-launch option (was a studio scenario
+    // setting). Persisted as JSON so it survives reload and reaches satellites.
+    if (config.cluesPage) meta.cluesPage = JSON.stringify(config.cluesPage);
 
     const teamRows = (config.teams ?? []).map((team, index) => ({
       team_number: index + 1,
@@ -393,7 +629,153 @@ export function GameList() {
       // read the global config.pattern from meta anyway.
       pattern: 0,
       key_id: team.chipId,
+      // Per-team display language: the operator's manual-roster pick, else the
+      // launch language. null lets the runtime fall back to the launch language.
+      language: team.language ?? config.language ?? null,
     }));
+
+    // ── Clash: one clan = one team row; the clash_config meta carries the
+    // territory/combination skeleton (from the scenario) + balise→combination
+    // station assignments (from the selected pattern) + the per-clan cap. The
+    // mother reads clash_config in clash_register / clash_validate.
+    let finalTeams: Array<{
+      team_number: number;
+      team_name?: string | null;
+      pattern: number;
+      key_id?: number | null;
+      language?: string | null;
+    }> = teamRows;
+    let finalNumberOfTeams =
+      config.autoRegisterTeam || config.selfRegisterTeam ? 1 : config.numberOfTeams;
+    const isClashLaunch = game.gameTypeName?.toLowerCase() === 'clash';
+    if (isClashLaunch) {
+      try {
+        const gd = (await scenarioStore.getGameData(game.uniqid)) as { game_data?: any } | any | null;
+        const gm = (gd?.game_data ?? gd)?.game_meta ?? (gd?.game_data ?? gd) ?? {};
+        const territoriesMeta: any[] = Array.isArray(gm.territories) ? gm.territories : [];
+        const clansMeta: any[] = Array.isArray(gm.clans) ? gm.clans : [];
+
+        // V2: each territory carries its physical balise station codes inline.
+        // The launch-time override grid (config.clashBalises) takes precedence per
+        // venue; fall back to the scenario's authored balises otherwise.
+        const territories = territoriesMeta.map((t, ti) => {
+          const override = config.clashBalises?.[ti];
+          const scenarioBalises: number[] = Array.isArray(t.balises)
+            ? t.balises.map((x: unknown) => Number(x)).filter((n: number) => !Number.isNaN(n))
+            : [];
+          const balises = override && override.length ? override : scenarioBalises;
+          return {
+            index: ti,
+            points: parseInt(String(t.points ?? '0'), 10) || 0,
+            balises,
+          };
+        });
+
+        // The Purge - enabled only when the launch says so AND the scenario has
+        // a purge image (no built-in fallback marker). Defensive re-check of the
+        // station collision here too (the modal hard-blocks it, but saved-config
+        // paths could carry a stale station): a collision disables the purge
+        // rather than corrupting validation.
+        const purgeStation = config.clashPurgeStation ?? 25;
+        const hasPurgeImage = typeof gm.purge_image === 'string' && gm.purge_image.length > 0;
+        let purgeEnabled = !!config.clashPurgeEnabled && hasPurgeImage;
+        if (purgeEnabled && territories.some((t) => t.balises.includes(purgeStation))) {
+          console.warn(`[Clash] purge station ${purgeStation} collides with a territory balise - The Purge is disabled for this launch.`);
+          purgeEnabled = false;
+        }
+
+        const clashConfig = {
+          territories,
+          max_per_clan: config.clashMaxPerClan ?? 0,
+          purge_enabled: purgeEnabled,
+          purge_station: purgeStation,
+        };
+        meta.clash_config = JSON.stringify(clashConfig);
+        if (config.clashRegistrationMode) meta.clashRegistrationMode = config.clashRegistrationMode;
+
+        const numClans = Math.max(2, Math.min(config.clashNumClans ?? clansMeta.length ?? 2, 4));
+        finalTeams = Array.from({ length: numClans }, (_, i) => {
+          const cn = clansMeta[i]?.name;
+          const name =
+            typeof cn === 'string'
+              ? cn
+              : cn && typeof cn === 'object'
+                ? (cn[config.language ?? 'fr'] ?? Object.values(cn)[0] ?? `Clan ${i + 1}`)
+                : `Clan ${i + 1}`;
+          return {
+            team_number: i + 1,
+            team_name: String(name),
+            pattern: 0,
+            key_id: null as number | null,
+            language: config.language ?? null,
+          };
+        });
+        finalNumberOfTeams = numClans;
+        if (territories.every((t) => t.balises.length === 0)) {
+          console.warn('[Clash] no territory balises found - validation will credit nothing until territories have station codes (author them in the scenario or set them in the launch grid).');
+        }
+      } catch (err) {
+        console.error('[Clash] failed to assemble clash_config', err);
+      }
+    }
+
+    // ── TagQuest self-register: no operator-built roster. Team mode pre-creates
+    // one named team row per team (key_id null) and reuses the clash_config
+    // per-team cap so the mother enforces it in clash_register - players bind
+    // their chip to a team on the registration screen. Solo mode creates no
+    // teams up front; each bipped chip enrols itself as its own team at runtime.
+    const isTagQuestSelfReg =
+      game.gameTypeName?.toLowerCase() === 'tagquest' && !!config.tagquestSelfRegister;
+    if (isTagQuestSelfReg) {
+      if (config.playMode === 'team') {
+        const numTeams = Math.max(1, config.numberOfTeams);
+        finalTeams = Array.from({ length: numTeams }, (_, i) => ({
+          team_number: i + 1,
+          team_name: config.tagquestTeamNames?.[i] || `Équipe ${i + 1}`,
+          pattern: 0,
+          key_id: null as number | null,
+          language: config.language ?? null,
+        }));
+        finalNumberOfTeams = numTeams;
+        meta.clash_config = JSON.stringify({
+          territories: [],
+          max_per_clan: config.tagquestMaxPerTeam ?? 0,
+        });
+      } else {
+        // Solo: empty roster + placeholder count (the create guard rejects <= 0).
+        finalTeams = [];
+        finalNumberOfTeams = 1;
+      }
+    }
+
+    // ── Station-based self-register: persist the device→teams registration
+    // assignment (each assigned device becomes a hard-locked kiosk for its
+    // teams; unassigned devices keep the pick-any-team grid). The wizard passes
+    // the resolved map; the headless Quick Launch path passes none, so
+    // auto-assign here over the resolved devices (excluding the mother and
+    // reader-less devices, mirroring the wizard's default deal).
+    // Design: project_selfregister_team_device_assignment.
+    const regAssignQualifies =
+      (isClashLaunch && (config.clashRegistrationMode ?? 'self') === 'self') ||
+      (isTagQuestSelfReg && config.playMode === 'team');
+    if (regAssignQualifies) {
+      let regMap = deviceSelection.reg_assignments;
+      if (!regMap) {
+        try {
+          const rows = await listPairedDevicesForLaunch();
+          const targets = new Set(deviceSelection.satellite_targets);
+          const eligibleIds = rows
+            .filter((r) => !r.is_self && targets.has(r.id) && r.has_reader)
+            .map((r) => r.id);
+          regMap = computeAutoRegAssignments(eligibleIds, finalNumberOfTeams);
+        } catch (err) {
+          console.error('[GameList] reg-assignment auto-deal failed:', err);
+          regMap = {};
+        }
+      }
+      const serialized = serializeRegAssignments(regMap);
+      if (serialized !== '{}') meta[REG_ASSIGNMENTS_META_KEY] = serialized;
+    }
 
     try {
       const res = await createLaunchedGame({
@@ -401,16 +783,103 @@ export function GameList() {
         name: config.name,
         // Auto-register builds no roster; the server's create guard rejects
         // <= 0, so send a placeholder. The all-teams-finished auto-end is
-        // disabled at runtime (disableAllFinishedEnd), so this is inert.
-        number_of_teams: config.autoRegisterTeam || config.selfRegisterTeam ? 1 : config.numberOfTeams,
+        // disabled at runtime (disableAllFinishedEnd), so this is inert. Clash
+        // creates one team per clan (finalTeams / finalNumberOfTeams).
+        number_of_teams: finalNumberOfTeams,
         game_type: game.gameTypeName,
         duration: config.duration,
         started: false,
         meta,
-        teams: teamRows,
+        teams: finalTeams,
         include_self: deviceSelection.include_self,
       });
       launchedGameId = res.id;
+      // ── Mass start (mystery/tracks "Départ groupé"): every pre-registered
+      // team begins together at launch, so stamp each team's start_time NOW -
+      // exactly what that team's first bip would have done under staggered
+      // starts. The runtime then treats each team's first real bip as its
+      // return/scoring bip (start_time already set ⇒ the end branch runs).
+      const launchGtLc = game.gameTypeName?.toLowerCase();
+      if (
+        config.massStart &&
+        (launchGtLc === 'mystery' || launchGtLc === 'tracks') &&
+        launchedGameId !== null
+      ) {
+        try {
+          const state = await getLaunchedGameState(launchedGameId, 0);
+          const startSec = Math.floor(Date.now() / 1000);
+          await Promise.all(
+            state.teams
+              .filter((t) => t.start_time == null)
+              .map((t) => updateTeam(t.id, { start_time: startSec }))
+          );
+        } catch (err) {
+          console.error('[GameList] mass-start team start failed:', err);
+        }
+      }
+      // Tracks multi-route launch: persist each team's route as a `route:{teamId}`
+      // meta override (read by the tracks runtime + Add Team flow). Team N defaults
+      // to routes[(N-1) % count] (cycling) unless the operator overrode it in step 2.
+      // The first route equals meta.route, so team_number 1 needs no override.
+      const tracksRoutesSel = config.routes ?? (config.route ? [config.route] : []);
+      if (
+        game.gameTypeName?.toLowerCase() === 'tracks' &&
+        tracksRoutesSel.length > 1 &&
+        launchedGameId !== null
+      ) {
+        try {
+          const state = await getLaunchedGameState(launchedGameId, 0);
+          const patch: Record<string, string> = {};
+          for (const tm of state.teams) {
+            const cfgTeam = (config.teams ?? [])[tm.team_number - 1];
+            const r = cfgTeam?.route ?? tracksRoutesSel[(tm.team_number - 1) % tracksRoutesSel.length];
+            if (r && r !== config.route) patch[`route:${tm.id}`] = r;
+          }
+          if (Object.keys(patch).length > 0) {
+            await mergeLaunchedGameMeta(launchedGameId, patch);
+          }
+        } catch (err) {
+          console.error('[GameList] tracks per-team route persist failed:', err);
+        }
+      }
+      // Clash chip→clan import (deferred apply): clans only exist now that the
+      // game is created, so bind each imported chip to its clan via the
+      // server-authoritative clash_register. Resolve clanIndex (1..N) against
+      // the freshly-created clans' team_number. Residual failures (e.g. a
+      // clan hit its cap) are reported, non-fatally, via an alert.
+      if (
+        isClashLaunch &&
+        (config.clashChipAssignments?.length ?? 0) > 0 &&
+        launchedGameId !== null
+      ) {
+        try {
+          const standings = await getClashState(launchedGameId);
+          const teamIdByNumber = new Map<number, number>();
+          for (const c of standings.clans) teamIdByNumber.set(c.team_number, c.team_id);
+          let ok = 0;
+          let failed = 0;
+          for (const a of config.clashChipAssignments!) {
+            const teamId = teamIdByNumber.get(a.clanIndex);
+            if (teamId === undefined) { failed++; continue; }
+            try {
+              const r = await clashRegister(launchedGameId, teamId, a.chipId);
+              if (r.status === 'ok' || r.status === 'already_in_clan') ok++;
+              else failed++;
+            } catch {
+              failed++;
+            }
+          }
+          if (failed > 0) {
+            showAlert('error', t('home:clashImportApplied', { ok, failed }));
+          } else if (ok > 0) {
+            showAlert('success', t('home:clashImportAppliedOk', { ok }));
+          }
+        } catch (err) {
+          console.error('[GameList] clash chip→clan import apply failed:', err);
+          showAlert('error', t('home:clashImportFailed'));
+        }
+      }
+
       // Fan out join_game to every pre-selected satellite. Server validates
       // each target individually; we don't await/inspect per-target results
       // here because the in-game Devices modal surfaces them anyway as the
@@ -426,11 +895,19 @@ export function GameList() {
       console.error('Error creating launched game:', error);
     }
 
-    setLaunchedGame({ config, uniqid: game.uniqid, launchedGameId });
     setLaunchModalOpen(false);
+    if (deviceSelection.include_self) {
+      // This device participates - enter the in-game page.
+      setLaunchedGame({ config, uniqid: game.uniqid, launchedGameId });
+    } else {
+      // This device only hosts/dispatches the game (not selected to run it) -
+      // redirect to the launched-games list instead of entering the game. The
+      // selected satellites get into the game via their join_game push.
+      onShowLaunchedGames?.();
+    }
   };
 
-  // Wizard launch — the modal's onLaunch. Targets the scenario the modal was
+  // Wizard launch - the modal's onLaunch. Targets the scenario the modal was
   // opened for.
   const handleGameLaunch = async (
     config: GameConfig,
@@ -442,7 +919,7 @@ export function GameList() {
 
   // ---- Quick Launch + saved-config orchestration ----
 
-  // Chips already assigned to a team in any active game — can't be reused.
+  // Chips already assigned to a team in any active game - can't be reused.
   const collectUsedChipIds = async (): Promise<Set<number>> => {
     const used = new Set<number>();
     try {
@@ -502,6 +979,7 @@ export function GameList() {
         slug: r.pattern_slug ?? r.pattern_uniqid,
         name: r.name || r.pattern_slug || r.pattern_uniqid,
         uniqid: r.pattern_uniqid,
+        isDefault: r.is_default,
       }));
       const tracksOptions = gameTypeLc === 'tracks' ? extractTracksOptions(rawGameData) : EMPTY_TRACKS_OPTIONS;
       const freeChips = cardRows.filter((c) => !used.has(c.id));
@@ -509,6 +987,7 @@ export function GameList() {
 
       const { ok, critical, resolved } = validateForHeadless(cfgRow.config, {
         patterns,
+        scenarioDefaultPatternId: extractDefaultPatternId(rawGameData),
         freeChips,
         tracksOptions,
         scenarioDownloaded,
@@ -523,12 +1002,12 @@ export function GameList() {
       const teams = resolved.autoRegisterTeam || resolved.selfRegisterTeam ? [] : buildRoster(resolved, freeChips, scenario.gameTypeName);
       const deviceSelection = await resolveDefaultDeviceSelection();
       setConfigModal(null);
-      await launchGame(scenario, { ...resolved, name: `${cfgRow.name} — ${frenchStamp()}`, teams }, deviceSelection);
+      await launchGame(scenario, { ...resolved, name: `${cfgRow.name} - ${frenchStamp()}`, teams }, deviceSelection);
     } catch (err) {
       console.error('[GameList] headlessLaunch failed:', err);
       // Last-resort fallback: open the pre-filled wizard so the operator can
       // launch manually rather than silently doing nothing.
-      openPrefilledWizard(scenario, cfgRow.config, cfgRow.name, 'Could not prepare a quick launch — please review and launch.');
+      openPrefilledWizard(scenario, cfgRow.config, cfgRow.name, t('home:quickLaunchPrepareFailed'));
     }
   };
 
@@ -545,6 +1024,7 @@ export function GameList() {
   // Main split-button action: 1 config → headless; >1 → open the picker.
   const handleQuickLaunch = async (scenario: LaunchTarget) => {
     if (!user?.client_id) return;
+    if (await blockedByLock(() => void handleQuickLaunch(scenario))) return;
     try {
       const configs = await launchConfigsStore.listForScenario(user.client_id, scenario.uniqid);
       if (configs.length === 1) {
@@ -575,6 +1055,10 @@ export function GameList() {
 
   const handleBackToList = () => {
     setLaunchedGame(null);
+    // The in-game operator panel's button is "Back to Launched Games", so route
+    // to the launched-games page rather than dropping back on the scenarios list
+    // we launched from.
+    onShowLaunchedGames?.();
   };
 
   const handleDeleteClick = (uniqid: string, title: string) => {
@@ -582,24 +1066,39 @@ export function GameList() {
     setDeleteConfirmOpen(true);
   };
 
+  // The actual local delete: drops the row + downloaded files. Not permanent -
+  // the next sync re-adds the scenario from the manifest and re-downloads it.
+  // Works for any scenario, including ones that never finished downloading
+  // (e.g. a mystery scenario stuck on failed attempts).
+  const performDelete = async (target: { uniqid: string; title: string }) => {
+    try {
+      await scenarioStore.deleteScenario(target.uniqid);
+      await loadScenarios();
+      await loadLocalGames();
+      showAlert('success', t('home:deleteSuccess', { title: target.title }));
+    } catch (err) {
+      console.error('[GameList] failed to delete scenario:', err);
+      showAlert('error', t('home:deleteError', { title: target.title }));
+    }
+  };
+
   const handleDeleteConfirm = async () => {
     const target = scenarioToDelete;
     setDeleteConfirmOpen(false);
     setScenarioToDelete(null);
     if (!target) return;
+    // Gate the deletion behind the device PIN when one is set. With no PIN
+    // configured there is nothing to verify against, so delete straight away
+    // (consistent with the other PIN gates, which bypass when no PIN exists).
     try {
-      // Local delete: drops the row + downloaded files. Not permanent — the
-      // next sync re-adds the scenario from the manifest and re-downloads it.
-      // Works for any scenario, including ones that never finished
-      // downloading (e.g. a mystery scenario stuck on failed attempts).
-      await scenarioStore.deleteScenario(target.uniqid);
-      await loadScenarios();
-      await loadLocalGames();
-      showAlert('success', `"${target.title}" was deleted. It will be downloaded again on the next sync.`);
+      if (await hasPin()) {
+        setDeletePinGate(target);
+        return;
+      }
     } catch (err) {
-      console.error('[GameList] failed to delete scenario:', err);
-      showAlert('error', `Could not delete "${target.title}". Please try again.`);
+      console.error('[GameList] hasPin check failed; deleting without gate:', err);
     }
+    await performDelete(target);
   };
 
   const handleDeleteCancel = () => {
@@ -607,8 +1106,16 @@ export function GameList() {
     setScenarioToDelete(null);
   };
 
-  const renderScenarioCard = (scenario: ScenarioWithType) => {
-    const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
+  // Shared action buttons (join / launch / quick launch / purchase) used by
+  // both the grid card and the list row. `includeDetails` adds the inline
+  // "view details" button - cards suppress it (the card has its own top-right
+  // details button) while list rows keep it. Deletion now lives in the details
+  // modal, so it's no longer offered here.
+  const renderScenarioActions = (
+    scenario: ScenarioWithType,
+    includeDetails = true,
+    layout: 'card' | 'row' = 'card'
+  ) => {
     const isAvailableForPurchase = scenario.available_for_purchase;
     const activeGame = scenario.uniqid ? activeGames.get(scenario.uniqid) : undefined;
     const configCount = scenario.uniqid ? (configCounts.get(scenario.uniqid) ?? 0) : 0;
@@ -618,114 +1125,177 @@ export function GameList() {
       gameTypeName: scenario.game_type.name,
     };
 
+    // When a card shows all three primary buttons (Join + Launch new + Quick),
+    // the row gets cramped - collapse them to icon-only.
+    const canPlay =
+      !isAvailableForPurchase &&
+      !!scenario.uniqid &&
+      (localGameIds.size === 0 || localGameIds.has(scenario.uniqid));
+    const hasJoin = canPlay && !!activeGame && !operatorOnly;
+    const hasQuick = !isAvailableForPurchase && !!scenario.uniqid && configCount > 0;
+    const compact = layout === 'card' && hasJoin && hasQuick;
+
     return (
-      <div
-        key={scenario.id}
-        className="bg-slate-800 rounded-xl shadow-xl overflow-hidden border border-slate-700 hover:border-slate-600 transition group"
-      >
-        <div className="w-full h-48 overflow-hidden bg-slate-700 relative">
+      <div className={`pg-card-actions${layout === 'row' ? ' pg-card-actions--row' : ''}`}>
+        {/* Primary actions. When a game is already running for this scenario we
+            offer BOTH "Join" (the running game) and "Launch new" - a fresh game
+            can run alongside it on other (free) devices. */}
+        {isAvailableForPurchase ? (
+          <a
+            href="https://studio.taghunter.fr"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="pg-btn-play"
+          >
+            {t('home:purchase')}
+          </a>
+        ) : scenario.uniqid && (localGameIds.size === 0 || localGameIds.has(scenario.uniqid)) ? (
+          <>
+            {activeGame && !operatorOnly && (
+              <button
+                onClick={() => handleJoinGame(scenario.uniqid || '')}
+                className="pg-btn-play pg-btn-join"
+                title={t('home:joinActiveGame', { name: activeGame.name })}
+              >
+                <LogIn size={15} />
+                {!compact && <span>{t('home:join')}</span>}
+              </button>
+            )}
+            <button
+              onClick={() => handleLaunchGame(scenario.uniqid || '', scenario.title, scenario.game_type.name)}
+              className="pg-btn-play"
+              title={t('home:launchFullOptions')}
+            >
+              <Play size={15} />
+              {!compact && <span>{activeGame ? t('home:launchNew') : t('home:launch')}</span>}
+            </button>
+          </>
+        ) : null}
+
+        {/* Quick Launch split button - only when this scenario has saved
+            configs. Main: 1 config → headless, >1 → picker. Caret: always
+            opens the picker/manage modal. */}
+        {!isAvailableForPurchase && scenario.uniqid && configCount > 0 && (
+          <div className="pg-split">
+            <button
+              onClick={() => void handleQuickLaunch(launchTarget)}
+              title={t('home:quickLaunchTitle')}
+            >
+              <Zap size={15} />
+              {!compact && t('home:quick')}
+            </button>
+            <button
+              onClick={() => void openConfigModal(launchTarget)}
+              title={t('home:manageConfigs')}
+            >
+              <ChevronDown size={15} />
+            </button>
+          </div>
+        )}
+
+        {includeDetails && (
+          <button
+            onClick={() => setDetailsScenario(scenario)}
+            className="pg-icon-action"
+            title={t('home:viewDetails')}
+          >
+            <Eye size={16} />
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderScenarioCard = (scenario: ScenarioWithType) => {
+    const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
+    const isAvailableForPurchase = scenario.available_for_purchase;
+
+    const difficultyLevel = coerceDifficulty(scenario.difficulty);
+
+    return (
+      <article key={scenario.id} className="pg-card">
+        <div className="pg-card-img">
+          <span className="pg-cat-tag">
+            <GameTypeIcon type={scenario.game_type.name} size={12} />
+            {gameTypeLabel(scenario.game_type.name).toUpperCase()}
+          </span>
+          {isAvailableForPurchase ? (
+            <span className="pg-tag">{t('home:new')}</span>
+          ) : (
+            <button
+              onClick={() => setDetailsScenario(scenario)}
+              className="pg-card-detail"
+              title={t('home:viewDetails')}
+              aria-label={t('home:viewDetails')}
+            >
+              <Eye size={15} />
+            </button>
+          )}
           <ScenarioThumbnail
             imageUrl={localImageUrl}
             gameTypeName={scenario.game_type.name}
             title={scenario.title}
           />
-          {isAvailableForPurchase && (
-            <div className="absolute top-3 right-3 bg-amber-500/90 backdrop-blur-sm px-3 py-1 rounded-full text-xs font-bold text-white shadow-lg">
-              Available for Purchase
+        </div>
+        <div className="pg-card-body">
+          <div className="pg-card-meta">
+            <Clock size={13} />
+            {t('home:durationMinutes', { count: scenario.duration_minutes })} ·
+            <DifficultyMeter level={difficultyLevel} />
+          </div>
+          <div className="pg-card-title">{scenario.title || t('home:untitledScenario')}</div>
+          <div className="pg-card-desc">{scenario.description}</div>
+          {scenario.univers.length > 0 && (
+            <div className="flex flex-wrap gap-1 mb-2">
+              {scenario.univers.map((tag) => (
+                <span key={tag} className="pg-pill" style={{ fontSize: '0.7rem' }}>
+                  {tag}
+                </span>
+              ))}
             </div>
           )}
+          {renderScenarioActions(scenario, false)}
         </div>
-        <div className="p-6">
-          <div className="flex items-start justify-between mb-3">
-            <span className="text-blue-400 text-sm font-semibold">
-              {scenario.game_type.name}
-            </span>
-            <span className={`px-3 py-1 rounded-full text-xs font-medium border ${getDifficultyColor(scenario.difficulty)}`}>
-              {scenario.difficulty || 'Medium'}
-            </span>
+      </article>
+    );
+  };
+
+  // Compact list row - same metadata + actions as the card, laid out
+  // horizontally so more scenarios fit on screen.
+  const renderScenarioRow = (scenario: ScenarioWithType) => {
+    const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
+    const isAvailableForPurchase = scenario.available_for_purchase;
+
+    return (
+      <div key={scenario.id} className="pg-row">
+        <div className="pg-row-thumb">
+          <ScenarioThumbnail
+            imageUrl={localImageUrl}
+            gameTypeName={scenario.game_type.name}
+            title={scenario.title}
+          />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            <h3 className="pg-card-title" style={{ marginBottom: 0 }}>
+              {scenario.title || t('home:untitledScenario')}
+            </h3>
+            {isAvailableForPurchase && <span className="pg-tag" style={{ position: 'static' }}>{t('home:forPurchase')}</span>}
           </div>
-          <h3 className="text-xl font-bold text-white mb-2 group-hover:text-blue-400 transition">
-            {scenario.title || 'Untitled scenario'}
-          </h3>
-          <p className="text-slate-400 text-sm mb-4 line-clamp-2">
-            {scenario.description}
-          </p>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-slate-500 text-sm">
-              <Clock size={16} />
-              <span>{scenario.duration_minutes} minutes</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setDetailsScenario(scenario)}
-                className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white rounded-lg transition font-medium text-sm border border-slate-600"
-                title="View scenario details"
-              >
-                <Eye size={16} />
-              </button>
-              {!isAvailableForPurchase && scenario.uniqid && !activeGame && (
-                <button
-                  onClick={() => handleDeleteClick(scenario.uniqid || '', scenario.title || 'Untitled scenario')}
-                  className="flex items-center gap-2 px-3 py-2 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg transition font-medium text-sm border border-red-600/30 hover:border-red-600"
-                  title="Delete scenario"
-                >
-                  <Trash2 size={16} />
-                </button>
-              )}
-              {!isAvailableForPurchase && scenario.uniqid && activeGame ? (
-                <button
-                  onClick={() => handleJoinGame(scenario.uniqid || '')}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition font-medium text-sm"
-                  title={`Join active game: ${activeGame.name}`}
-                >
-                  <LogIn size={16} />
-                  <span>Join</span>
-                </button>
-              ) : !isAvailableForPurchase && scenario.uniqid && (localGameIds.size === 0 || localGameIds.has(scenario.uniqid)) ? (
-                <>
-                  <button
-                    onClick={() => handleLaunchGame(scenario.uniqid || '', scenario.title, scenario.game_type.name)}
-                    className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg transition font-medium text-sm"
-                    title="Launch (full options)"
-                  >
-                    <Play size={16} />
-                  </button>
-                  {/* Quick Launch split button — only when this scenario has
-                      saved configs. Main: 1 config → headless, >1 → picker.
-                      Caret: always opens the picker/manage modal. */}
-                  {configCount > 0 && (
-                    <div className="flex items-stretch rounded-lg overflow-hidden">
-                      <button
-                        onClick={() => void handleQuickLaunch(launchTarget)}
-                        className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white transition font-medium text-sm"
-                        title="Quick launch from a saved configuration"
-                      >
-                        <Zap size={16} />
-                        Quick
-                      </button>
-                      <button
-                        onClick={() => void openConfigModal(launchTarget)}
-                        className="px-2 py-2 bg-blue-700 hover:bg-blue-600 text-white transition border-l border-blue-500/40"
-                        title="Manage saved configurations"
-                      >
-                        <ChevronDown size={16} />
-                      </button>
-                    </div>
-                  )}
-                </>
-              ) : null}
-              {isAvailableForPurchase && (
-                <a
-                  href="https://studio.taghunter.fr"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg transition font-medium text-sm"
-                >
-                  Purchase
-                </a>
-              )}
-            </div>
+          <div className="pg-card-meta" style={{ marginBottom: 0, gap: 12 }}>
+            <span className="inline-flex items-center gap-1.5">
+              <GameTypeIcon type={scenario.game_type.name} size={14} />
+              {gameTypeLabel(scenario.game_type.name)}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <Clock size={13} />
+              {t('home:durationMinutes', { count: scenario.duration_minutes })}
+            </span>
+            <DifficultyMeter level={coerceDifficulty(scenario.difficulty)} />
           </div>
+        </div>
+        <div className="flex-shrink-0">
+          {renderScenarioActions(scenario, true, 'row')}
         </div>
       </div>
     );
@@ -744,8 +1314,8 @@ export function GameList() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
-        <div className="text-white text-xl">Loading...</div>
+      <div className="min-h-screen pg-app-bg flex items-center justify-center">
+        <div className="text-[var(--pg-text)] text-xl">{t('home:loading')}</div>
       </div>
     );
   }
@@ -757,120 +1327,154 @@ export function GameList() {
       )}
 
       <main className="flex-1 container mx-auto px-6 py-8">
-        <div className="mb-3 flex justify-end">
-          <HelpButton chapter="scenarios" className="text-slate-400 hover:text-slate-200" />
-        </div>
-        <div className="mb-8">
-          <div className="flex flex-col md:flex-row gap-4">
-            <div className="flex-1 relative">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-slate-400" size={20} />
-              <input
-                type="text"
-                placeholder="Search scenarios..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-4 py-3 bg-slate-800 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
-              />
-            </div>
+        {/* Filters: search + view toggle */}
+        <div className="pg-filters mb-3">
+          <label className="pg-search">
+            <span className="pg-search-icon">
+              <Search size={16} />
+            </span>
+            <input
+              type="text"
+              placeholder={t('home:searchPlaceholder')}
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+          </label>
+          <div className="pg-view-toggle">
             <button
-              onClick={() => setShowOnlyLaunchable(!showOnlyLaunchable)}
-              className={`px-6 py-3 rounded-lg font-medium transition flex items-center gap-2 ${
-                showOnlyLaunchable
-                  ? 'bg-green-600 text-white hover:bg-green-500'
-                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-              }`}
+              onClick={() => setViewMode('grid')}
+              className={viewMode === 'grid' ? 'is-active' : ''}
+              aria-label={t('home:gridView')}
+              title={t('home:gridView')}
             >
-              <Play size={16} />
-              Launchable Only
+              <LayoutGrid size={16} />
             </button>
-            <select
-              value={selectedDifficulty}
-              onChange={(e) => setSelectedDifficulty(e.target.value)}
-              className="px-4 py-3 bg-slate-800 border border-slate-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+            <button
+              onClick={() => setViewMode('list')}
+              className={viewMode === 'list' ? 'is-active' : ''}
+              aria-label={t('home:listView')}
+              title={t('home:listView')}
             >
-              <option value="all">All Difficulties</option>
-              <option value="easy">Easy</option>
-              <option value="medium">Medium</option>
-              <option value="hard">Hard</option>
-            </select>
-            <div className="flex gap-2">
+              <List size={16} />
+            </button>
+          </div>
+        </div>
+
+        {/* Filter pills - game type, audience and difficulty, each a segmented
+            control laid out together on one line (wraps on narrow widths). */}
+        <div className="pg-filter-bar mb-7">
+          <div className="pg-cat-tabs-inner">
+            <button
+              onClick={() => setSelectedGameType('all')}
+              className={`pg-cat-tab${selectedGameType === 'all' ? ' is-active' : ''}`}
+            >
+              {t('home:all')}
+            </button>
+            {gameTypes.map((type) => (
               <button
-                onClick={() => setSelectedGameType('all')}
-                className={`px-6 py-3 rounded-lg font-medium transition ${
-                  selectedGameType === 'all'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                }`}
+                key={type}
+                onClick={() => setSelectedGameType(type)}
+                className={`pg-cat-tab${selectedGameType === type ? ' is-active' : ''}`}
               >
-                All
+                {gameTypeLabel(type)}
               </button>
-              {gameTypes.map((type) => (
+            ))}
+          </div>
+
+          {audiences.length > 0 && (
+            <div className="pg-cat-tabs-inner">
+              <button
+                onClick={() => setSelectedAudience('all')}
+                className={`pg-cat-tab${selectedAudience === 'all' ? ' is-active' : ''}`}
+              >
+                {t('home:allAudiences')}
+              </button>
+              {audiences.map((a) => (
                 <button
-                  key={type}
-                  onClick={() => setSelectedGameType(type)}
-                  className={`px-6 py-3 rounded-lg font-medium transition ${
-                    selectedGameType === type
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
+                  key={a}
+                  onClick={() => setSelectedAudience(a)}
+                  className={`pg-cat-tab${selectedAudience === a ? ' is-active' : ''}`}
                 >
-                  {type}
+                  {audienceLabel(a)}
                 </button>
               ))}
             </div>
+          )}
+
+          <div className="pg-cat-tabs-inner">
+            <button
+              onClick={() => setSelectedDifficulty('all')}
+              className={`pg-cat-tab${selectedDifficulty === 'all' ? ' is-active' : ''}`}
+            >
+              {t('home:allDifficulties')}
+            </button>
+            {[1, 2, 3, 4, 5].map((d) => (
+              <button
+                key={d}
+                onClick={() => setSelectedDifficulty(String(d))}
+                className={`pg-cat-tab${selectedDifficulty === String(d) ? ' is-active' : ''}`}
+                title={`${d} / 5`}
+              >
+                {'★'.repeat(d)}
+              </button>
+            ))}
           </div>
         </div>
 
         {scenarios.length === 0 && !loading && (
           <div className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="text-slate-400 text-lg mb-2">No scenarios found</div>
-            <p className="text-slate-500 text-sm">
-              Please configure your email in settings to sync scenarios from the server
+            <div className="text-[var(--pg-text-muted)] text-lg mb-2">{t('home:noScenariosFound')}</div>
+            <p className="text-[var(--pg-text-dim)] text-sm">
+              {t('home:noScenariosHint')}
             </p>
           </div>
         )}
 
         {scenarios.length > 0 && filteredScenarios.length === 0 && !loading && (
           <div className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="text-slate-400 text-lg mb-2">No scenarios match your filters</div>
-            <p className="text-slate-500 text-sm">
-              Try adjusting your search or filter criteria
+            <div className="text-[var(--pg-text-muted)] text-lg mb-2">{t('home:noScenariosMatchFilters')}</div>
+            <p className="text-[var(--pg-text-dim)] text-sm">
+              {t('home:adjustFiltersHint')}
             </p>
           </div>
         )}
 
         {purchasedScenarios.length > 0 && (
-          <>
-            <div className="mb-6">
-              <h2 className="text-2xl font-bold text-white">Your Scenarios</h2>
-              <p className="text-slate-400 text-sm mt-1">Scenarios you own and can launch</p>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
+          viewMode === 'grid' ? (
+            <div className="pg-grid mb-12">
               {purchasedScenarios.map(renderScenarioCard)}
             </div>
-          </>
+          ) : (
+            <div className="flex flex-col gap-3 mb-12">
+              {purchasedScenarios.map(renderScenarioRow)}
+            </div>
+          )
         )}
 
         {availableForPurchaseScenarios.length > 0 && (
           <>
-            <div className="mb-6 border-t border-slate-700 pt-12">
-              <h2 className="text-2xl font-bold text-white flex items-center gap-3">
-                Available for Purchase
-                <span className="px-3 py-1 bg-amber-500/20 text-amber-400 text-sm font-semibold rounded-full border border-amber-500/30">
-                  New
-                </span>
-              </h2>
-              <p className="text-slate-400 text-sm mt-1">Discover more scenarios and expand your collection</p>
+            <div className="mb-6 border-t border-[var(--pg-line)] pt-10">
+              <div className="pg-section-title flex items-center gap-3">
+                {t('home:availableForPurchase')}
+                <span className="pg-tag" style={{ position: 'static' }}>{t('home:new')}</span>
+              </div>
+              <p className="pg-section-sub">{t('home:availableForPurchaseSubtitle')}</p>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {availableForPurchaseScenarios.map(renderScenarioCard)}
-            </div>
+            {viewMode === 'grid' ? (
+              <div className="pg-grid">
+                {availableForPurchaseScenarios.map(renderScenarioCard)}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {availableForPurchaseScenarios.map(renderScenarioRow)}
+              </div>
+            )}
           </>
         )}
 
         {purchasedScenarios.length === 0 && availableForPurchaseScenarios.length === 0 && scenarios.length > 0 && (
           <div className="text-center py-12">
-            <p className="text-slate-400 text-lg">No scenarios found matching your criteria</p>
+            <p className="text-[var(--pg-text-muted)] text-lg">{t('home:noScenariosMatchCriteria')}</p>
           </div>
         )}
       </main>
@@ -890,7 +1494,7 @@ export function GameList() {
         noticeText={prefill?.notice}
         onConfigSaved={(name) => {
           void loadConfigCounts();
-          showAlert('success', `Configuration “${name}” saved.`);
+          showAlert('success', t('home:configSaved', { name }));
         }}
       />
 
@@ -910,18 +1514,68 @@ export function GameList() {
         isOpen={deleteConfirmOpen}
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
-        title="Delete Scenario"
-        message={`Delete "${scenarioToDelete?.title}" from this playground? Its downloaded files are removed now. It will be downloaded again on the next sync.`}
-        confirmText="Delete"
-        cancelText="Cancel"
+        title={t('home:deleteDialogTitle')}
+        message={t('home:deleteDialogMessage', { title: scenarioToDelete?.title })}
+        confirmText={t('home:delete')}
+        cancelText={t('home:cancel')}
         variant="danger"
       />
+
+      <ConfirmDialog
+        isOpen={motherPrompt !== null}
+        onConfirm={() => { motherPrompt?.resolve(true); setMotherPrompt(null); }}
+        onCancel={() => { motherPrompt?.resolve(false); setMotherPrompt(null); }}
+        title={t('becomeMotherPromptTitle')}
+        message={t('becomeMotherPromptBody')}
+        confirmText={t('becomeMotherPromptConfirm')}
+        cancelText={t('cancel')}
+        variant="warning"
+      />
+
+      {deletePinGate && (
+        <PinExitPrompt
+          title={t('home:enterPinTitle')}
+          subtitle={t('home:enterPinDeleteSubtitle', { title: deletePinGate.title })}
+          onSuccess={() => {
+            const target = deletePinGate;
+            setDeletePinGate(null);
+            void performDelete(target);
+          }}
+          onCancel={() => setDeletePinGate(null)}
+        />
+      )}
+
+      {lockGate && (
+        <GameLockGate
+          reason={lockGate.reason}
+          onReprieve={() => {
+            const run = lockGate.run;
+            setLockGate(null);
+            run();
+          }}
+          onClose={() => setLockGate(null)}
+        />
+      )}
 
       {detailsScenario && (
         <ScenarioDetailsModal
           scenario={detailsScenario}
           thumbnailUrl={(detailsScenario.uniqid && localImages.get(detailsScenario.uniqid)) || null}
           onClose={() => setDetailsScenario(null)}
+          onDelete={
+            detailsScenario.uniqid &&
+            !detailsScenario.available_for_purchase &&
+            !activeGames.has(detailsScenario.uniqid)
+              ? () => {
+                  const target = {
+                    uniqid: detailsScenario.uniqid || '',
+                    title: detailsScenario.title || t('home:untitledScenario'),
+                  };
+                  setDetailsScenario(null);
+                  handleDeleteClick(target.uniqid, target.title);
+                }
+              : undefined
+          }
         />
       )}
     </div>

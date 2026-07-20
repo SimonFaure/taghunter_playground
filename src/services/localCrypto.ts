@@ -1,4 +1,4 @@
-// Shared local KDF helpers for the device's "UX gate" secrets — the cold-start
+// Shared local KDF helpers for the device's "UX gate" secrets - the cold-start
 // device PIN (pinStore.ts) and the offline admin recovery codes
 // (recoveryCodesStore.ts). Centralised so both hash identically
 // (PBKDF2-HMAC-SHA256 → 32 bytes, base64-encoded) and so the crypto lives in
@@ -35,7 +35,7 @@ export async function pbkdf2(
   return base64Encode(new Uint8Array(bits));
 }
 
-// `byteLength` random bytes, base64-encoded — for a per-secret salt.
+// `byteLength` random bytes, base64-encoded - for a per-secret salt.
 export function randomSaltB64(byteLength: number): string {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);

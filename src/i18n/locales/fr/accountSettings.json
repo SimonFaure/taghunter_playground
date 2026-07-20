@@ -1,0 +1,22 @@
+{
+  "title": "Compte",
+  "name": "Nom",
+  "notSet": "Non renseigné",
+  "email": "E-mail",
+  "license": "Licence",
+  "unknown": "inconnue",
+  "billing": "Facturation",
+  "billingUpToDate": "À jour",
+  "billingPaymentNeeded": "Paiement requis",
+  "offlineAccess": "Accès hors ligne",
+  "daysLeft_one": "{{count}} jour restant <dim>sur {{total}}</dim>",
+  "daysLeft_other": "{{count}} jours restants <dim>sur {{total}}</dim>",
+  "offlineExpired": "Expiré - reconnexion requise",
+  "signOutDevice": "Déconnecter cet appareil",
+  "signOutOfflineTitle": "Connectez-vous à Internet pour vous déconnecter",
+  "signOutOfflineHint": "Connectez-vous à Internet pour vous déconnecter.",
+  "confirmTitle": "Déconnecter cet appareil ?",
+  "confirmBody": "Vous êtes connecté en tant que <strong>{{email}}</strong>. La déconnexion révoque cet appareil, efface le code PIN et supprime les données de compte locales. Une connexion Internet sera nécessaire pour vous reconnecter.",
+  "cancel": "Annuler",
+  "signOut": "Se déconnecter"
+}

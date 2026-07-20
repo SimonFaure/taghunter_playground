@@ -21,6 +21,7 @@ dist-ssr
 *.sln
 *.sw?
 .env
+.env*.local
 
 # Help system — generated from taghunter-help-content at predev/prebuild.
 src/help/_generated/

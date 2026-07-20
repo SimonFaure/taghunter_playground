@@ -3,7 +3,7 @@
 // prompting the operator to set a new PIN in Settings.
 //
 // A plain window CustomEvent (rather than syncEvents) because the firing
-// component can live OUTSIDE the React tree that renders the banner — e.g.
+// component can live OUTSIDE the React tree that renders the banner - e.g.
 // FullscreenHint mounts at the app root, beside <App>, not inside it.
 
 const EVENT = 'taghunter:pin-reset';
@@ -12,7 +12,7 @@ export function signalPinReset(): void {
   try {
     window.dispatchEvent(new CustomEvent(EVENT));
   } catch {
-    /* non-DOM env — no-op */
+    /* non-DOM env - no-op */
   }
 }
 

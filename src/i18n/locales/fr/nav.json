@@ -1,0 +1,14 @@
+{
+  "scenarios": "Scénarios",
+  "launchedGames": "Parties lancées",
+  "cardsPatterns": "Puces & Modèles",
+  "settings": "Paramètres",
+  "help": "Aide",
+  "database": "Base de données",
+  "adminConfig": "Config admin",
+  "exitAdmin": "Quitter admin",
+  "logoScreen": "Écran logo",
+  "lock": "Verrouiller",
+  "testChannelBadge": "TEST",
+  "testChannelHint": "Cet appareil est un testeur : il télécharge les mises à jour depuis le canal de test."
+}

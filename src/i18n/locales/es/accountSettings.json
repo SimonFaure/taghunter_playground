@@ -1,0 +1,22 @@
+{
+  "title": "Cuenta",
+  "name": "Nombre",
+  "notSet": "Sin definir",
+  "email": "Correo electrónico",
+  "license": "Licencia",
+  "unknown": "desconocida",
+  "billing": "Facturación",
+  "billingUpToDate": "Al día",
+  "billingPaymentNeeded": "Pago pendiente",
+  "offlineAccess": "Acceso sin conexión",
+  "daysLeft_one": "Queda {{count}} día <dim>de {{total}}</dim>",
+  "daysLeft_other": "Quedan {{count}} días <dim>de {{total}}</dim>",
+  "offlineExpired": "Caducado - se requiere reconexión",
+  "signOutDevice": "Cerrar sesión en este dispositivo",
+  "signOutOfflineTitle": "Conéctate a Internet para cerrar sesión",
+  "signOutOfflineHint": "Conéctate a Internet para cerrar sesión.",
+  "confirmTitle": "¿Cerrar sesión en este dispositivo?",
+  "confirmBody": "Has iniciado sesión como <strong>{{email}}</strong>. Al cerrar sesión se revoca este dispositivo, se borra el PIN y se eliminan los datos de la cuenta local. Necesitarás conexión a Internet para volver a iniciar sesión.",
+  "cancel": "Cancelar",
+  "signOut": "Cerrar sesión"
+}

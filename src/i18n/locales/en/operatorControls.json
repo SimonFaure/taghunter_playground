@@ -1,0 +1,39 @@
+{
+  "rankings": {
+    "title": "Rankings",
+    "tabTimeRange": "Time Range",
+    "tabActiveGames": "Active Games",
+    "scenario": "Scenario",
+    "noScenarios": "No scenarios found.",
+    "selectScenario": "Select a scenario",
+    "timeRange": "Time Range",
+    "viewRankings": "View Rankings",
+    "noActiveGames": "No active games running right now.",
+    "selectUpTo_one": "Select up to {{count}} game to compare side by side.",
+    "selectUpTo_other": "Select up to {{count}} games to compare side by side.",
+    "maximumReached": "Maximum reached.",
+    "rangeToday": "Today",
+    "rangeWeek": "This Week",
+    "rangeMonth": "This Month",
+    "rangeQuarter": "This Quarter",
+    "rangeYear": "This Year",
+    "rangeAll": "All Time"
+  },
+  "addTime": {
+    "title": "Add time",
+    "minutesToAdd": "Minutes to add",
+    "failed": "Failed to add time",
+    "adding": "Adding…",
+    "addMinutes": "Add {{count}} min",
+    "cancel": "Cancel"
+  },
+  "devicePicker": {
+    "close": "Close"
+  },
+  "cardDetection": {
+    "detected": "Card Detected",
+    "id": "ID: {{id}}",
+    "punches_one": "Punch: {{count}}",
+    "punches_other": "Punches: {{count}}"
+  }
+}

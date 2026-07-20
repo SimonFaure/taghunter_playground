@@ -11,8 +11,9 @@
 // fresh AND exposes `listPoolNames` so the UI can draw a name client-side for
 // the manual "Random name" button in the launched-game team/player editor.
 
-import { exists, readTextFile, BaseDirectory } from '@tauri-apps/plugin-fs';
+import { exists, readTextFile, writeTextFile, mkdir, BaseDirectory } from '@tauri-apps/plugin-fs';
 import { teamNamesFileRel } from './contentFs';
+import { apiCall } from './api';
 import { getDb } from './db';
 
 export interface NamePoolsStateRow {
@@ -63,7 +64,7 @@ export async function incrementFailedAttempts(clientId: number): Promise<void> {
 }
 
 // Pull needed when studio's remote_version differs from what we last persisted.
-// remote_version 0 means "no pools exist" — still worth one download to clear a
+// remote_version 0 means "no pools exist" - still worth one download to clear a
 // stale file, but only if we've never downloaded (local null) or it changed.
 export async function needsTeamNamesDownload(clientId: number): Promise<boolean> {
   const row = await get(clientId);
@@ -81,11 +82,22 @@ export async function getTeamNamesJson(): Promise<unknown | null> {
   }
 }
 
+// audience -> language -> [names]
+export type PoolsByAudience = Record<string, Record<string, string[]>>;
+
 // On-disk shape (written by the sync orchestrator from playground.php
-// `get_team_names`): { version, pools: { [audience]: { [language]: string[] } } }.
+// `get_team_names`):
+//   pools        - EFFECTIVE draw set (honors the own_only preference); read by
+//                  the LAN mother (Rust) and the manual "Random name" button.
+//   pools_global - the always-full default catalog (display only).
+//   pools_client - the always-full per-client list (display only).
+//   own_only     - the client's "use my own lists only" preference.
 interface TeamNamesFile {
   version?: number;
-  pools?: Record<string, Record<string, string[]>>;
+  own_only?: boolean;
+  pools?: PoolsByAudience;
+  pools_global?: PoolsByAudience;
+  pools_client?: PoolsByAudience;
 }
 
 // Candidate names for an (audience, language) pair, used by the manual
@@ -103,4 +115,128 @@ export async function listPoolNames(audience: string, language: string): Promise
     if (byLang[l]?.length) return byLang[l];
   }
   return [];
+}
+
+// Client vs default breakdown of the candidate names for an (audience, language)
+// pair. Bulk-assignment affordances ("Utiliser les noms de la liste") prefer the
+// client's own list and only draw from the default catalog to COMPLETE when the
+// client pool is too small for the team count.
+export interface TieredPoolNames {
+  /** The client's own list (the "custom name pool of the client"). */
+  client: string[];
+  /** The default/global catalog, used to complete a short client pool. */
+  global: string[];
+}
+
+// Pick the best language slice from a `{ lang: [names] }` map - the requested
+// language, else the first other language that has names (same fallback as
+// listPoolNames). Empty when the map is missing or has no names anywhere.
+function pickLangSlice(byLang: Record<string, string[]> | undefined, lang: string): string[] {
+  if (!byLang) return [];
+  if (byLang[lang]?.length) return byLang[lang];
+  for (const l of Object.keys(byLang)) {
+    if (byLang[l]?.length) return byLang[l];
+  }
+  return [];
+}
+
+// Return the client list and the default catalog SEPARATELY so callers can put
+// the client names first and top up from the default pool. Reads the always-full
+// pools_client / pools_global breakdown (independent of the own_only preference,
+// which the requirement deliberately softens: custom names first, default only
+// to complete). Falls back to the flat effective `pools` set (as the client
+// tier) for older on-disk files that predate the breakdown.
+export async function listPoolNamesTiered(audience: string, language: string): Promise<TieredPoolNames> {
+  const json = (await getTeamNamesJson()) as TeamNamesFile | null;
+  const lang = (language || '').toLowerCase();
+  const client = pickLangSlice(json?.pools_client?.[audience], lang);
+  const global = pickLangSlice(json?.pools_global?.[audience], lang);
+  if (client.length === 0 && global.length === 0) {
+    return { client: pickLangSlice(json?.pools?.[audience], lang), global: [] };
+  }
+  return { client, global };
+}
+
+// The full breakdown for the Settings → Team names tab: the default catalog and
+// this client's own lists (both always complete, independent of the own_only
+// preference), plus the current preference value. Missing file -> empty view.
+export interface TeamNamesView {
+  ownOnly: boolean;
+  global: PoolsByAudience;
+  client: PoolsByAudience;
+}
+
+export async function getTeamNamesView(): Promise<TeamNamesView> {
+  const json = (await getTeamNamesJson()) as TeamNamesFile | null;
+  return {
+    ownOnly: Boolean(json?.own_only),
+    global: json?.pools_global ?? {},
+    client: json?.pools_client ?? {},
+  };
+}
+
+// Pull the latest pools straight from studio and refresh the on-disk file. Used
+// when the Team names tab opens so it always reflects the current catalog AND
+// self-heals the file shape on devices whose last download predates the
+// global/client breakdown (a plain PHP deploy doesn't bump the version, so the
+// regular version-gated sync would never re-pull it). Throws when offline - the
+// caller falls back to the local file.
+export async function refreshFromServer(clientId: number): Promise<TeamNamesView> {
+  const res = await apiCall<TeamNamesFile>('playground', 'get_team_names', { bearer: true });
+  const file: TeamNamesFile = {
+    version: res?.version,
+    own_only: res?.own_only,
+    pools: res?.pools,
+    pools_global: res?.pools_global,
+    pools_client: res?.pools_client,
+  };
+  await writeTeamNamesJson(file);
+  if (typeof file.version === 'number') {
+    await markDownloaded(clientId, file.version);
+  }
+  return {
+    ownOnly: Boolean(file.own_only),
+    global: file.pools_global ?? {},
+    client: file.pools_client ?? {},
+  };
+}
+
+// Overwrite the local team_names.json (used to apply a toggle immediately,
+// without waiting for the next sync cycle to re-pull it).
+async function writeTeamNamesJson(payload: unknown): Promise<void> {
+  await mkdir('media/name_pools', { baseDir: BaseDirectory.AppData, recursive: true });
+  await writeTextFile(teamNamesFileRel(), JSON.stringify(payload), {
+    baseDir: BaseDirectory.AppData,
+  });
+}
+
+// Persist the client-wide "use my own lists only" preference. Writes through to
+// the studio (so the cloud add_team draw honors it too), then mirrors the fresh
+// payload - already re-filtered server-side - onto disk so the LAN mother and
+// the manual draw pick it up at once. Returns the new view for the UI.
+export async function setOwnOnly(clientId: number, ownOnly: boolean): Promise<TeamNamesView> {
+  const res = await apiCall<TeamNamesFile>('playground', 'set_team_names_own_only', {
+    method: 'POST',
+    bearer: true,
+    body: { own_only: ownOnly },
+  });
+  // Write only the team-names shape to disk (the response also carries an
+  // `auth_state` block that apiCall already consumed) so the on-disk file
+  // matches what the get_team_names download produces.
+  const file: TeamNamesFile = {
+    version: res?.version,
+    own_only: res?.own_only,
+    pools: res?.pools,
+    pools_global: res?.pools_global,
+    pools_client: res?.pools_client,
+  };
+  await writeTeamNamesJson(file);
+  if (typeof file.version === 'number') {
+    await markDownloaded(clientId, file.version);
+  }
+  return {
+    ownOnly: Boolean(file.own_only ?? ownOnly),
+    global: file.pools_global ?? {},
+    client: file.pools_client ?? {},
+  };
 }

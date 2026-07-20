@@ -1,12 +1,14 @@
-// Custom URI scheme that resolves `scenario://{uniqid}/{relpath}` to the
-// matching file on disk under
-//   <app_data_dir>/media/scenarios/{uniqid}/v{local_version}/{relpath}
+// Custom URI scheme that resolves `scenario://{uniqid}/{relpath}` to a blob in
+// the content-addressed pool:
+//   <app_data_dir>/media/blobs/{first2}/{content_hash}
 //
-// `local_version` is looked up per-request from the same SQLite the sync
-// orchestrator writes to (`playground.db`, `scenarios` table). Per-request
-// lookup keeps URLs stable: a `<img src="scenario://abc/foo.png">` survives
-// a version bump because the next request resolves against the new
-// local_version automatically.
+// The (uniqid, relpath) -> content_hash mapping is the scenario's active
+// manifest, looked up per-request from `scenario_files` in the same SQLite the
+// sync orchestrator writes to (`playground.db`). Per-request lookup keeps URLs
+// stable across content changes: a `<img src="scenario://abc/foo.png">`
+// survives a scenario update because the next request resolves the (possibly
+// new) hash automatically - and unchanged files keep the same hash, so the
+// blob is shared, never re-downloaded. Design: project_scenario_incremental_sync_cas.
 //
 // On Windows, Tauri rewrites `scenario://abc/foo.png` to
 // `http://scenario.localhost/abc/foo.png` for the webview round-trip. The
@@ -47,28 +49,45 @@ async fn resolve(app: AppHandle, request: &Request<Vec<u8>>) -> Result<Response<
             )
             .map_err(|e| format!("open {} failed: {e}", db_path.display()))?;
 
-            let local_version: Option<i64> = conn
+            // Resolve the active manifest entry: (uniqid, relpath) -> content
+            // hash. A missing row means this file isn't part of the committed
+            // download (e.g. an operator-only device that only keeps the visual,
+            // or a not-yet-synced scenario) - 404 is the correct outcome.
+            //
+            // Match the full relpath first, falling back to its basename - the
+            // SAME fallback scenarioStore.activeHash() uses on the TS side. The
+            // manifest stores the studio's (flat) filename, while a game-data
+            // field may reference it with a subdir prefix (or vice-versa); both
+            // resolution paths MUST agree or in-game media 404s where the test
+            // modals would have resolved it.
+            let basename = relpath.rsplit('/').next().unwrap_or(&relpath).to_string();
+            let content_hash: String = conn
                 .query_row(
-                    "SELECT local_version FROM scenarios WHERE uniqid = ?1",
-                    [&uniqid],
-                    |row| row.get(0),
+                    "SELECT content_hash FROM scenario_files \
+                     WHERE uniqid = ?1 AND (rel_path = ?2 OR rel_path = ?3) \
+                     ORDER BY (rel_path = ?2) DESC LIMIT 1",
+                    rusqlite::params![&uniqid, &relpath, &basename],
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()
-                .map_err(|e| format!("query local_version for {uniqid} failed: {e}"))?
-                .flatten();
-            let version = local_version
-                .ok_or_else(|| format!("no local_version for uniqid {uniqid} (NULL or no row)"))?;
+                .map_err(|e| format!("query scenario_files for {uniqid}/{relpath} failed: {e}"))?
+                .ok_or_else(|| format!("no manifest entry for {uniqid}/{relpath}"))?;
 
+            if content_hash.len() < 2 {
+                return Err(format!("malformed content_hash for {uniqid}/{relpath}"));
+            }
+            let shard = &content_hash[0..2];
             let file_path: PathBuf = db_dir
                 .join("media")
-                .join("scenarios")
-                .join(&uniqid)
-                .join(format!("v{version}"))
-                .join(relpath_to_os(&relpath));
+                .join("blobs")
+                .join(shard)
+                .join(&content_hash);
 
             let bytes = std::fs::read(&file_path)
                 .map_err(|e| format!("read {} failed: {e}", file_path.display()))?;
-            let mime = mime_for(&file_path).to_string();
+            // MIME comes from the requested relpath's extension, not the blob's
+            // hash name (the blob file has no extension).
+            let mime = mime_for(std::path::Path::new(&relpath)).to_string();
             Ok((bytes, mime))
         })
         .await
@@ -95,7 +114,7 @@ fn not_found() -> Response<Vec<u8>> {
 /// Returns (uniqid, relpath) for the URI shapes Tauri 2 may deliver.
 ///
 /// The webview mints `http(s)://scenario.localhost/<uniqid>/<relpath>` on
-/// Windows/Android and `scenario://…` elsewhere — but Tauri NORMALISES every
+/// Windows/Android and `scenario://…` elsewhere - but Tauri NORMALISES every
 /// custom-protocol request to `scenario://localhost/<uniqid>/<relpath>` before
 /// it reaches this handler (host becomes the literal `localhost`). So:
 ///   host == "localhost" / "scenario.localhost"  → uniqid is the 1st path seg
@@ -127,14 +146,6 @@ fn is_safe_path(relpath: &str) -> bool {
         }
     }
     true
-}
-
-fn relpath_to_os(relpath: &str) -> PathBuf {
-    let mut p = PathBuf::new();
-    for seg in relpath.split('/') {
-        p.push(seg);
-    }
-    p
 }
 
 fn percent_decode(s: &str) -> String {

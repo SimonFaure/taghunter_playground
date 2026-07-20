@@ -6,11 +6,17 @@ import {
   getLaunchedGameState,
 } from '../services/launchedGames';
 import type { TimeRange, ScenarioOption } from './RankingsModal';
+import { closeSelfProjectorWindow } from '../services/projectorWindow';
+import { pushOverlay, popOverlay } from '../services/screenState';
 
 interface TimeRangeLeaderboardProps {
   scenario: ScenarioOption;
   timeRange: TimeRange;
   onBack: () => void;
+  /** When true, render as the dedicated projector window - hides the back
+   *  button, scales typography for big-screen viewing, and wires Esc to
+   *  close-self. */
+  projectorMode?: boolean;
 }
 
 interface TeamEntry {
@@ -73,29 +79,48 @@ function getRankBg(index: number): string {
   if (index === 0) return 'bg-yellow-400/10 border-yellow-400/30';
   if (index === 1) return 'bg-slate-300/10 border-slate-300/20';
   if (index === 2) return 'bg-amber-500/10 border-amber-500/25';
-  return 'bg-slate-700/40 border-slate-600/30';
+  return 'bg-[var(--pg-surface-2)] border-[var(--pg-line)]';
 }
 
 function getRankColor(index: number): string {
   if (index === 0) return 'text-yellow-400';
   if (index === 1) return 'text-slate-300';
   if (index === 2) return 'text-amber-500';
-  return 'text-slate-400';
+  return 'text-[var(--pg-text-muted)]';
 }
 
 function RankIcon({ index }: { index: number }) {
   if (index === 0) return <Trophy size={22} className="text-yellow-400" />;
   if (index === 1) return <Medal size={22} className="text-slate-300" />;
   if (index === 2) return <Medal size={22} className="text-amber-500" />;
-  return <span className="text-slate-400 font-bold text-sm w-5 text-center inline-block">#{index + 1}</span>;
+  return <span className="text-[var(--pg-text-dim)] font-bold text-sm w-5 text-center inline-block">#{index + 1}</span>;
 }
 
-export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeLeaderboardProps) {
+export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMode = false }: TimeRangeLeaderboardProps) {
   const [teams, setTeams] = useState<TeamEntry[]>([]);
   const [victoryType, setVictoryType] = useState<'speed' | 'score'>('score');
   const [playMode, setPlayMode] = useState<'solo' | 'team'>('solo');
   const [loading, setLoading] = useState(true);
   const [visible, setVisible] = useState(false);
+
+  // Report "showing a ranking" to paired mothers while this page is mounted
+  // (mirrors LeaderboardPage - same overlay, scenario time-range variant).
+  // Skip in the projector child window (shared device state - see LeaderboardPage).
+  useEffect(() => {
+    if (projectorMode) return;
+    pushOverlay('ranking');
+    return () => popOverlay('ranking');
+  }, [projectorMode]);
+
+  // Esc-to-close inside the projector window (mirrors LeaderboardPage).
+  useEffect(() => {
+    if (!projectorMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') void closeSelfProjectorWindow();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [projectorMode]);
 
   useEffect(() => {
     const load = async () => {
@@ -187,7 +212,10 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
   }, [scenario.uniqid, timeRange]);
 
   return (
-    <div className="fixed inset-0 z-[200] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 overflow-auto">
+    <div
+      className="fixed inset-0 z-[200] bg-[var(--pg-app-bg)] overflow-auto"
+      style={projectorMode ? { zoom: 1.5 } : undefined}
+    >
       <div
         className="min-h-screen flex flex-col"
         style={{
@@ -196,17 +224,21 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
           transition: 'opacity 0.5s ease, transform 0.5s ease',
         }}
       >
-        <header className="flex items-center justify-between px-6 py-5 border-b border-slate-700/60">
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors text-sm font-medium"
-          >
-            <ArrowLeft size={18} />
-            Back
-          </button>
+        <header className="flex items-center justify-between px-6 py-5 border-b border-[var(--pg-line)]">
+          {projectorMode ? (
+            <span />
+          ) : (
+            <button
+              onClick={onBack}
+              className="flex items-center gap-2 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition-colors text-sm font-medium"
+            >
+              <ArrowLeft size={18} />
+              Back
+            </button>
+          )}
 
           <div className="flex items-center gap-3">
-            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-700/60 border border-slate-600/40 text-slate-400 text-xs font-medium">
+            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs font-medium">
               <Calendar size={12} />
               {timeRangeLabel(timeRange)}
             </span>
@@ -222,7 +254,7 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
                 Speed
               </span>
             ) : (
-              <span className="flex items-center gap-1.5 text-blue-400 text-xs font-semibold uppercase tracking-wide">
+              <span className="flex items-center gap-1.5 text-[var(--pg-accent-bright)] text-xs font-semibold uppercase tracking-wide">
                 <Star size={13} />
                 Score
               </span>
@@ -235,21 +267,21 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
             <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-yellow-400/10 border-2 border-yellow-400/40 mb-5">
               <Trophy size={36} className="text-yellow-400" />
             </div>
-            <h1 className="text-4xl font-bold text-white tracking-tight mb-1">Rankings</h1>
-            <p className="text-blue-400 font-medium text-base mt-1">{scenario.title}</p>
-            <p className="text-slate-500 text-sm mt-1">{timeRangeLabel(timeRange)}</p>
+            <h1 className="text-4xl font-bold text-[var(--pg-text)] tracking-tight mb-1">Rankings</h1>
+            <p className="text-[var(--pg-accent-bright)] font-medium text-base mt-1">{scenario.title}</p>
+            <p className="text-[var(--pg-text-dim)] text-sm mt-1">{timeRangeLabel(timeRange)}</p>
           </div>
 
           {loading ? (
             <div className="w-full space-y-3">
               {[1, 2, 3].map(i => (
-                <div key={i} className="h-20 bg-slate-800/60 rounded-xl animate-pulse" />
+                <div key={i} className="h-20 bg-[var(--pg-surface-2)] rounded-xl animate-pulse" />
               ))}
             </div>
           ) : teams.length === 0 ? (
             <div className="text-center py-16">
-              <Trophy size={36} className="text-slate-700 mx-auto mb-3" />
-              <p className="text-slate-400">No results found for this time range.</p>
+              <Trophy size={36} className="text-[var(--pg-text-dim)] mx-auto mb-3" />
+              <p className="text-[var(--pg-text-dim)]">No results found for this time range.</p>
             </div>
           ) : (
             <div className="w-full space-y-3">
@@ -273,11 +305,11 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
                         {team.team_name}
                       </div>
                       <div className="flex items-center gap-2 mt-1 flex-wrap">
-                        <span className="text-slate-500 text-xs truncate max-w-[180px]">{team.launched_game_name}</span>
+                        <span className="text-[var(--pg-text-dim)] text-xs truncate max-w-[180px]">{team.launched_game_name}</span>
                         {team.game_date && (
                           <>
-                            <span className="text-slate-700 text-xs">·</span>
-                            <span className="flex items-center gap-1 text-slate-500 text-xs">
+                            <span className="text-[var(--pg-text-dim)] text-xs">·</span>
+                            <span className="flex items-center gap-1 text-[var(--pg-text-dim)] text-xs">
                               <Calendar size={10} />
                               {formatDate(team.game_date)}
                             </span>
@@ -292,21 +324,21 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack }: TimeRangeL
                           <div className={`text-xl font-bold ${getRankColor(index)}`}>
                             {formatDuration(team.duration)}
                           </div>
-                          <div className="text-slate-500 text-xs mt-0.5 flex items-center justify-end gap-1">
+                          <div className="text-[var(--pg-text-dim)] text-xs mt-0.5 flex items-center justify-end gap-1">
                             <Clock size={10} />
                             time
                           </div>
                         </>
                       ) : victoryType === 'score' ? (
                         <>
-                          <div className={`text-xl font-bold ${index === 0 ? 'text-yellow-400' : 'text-white'}`}>
+                          <div className={`text-xl font-bold ${index === 0 ? 'text-yellow-400' : 'text-[var(--pg-text)]'}`}>
                             {team.score}
-                            <span className="text-slate-400 text-sm font-normal ml-1">pts</span>
+                            <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">pts</span>
                           </div>
-                          <div className="text-slate-500 text-xs mt-0.5">score</div>
+                          <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">score</div>
                         </>
                       ) : (
-                        <div className="text-slate-500 text-sm">&mdash;</div>
+                        <div className="text-[var(--pg-text-dim)] text-sm">&mdash;</div>
                       )}
                     </div>
                   </div>

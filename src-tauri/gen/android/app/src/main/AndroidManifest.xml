@@ -4,6 +4,10 @@
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
+    <!-- SportIdent reader (CP210x USB-UART) attaches via USB OTG. `required=false`
+         keeps the app installable on devices without USB-host support; the JS
+         layer surfaces "no reader available" when enumeration returns empty. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <application
         android:icon="@mipmap/ic_launcher"
@@ -22,6 +26,15 @@
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+            <!-- Bring the app to the foreground when the SI reader is plugged in.
+                 `device_filter` restricts this to CP210x (VID 0x10C4 / PID 0x800A)
+                 so other USB devices don't trigger us. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
 
         <provider

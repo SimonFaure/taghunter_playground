@@ -7,11 +7,11 @@
 export type ContentKind =
   | 'scenarios'
   | 'patterns'
-  | 'layouts'
   | 'cards'
   | 'on_demand_cards'
   | 'team_names'
   | 'recovery_codes'
+  | 'report_layouts'
   | 'game_types'
   | 'game_type_overrides';
 
@@ -21,8 +21,9 @@ export type WorkItemKind =
   | 'on_demand'
   | 'team_names'
   | 'recovery_codes'
+  | 'report_layouts'
+  | 'lan_networks'
   | 'pattern'
-  | 'layout'
   | 'scenario_meta'
   | 'scenario_media'
   | 'game_type_admin_video'
@@ -44,7 +45,7 @@ export interface CyclePhasePayload {
 
 // Per-item streaming-download progress. Emitted while a binary item
 // (scenario_media, on_demand) is being read chunk-by-chunk so the UI can
-// show "Downloading foo.png — 8.2 / 12.3 KB (67%)" instead of a stalled
+// show "Downloading foo.png - 8.2 / 12.3 KB (67%)" instead of a stalled
 // label that just reads "Scenario media: foo.png" for 30s. `key` is the
 // caller's choice of stable identifier (typically the WorkItem.label);
 // `total` is null when the server didn't send Content-Length.

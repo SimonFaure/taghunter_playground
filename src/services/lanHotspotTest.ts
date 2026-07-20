@@ -13,6 +13,7 @@
 // "not implemented" error so the user knows what to expect.
 
 import { invoke } from '@tauri-apps/api/core';
+import { defaultSsid, defaultPassword } from './lanCredentials';
 
 interface HotspotInfo {
   ssid: string;
@@ -42,20 +43,6 @@ export interface HotspotTestReport {
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
-}
-
-function defaultSsid(): string {
-  const suffix = crypto.randomUUID().slice(0, 8);
-  return `TagHunter-${suffix}`;
-}
-
-function defaultPassword(): string {
-  // Alphanumeric only — avoids escape rules in the WIFI: QR format.
-  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  let out = '';
-  const bytes = crypto.getRandomValues(new Uint8Array(12));
-  for (const b of bytes) out += alphabet[b % alphabet.length];
-  return out;
 }
 
 export async function runLanHotspotTest(opts?: {

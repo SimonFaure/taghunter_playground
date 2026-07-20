@@ -7,13 +7,14 @@
 import type { GameConfig } from '../components/LaunchGameModal';
 import * as scenarioStore from './scenarioStore';
 import * as gameTypesStore from './gameTypesStore';
+import { loadConfig } from '../utils/config';
+import {
+  pickDefaultSubtitleLang,
+  collectIntroSubtitleUrls,
+  type VideoSource,
+} from './videoResolution';
 
-export interface VideoSource {
-  kind: 'intro' | 'tutorial';
-  videoUrl: string;
-  subtitleLang: string | null;
-  subtitleUrl: string | null;
-}
+export type { VideoSource };
 
 export async function resolveFirstBipVideos(
   config: GameConfig,
@@ -22,10 +23,13 @@ export async function resolveFirstBipVideos(
   rawGameData: unknown,
 ): Promise<VideoSource[]> {
   const lang = config.language || 'en';
+  const appCfg = await loadConfig().catch(() => null);
+  const useSubs = appCfg?.useSubtitlesByDefault !== false; // default on
   const sources: VideoSource[] = [];
 
-  // Intro = per-scenario scenario_video. Subtitle file lives in
-  // scenarios/<uniqid>/v<N>/<scenario_video_subtitle_<lang>>.
+  // Intro = per-scenario scenario_video. Subtitle files live in
+  // scenarios/<uniqid>/v<N>/ and are referenced from medias.sounds under
+  // keys like scenario_video_subtitle_<lang>.
   if (config.playIntroOnBip) {
     const introFilename =
       (rawGameData as { scenario_video?: unknown } | null)?.scenario_video
@@ -37,14 +41,14 @@ export async function resolveFirstBipVideos(
       const bare = introFilename.split('/').filter(Boolean).pop() ?? introFilename;
       const url = await scenarioStore.getMediaPath(gameUniqid, bare);
       if (url) {
-        const subtitleField = `scenario_video_subtitle_${lang}`;
-        const subFilename =
-          (rawGameData as { medias?: { sounds?: Record<string, string> } } | null)?.medias?.sounds?.[subtitleField];
-        let subUrl: string | null = null;
-        if (typeof subFilename === 'string' && subFilename) {
-          subUrl = await scenarioStore.getMediaPath(gameUniqid, subFilename);
-        }
-        sources.push({ kind: 'intro', videoUrl: url, subtitleLang: lang, subtitleUrl: subUrl });
+        const sounds = (rawGameData as { medias?: { sounds?: Record<string, string> } } | null)?.medias?.sounds;
+        const subtitles = await collectIntroSubtitleUrls(sounds, gameUniqid);
+        sources.push({
+          kind: 'intro',
+          videoUrl: url,
+          subtitles,
+          defaultSubtitleLang: pickDefaultSubtitleLang(subtitles, lang, useSubs),
+        });
       }
     }
   }
@@ -53,8 +57,12 @@ export async function resolveFirstBipVideos(
   if (config.playTutorialOnBip) {
     const resolved = await gameTypesStore.resolveTutorialVideoUrl(gameTypeCode);
     if (resolved) {
-      const subUrl = resolved.subtitleUrls[lang] ?? null;
-      sources.push({ kind: 'tutorial', videoUrl: resolved.videoUrl, subtitleLang: lang, subtitleUrl: subUrl });
+      sources.push({
+        kind: 'tutorial',
+        videoUrl: resolved.videoUrl,
+        subtitles: resolved.subtitleUrls,
+        defaultSubtitleLang: pickDefaultSubtitleLang(resolved.subtitleUrls, lang, useSubs),
+      });
     }
   }
 

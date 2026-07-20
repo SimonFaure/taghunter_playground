@@ -1,0 +1,22 @@
+{
+  "close": "Cerrar",
+  "untitledScenario": "Escenario sin título",
+  "loadingDetails": "Cargando detalles…",
+  "difficulty": "Dificultad",
+  "difficultyMedium": "Media",
+  "notDownloaded": "No descargado",
+  "updateAvailable": "Actualización disponible",
+  "description": "Descripción",
+  "noDescription": "No se ha proporcionado descripción para este escenario.",
+  "downloadForDescription": "Descarga el escenario para ver su descripción.",
+  "version": "Versión",
+  "duration": "Duración",
+  "durationValue": "{{count}} min",
+  "quests": "Misiones",
+  "enigmas": "Enigmas",
+  "audience": "Público",
+  "font": "Fuente",
+  "languages": "Idiomas",
+  "installedVersion": "Versión instalada {{local}} · última {{remote}}",
+  "latestVersionNotDownloaded": "Última versión {{remote}} - aún no descargada"
+}

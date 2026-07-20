@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Usb, Wifi } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import { Globe, Usb, Wifi, Crown, RadioTower } from 'lucide-react';
 import { platform } from '@tauri-apps/plugin-os';
 import { invoke } from '@tauri-apps/api/core';
 import { isReaderConnected } from '../services/sportidentService';
+import { loadConfig } from '../utils/config';
 import {
   getDeviceMetadata,
   getCachedDeviceDisplayName,
@@ -11,24 +14,75 @@ import {
 import { refreshDeviceDisplayName } from '../services/auth';
 import {
   useMotherConnection,
+  useLocalRole,
   type MotherConnectionState,
 } from '../services/motherConnection';
+import { probeStudioReachable } from '../services/connectivity';
 
 const POLL_MS = 10_000;
+// Internet reachability is probed less often than the reader poll - a real
+// HTTP round-trip to studio, so 30s keeps it cheap. Reconnects surface faster
+// via the window online/offline listeners below.
+const ONLINE_POLL_MS = 30_000;
 
 type ReaderState = 'unknown' | 'ok' | 'bad';
+type OnlineState = 'unknown' | 'online' | 'offline';
+
+// Whether this device can actually reach the internet (studio). We deliberately
+// do NOT trust navigator.onLine here: a satellite joined to the mother's hotspot
+// has LAN connectivity but no internet, yet navigator.onLine reports `true`.
+// probeStudioReachable() makes a real request to studio's health check, so the
+// footer reflects true internet access rather than mere link state.
+function useInternetReachable(): OnlineState {
+  const [state, setState] = useState<OnlineState>('unknown');
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const check = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const ok = await probeStudioReachable();
+        if (!cancelled) setState(ok ? 'online' : 'offline');
+      } finally {
+        inFlight = false;
+      }
+    };
+    void check();
+    const id = setInterval(() => void check(), ONLINE_POLL_MS);
+    // navigator.onLine can lie, but its transitions are still a useful trigger
+    // to re-probe immediately so reconnects don't wait for the next 30s tick.
+    const onChange = () => void check();
+    window.addEventListener('online', onChange);
+    window.addEventListener('offline', onChange);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      window.removeEventListener('online', onChange);
+      window.removeEventListener('offline', onChange);
+    };
+  }, []);
+  return state;
+}
 
 export function Footer() {
+  const { t } = useTranslation();
   const [device, setDevice] = useState<DeviceMetadata | null>(null);
   // Operator-assigned friendly name (Settings → My Devices). Falls back to the
   // OS hostname (device.device_label) when unset.
   const [displayName, setDisplayName] = useState<string | null>(null);
   const [readerState, setReaderState] = useState<ReaderState>('unknown');
-  // Windows-only for this slice — non-Windows hides the wifi icon entirely.
+  // Operator-only devices have no reader role - the reader indicator (and its
+  // 10s poll) are hidden entirely. Re-read on the 'operator-mode:changed' event
+  // the Settings toggle dispatches so it reacts without a reload.
+  const [operatorOnly, setOperatorOnly] = useState(false);
+  // Windows-only for this slice - non-Windows hides the wifi icon entirely.
   // null while the platform() promise hasn't resolved (one render frame).
   const [isWindows, setIsWindows] = useState<boolean | null>(null);
 
   const mother = useMotherConnection();
+  const localRole = useLocalRole();
+  const online = useInternetReachable();
 
   useEffect(() => {
     try {
@@ -72,6 +126,23 @@ export function Footer() {
 
   useEffect(() => {
     let cancelled = false;
+    const load = async () => {
+      const cfg = await loadConfig().catch(() => null);
+      if (!cancelled) setOperatorOnly(cfg?.operatorOnlyDevice === true);
+    };
+    void load();
+    const onChange = () => void load();
+    window.addEventListener('operator-mode:changed', onChange);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('operator-mode:changed', onChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    // No reader role on operator-only devices - skip the poll + presence report.
+    if (operatorOnly) return;
+    let cancelled = false;
     let lastState: ReaderState = 'unknown';
     const tick = async () => {
       const ok = await isReaderConnected().catch(() => false);
@@ -100,45 +171,104 @@ export function Footer() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [operatorOnly]);
 
-  const wifiView = isWindows === true ? motherToView(mother) : null;
+  const wifiView = isWindows === true ? motherToView(mother, t) : null;
 
   return (
-    <footer className="fixed bottom-0 left-0 right-0 z-40 bg-slate-800/90 backdrop-blur-sm border-t border-slate-700 py-3">
-      <div className="container mx-auto px-6">
-        <div className="flex items-center justify-between gap-6 text-slate-400 text-sm">
-          <div className="flex items-center gap-6">
-            {wifiView && (
-              <Indicator
-                icon={<Wifi size={16} />}
-                label="WiFi"
-                value={wifiView.value}
-                color={wifiView.color}
-                tooltip={wifiView.tooltip}
-              />
-            )}
-            <Indicator
-              icon={<Usb size={16} />}
-              label="Reader"
-              value={readerState === 'ok' ? 'OK' : readerState === 'bad' ? 'KO' : '…'}
-              color={
-                readerState === 'ok'
-                  ? 'text-green-400'
-                  : readerState === 'bad'
-                    ? 'text-red-400'
-                    : 'text-slate-500'
-              }
-            />
-          </div>
-          <div className="text-slate-500">
-            {(() => {
-              const name = displayName ?? device?.device_label ?? null;
-              if (!name) return '…';
-              return device ? `${name} · v${device.app_version}` : name;
-            })()}
-          </div>
-        </div>
+    <footer className="pg-statusbar fixed bottom-0 left-0 right-0 z-40">
+      <div className="flex items-center gap-6">
+        <Indicator
+          icon={<Globe size={16} />}
+          label={t('footer:internet')}
+          value={online === 'online' ? t('footer:on') : online === 'offline' ? t('footer:off') : '…'}
+          color={
+            online === 'online'
+              ? 'text-green-400'
+              : online === 'offline'
+                ? 'text-red-400'
+                : 'text-[var(--pg-text-dim)]'
+          }
+          tooltip={
+            online === 'online'
+              ? t('footer:internetOk')
+              : online === 'offline'
+                ? t('footer:internetNone')
+                : t('footer:internetChecking')
+          }
+        />
+        {wifiView && (
+          <Indicator
+            icon={<Wifi size={16} />}
+            label={t('footer:wifi')}
+            value={wifiView.value}
+            color={wifiView.color}
+            tooltip={wifiView.tooltip}
+          />
+        )}
+        {isWindows === true && (
+          <Indicator
+            icon={<Crown size={16} />}
+            label={t('footer:motherRole')}
+            value={
+              localRole === null
+                ? '…'
+                : localRole.isMother
+                  ? t('footer:yes')
+                  : t('footer:no')
+            }
+            color={localRole?.isMother ? 'text-green-400' : 'text-[var(--pg-text-dim)]'}
+            tooltip={
+              localRole === null
+                ? t('footer:checkingLan')
+                : localRole.isMother
+                  ? t('footer:motherRoleYes')
+                  : t('footer:motherRoleNo')
+            }
+          />
+        )}
+        {isWindows === true && (
+          <Indicator
+            icon={<RadioTower size={16} />}
+            label={t('footer:hotspot')}
+            value={
+              localRole === null
+                ? '…'
+                : localRole.isHotspot
+                  ? t('footer:hotspotStateOn')
+                  : t('footer:hotspotStateOff')
+            }
+            color={localRole?.isHotspot ? 'text-green-400' : 'text-[var(--pg-text-dim)]'}
+            tooltip={
+              localRole === null
+                ? t('footer:checkingLan')
+                : localRole.isHotspot
+                  ? t('footer:hotspotOn')
+                  : t('footer:hotspotOff')
+            }
+          />
+        )}
+        {!operatorOnly && (
+          <Indicator
+            icon={<Usb size={16} />}
+            label={t('footer:reader')}
+            value={readerState === 'ok' ? t('footer:ok') : readerState === 'bad' ? t('footer:ko') : '…'}
+            color={
+              readerState === 'ok'
+                ? 'text-green-400'
+                : readerState === 'bad'
+                  ? 'text-[var(--pg-accent-bright)]'
+                  : 'text-[var(--pg-text-dim)]'
+            }
+          />
+        )}
+      </div>
+      <div className="pg-status-right">
+        {(() => {
+          const name = displayName ?? device?.device_label ?? null;
+          if (!name) return '…';
+          return device ? `${name} · v${device.app_version}` : name;
+        })()}
       </div>
     </footer>
   );
@@ -150,47 +280,56 @@ interface WifiView {
   tooltip: string;
 }
 
-function motherToView(state: MotherConnectionState): WifiView | null {
+function motherToView(state: MotherConnectionState, t: TFunction): WifiView | null {
   switch (state.kind) {
     case 'hidden':
       return null;
     case 'checking':
-      return { value: '…', color: 'text-slate-500', tooltip: 'Checking LAN…' };
+      return { value: '…', color: 'text-[var(--pg-text-dim)]', tooltip: t('footer:checkingLan') };
     case 'mother_hosting':
       return {
-        value: 'OK',
+        value: t('footer:ok'),
         color: 'text-green-400',
-        tooltip: `Hotspot active, ${state.clientCount} client${state.clientCount === 1 ? '' : 's'}`,
+        tooltip: t('footer:hotspotActive', { count: state.clientCount }),
       };
     case 'mother_partial':
       return {
-        value: 'IDLE',
-        color: 'text-slate-400',
-        tooltip: 'Hotspot up, server not started',
+        value: t('footer:idle'),
+        color: 'text-[var(--pg-text-dim)]',
+        tooltip: t('footer:hotspotUpServerNotStarted'),
       };
     case 'mother_idle':
       return {
-        value: 'IDLE',
-        color: 'text-slate-400',
-        tooltip: 'Mother (hotspot off)',
+        value: t('footer:idle'),
+        color: 'text-[var(--pg-text-dim)]',
+        tooltip: t('footer:motherHotspotOff'),
+      };
+    case 'mother_detected':
+      return {
+        value: t('footer:detected'),
+        color: 'text-blue-300',
+        tooltip: t('footer:motherDetected', { count: state.count }),
       };
     case 'child_ok':
       return {
-        value: 'OK',
+        value: t('footer:ok'),
         color: 'text-green-400',
-        tooltip: `Connected to ${state.motherLabel ?? 'mother'} (${state.ssid ?? '—'})`,
+        tooltip: t('footer:connectedTo', {
+          mother: state.motherLabel ?? t('footer:mother'),
+          ssid: state.ssid ?? '-',
+        }),
       };
     case 'child_nearby':
       return {
-        value: 'NEAR',
+        value: t('footer:near'),
         color: 'text-orange-400',
-        tooltip: 'Mother nearby but not responding',
+        tooltip: t('footer:motherNearbyNotResponding'),
       };
     case 'child_offline':
       return {
-        value: 'KO',
+        value: t('footer:ko'),
         color: 'text-red-400',
-        tooltip: 'No mother reachable',
+        tooltip: t('footer:noMotherReachable'),
       };
   }
 }
@@ -205,7 +344,7 @@ interface IndicatorProps {
 
 function Indicator({ icon, label, value, color, tooltip }: IndicatorProps) {
   return (
-    <div className="flex items-center gap-2" title={tooltip}>
+    <div className="pg-status-item" title={tooltip}>
       <span className={color}>{icon}</span>
       <span>
         {label}: <span className={`font-medium ${color}`}>{value}</span>

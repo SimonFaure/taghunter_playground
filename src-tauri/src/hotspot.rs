@@ -126,7 +126,7 @@ fn validate_creds(ssid: &str, password: &str) -> Result<(), String> {
     if password.len() < 8 || password.len() > 63 {
         return Err("WPA2 password must be 8-63 characters".into());
     }
-    // The WIFI: QR format uses ; , " : \ as separators/escapes — we'd rather
+    // The WIFI: QR format uses ; , " : \ as separators/escapes - we'd rather
     // refuse those than rely on perfect escaping in the QR generator.
     if ssid.contains(|c: char| matches!(c, ';' | ',' | '"' | ':' | '\\')) {
         return Err("SSID must not contain ; , \" : \\".into());
@@ -272,7 +272,7 @@ mod windows_impl {
             return Ok(p);
         }
         // Fallback: pick any saved connection profile. Tethering doesn't
-        // require an *active* upstream — we just need a profile object to
+        // require an *active* upstream - we just need a profile object to
         // anchor the manager. LAN devices joining the AP get LAN-only
         // connectivity, which is what slice C explicitly wants.
         let profiles = NetworkInformation::GetConnectionProfiles()

@@ -7,7 +7,7 @@ import { captureRecoveryCodeUsed } from './telemetry';
 // fully offline. A code is consumed ONCE PER DEVICE (used_at flips locally),
 // so the same code can still be used once on a different device. Entering a
 // valid code is the caller's signal to clear the device PIN and let the
-// operator back in — see PinExitPrompt / LockScreen.
+// operator back in - see PinExitPrompt / LockScreen.
 //
 // Storage: studio is the plaintext source of truth (so the admin can read a
 // code aloud); the device keeps only salted PBKDF2 hashes. All codes in a pool
@@ -59,9 +59,14 @@ export type ConsumeOutcome =
 // Verify a typed code against the unused pool; on a match, burn it locally
 // (used_at) and return its index so the caller can report the consumption up
 // to studio later (best-effort, slice 4). Never mutates on a miss, and never
-// locks out — guessing is impractical against 8 digits × a small pool, and an
+// locks out - guessing is impractical against 8 digits × a small pool, and an
 // operator mustn't be able to brick their own recovery.
-export async function tryConsumeRecoveryCode(raw: string): Promise<ConsumeOutcome> {
+export async function tryConsumeRecoveryCode(
+  raw: string,
+  // Which gate is burning the code, reported up so studio can tell a
+  // forgotten-PIN from a non-payment bypass. project_client_device_lock.
+  context: 'pin' | 'billing' = 'pin',
+): Promise<ConsumeOutcome> {
   const code = normalizeRecoveryCode(raw);
   if (!CODE_SHAPE.test(code)) return { ok: false, reason: 'bad_shape' };
 
@@ -92,6 +97,7 @@ export async function tryConsumeRecoveryCode(raw: string): Promise<ConsumeOutcom
       void captureRecoveryCodeUsed({
         code_index: row.code_index,
         pool_version: row.pool_version,
+        context,
       });
       return { ok: true, codeIndex: row.code_index };
     }
@@ -101,7 +107,7 @@ export async function tryConsumeRecoveryCode(raw: string): Promise<ConsumeOutcom
 
 // Replace the device's whole pool with a freshly synced set (admin
 // "Regenerate all" or first sync). Hashes each plaintext code under one new
-// device salt and resets all used flags — the slice-2 sync orchestrator will
+// device salt and resets all used flags - the slice-2 sync orchestrator will
 // call this when remote_version advances. Codes arrive plaintext over TLS and
 // are never persisted in the clear.
 export async function replaceRecoveryPool(
@@ -132,7 +138,7 @@ export async function devSeedRecoveryCodes(codes: string[]): Promise<void> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Sync state (recovery_codes_state) — incremental version compare, mirrors
+// Sync state (recovery_codes_state) - incremental version compare, mirrors
 // namePoolsStore. The codes table above is the validated pool; this tracks
 // what studio advertised (remote_version) vs what we last pulled
 // (local_version) so the orchestrator only re-downloads on a Regenerate.
@@ -186,7 +192,7 @@ export async function incrementFailedAttempts(clientId: number): Promise<void> {
 }
 
 // Pull needed when studio's remote_version differs from what we last persisted.
-// remote_version 0 means "no pool exists" — still worth one download to clear a
+// remote_version 0 means "no pool exists" - still worth one download to clear a
 // stale pool, but only if we've never downloaded (local null) or it changed.
 export async function needsRecoveryCodesDownload(clientId: number): Promise<boolean> {
   const row = await getState(clientId);

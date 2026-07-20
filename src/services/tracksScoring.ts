@@ -1,5 +1,5 @@
 /**
- * Tracks scoring + route logic — pure functions, no I/O, easy to reason about.
+ * Tracks scoring + route logic - pure functions, no I/O, easy to reason about.
  *
  * Design plan: C:\Users\faure\.claude\plans\tracks-game-type-design.md (§6)
  */
@@ -84,7 +84,7 @@ export function computeScore(input: ScoreInput): number {
  * `brokeAfterId` is the last credited checkpoint id when the run deviated
  * (credited prefix shorter than the route); null on a perfect run, or when even
  * the first checkpoint failed (then `hitIds` is empty). Free mode does NOT use
- * this — it counts any reached checkpoint regardless of order.
+ * this - it counts any reached checkpoint regardless of order.
  */
 export function orderedHitCheckpointIds(
   routeCheckpoints: TracksCheckpoint[],
@@ -116,7 +116,7 @@ function teamDurationSec(t: RankableTeam): number {
   return Number.POSITIVE_INFINITY;
 }
 
-/** Rank by score (desc), tie-break by completion time (asc — faster wins). */
+/** Rank by score (desc), tie-break by completion time (asc - faster wins). */
 export function sortTracksTeams<T extends RankableTeam>(teams: T[]): T[] {
   return [...teams].sort((a, b) => {
     const sa = a.score ?? 0;

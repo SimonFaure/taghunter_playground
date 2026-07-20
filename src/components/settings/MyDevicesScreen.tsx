@@ -1,16 +1,20 @@
 import { useEffect, useState, useCallback, KeyboardEvent } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Monitor, Smartphone, Tablet, Trash2, Loader2, RefreshCw, LogOut, Pencil, Check, X } from 'lucide-react';
 import { listMyDevices, revokeDevice, renameDevice, signOutOfThisDevice, MyDeviceListItem } from '../../services/auth';
 import { ApiError } from '../../services/api';
-import { HelpButton } from '../../help';
 
 const MAX_DISPLAY_NAME = 120;
 
 interface MyDevicesScreenProps {
   onLoggedOut?: () => void;
+  /** Rendered inside the unified DevicesScreen: skip the page container + title. */
+  embedded?: boolean;
 }
 
-export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
+export function MyDevicesScreen({ onLoggedOut, embedded = false }: MyDevicesScreenProps) {
+  const { t } = useTranslation();
   const [devices, setDevices] = useState<MyDeviceListItem[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -28,11 +32,11 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
       setDevices(res.devices);
       setCurrentDeviceId(res.current_device_id);
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     refresh();
@@ -51,7 +55,7 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
       }
       await refresh();
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setRevokingId(null);
     }
@@ -63,7 +67,7 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
       await signOutOfThisDevice();
       onLoggedOut?.();
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     }
   }
 
@@ -81,7 +85,7 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
   async function saveEdit(d: MyDeviceListItem) {
     const trimmed = draft.trim();
     if (trimmed.length > MAX_DISPLAY_NAME) {
-      setError(`Name must be ${MAX_DISPLAY_NAME} characters or fewer`);
+      setError(t('myDevices:nameTooLong', { max: MAX_DISPLAY_NAME }));
       return;
     }
     setSaving(true);
@@ -94,7 +98,7 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
       window.dispatchEvent(new CustomEvent('device:renamed'));
       await refresh();
     } catch (err) {
-      setError(extractErrorMessage(err));
+      setError(extractErrorMessage(err, t));
     } finally {
       setSaving(false);
     }
@@ -111,27 +115,28 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
   }
 
   return (
-    <div className="container mx-auto px-6 py-8 max-w-3xl">
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-2">
-          <h1 className="text-2xl font-bold text-white">My Devices</h1>
-          <HelpButton chapter="devices" className="text-slate-400 hover:text-slate-200" />
-        </div>
+    <div className={embedded ? '' : 'container mx-auto px-6 py-8 max-w-3xl'}>
+      <div className={`flex items-center mb-6 ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && (
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-bold text-[var(--pg-text)]">{t('myDevices:title')}</h1>
+          </div>
+        )}
         <div className="flex gap-2">
           <button
             onClick={refresh}
             disabled={loading}
-            className="px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-700 flex items-center gap-2 disabled:opacity-50"
+            className="px-3 py-2 rounded-lg text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)] flex items-center gap-2 disabled:opacity-50"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            Refresh
+            {t('myDevices:refresh')}
           </button>
           <button
             onClick={handleSignOut}
             className="px-3 py-2 rounded-lg text-red-300 hover:bg-red-500/20 flex items-center gap-2"
           >
             <LogOut className="w-4 h-4" />
-            Sign out
+            {t('myDevices:signOut')}
           </button>
         </div>
       </div>
@@ -144,12 +149,12 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
 
       {loading && devices.length === 0 ? (
         <div className="flex items-center justify-center py-12">
-          <Loader2 className="w-6 h-6 text-slate-400 animate-spin" />
+          <Loader2 className="w-6 h-6 text-[var(--pg-text-dim)] animate-spin" />
         </div>
       ) : (
         <div className="space-y-2">
           {devices.length === 0 && (
-            <div className="text-slate-500 text-center py-8">No devices found.</div>
+            <div className="text-[var(--pg-text-dim)] text-center py-8">{t('myDevices:noDevices')}</div>
           )}
           {devices.map((d) => {
             const Icon = osIcon(d.os);
@@ -160,11 +165,11 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
                 key={d.id}
                 className={`p-4 rounded-xl border flex items-center gap-4 ${
                   isCurrent
-                    ? 'bg-blue-500/10 border-blue-500/40'
-                    : 'bg-slate-800 border-slate-700'
+                    ? 'bg-[var(--pg-accent-tint)] border-[var(--pg-accent-line)]'
+                    : 'bg-[var(--pg-surface-2)] border-[var(--pg-line)]'
                 }`}
               >
-                <Icon className="w-6 h-6 text-slate-300 shrink-0" />
+                <Icon className="w-6 h-6 text-[var(--pg-text-muted)] shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     {editingId === d.id ? (
@@ -176,14 +181,14 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
                           onChange={(e) => setDraft(e.target.value)}
                           onKeyDown={(e) => handleRenameKeyDown(e, d)}
                           maxLength={MAX_DISPLAY_NAME + 1}
-                          placeholder={d.device_label ?? 'Device name'}
-                          className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm font-medium text-white w-44"
+                          placeholder={d.device_label ?? t('myDevices:deviceNamePlaceholder')}
+                          className="pg-input w-44 !py-1 text-sm font-medium"
                         />
                         <button
                           type="button"
                           onClick={() => saveEdit(d)}
                           disabled={saving}
-                          title="Save"
+                          title={t('myDevices:save')}
                           className="p-1 rounded text-green-300 hover:bg-green-500/20 disabled:opacity-50"
                         >
                           <Check className="w-4 h-4" />
@@ -192,50 +197,50 @@ export function MyDevicesScreen({ onLoggedOut }: MyDevicesScreenProps) {
                           type="button"
                           onClick={cancelEdit}
                           disabled={saving}
-                          title="Cancel"
-                          className="p-1 rounded text-slate-400 hover:bg-slate-700 disabled:opacity-50"
+                          title={t('myDevices:cancel')}
+                          className="p-1 rounded text-[var(--pg-text-dim)] hover:bg-[var(--pg-surface-3)] disabled:opacity-50"
                         >
                           <X className="w-4 h-4" />
                         </button>
                       </div>
                     ) : (
                       <div className="flex items-center gap-1.5 min-w-0 group">
-                        <span className="text-white font-medium truncate">
-                          {d.display_name || d.device_label || `${d.os ?? 'Unknown'} device`}
+                        <span className="text-[var(--pg-text)] font-medium truncate">
+                          {d.display_name || d.device_label || t('myDevices:deviceNameFallback', { os: d.os ?? t('myDevices:unknownOs') })}
                         </span>
                         <button
                           type="button"
                           onClick={() => startEdit(d)}
-                          title="Rename"
-                          className="opacity-60 hover:opacity-100 p-1 rounded text-slate-400 hover:text-blue-300 hover:bg-slate-700 transition-opacity shrink-0"
+                          title={t('myDevices:rename')}
+                          className="opacity-60 hover:opacity-100 p-1 rounded text-[var(--pg-text-dim)] hover:text-[var(--pg-accent-bright)] hover:bg-[var(--pg-surface-3)] transition-opacity shrink-0"
                         >
                           <Pencil className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     )}
                     {isCurrent && (
-                      <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/30 text-blue-200 border border-blue-500/40">
-                        This device
+                      <span className="pg-badge pg-badge--accent">
+                        {t('myDevices:thisDevice')}
                       </span>
                     )}
                     {!hasActive && !isCurrent && (
-                      <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-slate-400 border border-slate-600">
-                        Logged out
+                      <span className="pg-badge">
+                        {t('myDevices:loggedOut')}
                       </span>
                     )}
                   </div>
-                  <div className="text-xs text-slate-400 mt-1">
-                    {[d.os, d.os_version, d.app_version && `app ${d.app_version}`]
+                  <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+                    {[d.os, d.os_version, d.app_version && t('myDevices:appVersion', { version: d.app_version })]
                       .filter(Boolean)
                       .join(' · ')}
-                    {d.last_seen_at && ` · last seen ${formatTimestamp(d.last_seen_at)}`}
+                    {d.last_seen_at && ` · ${t('myDevices:lastSeen', { time: formatTimestamp(d.last_seen_at) })}`}
                   </div>
                 </div>
                 <button
                   onClick={() => handleRevoke(d.id)}
                   disabled={revokingId === d.id}
                   className="p-2 rounded-lg text-red-300 hover:bg-red-500/20 disabled:opacity-50"
-                  title={isCurrent ? 'Sign out this device' : 'Revoke device'}
+                  title={isCurrent ? t('myDevices:signOutThisDevice') : t('myDevices:revokeDevice')}
                 >
                   {revokingId === d.id ? (
                     <Loader2 className="w-5 h-5 animate-spin" />
@@ -272,11 +277,11 @@ function formatTimestamp(iso: string): string {
   }
 }
 
-function extractErrorMessage(err: unknown): string {
+function extractErrorMessage(err: unknown, t: TFunction): string {
   if (err instanceof ApiError) {
     const body = err.body as { error?: string } | null;
-    return body?.error || `Request failed (${err.status})`;
+    return body?.error || t('myDevices:requestFailed', { status: err.status });
   }
   if (err instanceof Error) return err.message;
-  return 'Something went wrong.';
+  return t('myDevices:genericError');
 }

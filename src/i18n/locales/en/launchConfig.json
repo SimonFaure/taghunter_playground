@@ -1,0 +1,19 @@
+{
+  "title": "Quick Launch",
+  "emptyState": "No saved configurations for this scenario yet. Use “Save configuration” on the launch screen to create one.",
+  "launch": "Launch",
+  "launchTitle": "Launch this configuration",
+  "editTitle": "Edit configuration",
+  "deleteTitle": "Delete configuration",
+  "deleteDialogTitle": "Delete configuration",
+  "deleteDialogMessage": "Delete the saved configuration “{{name}}”? This can't be undone.",
+  "delete": "Delete",
+  "cancel": "Cancel",
+  "summaryAutoRegister": "auto-register",
+  "summarySelfRegister": "self-register",
+  "summaryTeamCount_one": "{{count}} team",
+  "summaryTeamCount_other": "{{count}} teams",
+  "summaryDuration": "{{duration}} min",
+  "summaryReuseCards": "reuse cards",
+  "summaryNamePool": "name pool"
+}

@@ -1,6 +1,6 @@
 // cards_state row + cross-system orchestration for the card registry.
 //
-// The actual card rows live in the `cards` table — read/written via
+// The actual card rows live in the `cards` table - read/written via
 // services/cardsRepo.ts. This module owns the *sync metadata* in
 // `cards_state` (remote_version, local_version, on-demand flag, retry
 // counters) plus the high-level operations (pull JSON from studio, push
@@ -8,7 +8,7 @@
 //
 // History: this file used to manage a per-version CSV file on disk
 // (cards/v{N}.csv) that the game engine parsed at launch. After Unit 4 the
-// CSV path is gone — `pullCardsFromServer` now upserts JSON rows via
+// CSV path is gone - `pullCardsFromServer` now upserts JSON rows via
 // `cardsRepo.applyServerPull`. A thin `getCardsCsvText` shim remains for
 // LaunchGameModal's CSV parser; Unit 6 deletes that shim alongside its
 // caller.
@@ -232,7 +232,7 @@ async function reconcileSingleCard(id: number): Promise<void> {
       await cardsRepo.acceptServerOverwrite(server);
     }
   } catch {
-    /* swallow — next cycle will retry */
+    /* swallow - next cycle will retry */
   }
 }
 

@@ -93,8 +93,8 @@ export function AdminConfigPage() {
   if (loading) {
     return (
       <div className="container mx-auto px-6 py-8">
-        <div className="bg-slate-800 rounded-xl shadow-lg p-6 border border-slate-700">
-          <p className="text-slate-300">Loading...</p>
+        <div className="pg-panel shadow-lg p-6">
+          <p className="text-[var(--pg-text-muted)]">Loading...</p>
         </div>
       </div>
     );
@@ -103,10 +103,10 @@ export function AdminConfigPage() {
 
   return (
     <div className="container mx-auto px-6 py-8">
-      <div className="bg-slate-800 rounded-xl shadow-lg p-6 border border-slate-700">
+      <div className="pg-panel shadow-lg p-6">
         <div className="flex items-center gap-3 mb-6">
-          <ShieldCheck className="text-red-500" size={32} />
-          <h2 className="text-2xl font-bold text-white">Admin Configuration</h2>
+          <ShieldCheck className="text-[var(--pg-accent-bright)]" size={32} />
+          <h2 className="text-2xl font-bold text-[var(--pg-text)]">Admin Configuration</h2>
         </div>
 
         {saveMessage && (
@@ -117,7 +117,7 @@ export function AdminConfigPage() {
 
         <div className="space-y-4">
           <div>
-            <label htmlFor="client-select" className="block text-lg font-semibold text-white mb-3">
+            <label htmlFor="client-select" className="block text-lg font-semibold text-[var(--pg-text)] mb-3">
               Select Client
             </label>
             <select
@@ -131,7 +131,7 @@ export function AdminConfigPage() {
                 }
               }}
               disabled={testingConnection}
-              className="w-full px-4 py-3 bg-slate-700 border-2 border-slate-600 rounded-lg text-white text-base focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="pg-select text-base disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {clients.map((client) => (
                 <option key={client.id} value={client.name}>
@@ -142,17 +142,17 @@ export function AdminConfigPage() {
           </div>
 
           {selectedClientId && (
-            <div className="p-4 bg-slate-700/50 rounded-lg border border-slate-600">
+            <div className="p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)] border border-[var(--pg-line)]">
               {(() => {
                 const selected = clients.find(c => c.id === selectedClientId);
                 return selected ? (
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
-                      <Check size={16} className="text-blue-400" />
-                      <span className="text-white font-semibold">{selected.name}</span>
+                      <Check size={16} className="text-[var(--pg-accent-bright)]" />
+                      <span className="text-[var(--pg-text)] font-semibold">{selected.name}</span>
                     </div>
-                    <div className="text-slate-400 text-sm">{selected.email}</div>
-                    <div className="text-slate-500 text-sm">Database: {selected.url}</div>
+                    <div className="text-[var(--pg-text-dim)] text-sm">{selected.email}</div>
+                    <div className="text-[var(--pg-text-dim)] text-sm">Database: {selected.url}</div>
                   </div>
                 ) : null;
               })()}

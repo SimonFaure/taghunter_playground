@@ -2,7 +2,7 @@
 //
 // Why only the panic hook lives in Rust: JS captures its own uncaught errors
 // (window.error / unhandledrejection) directly. The remaining gap is Rust
-// panics inside Tauri commands or background tasks — those don't surface to
+// panics inside Tauri commands or background tasks - those don't surface to
 // JS as throwables. We trap them with std::panic::set_hook and persist the
 // captured info to a small file under the OS app-data dir. On the next app
 // boot, the JS side calls `take_pending_panic`, drains the file (deleting it),
@@ -103,7 +103,7 @@ pub fn take_pending_panic(app: tauri::AppHandle) -> Result<Option<PendingPanic>,
     let record: PendingPanic = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
 
     // Delete after read so we don't replay the same panic forever. A failure
-    // here means the file stays and the next boot retries — acceptable.
+    // here means the file stays and the next boot retries - acceptable.
     let _ = fs::remove_file(&path);
 
     Ok(Some(record))

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { on } from '../../services/syncEvents';
 
@@ -9,9 +10,10 @@ interface FirstLaunchProgressProps {
 
 // Full-screen "Setting up your library" overlay shown on first launch (no row
 // has local_version IS NOT NULL) while the initial cycle is downloading
-// content. Dismissible — user can skip into the app and let downloads finish
+// content. Dismissible - user can skip into the app and let downloads finish
 // in the background (the SyncStatusPill takes over).
 export function FirstLaunchProgress({ onSkip, onDone }: FirstLaunchProgressProps) {
+  const { t } = useTranslation();
   const [total, setTotal] = useState(0);
   const [completed, setCompleted] = useState(0);
   const [failed, setFailed] = useState(0);
@@ -57,8 +59,8 @@ export function FirstLaunchProgress({ onSkip, onDone }: FirstLaunchProgressProps
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
-      <div className="max-w-md w-full bg-slate-800 border border-slate-700 rounded-2xl p-8 text-center space-y-5">
+    <div className="min-h-screen flex items-center justify-center p-6 pg-app-bg">
+      <div className="max-w-md w-full bg-[var(--pg-surface)] border border-[var(--pg-line)] rounded-2xl p-8 text-center space-y-5">
         {phase === 'failed' ? (
           <div className="bg-red-500/20 border border-red-500/40 rounded-full p-3 inline-flex">
             <AlertTriangle className="w-6 h-6 text-red-400" />
@@ -68,48 +70,48 @@ export function FirstLaunchProgress({ onSkip, onDone }: FirstLaunchProgressProps
             <CheckCircle2 className="w-6 h-6 text-emerald-400" />
           </div>
         ) : (
-          <div className="bg-blue-500/20 border border-blue-500/40 rounded-full p-3 inline-flex">
-            <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
+          <div className="bg-[var(--pg-accent-tint)] border border-[var(--pg-accent-line)] rounded-full p-3 inline-flex">
+            <Loader2 className="w-6 h-6 text-[var(--pg-accent-bright)] animate-spin" />
           </div>
         )}
 
-        <h2 className="text-2xl font-semibold text-white">
+        <h2 className="text-2xl font-semibold text-[var(--pg-text)]">
           {phase === 'done'
-            ? 'All set'
+            ? t('sync:allSet')
             : phase === 'failed'
-              ? "Couldn't finish setup"
-              : 'Setting up your library'}
+              ? t('sync:couldNotFinishSetup')
+              : t('sync:settingUpLibrary')}
         </h2>
 
         {phase === 'failed' ? (
-          <p className="text-slate-400 text-sm">
+          <p className="text-[var(--pg-text-dim)] text-sm">
             {errorReason === 'auth_invalid'
-              ? 'Your session is no longer valid. Please sign in again.'
-              : 'Some items failed to download. You can keep using the app and try again later.'}
+              ? t('sync:sessionInvalid')
+              : t('sync:someItemsFailed')}
           </p>
         ) : phase === 'done' ? (
-          <p className="text-slate-400 text-sm">
+          <p className="text-[var(--pg-text-dim)] text-sm">
             {failed > 0
-              ? `${completed} of ${total} downloaded. ${failed} failed — you can retry from settings.`
+              ? t('sync:downloadedWithFailures', { completed, total, failed })
               : total === 0
-                ? 'Library is up to date.'
-                : `Downloaded ${completed} item${completed === 1 ? '' : 's'}.`}
+                ? t('sync:libraryUpToDate')
+                : t('sync:downloadedItems', { count: completed })}
           </p>
         ) : (
           <>
-            <p className="text-slate-400 text-sm">
-              {currentLabel ?? 'Preparing scenarios, patterns and layouts…'}
+            <p className="text-[var(--pg-text-dim)] text-sm">
+              {currentLabel ?? t('sync:preparingContent')}
             </p>
             <div>
-              <div className="h-2 bg-slate-900 rounded-full overflow-hidden border border-slate-700">
+              <div className="h-2 bg-[var(--pg-surface-3)] rounded-full overflow-hidden border border-[var(--pg-line)]">
                 <div
-                  className="h-full bg-blue-500 transition-all duration-300"
+                  className="h-full bg-[var(--pg-accent)] transition-all duration-300"
                   style={{ width: `${pct}%` }}
                 />
               </div>
-              <div className="flex items-center justify-between text-xs text-slate-500 mt-2">
-                <span>{completed} of {total}</span>
-                {failed > 0 && <span className="text-amber-400">{failed} failed</span>}
+              <div className="flex items-center justify-between text-xs text-[var(--pg-text-dim)] mt-2">
+                <span>{t('sync:countOfTotal', { completed, total })}</span>
+                {failed > 0 && <span className="text-amber-400">{t('sync:countFailed', { count: failed })}</span>}
               </div>
             </div>
           </>
@@ -118,16 +120,16 @@ export function FirstLaunchProgress({ onSkip, onDone }: FirstLaunchProgressProps
         {phase === 'failed' ? (
           <button
             onClick={onDone}
-            className="w-full py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium"
+            className="pg-btn pg-btn--primary w-full !py-3"
           >
-            Continue to app
+            {t('sync:continueToApp')}
           </button>
         ) : phase !== 'done' ? (
           <button
             onClick={onSkip}
-            className="text-slate-400 hover:text-white text-sm underline"
+            className="text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] text-sm underline"
           >
-            Skip — finish in background
+            {t('sync:skipFinishInBackground')}
           </button>
         ) : null}
       </div>

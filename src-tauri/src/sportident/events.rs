@@ -7,23 +7,23 @@
 // don't depend on serde, and adding `#[derive(Serialize)]` here would
 // require adding a serde dep on the `bytes::Bytes` field of Frame
 // transitively. Step 5 will define dedicated payload structs with serde
-// derives — these in-Rust types stay clean.
+// derives - these in-Rust types stay clean.
 
 use crate::sportident::cards::Card;
 use crate::sportident::framing::ResyncReason;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReaderState {
-    /// Reader not yet started. Never observed in practice — `Reader::spawn`
+    /// Reader not yet started. Never observed in practice - `Reader::spawn`
     /// immediately transitions to `Awakening`.
     Idle,
     /// Wakeup frame sent; waiting for the first valid response from the
     /// master to confirm it's alive.
     Awakening,
-    /// Steady state — connected to the master, waiting for `0xE8`
+    /// Steady state - connected to the master, waiting for `0xE8`
     /// card-inserted notifications.
     Listening,
-    /// Mid-card-read — sent `0xEF` block requests, accumulating responses.
+    /// Mid-card-read - sent `0xEF` block requests, accumulating responses.
     Reading,
     /// Transport-level failure. Reader task is winding down. (Recovery
     /// loop is a step-4-followup item; right now we just exit and let the
@@ -67,7 +67,7 @@ pub enum ReaderEvent {
     /// Fired after a full card readout completes and the master has been
     /// ACK'd. Step 5 forwards as `si://card-read`.
     CardRead(Card),
-    /// Decoder dropped a byte during resync. Surfaced for telemetry —
+    /// Decoder dropped a byte during resync. Surfaced for telemetry -
     /// step 5 may or may not propagate to JS depending on noise level.
     Resync { dropped: u8, reason: ResyncReason },
     /// Higher-level error (transport, parse, unsupported card, …). Step

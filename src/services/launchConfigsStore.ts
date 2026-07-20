@@ -2,7 +2,7 @@
 //
 // A "launch config" is the step-1 settings of the launch wizard (the
 // GameConfig blob) MINUS the per-instance `name` and the per-session `teams`
-// roster. It is keyed by (client_id, game_uniqid, name) — the name is the
+// roster. It is keyed by (client_id, game_uniqid, name) - the name is the
 // human-facing unique key per scenario, so saving over an existing name
 // overwrites that row.
 //
@@ -48,7 +48,7 @@ function rowOut(row: LaunchConfigDbRow): LaunchConfigRow {
   try {
     config = JSON.parse(row.config_json) as SavedLaunchConfig;
   } catch {
-    // Corrupt blob — surface an empty config rather than throwing; the
+    // Corrupt blob - surface an empty config rather than throwing; the
     // headless validator will treat it as critical drift and open the modal.
     config = {} as SavedLaunchConfig;
   }

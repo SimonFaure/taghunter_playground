@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SportIdent master station USB filter.
+
+    Silicon Labs CP210x USB-UART bridge inside the BSM8 / BSM7 stations:
+        vendor-id  = 0x10C4  = 4292
+        product-id = 0x800A  = 32778
+
+    The integer attributes are required to be decimal (Android USB device filter
+    convention); hex is shown above for cross-reference with cp210x_driver.rs.
+-->
+<resources>
+    <usb-device vendor-id="4292" product-id="32778" />
+</resources>

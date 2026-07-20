@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-update",
-  "description": "Desktop-only permissions for the app self-update flow. The Tauri updater and process plugins are compiled for desktop targets only (mobile updates go through the app stores), so these permissions must be platform-scoped to keep Android/iOS builds compiling.",
+  "description": "Desktop-only permissions for the app self-update flow and autostart-on-login. The Tauri updater, process, and autostart plugins are compiled for desktop targets only (mobile updates go through the app stores; there is no launch-on-login concept), so these permissions must be platform-scoped to keep Android/iOS builds compiling.",
   "platforms": ["windows", "macOS", "linux"],
   "windows": ["main", "projector"],
   "permissions": [
     "updater:default",
     "process:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "autostart:default"
   ]
 }

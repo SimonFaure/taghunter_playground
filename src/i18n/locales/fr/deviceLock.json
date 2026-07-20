@@ -1,0 +1,13 @@
+{
+  "disabledTitle": "Appareils désactivés",
+  "disabledSubtitle": "Un administrateur a désactivé cet appareil. Saisissez un code de récupération pour animer un événement.",
+  "billingTitle": "Paiement requis",
+  "billingSubtitle": "Cet abonnement est en retard de paiement : le lancement et la participation aux parties sont désactivés. Saisissez un code de récupération pour animer un événement.",
+  "recoveryTitle": "Saisir un code de récupération",
+  "recoverySubtitle": "Demandez un code de récupération à 8 chiffres à votre administrateur.",
+  "reprieveGranted": "Déverrouillé pour {{days}} jour(s).",
+  "close": "Fermer",
+  "bannerOverdue": "Paiement en retard - les parties seront désactivées dans {{days}} jour(s).",
+  "bannerLocked": "Paiement en retard - le lancement des parties est désactivé. Utilisez un code de récupération pour animer un événement.",
+  "bannerDisabled": "Appareils désactivés par votre administrateur. Utilisez un code de récupération pour animer un événement."
+}

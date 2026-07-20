@@ -25,7 +25,7 @@ pub mod transport;
 
 // ─────────────────────────────────────────────────────────────────────
 // Tauri surface (event payloads, commands, managed state). This is the
-// only layer aware of `tauri::` — the rest of the module is pure Rust
+// only layer aware of `tauri::` - the rest of the module is pure Rust
 // and can be tested without an app context.
 // ─────────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ use crate::sportident::reader::{Reader, ReaderHandle};
 use crate::sportident::transport::PortInfo;
 
 /// Tauri-managed state. Wrapped in a `tokio::sync::Mutex` because every
-/// access happens inside an `async fn` Tauri command — `std::sync::Mutex`
+/// access happens inside an `async fn` Tauri command - `std::sync::Mutex`
 /// across awaits is a hazard.
 #[derive(Default)]
 pub struct SportIdentState(Mutex<Option<ReaderHandle>>);
@@ -78,7 +78,7 @@ impl From<PortInfo> for PortPayload {
 #[derive(Serialize, Clone)]
 pub struct PunchPayload {
     pub code: u16,
-    /// "HH:MM:SS" — matches the legacy `CardData.punches[].time` shape.
+    /// "HH:MM:SS" - matches the legacy `CardData.punches[].time` shape.
     pub time: String,
 }
 
@@ -174,15 +174,15 @@ fn resync_reason_name(r: &ResyncReason) -> &'static str {
 
 // ─── Event names (single source of truth) ────────────────────────────
 
-/// `si://reader-state` — fires on every state machine transition.
+/// `si://reader-state` - fires on every state machine transition.
 pub const EVT_READER_STATE: &str = "si://reader-state";
-/// `si://station-detected` — fires on every `0x83` response from the master.
+/// `si://station-detected` - fires on every `0x83` response from the master.
 pub const EVT_STATION_DETECTED: &str = "si://station-detected";
-/// `si://card-read` — fires once per fully-read card, after the master is ACK'd.
+/// `si://card-read` - fires once per fully-read card, after the master is ACK'd.
 pub const EVT_CARD_READ: &str = "si://card-read";
-/// `si://decoder-resync` — diagnostic: decoder dropped a byte during resync.
+/// `si://decoder-resync` - diagnostic: decoder dropped a byte during resync.
 pub const EVT_DECODER_RESYNC: &str = "si://decoder-resync";
-/// `si://error` — higher-level error (transport, parse, unsupported card).
+/// `si://error` - higher-level error (transport, parse, unsupported card).
 pub const EVT_ERROR: &str = "si://error";
 
 fn emit_reader_event(app: &AppHandle, event: ReaderEvent) {
@@ -230,20 +230,31 @@ pub async fn si_start(
         return Err("reader already running; call si_stop first".into());
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     {
         let _ = (app, device_id);
-        return Err("mobile transport pending step 8 of the migration plan".into());
+        return Err("ios transport not supported".into());
     }
 
+    #[cfg(target_os = "android")]
+    let (transport_arc, rx_bytes): (Arc<dyn transport::SerialTransport>, _) = {
+        let (a, r) = transport::android::open(&device_id, config::DEFAULT_BAUD)
+            .await
+            .map_err(|e| e.to_string())?;
+        (a, r)
+    };
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let (transport_arc, rx_bytes): (Arc<dyn transport::SerialTransport>, _) = {
+        let (a, r) = transport::desktop::open(&device_id, config::DEFAULT_BAUD)
+            .await
+            .map_err(|e| e.to_string())?;
+        (a, r)
+    };
+
+    #[cfg(not(target_os = "ios"))]
     {
-        let (transport_arc, rx_bytes) =
-            transport::desktop::open(&device_id, config::DEFAULT_BAUD)
-                .await
-                .map_err(|e| e.to_string())?;
-        let transport: Arc<dyn transport::SerialTransport> = transport_arc;
-        let (handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let (handle, mut events) = Reader::spawn(transport_arc, rx_bytes);
 
         // Detached forwarder task: drains the reader's event channel onto
         // Tauri's event bus until the channel closes (which happens after
@@ -262,7 +273,7 @@ pub async fn si_start(
 
 #[tauri::command]
 pub async fn si_stop(state: State<'_, SportIdentState>) -> Result<(), String> {
-    // Hold the state mutex across `handle.stop().await` — that way a
+    // Hold the state mutex across `handle.stop().await` - that way a
     // concurrent `si_start` (e.g. the settings test panel mounting while
     // a game page is still unmounting) blocks until the previous reader
     // has fully released the OS port handle. Without this, the next
@@ -277,7 +288,7 @@ pub async fn si_stop(state: State<'_, SportIdentState>) -> Result<(), String> {
 
 // Beep / set-time / read-config require a control channel inside the
 // reader task that doesn't exist yet. Returning a clear error here is
-// better than silently no-op'ing — JS surfaces the message verbatim so
+// better than silently no-op'ing - JS surfaces the message verbatim so
 // the developer knows to add the plumbing when first wiring these
 // buttons. Tracked as a follow-up to step 5.
 #[tauri::command]
@@ -372,7 +383,7 @@ mod tauri_payload_tests {
 
     #[test]
     fn reader_state_names_match_documented_strings() {
-        // These strings cross the Tauri boundary into TS — any change
+        // These strings cross the Tauri boundary into TS - any change
         // here must be reflected in sportidentService.ts (step 6).
         assert_eq!(reader_state_name(&ReaderState::Idle), "idle");
         assert_eq!(reader_state_name(&ReaderState::Awakening), "awakening");

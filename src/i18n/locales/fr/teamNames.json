@@ -1,0 +1,14 @@
+{
+  "title": "Noms d'équipe",
+  "intro": "Voici les listes de noms d'équipe utilisées lorsqu'une équipe reçoit un nom automatique (auto-inscription ou réutilisation des puces). Elles sont gérées dans le studio.",
+  "loading": "Chargement des noms d'équipe…",
+  "ownOnlyLabel": "Utiliser uniquement mes listes",
+  "ownOnlyDesc": "Tirer les noms uniquement dans vos listes personnalisées. Si vous n'avez pas de liste pour une tranche d'âge, les listes par défaut sont utilisées.",
+  "saveError": "Impossible d'enregistrer la modification. Vérifiez votre connexion et réessayez.",
+  "defaultListsTitle": "Listes par défaut",
+  "defaultListsSubtitle": "Le catalogue de noms partagé, disponible pour tous.",
+  "defaultListsEmpty": "Aucune liste par défaut pour le moment.",
+  "customListsTitle": "Mes listes personnalisées",
+  "customListsSubtitle": "Noms ajoutés pour votre compte dans le studio.",
+  "customListsEmpty": "Vous n'avez pas encore de liste personnalisée - les listes par défaut sont utilisées."
+}

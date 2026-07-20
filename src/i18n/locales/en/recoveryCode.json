@@ -1,0 +1,10 @@
+{
+  "title": "Enter a recovery code",
+  "subtitle": "Ask your administrator for a recovery code, then type it here.",
+  "wrongCode": "That code didn’t work. Check it and try again.",
+  "checkFailed": "Could not check the code. Try again.",
+  "loading": "Loading…",
+  "noCodes": "No recovery codes are available on this device. Connect to the internet and reset your PIN by email, or contact your administrator.",
+  "checking": "Checking…",
+  "cancel": "Cancel"
+}

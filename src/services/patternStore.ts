@@ -12,6 +12,9 @@ export interface PatternRow {
   pattern_data_json: string | null;
   last_manifest_seen_at: string;
   failed_attempts: number;
+  // 1 when this pattern was imported from a local file (manual upload) rather
+  // than synced from the cloud - keeps the sync tombstone from deleting it.
+  is_local: boolean;
 }
 
 export interface PatternManifestRow {
@@ -22,8 +25,10 @@ export interface PatternManifestRow {
   is_default: boolean;
 }
 
-function rowOut(row: Omit<PatternRow, 'is_default'> & { is_default: number }): PatternRow {
-  return { ...row, is_default: Boolean(row.is_default) };
+function rowOut(
+  row: Omit<PatternRow, 'is_default' | 'is_local'> & { is_default: number; is_local?: number }
+): PatternRow {
+  return { ...row, is_default: Boolean(row.is_default), is_local: Boolean(row.is_local) };
 }
 
 export async function list(filter?: { isDefault?: boolean; gameType?: string }): Promise<PatternRow[]> {
@@ -118,6 +123,23 @@ export async function getRouting(patternUniqid: string): Promise<PatternRoutingI
   return flattenAssignments(data);
 }
 
+// Station id → station "number" (the si_balises.station_name, e.g. "1") lookup
+// delivered alongside the pattern by `download_pattern`. Assignment values are
+// station ids; this resolves them to the human-facing number shown in details.
+// Returns `{}` for patterns downloaded before the stations map was introduced
+// (they re-populate on the next download).
+export async function getStations(patternUniqid: string): Promise<Record<string, string>> {
+  const data = await getData(patternUniqid);
+  if (!data || typeof data !== 'object') return {};
+  const raw = (data as { stations?: unknown }).stations;
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, string> = {};
+  for (const [id, name] of Object.entries(raw as Record<string, unknown>)) {
+    if (name !== null && name !== undefined) out[id] = String(name);
+  }
+  return out;
+}
+
 // Compatibility shape for legacy Mystery game-modal scoring loops, which
 // expect `{enigma_id, good_answers[], wrong_answers[]}` (CSV-era format).
 // Reconstructed from the routing rows: one good_answer_station + one
@@ -160,7 +182,7 @@ export async function getMysteryEnigmas(patternUniqid: string): Promise<PatternE
 // a "hit" for that checkpoint. A checkpoint is binary (reached or not), so we
 // bucket ALL routing stations by item_index regardless of `assignment_type`
 // (tracks patterns may use a single `checkpoint_station` assignment or reuse
-// the mystery `good_answer_station` label — either works here).
+// the mystery `good_answer_station` label - either works here).
 //
 // NOTE (Slice C): this mapping is the one piece the design grill left open
 // (checkpoint → station code). Verify against a real tracks pattern once one
@@ -186,7 +208,7 @@ export async function listGameTypes(): Promise<string[]> {
 
 // Versions may be semantic decimals (e.g. 1.0 → 1.1) delivered as strings (the
 // studio column is VARCHAR). Parse to a float so `remote_version` stays numeric
-// and a 0.1 bump is detected by `listPendingDownloads` — same fix as scenarios.
+// and a 0.1 bump is detected by `listPendingDownloads` - same fix as scenarios.
 function parseManifestVersion(v: unknown): number {
   const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
   return Number.isFinite(n) ? n : 0;
@@ -220,9 +242,17 @@ export async function markDownloaded(
     pattern_slug?: string | null;
     description?: string | null;
     pattern_data?: unknown;
+    stations?: Record<string, string> | null;
   }
 ): Promise<void> {
   const db = await getDb();
+  // Persist as a `{ pattern_data, stations }` envelope. All readers (flatten,
+  // clash parsing) already accept the `{ pattern_data: [...] }` shape, and the
+  // stations map lets the details view show each station's number alongside id.
+  const json =
+    payload.pattern_data === undefined
+      ? null
+      : JSON.stringify({ pattern_data: payload.pattern_data, stations: payload.stations ?? null });
   await db.execute(
     `UPDATE patterns SET
        local_version = $1,
@@ -235,8 +265,59 @@ export async function markDownloaded(
       version,
       payload.pattern_slug ?? null,
       payload.description ?? null,
-      payload.pattern_data === undefined ? null : JSON.stringify(payload.pattern_data),
+      json,
       patternUniqid,
+    ]
+  );
+}
+
+// Import a pattern from a local file (manual upload), fully downloaded and
+// flagged is_local = 1 so the sync tombstone won't remove it. Stores the same
+// `{ pattern_data, stations }` envelope cloud downloads use, so every reader
+// (flatten/routing/clash) works unchanged.
+export async function importLocal(
+  p: {
+    pattern_uniqid: string;
+    name: string;
+    game_type: string;
+    version: number;
+    is_default: boolean;
+    pattern_slug?: string | null;
+    description?: string | null;
+    pattern_data: unknown;
+    stations?: Record<string, string> | null;
+  },
+  seenAt: string
+): Promise<void> {
+  const db = await getDb();
+  const json = JSON.stringify({ pattern_data: p.pattern_data, stations: p.stations ?? null });
+  await db.execute(
+    `INSERT INTO patterns (
+       pattern_uniqid, name, game_type, pattern_slug, description, is_default,
+       remote_version, local_version, pattern_data_json, last_manifest_seen_at,
+       failed_attempts, is_local
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 0, 1)
+     ON CONFLICT(pattern_uniqid) DO UPDATE SET
+       name = excluded.name,
+       game_type = excluded.game_type,
+       pattern_slug = excluded.pattern_slug,
+       description = excluded.description,
+       is_default = excluded.is_default,
+       remote_version = excluded.remote_version,
+       local_version = excluded.local_version,
+       pattern_data_json = excluded.pattern_data_json,
+       last_manifest_seen_at = excluded.last_manifest_seen_at,
+       is_local = 1`,
+    [
+      p.pattern_uniqid,
+      p.name,
+      p.game_type,
+      p.pattern_slug ?? null,
+      p.description ?? null,
+      p.is_default ? 1 : 0,
+      p.version,
+      json,
+      seenAt,
     ]
   );
 }
@@ -250,7 +331,7 @@ export async function incrementFailedAttempts(patternUniqid: string): Promise<vo
 }
 
 // Locally remove a single pattern from this device. This only touches the
-// local SQLite cache — the pattern still exists in the user's cloud account,
+// local SQLite cache - the pattern still exists in the user's cloud account,
 // so the next sync cycle will re-add it (see `upsertFromManifest`). Used by
 // the Cards & Patterns screen's per-pattern delete action.
 export async function remove(patternUniqid: string): Promise<void> {
@@ -260,8 +341,10 @@ export async function remove(patternUniqid: string): Promise<void> {
 
 export async function tombstoneMissing(keepUniqids: string[]): Promise<string[]> {
   const db = await getDb();
+  // Only cloud-synced patterns are subject to tombstoning. Locally-imported
+  // ones (is_local = 1) are never in the cloud manifest, so exclude them.
   const existing = await db.select<Array<{ pattern_uniqid: string }>>(
-    'SELECT pattern_uniqid FROM patterns'
+    'SELECT pattern_uniqid FROM patterns WHERE is_local = 0'
   );
   const keep = new Set(keepUniqids);
   const removed: string[] = [];

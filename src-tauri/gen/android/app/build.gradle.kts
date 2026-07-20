@@ -62,6 +62,13 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
+    // SportIdent reader (CP210x) userspace USB-serial driver. The JNI bridge
+    // in SportIdentSerial.kt wraps this; Rust never touches the JNI layer.
+    implementation("com.github.mik3y:usb-serial-for-android:3.7.0")
+    // Background read loop runs on a dedicated dispatcher; the kotlinx-coroutines
+    // android artifact is already pulled transitively by activity-ktx but pinning
+    // it here makes intent explicit for the SerialInputOutputManager wrapper.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

@@ -61,7 +61,7 @@ export function OtpInput({ value, onChange, onComplete, disabled, length = 6 }: 
               inputs.current[focusAt]?.focus();
             }
           }}
-          className="w-12 h-14 text-center text-2xl font-mono bg-slate-800 border border-slate-600 rounded-lg text-white focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30 disabled:opacity-50"
+          className="w-12 h-14 text-center text-2xl font-mono bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] text-[var(--pg-text)] focus:outline-none focus:border-[var(--pg-accent-line)] disabled:opacity-50"
         />
       ))}
     </div>

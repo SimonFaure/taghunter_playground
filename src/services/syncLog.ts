@@ -48,7 +48,7 @@ export interface SyncLogSnapshot {
   // Most-recently-processed item label, for the inline progress caption.
   currentLabel: string | null;
   // All work items processed this cycle, in arrival order. Unbounded by
-  // design — the buffer naturally resets at the next cycle start.
+  // design - the buffer naturally resets at the next cycle start.
   entries: LogEntry[];
   totalBytes: number;
   // Counts mirrored from cycle:progress so subscribers don't have to listen
@@ -63,7 +63,7 @@ export interface SyncLogSnapshot {
   // error box. Cleared on the next cycle:started.
   interrupted: { kind: 'auth_refresh'; at: string } | null;
   // Per-binary-item streaming progress. Keyed by the item label so the UI
-  // can show "Downloading foo.png — 8.2 / 12.3 KB (67%)" while a download
+  // can show "Downloading foo.png - 8.2 / 12.3 KB (67%)" while a download
   // is in flight. Entries are added on the first chunk, updated per chunk,
   // and removed on done. Multiple entries coexist when the worker pool has
   // multiple parallel downloads.
@@ -194,7 +194,7 @@ on('cycle:finished', (p) => {
 on('cycle:failed', (p) => {
   const now = new Date().toISOString();
   // auth_invalid is special: it isn't really a "failure" the user needs to
-  // see a red box for — AuthProvider transparently refreshes the JWT and
+  // see a red box for - AuthProvider transparently refreshes the JWT and
   // the next cycle picks up the remaining work. We mark this as
   // `interrupted` so the UI can render a calmer "credentials are
   // refreshing" affordance and still surface the partial counts.
@@ -228,19 +228,21 @@ export function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-export function triggerLabel(t: CycleStartedPayload['trigger'] | null): string {
-  switch (t) {
+// Returns an i18n key (namespace `sync`) rather than literal text, so the
+// caller resolves it in the active UI language via `t(...)`.
+export function triggerLabel(trigger: CycleStartedPayload['trigger'] | null): string {
+  switch (trigger) {
     case 'startup':
-      return 'app launch';
+      return 'sync:triggerStartup';
     case 'foreground':
-      return 'app foreground';
+      return 'sync:triggerForeground';
     case 'network_up':
-      return 'network reconnected';
+      return 'sync:triggerNetworkUp';
     case 'timer':
-      return 'periodic check';
+      return 'sync:triggerTimer';
     case 'manual':
-      return 'manual';
+      return 'sync:triggerManual';
     default:
-      return 'unknown';
+      return 'sync:triggerUnknown';
   }
 }

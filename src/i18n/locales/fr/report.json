@@ -1,0 +1,22 @@
+{
+  "date": "DATE",
+  "duration": "DURÉE",
+  "durationFormat": "{{m}} MINUTES ET {{s}} SECONDES",
+  "score": "SCORE",
+  "points": "POINTS",
+  "rank": "CLASSEMENT",
+  "rankValue": "{{rank}} / {{total}}",
+  "stat_rate": "TAUX DE RÉUSSITE",
+  "stat_success": "SUCCÈS",
+  "stat_fail": "ÉCHECS",
+  "stat_absent": "ABSENTS",
+  "stat_correct": "CORRECTS",
+  "stat_wrong": "ERREURS",
+  "stat_missing": "MANQUANTS",
+  "stat_quests": "QUÊTES",
+  "stat_points": "POINTS",
+  "stat_level": "RANG",
+  "stat_combos": "COMBOS",
+  "stat_players": "JOUEURS",
+  "stat_territories": "TERRITOIRES"
+}

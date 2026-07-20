@@ -1,0 +1,22 @@
+{
+  "date": "DATE",
+  "duration": "DURATION",
+  "durationFormat": "{{m}} MINUTES AND {{s}} SECONDS",
+  "score": "SCORE",
+  "points": "POINTS",
+  "rank": "RANK",
+  "rankValue": "{{rank}} / {{total}}",
+  "stat_rate": "SUCCESS RATE",
+  "stat_success": "SUCCESSES",
+  "stat_fail": "FAILURES",
+  "stat_absent": "MISSED",
+  "stat_correct": "CORRECT",
+  "stat_wrong": "WRONG",
+  "stat_missing": "MISSING",
+  "stat_quests": "QUESTS",
+  "stat_points": "POINTS",
+  "stat_level": "RANK",
+  "stat_combos": "COMBOS",
+  "stat_players": "PLAYERS",
+  "stat_territories": "TERRITORIES"
+}

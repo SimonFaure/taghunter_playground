@@ -9,7 +9,8 @@ import {
   Sliders,
   Cpu,
   CloudCog,
-  Smartphone,
+  Network,
+  CreditCard,
   BookOpen,
   User as UserIcon,
   Play,
@@ -21,9 +22,15 @@ import {
   Download,
   Upload,
   Image as ImageIcon,
+  Film,
   ShieldCheck,
+  Printer,
+  Palette,
+  ServerCog,
+  Tags,
 } from 'lucide-react';
 import { enable as enableAutostart, disable as disableAutostart } from '@tauri-apps/plugin-autostart';
+import { useTranslation } from 'react-i18next';
 import {
   sportidentService,
   type CardData,
@@ -31,6 +38,9 @@ import {
 } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { useDriverState } from '../services/useDriverState';
+import ClientCardsPage from './ClientCardsPage';
+import { VideosTab, ImagesTab } from './MediaTabs';
+import { setUiLanguage } from '../i18n';
 import { loadConfig, saveConfig, AppConfig } from '../utils/config';
 import {
   extForFile,
@@ -48,20 +58,28 @@ import {
 import * as cardsRepo from '../services/cardsRepo';
 import { on } from '../services/syncEvents';
 import { runCycleNow } from '../services/syncOrchestrator';
+import { applyOperatorModeChange } from '../services/operatorMode';
+import { listActiveLaunchedGames } from '../services/launchedGames';
+import * as scenarioStore from '../services/scenarioStore';
+import { ConfirmDialog } from './ConfirmDialog';
 import { useAuth } from './auth/AuthProvider';
+import { getStoredTheme, setTheme as applyThemeChoice, type ThemeName } from '../services/theme';
 import { AccountScreen } from './settings/AccountScreen';
 import { SyncStatusScreen } from './settings/SyncStatusScreen';
-import { MyDevicesScreen } from './settings/MyDevicesScreen';
+import { DevicesScreen } from './settings/DevicesScreen';
 import { UpdatesScreen } from './settings/UpdatesScreen';
 import { UsbDriverScreen } from './settings/UsbDriverScreen';
+import { PrintingScreen } from './settings/PrintingScreen';
+import { TeamNamesScreen } from './settings/TeamNamesScreen';
 import { ApiDocsPage } from './ApiDocsPage';
 import { DevicePinSettings } from './settings/DevicePinSettings';
-import { HelpButton } from '../help';
 
 const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
   fullscreenOnLaunch: false,
   autoLaunch: false,
+  startHotspotOnLaunch: false,
+  beMotherWhenAvailable: false,
   logoScreenOnLaunch: false,
   logoScreenBgColor: '#000000',
   logoScreenLogoFile: null,
@@ -75,22 +93,30 @@ const DEFAULT_CONFIG: AppConfig = {
 export type SettingsTab =
   | 'account'
   | 'general'
+  | 'cards'
+  | 'videos'
+  | 'images'
   | 'hardware'
   | 'sync'
   | 'devices'
   | 'updates'
+  | 'printing'
+  | 'team-names'
   | 'api-docs'
   | 'usb-driver';
 
 interface ConfigurationPageProps {
   // When the user clicks the sync pill or failure banner, App sets this to
   // 'sync' to deep-link into the right tab. The value is consumed once on
-  // change (the parent flips it back to undefined afterwards) — we don't
+  // change (the parent flips it back to undefined afterwards) - we don't
   // want subsequent in-page tab clicks to be overridden by the prop.
   initialTab?: SettingsTab;
+  /** API docs are an admin-only surface - gates the nav entry + its content. */
+  isAdminMode?: boolean;
 }
 
-export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
+export function ConfigurationPage({ initialTab, isAdminMode = false }: ConfigurationPageProps = {}) {
+  const { t, i18n } = useTranslation();
   const auth = useAuth();
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? 'account');
 
@@ -101,8 +127,29 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
   useEffect(() => {
     if (initialTab) setActiveTab(initialTab);
   }, [initialTab]);
+
+  // API docs are admin-only: if admin mode is dropped while the tab is open,
+  // bounce back to a safe tab so the content doesn't vanish into a blank pane.
+  useEffect(() => {
+    if (!isAdminMode && activeTab === 'api-docs') setActiveTab('account');
+  }, [isAdminMode, activeTab]);
   const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
   const [savedConfig, setSavedConfig] = useState<AppConfig>(DEFAULT_CONFIG);
+  // Colour theme (red/blue). A pure UI preference applied + persisted instantly
+  // via the theme service (not part of the Save bar / config.json flow).
+  const [theme, setThemeState] = useState<ThemeName>(getStoredTheme());
+  const pickTheme = (next: ThemeName) => {
+    setThemeState(next);
+    applyThemeChoice(next);
+  };
+  // Pick the operator chrome (UI) language. Applies immediately + persists via
+  // i18next/localStorage, and mirrors it into AppConfig.language for any
+  // language-aware app preference. This is the single language control (the
+  // old nav switcher was removed).
+  const pickUiLanguage = (code: 'en' | 'fr' | 'es', cfgValue: AppConfig['language']) => {
+    setUiLanguage(code);
+    setConfig((c) => ({ ...c, language: cfgValue }));
+  };
   const [isSaving, setIsSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   // A logo picked but not yet saved. Held in memory (bytes + a preview
@@ -116,9 +163,65 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
   const [savedLogoUrl, setSavedLogoUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Operator-only device toggle. Unlike the other AppConfig prefs it does NOT
+  // flow through the Save bar - flipping it resets + re-syncs all content
+  // (services/operatorMode.ts), so it applies immediately behind a confirm and
+  // is blocked while a game is running on this device. `operatorPending` holds
+  // the requested next value while the confirm dialog is open.
+  const [operatorPending, setOperatorPending] = useState<{ next: boolean } | null>(null);
+  const [operatorBusy, setOperatorBusy] = useState(false);
+
+  // Request a change. Guard: refuse while a game is active here (the reset would
+  // yank media out from under it). Confirm first when there's downloaded content
+  // to reset; apply straight away on a still-empty device.
+  const requestOperatorChange = async (next: boolean) => {
+    if (operatorBusy) return;
+    try {
+      const active = await listActiveLaunchedGames();
+      if (active.length > 0) {
+        setMessage({ type: 'error', text: t('settings:operatorOnlyActiveGameBlock') });
+        setTimeout(() => setMessage(null), 4000);
+        return;
+      }
+      const downloaded = await scenarioStore.count({ downloaded: true });
+      if (downloaded > 0) {
+        setOperatorPending({ next });
+      } else {
+        await applyOperatorChange(next);
+      }
+    } catch (err) {
+      console.error('[ConfigurationPage] requestOperatorChange failed:', err);
+    }
+  };
+
+  const applyOperatorChange = async (next: boolean) => {
+    setOperatorBusy(true);
+    setOperatorPending(null);
+    try {
+      await applyOperatorModeChange(next);
+      setConfig((c) => ({ ...c, operatorOnlyDevice: next }));
+      setSavedConfig((c) => ({ ...c, operatorOnlyDevice: next }));
+      setMessage({ type: 'success', text: t('settings:operatorOnlyApplied') });
+      setTimeout(() => setMessage(null), 3000);
+    } catch (err) {
+      console.error('[ConfigurationPage] applyOperatorChange failed:', err);
+      setMessage({ type: 'error', text: t('settings:operatorOnlyFailed') });
+    } finally {
+      setOperatorBusy(false);
+    }
+  };
+
   useEffect(() => {
     void loadConfiguration();
   }, []);
+
+  // Operator-only hides the hardware tabs - if one is open when the mode flips
+  // on, bounce back to a safe tab so the pane doesn't go blank.
+  useEffect(() => {
+    if (config.operatorOnlyDevice && (activeTab === 'hardware' || activeTab === 'usb-driver')) {
+      setActiveTab('general');
+    }
+  }, [config.operatorOnlyDevice, activeTab]);
 
   const loadConfiguration = async () => {
     try {
@@ -146,7 +249,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
         );
         finalConfig = { ...config, logoScreenLogoFile: filename };
       } else if (!config.logoScreenLogoFile && savedConfig.logoScreenLogoFile) {
-        // Logo was removed — delete the previously saved file.
+        // Logo was removed - delete the previously saved file.
         await removeLaunchLogo(savedConfig.logoScreenLogoFile);
       }
 
@@ -165,18 +268,18 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
 
       setConfig(finalConfig);
       setSavedConfig(finalConfig);
-      // The picked logo is now the saved logo — adopt its preview URL.
+      // The picked logo is now the saved logo - adopt its preview URL.
       if (pickedLogo) {
         setSavedLogoUrl(pickedLogo.url);
         setPickedLogo(null);
       } else if (!finalConfig.logoScreenLogoFile) {
         setSavedLogoUrl(null);
       }
-      setMessage({ type: 'success', text: 'Configuration saved' });
+      setMessage({ type: 'success', text: t('settings:toastConfigSaved') });
       setTimeout(() => setMessage(null), 3000);
     } catch (err) {
       console.error('Error saving configuration:', err);
-      setMessage({ type: 'error', text: 'Failed to save configuration' });
+      setMessage({ type: 'error', text: t('settings:toastConfigSaveFailed') });
     } finally {
       setIsSaving(false);
     }
@@ -190,12 +293,12 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
     if (!isSupportedLogoExt(ext)) {
       setMessage({
         type: 'error',
-        text: 'Unsupported image format. Use PNG, JPG, SVG, WebP or GIF.',
+        text: t('settings:toastUnsupportedImage'),
       });
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
-      setMessage({ type: 'error', text: 'Logo image is too large (max 5 MB).' });
+      setMessage({ type: 'error', text: t('settings:toastLogoTooLarge') });
       return;
     }
     try {
@@ -205,7 +308,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
       setConfig((c) => ({ ...c, logoScreenLogoFile: `launch-logo.${ext}` }));
     } catch (err) {
       console.error('Error reading logo file:', err);
-      setMessage({ type: 'error', text: 'Could not read that image.' });
+      setMessage({ type: 'error', text: t('settings:toastCouldNotReadImage') });
     }
   };
 
@@ -225,17 +328,16 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
   const hasCustomLogo = pickedLogo !== null || Boolean(config.logoScreenLogoFile);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white py-8">
+    <div className="min-h-screen pg-app-bg text-[var(--pg-text)] py-8">
       <div className="container mx-auto px-6">
         <div className="flex items-center gap-3 mb-8">
-          <Settings className="text-blue-400" size={32} />
-          <h1 className="text-3xl font-bold">Configuration</h1>
-          <HelpButton chapter="settings" className="text-slate-400 hover:text-slate-200 ml-1" />
+          <Settings className="text-[var(--pg-accent-bright)]" size={32} />
+          <h1 className="text-3xl font-bold">{t('settings:pageTitle')}</h1>
         </div>
 
         <div className="flex gap-6">
           <aside className="w-56 shrink-0">
-            <SettingsNav active={activeTab} onChange={setActiveTab} />
+            <SettingsNav active={activeTab} onChange={setActiveTab} isAdminMode={isAdminMode} operatorOnly={Boolean(config.operatorOnlyDevice)} />
           </aside>
 
           <main className="flex-1 min-w-0 max-w-4xl">
@@ -253,57 +355,116 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
 
             {activeTab === 'general' && (
               <>
-                <Section icon={<Globe className="text-blue-400" size={24} />} title="Language">
-                  <div className="grid grid-cols-2 gap-4">
+                <Section icon={<Globe className="text-[var(--pg-accent-bright)]" size={24} />} title={t('settings:sectionLanguage')}>
+                  <div className="grid grid-cols-3 gap-4">
                     <ChoiceCard
-                      active={config.language === 'english'}
-                      onClick={() => setConfig({ ...config, language: 'english' })}
-                      title="English"
-                      subtitle="English language"
+                      active={i18n.language === 'en'}
+                      onClick={() => pickUiLanguage('en', 'english')}
+                      title={t('settings:languageEnglishTitle')}
+                      subtitle={t('settings:languageEnglishSubtitle')}
                     />
                     <ChoiceCard
-                      active={config.language === 'french'}
-                      onClick={() => setConfig({ ...config, language: 'french' })}
-                      title="Français"
-                      subtitle="French language"
+                      active={i18n.language === 'fr'}
+                      onClick={() => pickUiLanguage('fr', 'french')}
+                      title={t('settings:languageFrenchTitle')}
+                      subtitle={t('settings:languageFrenchSubtitle')}
+                    />
+                    <ChoiceCard
+                      active={i18n.language === 'es'}
+                      onClick={() => pickUiLanguage('es', 'spanish')}
+                      title={t('settings:languageSpanishTitle')}
+                      subtitle={t('settings:languageSpanishSubtitle')}
                     />
                   </div>
                 </Section>
 
-                <Section icon={<Monitor className="text-blue-400" size={24} />} title="Display Settings">
+                <Section icon={<Palette className="text-[var(--pg-accent-bright)]" size={24} />} title={t('settings:sectionAppearance')}>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <ThemeCard
+                      active={theme === 'red'}
+                      onClick={() => pickTheme('red')}
+                      title={t('settings:themeRedTitle')}
+                      subtitle={t('settings:themeRedSubtitle')}
+                      accent="#E11D2A"
+                      surface="#161618"
+                    />
+                    <ThemeCard
+                      active={theme === 'blue'}
+                      onClick={() => pickTheme('blue')}
+                      title={t('settings:themeBlueTitle')}
+                      subtitle={t('settings:themeBlueSubtitle')}
+                      accent="#2D6BFF"
+                      surface="#16213A"
+                    />
+                    <ThemeCard
+                      active={theme === 'red-light'}
+                      onClick={() => pickTheme('red-light')}
+                      title={t('settings:themeRedLightTitle')}
+                      subtitle={t('settings:themeRedLightSubtitle')}
+                      accent="#E11D2A"
+                      surface="#F4F4F6"
+                    />
+                    <ThemeCard
+                      active={theme === 'blue-light'}
+                      onClick={() => pickTheme('blue-light')}
+                      title={t('settings:themeBlueLightTitle')}
+                      subtitle={t('settings:themeBlueLightSubtitle')}
+                      accent="#2D6BFF"
+                      surface="#F4F4F6"
+                    />
+                  </div>
+                </Section>
+
+                <Section icon={<Monitor className="text-[var(--pg-accent-bright)]" size={24} />} title={t('settings:sectionDisplay')}>
                   <Toggle
-                    label="Fullscreen on launch"
-                    description="Open the app in fullscreen when it starts. Press F11 any time to exit or re-enter fullscreen. Takes effect next launch."
+                    label={t('settings:fullscreenOnLaunchLabel')}
+                    description={t('settings:fullscreenOnLaunchDesc')}
                     value={Boolean(config.fullscreenOnLaunch)}
                     onChange={(v) => setConfig({ ...config, fullscreenOnLaunch: v })}
                   />
                   <Toggle
-                    label="Launch on startup"
-                    description="Start automatically when your computer boots."
+                    label={t('settings:launchOnStartupLabel')}
+                    description={t('settings:launchOnStartupDesc')}
                     value={Boolean(config.autoLaunch)}
                     onChange={(v) => setConfig({ ...config, autoLaunch: v })}
                   />
                 </Section>
 
                 <Section
-                  icon={<ShieldCheck className="text-blue-400" size={24} />}
-                  title="Security"
+                  icon={<ServerCog className="text-[var(--pg-accent-bright)]" size={24} />}
+                  title={t('settings:sectionDeviceRole')}
                 >
                   <Toggle
-                    label="Require PIN to exit a running game"
-                    description="Ask for the device PIN before leaving a running game or opening the operator panel. Stops players from exiting or ending the game. Uses your device PIN."
+                    label={t('settings:operatorOnlyLabel')}
+                    description={t('settings:operatorOnlyDesc')}
+                    value={Boolean(config.operatorOnlyDevice)}
+                    onChange={(v) => void requestOperatorChange(v)}
+                    disabled={operatorBusy}
+                  />
+                  <p className="text-sm text-[var(--pg-text-dim)] mt-2 leading-relaxed">
+                    {t('settings:operatorOnlyExplainer')}
+                  </p>
+                </Section>
+
+                <Section
+                  icon={<ShieldCheck className="text-[var(--pg-accent-bright)]" size={24} />}
+                  title={t('settings:sectionSecurity')}
+                >
+                  <Toggle
+                    label={t('settings:pinExitGameLabel')}
+                    description={t('settings:pinExitGameDesc')}
                     value={Boolean(config.requirePinToExitGame)}
                     onChange={(v) => setConfig({ ...config, requirePinToExitGame: v })}
                   />
                   <Toggle
-                    label="Require PIN to exit the logo screen"
-                    description="Ask for the device PIN before dismissing the logo screen — at launch and when raised from the nav bar. Turns the logo screen into a step-away lock. Uses your device PIN."
+                    label={t('settings:pinExitLogoLabel')}
+                    description={t('settings:pinExitLogoDesc')}
                     value={Boolean(config.requirePinToExitLogo)}
                     onChange={(v) => setConfig({ ...config, requirePinToExitLogo: v })}
                   />
                   <Toggle
-                    label="Require PIN to exit fullscreen"
-                    description="Ask for the device PIN before F11 leaves fullscreen. Keeps players from dropping out of the kiosk view. Uses your device PIN."
+                    label={t('settings:pinExitFullscreenLabel')}
+                    description={t('settings:pinExitFullscreenDesc')}
                     value={Boolean(config.requirePinToExitFullscreen)}
                     onChange={(v) => setConfig({ ...config, requirePinToExitFullscreen: v })}
                   />
@@ -311,23 +472,22 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                 </Section>
 
                 <Section
-                  icon={<ImageIcon className="text-blue-400" size={24} />}
-                  title="Launch logo screen"
+                  icon={<ImageIcon className="text-[var(--pg-accent-bright)]" size={24} />}
+                  title={t('settings:sectionLaunchLogo')}
                 >
                   <Toggle
-                    label="Logo screen on launch"
-                    description="Show a branded logo screen instead of the home page when the app starts. Tap anywhere to continue. Takes effect next launch."
+                    label={t('settings:logoScreenOnLaunchLabel')}
+                    description={t('settings:logoScreenOnLaunchDesc')}
                     value={Boolean(config.logoScreenOnLaunch)}
                     onChange={(v) => setConfig({ ...config, logoScreenOnLaunch: v })}
                   />
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
-                    <div className="space-y-4 p-4 rounded-lg border-2 border-slate-700 bg-slate-700/30">
+                    <div className="space-y-4 p-4 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)]">
                       <div>
-                        <div className="font-semibold mb-1">Logo</div>
-                        <div className="text-sm text-slate-400 mb-2">
-                          PNG, JPG, SVG or WebP. A transparent background works best.
-                          Without a custom logo the TagHunter logo is shown.
+                        <div className="font-semibold mb-1">{t('settings:logoLabel')}</div>
+                        <div className="text-sm text-[var(--pg-text-dim)] mb-2">
+                          {t('settings:logoHint')}
                         </div>
                         <input
                           ref={fileInputRef}
@@ -339,25 +499,25 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                         <div className="flex items-center gap-2">
                           <button
                             onClick={() => fileInputRef.current?.click()}
-                            className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors text-sm"
+                            className="pg-btn pg-btn--primary pg-btn--sm"
                           >
                             <Upload size={14} />
-                            {hasCustomLogo ? 'Replace logo' : 'Upload logo'}
+                            {hasCustomLogo ? t('settings:replaceLogo') : t('settings:uploadLogo')}
                           </button>
                           {hasCustomLogo && (
                             <button
                               onClick={handleRemoveLogo}
-                              className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-sm"
+                              className="pg-btn pg-btn--ghost pg-btn--sm"
                             >
                               <Trash2 size={14} />
-                              Remove
+                              {t('settings:removeLogo')}
                             </button>
                           )}
                         </div>
                       </div>
 
                       <div>
-                        <div className="font-semibold mb-1">Background color</div>
+                        <div className="font-semibold mb-1">{t('settings:backgroundColor')}</div>
                         <div className="flex items-center gap-3">
                           <input
                             type="color"
@@ -365,19 +525,18 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                             onChange={(e) =>
                               setConfig({ ...config, logoScreenBgColor: e.target.value })
                             }
-                            className="h-10 w-16 rounded bg-transparent cursor-pointer border border-slate-600"
+                            className="h-10 w-16 rounded bg-transparent cursor-pointer border border-[var(--pg-line-strong)]"
                           />
-                          <span className="font-mono text-sm text-slate-400">
+                          <span className="font-mono text-sm text-[var(--pg-text-dim)]">
                             {(config.logoScreenBgColor ?? '#000000').toUpperCase()}
                           </span>
                         </div>
                       </div>
 
                       <div>
-                        <div className="font-semibold mb-1">Animation</div>
-                        <div className="text-sm text-slate-400 mb-2">
-                          A subtle glow that hugs the logo. Works best on a
-                          transparent logo; an opaque one glows by its rectangle.
+                        <div className="font-semibold mb-1">{t('settings:animation')}</div>
+                        <div className="text-sm text-[var(--pg-text-dim)] mb-2">
+                          {t('settings:animationHint')}
                         </div>
                         <select
                           value={config.logoScreenAnimation ?? 'pulse'}
@@ -387,7 +546,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                               logoScreenAnimation: e.target.value as LogoAnimation,
                             })
                           }
-                          className="w-full px-3 py-2 bg-slate-900 border border-slate-600 rounded-lg text-sm text-white"
+                          className="pg-select w-full"
                         >
                           {LOGO_ANIMATION_OPTIONS.map((opt) => (
                             <option key={opt.value} value={opt.value}>
@@ -399,7 +558,7 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
 
                       {(config.logoScreenAnimation ?? 'pulse') !== 'none' && (
                         <div>
-                          <div className="font-semibold mb-1">Glow color</div>
+                          <div className="font-semibold mb-1">{t('settings:glowColor')}</div>
                           <div className="flex items-center gap-3">
                             <input
                               type="color"
@@ -407,9 +566,9 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                               onChange={(e) =>
                                 setConfig({ ...config, logoScreenGlowColor: e.target.value })
                               }
-                              className="h-10 w-16 rounded bg-transparent cursor-pointer border border-slate-600"
+                              className="h-10 w-16 rounded bg-transparent cursor-pointer border border-[var(--pg-line-strong)]"
                             />
-                            <span className="font-mono text-sm text-slate-400">
+                            <span className="font-mono text-sm text-[var(--pg-text-dim)]">
                               {(config.logoScreenGlowColor ?? '#FFFFFF').toUpperCase()}
                             </span>
                           </div>
@@ -418,9 +577,9 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                     </div>
 
                     <div>
-                      <div className="font-semibold mb-1">Preview</div>
+                      <div className="font-semibold mb-1">{t('settings:preview')}</div>
                       <div
-                        className="rounded-lg border border-slate-700 overflow-hidden w-full"
+                        className="rounded-lg border border-[var(--pg-line)] overflow-hidden w-full"
                         style={{
                           aspectRatio: '16 / 9',
                           backgroundColor: config.logoScreenBgColor ?? '#000000',
@@ -458,8 +617,8 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
                         </div>
                       </div>
                       {!hasCustomLogo && (
-                        <div className="text-xs text-slate-500 mt-1">
-                          No custom logo — showing the TagHunter logo.
+                        <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+                          {t('settings:noCustomLogo')}
                         </div>
                       )}
                     </div>
@@ -474,15 +633,37 @@ export function ConfigurationPage({ initialTab }: ConfigurationPageProps = {}) {
               <HardwareTab onOpenUsbDriver={() => setActiveTab('usb-driver')} />
             )}
 
+            {activeTab === 'cards' && <ClientCardsPage embedded />}
+            {activeTab === 'videos' && <VideosTab />}
+            {activeTab === 'images' && <ImagesTab />}
             {activeTab === 'account' && <AccountScreen />}
             {activeTab === 'sync' && <SyncStatusScreen />}
-            {activeTab === 'devices' && <MyDevicesScreen onLoggedOut={auth.refresh} />}
+            {activeTab === 'devices' && <DevicesScreen onLoggedOut={auth.refresh} />}
             {activeTab === 'updates' && <UpdatesScreen />}
-            {activeTab === 'api-docs' && <ApiDocsPage />}
+            {activeTab === 'printing' && <PrintingScreen />}
+            {activeTab === 'team-names' && <TeamNamesScreen />}
+            {activeTab === 'api-docs' && isAdminMode && <ApiDocsPage />}
             {activeTab === 'usb-driver' && <UsbDriverScreen />}
           </main>
         </div>
       </div>
+
+      {operatorPending && (
+        <ConfirmDialog
+          isOpen={true}
+          title={t('settings:operatorOnlyConfirmTitle')}
+          message={
+            operatorPending.next
+              ? t('settings:operatorOnlyConfirmEnable')
+              : t('settings:operatorOnlyConfirmDisable')
+          }
+          confirmText={t('settings:operatorOnlyConfirmAction')}
+          cancelText={t('settings:cancel')}
+          variant="danger"
+          onConfirm={() => void applyOperatorChange(operatorPending.next)}
+          onCancel={() => setOperatorPending(null)}
+        />
+      )}
     </div>
   );
 }
@@ -496,7 +677,7 @@ interface SectionProps {
 
 function Section({ icon, title, headerExtra, children }: SectionProps) {
   return (
-    <div className="bg-slate-800/50 rounded-lg p-6 mb-6">
+    <div className="pg-panel p-6 mb-6">
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
           {icon}
@@ -523,16 +704,56 @@ function ChoiceCard({
   return (
     <button
       onClick={onClick}
-      className={`p-4 rounded-lg border-2 transition-all ${
-        active ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 bg-slate-700/30 hover:border-slate-600'
+      className={`p-4 rounded-lg border transition-all ${
+        active ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)]' : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] hover:border-[var(--pg-line-strong)]'
       }`}
     >
       <div className="flex items-center justify-between">
         <div>
           <div className="font-semibold text-lg">{title}</div>
-          <div className="text-sm text-slate-400">{subtitle}</div>
+          <div className="text-sm text-[var(--pg-text-dim)]">{subtitle}</div>
         </div>
-        {active && <Check className="text-blue-400" size={24} />}
+        {active && <Check className="text-[var(--pg-accent-bright)]" size={24} />}
+      </div>
+    </button>
+  );
+}
+
+function ThemeCard({
+  active,
+  onClick,
+  title,
+  subtitle,
+  accent,
+  surface,
+}: {
+  active: boolean;
+  onClick: () => void;
+  title: string;
+  subtitle: string;
+  accent: string;
+  surface: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`p-4 rounded-lg border transition-all text-left ${
+        active ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)]' : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] hover:border-[var(--pg-line-strong)]'
+      }`}
+    >
+      <div className="flex items-center gap-3">
+        {/* Mini palette preview: surface chip with an accent bar. */}
+        <span
+          className="flex h-10 w-14 shrink-0 items-center justify-end overflow-hidden rounded-md border border-black/40"
+          style={{ backgroundColor: surface }}
+        >
+          <span className="h-full w-3" style={{ backgroundColor: accent }} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="font-semibold text-lg">{title}</div>
+          <div className="text-sm text-[var(--pg-text-dim)]">{subtitle}</div>
+        </div>
+        {active && <Check className="text-[var(--pg-accent-bright)] shrink-0" size={22} />}
       </div>
     </button>
   );
@@ -543,26 +764,32 @@ function Toggle({
   description,
   value,
   onChange,
+  disabled = false,
 }: {
   label: string;
   description: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between p-4 rounded-lg border-2 border-slate-700 bg-slate-700/30 hover:border-slate-600 transition-all mb-3">
-      <div>
+    <div className="flex items-center justify-between gap-4 p-4 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] hover:border-[var(--pg-line-strong)] transition-all mb-3">
+      <div className="min-w-0">
         <div className="font-semibold text-lg">{label}</div>
-        <div className="text-sm text-slate-400">{description}</div>
+        <div className="text-sm text-[var(--pg-text-dim)]">{description}</div>
       </div>
       <button
+        type="button"
+        role="switch"
+        aria-checked={value}
+        disabled={disabled}
         onClick={() => onChange(!value)}
-        className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors ${
-          value ? 'bg-blue-600' : 'bg-slate-600'
+        className={`relative inline-flex h-7 w-14 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+          value ? 'bg-[var(--pg-accent)]' : 'bg-[var(--pg-surface-3)]'
         }`}
       >
         <span
-          className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+          className={`inline-block h-5 w-5 shrink-0 transform rounded-full bg-white transition-transform ${
             value ? 'translate-x-8' : 'translate-x-1'
           }`}
         />
@@ -580,6 +807,7 @@ function SaveBar({
   isSaving: boolean;
   onSave: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="flex justify-end mb-6">
       <button
@@ -590,12 +818,12 @@ function SaveBar({
         {isSaving ? (
           <>
             <RefreshCw size={16} className="animate-spin" />
-            Saving…
+            {t('settings:saving')}
           </>
         ) : (
           <>
             <Check size={16} />
-            Save configuration
+            {t('settings:saveConfiguration')}
           </>
         )}
       </button>
@@ -609,7 +837,7 @@ function SaveBar({
 //
 // Operator-facing diagnostic: pick a USB port above, hit Start, then punch
 // cards into the SI master station. Each card's full readout streams into
-// the list below — start/finish/check punches and every code on the card.
+// the list below - start/finish/check punches and every code on the card.
 // Useful for verifying:
 //   - the dongle is detected on the right port
 //   - the master station is awake and forwarding 0xE8 notifications
@@ -617,7 +845,7 @@ function SaveBar({
 //
 // Lifecycle: starts a global reader via `sportidentService`. On tab switch
 // or unmount, the useEffect cleanup stops it. Note this is the same singleton
-// the game pages use — running this test while a game is mid-flight would
+// the game pages use - running this test while a game is mid-flight would
 // fight for the port; the use case for that doesn't exist (settings panel
 // is reached from the home screen, not mid-game).
 
@@ -626,7 +854,7 @@ interface CardWithReceivedAt {
   receivedAt: Date;
 }
 
-// HardwareTab — the Reader status card plus the card-reader test panel. When
+// HardwareTab - the Reader status card plus the card-reader test panel. When
 // the reader has a driver problem, the status card links over to the dedicated
 // USB driver settings tab (Developer → USB driver), which owns the full fix.
 function HardwareTab({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
@@ -639,9 +867,10 @@ function HardwareTab({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
 }
 
 // Read-only status block showing the auto-detected reader port. Replaces the
-// old port-picker section: there's no choice to be made — the app filters
+// old port-picker section: there's no choice to be made - the app filters
 // available ports by VID 10c4 / PID 800a and takes the first match.
 function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
+  const { t } = useTranslation();
   const { port, detail, isPresent, refresh } = useDetectedReaderPort();
   const { state: driverState, recheck: recheckDriver } = useDriverState();
   const available = sportidentService.isAvailable();
@@ -656,38 +885,38 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
 
   return (
     <Section
-      icon={<Usb className="text-blue-400" size={24} />}
-      title="Reader"
+      icon={<Usb className="text-[var(--pg-accent-bright)]" size={24} />}
+      title={t('settings:readerSection')}
       headerExtra={
         <button
           onClick={refreshAll}
           disabled={!available}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50"
+          className="pg-btn pg-btn--primary"
         >
           <RefreshCw size={16} />
-          Refresh
+          {t('settings:refresh')}
         </button>
       }
     >
       {!available ? (
-        <div className="text-sm text-slate-400">
-          Reader detection is only available inside the Tauri desktop app.
+        <div className="text-sm text-[var(--pg-text-dim)]">
+          {t('settings:readerDetectionDesktopOnly')}
         </div>
       ) : isPresent && port ? (
         <div className="rounded-lg border-2 border-green-500/40 bg-green-500/10 px-4 py-3">
           <div className="flex items-center gap-2">
             <Check className="text-green-400 flex-shrink-0" size={18} />
             <span className="font-mono font-semibold text-green-300">{port}</span>
-            <span className="text-sm text-slate-400">
+            <span className="text-sm text-[var(--pg-text-dim)]">
               ({detail?.manufacturer ?? 'Silicon Labs CP210x'})
             </span>
           </div>
-          <div className="text-xs text-slate-500 mt-1 ml-7">
-            Detected by USB VID/PID. The app auto-binds at game start.
+          <div className="text-xs text-[var(--pg-text-dim)] mt-1 ml-7">
+            {t('settings:readerDetectedHint')}
           </div>
         </div>
       ) : driverState.kind === 'blocked_by_policy' ? (
-        // SetupDi saw a CP210x device with CM problem code 39/40 — the
+        // SetupDi saw a CP210x device with CM problem code 39/40 - the
         // Vulnerable Driver Blocklist or HVCI refused silabser.sys. The
         // hardware is plugged in; the driver just isn't loading.
         <div className="rounded-lg border-2 border-red-500/50 bg-red-500/10 px-4 py-3">
@@ -695,44 +924,40 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
             <AlertTriangle className="text-red-400 flex-shrink-0 mt-0.5" size={18} />
             <div className="flex-1 min-w-0">
               <div className="text-red-300 font-medium">
-                We see a SportIdent reader, but Windows blocked its driver
+                {t('settings:driverBlockedTitle')}
               </div>
-              <div className="text-xs text-slate-400 mt-1">
-                The Vulnerable Driver Blocklist is refusing the legacy
-                silabser.sys. Install the signed driver to fix it — no Memory
-                Integrity change needed.
+              <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+                {t('settings:driverBlockedDesc')}
               </div>
               <button
                 onClick={onOpenUsbDriver}
                 className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded font-medium text-white text-sm transition-colors"
               >
                 <Usb size={14} />
-                Fix it in USB driver settings
+                {t('settings:driverBlockedCta')}
               </button>
             </div>
           </div>
         </div>
       ) : driverState.kind === 'driver_not_installed' ? (
-        // SetupDi saw a CP210x device with CM problem code 28/18 — plugged in
+        // SetupDi saw a CP210x device with CM problem code 28/18 - plugged in
         // but no driver bound (sits under "Other devices"). Installing one fixes it.
         <div className="rounded-lg border-2 border-amber-500/50 bg-amber-500/10 px-4 py-3">
           <div className="flex items-start gap-2">
             <AlertTriangle className="text-amber-400 flex-shrink-0 mt-0.5" size={18} />
             <div className="flex-1 min-w-0">
               <div className="text-amber-300 font-medium">
-                We see a SportIdent reader, but its driver isn't installed
+                {t('settings:driverNotInstalledTitle')}
               </div>
-              <div className="text-xs text-slate-400 mt-1">
-                Windows has no driver bound to the reader (Device Manager shows
-                it under "Other devices", code 28). Install the SportIdent USB
-                driver to bring it online.
+              <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+                {t('settings:driverNotInstalledDesc')}
               </div>
               <button
                 onClick={onOpenUsbDriver}
                 className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 rounded font-medium text-white text-sm transition-colors"
               >
                 <Usb size={14} />
-                Install it from USB driver settings
+                {t('settings:driverNotInstalledCta')}
               </button>
             </div>
           </div>
@@ -741,16 +966,16 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
         <div className="rounded-lg border-2 border-orange-500/40 bg-orange-500/10 px-4 py-3 flex items-start gap-2">
           <AlertCircle className="text-orange-400 flex-shrink-0 mt-0.5" size={18} />
           <div>
-            <div className="text-orange-300 font-medium">No SportIdent reader detected</div>
-            <div className="text-xs text-slate-400 mt-1">
-              Plug in your reader. The footer's reader indicator will turn green when it's online.
+            <div className="text-orange-300 font-medium">{t('settings:noReaderTitle')}</div>
+            <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+              {t('settings:noReaderDesc')}
             </div>
             <button
               onClick={onOpenUsbDriver}
-              className="mt-2 inline-flex items-center gap-1.5 text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2"
+              className="mt-2 inline-flex items-center gap-1.5 text-xs text-[var(--pg-accent-bright)] hover:text-[var(--pg-accent-hover)] underline underline-offset-2"
             >
               <Usb size={13} />
-              Driver blocked or missing? Open USB driver settings
+              {t('settings:noReaderCta')}
             </button>
           </div>
         </div>
@@ -760,6 +985,7 @@ function ReaderStatusSection({ onOpenUsbDriver }: { onOpenUsbDriver: () => void 
 }
 
 function CardReaderTestSection() {
+  const { t } = useTranslation();
   const { port: detectedPort, isPresent } = useDetectedReaderPort();
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -775,7 +1001,7 @@ function CardReaderTestSection() {
     if (!canStart || !detectedPort) return;
     setBusy(true);
     setErrorMessage(null);
-    setStatusMessage('Opening port…');
+    setStatusMessage(t('settings:statusOpeningPort'));
     try {
       // Wire callbacks BEFORE starting the reader so we don't miss the
       // first events the master fires after wakeup. Both callbacks
@@ -790,16 +1016,16 @@ function CardReaderTestSection() {
       const initialized = await sportidentService.initializePort(detectedPort);
       if (!initialized) {
         setErrorMessage(
-          "Failed to open the port. Check the cable, that no other app holds it, and try Refresh above.",
+          t('settings:errorFailedToOpenPort'),
         );
         setStatusMessage(null);
         return;
       }
       await sportidentService.start();
       setRunning(true);
-      setStatusMessage('Listening — punch a card into the station to see its data appear.');
+      setStatusMessage(t('settings:statusListening'));
     } catch (err) {
-      setErrorMessage(`Couldn't start: ${err}`);
+      setErrorMessage(t('settings:errorCouldNotStart', { error: String(err) }));
       setStatusMessage(null);
     } finally {
       setBusy(false);
@@ -810,9 +1036,9 @@ function CardReaderTestSection() {
     setBusy(true);
     try {
       await sportidentService.stop();
-      setStatusMessage('Stopped.');
+      setStatusMessage(t('settings:statusStopped'));
     } catch (err) {
-      setErrorMessage(`Error stopping: ${err}`);
+      setErrorMessage(t('settings:errorStopping', { error: String(err) }));
     } finally {
       setRunning(false);
       setBusy(false);
@@ -827,7 +1053,7 @@ function CardReaderTestSection() {
 
   // Clean shutdown on tab-switch or unmount. The hardware tab is
   // conditionally rendered in the parent, so unmount fires whenever the
-  // user picks a different settings tab — exactly when we want to stop.
+  // user picks a different settings tab - exactly when we want to stop.
   useEffect(() => {
     return () => {
       if (running) {
@@ -838,55 +1064,55 @@ function CardReaderTestSection() {
 
   return (
     <Section
-      icon={<Activity className="text-blue-400" size={24} />}
-      title="Card reader test"
+      icon={<Activity className="text-[var(--pg-accent-bright)]" size={24} />}
+      title={t('settings:cardReaderTestSection')}
       headerExtra={
         <div className="flex items-center gap-2">
           {cards.length > 0 && (
             <button
               onClick={handleClear}
-              className="flex items-center gap-2 px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-sm"
+              className="pg-btn pg-btn--ghost pg-btn--sm"
             >
               <Trash2 size={14} />
-              Clear ({cards.length})
+              {t('settings:clearCount', { count: cards.length })}
             </button>
           )}
           {running ? (
             <button
               onClick={handleStop}
               disabled={busy}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg transition-colors"
+              className="pg-btn pg-btn--danger"
             >
               <Square size={16} />
-              Stop test
+              {t('settings:stopTest')}
             </button>
           ) : (
             <button
               onClick={handleStart}
               disabled={!canStart}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
+              className="pg-btn pg-btn--primary"
             >
               <Play size={16} />
-              Start test
+              {t('settings:startTest')}
             </button>
           )}
         </div>
       }
     >
       {!available && (
-        <div className="text-sm text-slate-400 mb-3">
-          Reader test is only available inside the Tauri desktop app.
+        <div className="text-sm text-[var(--pg-text-dim)] mb-3">
+          {t('settings:cardReaderTestDesktopOnly')}
         </div>
       )}
       {available && !isPresent && (
-        <div className="text-sm text-slate-400 mb-3">
-          Plug in your SportIdent reader to enable the test.
+        <div className="text-sm text-[var(--pg-text-dim)] mb-3">
+          {t('settings:plugInReaderToTest')}
         </div>
       )}
 
       {statusMessage && (
-        <div className="mb-3 rounded-lg border border-slate-700 bg-slate-900/40 px-4 py-2 text-sm text-slate-300">
-          <span className={running ? 'text-green-400' : 'text-slate-400'}>●</span>{' '}
+        <div className="mb-3 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] px-4 py-2 text-sm text-[var(--pg-text-muted)]">
+          <span className={running ? 'text-green-400' : 'text-[var(--pg-text-dim)]'}>●</span>{' '}
           {statusMessage}
         </div>
       )}
@@ -897,29 +1123,29 @@ function CardReaderTestSection() {
         </div>
       )}
       {station && (
-        <div className="mb-4 rounded-lg border border-slate-700 bg-slate-900/40 px-4 py-3 text-sm">
-          <div className="text-xs uppercase tracking-wider text-slate-500 mb-1">Master station</div>
-          <div className="flex flex-wrap gap-x-6 gap-y-1 text-slate-300">
+        <div className="mb-4 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] px-4 py-3 text-sm">
+          <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)] mb-1">{t('settings:masterStation')}</div>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-[var(--pg-text-muted)]">
             <span>
-              <span className="text-slate-500">#</span>
+              <span className="text-[var(--pg-text-dim)]">#</span>
               {station.stationNumber}
             </span>
             <span>
-              <span className="text-slate-500">mode </span>
+              <span className="text-[var(--pg-text-dim)]">{t('settings:stationModePrefix')} </span>
               {station.stationMode}
             </span>
-            {station.extended && <span className="text-blue-400">extended</span>}
-            {station.autoSend && <span className="text-blue-400">auto-send</span>}
-            {station.handShake && <span className="text-blue-400">handshake</span>}
+            {station.extended && <span className="text-[var(--pg-accent-bright)]">{t('settings:stationExtended')}</span>}
+            {station.autoSend && <span className="text-[var(--pg-accent-bright)]">{t('settings:stationAutoSend')}</span>}
+            {station.handShake && <span className="text-[var(--pg-accent-bright)]">{t('settings:stationHandshake')}</span>}
           </div>
         </div>
       )}
 
       {cards.length === 0 ? (
-        <div className="text-center py-10 text-slate-500 text-sm">
+        <div className="text-center py-10 text-[var(--pg-text-dim)] text-sm">
           {running
-            ? 'Waiting for a card…'
-            : 'No cards yet. Start the test, then punch a card to see its data here.'}
+            ? t('settings:waitingForCard')
+            : t('settings:noCardsYet')}
         </div>
       ) : (
         <div className="space-y-3">
@@ -933,6 +1159,7 @@ function CardReaderTestSection() {
 }
 
 function CardRow({ entry }: { entry: CardWithReceivedAt }) {
+  const { t } = useTranslation();
   const { card, receivedAt } = entry;
   const [registered, setRegistered] = useState<cardsRepo.CardRow | null>(null);
   const [showRegister, setShowRegister] = useState(false);
@@ -981,7 +1208,7 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
     if (keyName.trim() === '') return;
     const all = await cardsRepo.list();
     if (all.some((c) => c.key_number === keyNumber)) {
-      setKeyNumberError('Key number already taken');
+      setKeyNumberError(t('settings:errorKeyNumberTaken'));
       return;
     }
     setBusy(true);
@@ -996,81 +1223,81 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
       await lookup();
       void runCycleNow('manual').catch(() => undefined);
     } catch {
-      // surfaced as no UI change — user can retry
+      // surfaced as no UI change - user can retry
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-4">
+    <div className="rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] p-4">
       <div className="flex items-baseline justify-between mb-3 flex-wrap gap-y-2">
         <div className="flex items-baseline gap-3 flex-wrap">
-          <span className="font-mono text-2xl text-blue-300">#{card.id}</span>
-          <span className="text-sm text-slate-400">
-            {card.cardType} · {card.nbPunch} punch{card.nbPunch === 1 ? '' : 'es'}
+          <span className="font-mono text-2xl text-[var(--pg-accent-bright)]">#{card.id}</span>
+          <span className="text-sm text-[var(--pg-text-dim)]">
+            {card.cardType} · {t('settings:punchCount', { count: card.nbPunch })}
           </span>
           {registered ? (
             <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-green-500/20 text-green-300 text-xs font-medium border border-green-500/30">
               <Check size={12} />
-              Registered · {registered.key_name} (#{registered.key_number})
+              {t('settings:registeredChip', { name: registered.key_name, number: registered.key_number })}
             </span>
           ) : (
             <>
               <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-orange-500/20 text-orange-300 text-xs font-medium border border-orange-500/30">
-                Not registered
+                {t('settings:notRegistered')}
               </span>
               <button
                 onClick={openRegister}
                 disabled={showRegister || busy}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium disabled:opacity-50"
+                className="pg-btn pg-btn--primary pg-btn--sm"
               >
-                Register
+                {t('settings:register')}
               </button>
             </>
           )}
         </div>
-        <span className="font-mono text-xs text-slate-500">
+        <span className="font-mono text-xs text-[var(--pg-text-dim)]">
           {receivedAt.toLocaleTimeString()}
         </span>
       </div>
 
       {showRegister && !registered && (
-        <div className="mb-3 p-3 rounded-md border border-slate-700 bg-slate-800/60">
+        <div className="mb-3 p-3 rounded-md border border-[var(--pg-line)] bg-[var(--pg-surface-3)]">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-2">
             <label className="block">
-              <span className="block text-xs text-slate-400 mb-1">
-                Key # {keyNumberError && <span className="text-red-400">— {keyNumberError}</span>}
+              <span className="block text-xs text-[var(--pg-text-dim)] mb-1">
+                {t('settings:keyNumberLabel')} {keyNumberError && <span className="text-red-400">- {keyNumberError}</span>}
               </span>
               <input
                 type="number"
                 min={1}
                 value={keyNumberStr}
                 onChange={(e) => setKeyNumberStr(e.target.value)}
-                className={`w-full px-2 py-1 bg-slate-900 border rounded text-sm text-white ${
-                  keyNumberError ? 'border-red-500' : 'border-slate-600'
+                className={`pg-input w-full !py-1 text-sm ${
+                  keyNumberError ? '!border-red-500' : ''
                 }`}
               />
             </label>
             <label className="block">
-              <span className="block text-xs text-slate-400 mb-1">Name (required)</span>
+              <span className="block text-xs text-[var(--pg-text-dim)] mb-1">{t('settings:nameLabel')}</span>
               <input
                 type="text"
                 value={keyName}
                 onChange={(e) => setKeyName(e.target.value)}
-                className="w-full px-2 py-1 bg-slate-900 border border-slate-600 rounded text-sm text-white"
-                placeholder="e.g. Alpha"
+                className="pg-input w-full !py-1 text-sm"
+                placeholder={t('settings:namePlaceholder')}
                 autoFocus
               />
             </label>
             <label className="block">
-              <span className="block text-xs text-slate-400 mb-1">Color (optional)</span>
+              <span className="block text-xs text-[var(--pg-text-dim)] mb-1">{t('settings:colorLabel')}</span>
               <input
                 type="text"
                 value={color}
                 onChange={(e) => setColor(e.target.value)}
-                className="w-full px-2 py-1 bg-slate-900 border border-slate-600 rounded text-sm text-white"
-                placeholder="e.g. red"
+                className="pg-input w-full !py-1 text-sm"
+                placeholder={t('settings:colorPlaceholder')}
               />
             </label>
           </div>
@@ -1078,40 +1305,40 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
             <button
               onClick={submitRegister}
               disabled={busy || keyName.trim() === ''}
-              className="inline-flex items-center gap-1 px-3 py-1 bg-green-600 hover:bg-green-500 disabled:bg-slate-700 disabled:text-slate-400 text-white rounded text-sm"
+              className="inline-flex items-center gap-1 px-3 py-1 bg-green-600 hover:bg-green-500 disabled:bg-[var(--pg-surface-3)] disabled:text-[var(--pg-text-dim)] text-white rounded text-sm"
             >
-              Save
+              {t('settings:save')}
             </button>
             <button
               onClick={cancelRegister}
               disabled={busy}
-              className="inline-flex items-center gap-1 px-3 py-1 border border-slate-600 text-slate-300 hover:bg-slate-700 rounded text-sm"
+              className="pg-btn pg-btn--ghost pg-btn--sm"
             >
-              Cancel
+              {t('settings:cancel')}
             </button>
           </div>
         </div>
       )}
 
       <div className="grid grid-cols-3 gap-2 mb-3">
-        <TimeSlot label="Start" punch={card.start} />
-        <TimeSlot label="Check" punch={card.check} />
-        <TimeSlot label="Finish" punch={card.end} />
+        <TimeSlot label={t('settings:timeSlotStart')} punch={card.start} />
+        <TimeSlot label={t('settings:timeSlotCheck')} punch={card.check} />
+        <TimeSlot label={t('settings:timeSlotFinish')} punch={card.end} />
       </div>
 
       {card.punches.length > 0 && (
         <div>
-          <div className="text-xs uppercase tracking-wider text-slate-500 mb-2">
-            Punches
+          <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)] mb-2">
+            {t('settings:punchesHeading')}
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-1">
             {card.punches.map((p, i) => (
               <div
                 key={i}
-                className="flex justify-between items-center font-mono text-xs bg-slate-800/60 rounded px-2 py-1"
+                className="flex justify-between items-center font-mono text-xs bg-[var(--pg-surface-3)] rounded px-2 py-1"
               >
-                <span className="text-blue-300">#{p.code}</span>
-                <span className="text-slate-400">{p.time}</span>
+                <span className="text-[var(--pg-accent-bright)]">#{p.code}</span>
+                <span className="text-[var(--pg-text-dim)]">{p.time}</span>
               </div>
             ))}
           </div>
@@ -1129,12 +1356,12 @@ function TimeSlot({
   punch?: { code: number; time: string };
 }) {
   return (
-    <div className="rounded bg-slate-800/40 px-3 py-2">
-      <div className="text-xs uppercase tracking-wider text-slate-500">{label}</div>
+    <div className="rounded bg-[var(--pg-surface-2)] px-3 py-2">
+      <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)]">{label}</div>
       {punch ? (
-        <div className="font-mono text-sm text-white">{punch.time}</div>
+        <div className="font-mono text-sm text-[var(--pg-text)]">{punch.time}</div>
       ) : (
-        <div className="font-mono text-sm text-slate-600">—</div>
+        <div className="font-mono text-sm text-[var(--pg-text-dim)]">-</div>
       )}
     </div>
   );
@@ -1143,6 +1370,9 @@ function TimeSlot({
 interface SettingsNavProps {
   active: SettingsTab;
   onChange: (tab: SettingsTab) => void;
+  isAdminMode?: boolean;
+  /** Operator-only devices hide the reader/driver hardware tabs entirely. */
+  operatorOnly?: boolean;
 }
 
 interface NavGroup {
@@ -1150,38 +1380,57 @@ interface NavGroup {
   items: { tab: SettingsTab; label: string; icon: React.ReactNode }[];
 }
 
-function SettingsNav({ active, onChange }: SettingsNavProps) {
+function SettingsNav({ active, onChange, isAdminMode = false, operatorOnly = false }: SettingsNavProps) {
+  const { t } = useTranslation();
   const groups: NavGroup[] = [
     {
-      label: 'Account',
+      label: t('settings:navGroupAccount'),
       items: [
-        { tab: 'account', label: 'Account', icon: <UserIcon size={16} /> },
-        { tab: 'sync', label: 'Sync', icon: <CloudCog size={16} /> },
-        { tab: 'devices', label: 'My devices', icon: <Smartphone size={16} /> },
+        { tab: 'account', label: t('settings:navAccount'), icon: <UserIcon size={16} /> },
+        { tab: 'sync', label: t('settings:navSync'), icon: <CloudCog size={16} /> },
+        { tab: 'cards', label: t('settings:navCardsPatterns'), icon: <CreditCard size={16} /> },
+        { tab: 'videos', label: t('settings:navVideos'), icon: <Film size={16} /> },
+        { tab: 'images', label: t('settings:navImages'), icon: <ImageIcon size={16} /> },
+        { tab: 'team-names', label: t('settings:navTeamNames'), icon: <Tags size={16} /> },
       ],
     },
     {
-      label: 'App',
+      label: t('settings:navGroupApp'),
       items: [
-        { tab: 'general', label: 'Preferences', icon: <Sliders size={16} /> },
-        { tab: 'hardware', label: 'Hardware', icon: <Cpu size={16} /> },
-        { tab: 'updates', label: 'Updates', icon: <Download size={16} /> },
+        { tab: 'general', label: t('settings:navPreferences'), icon: <Sliders size={16} /> },
+        { tab: 'devices', label: t('settings:navNetwork'), icon: <Network size={16} /> },
+        { tab: 'hardware', label: t('settings:navHardware'), icon: <Cpu size={16} /> },
+        { tab: 'printing', label: t('settings:navPrinting'), icon: <Printer size={16} /> },
+        { tab: 'updates', label: t('settings:navUpdates'), icon: <Download size={16} /> },
       ],
     },
     {
-      label: 'Developer',
+      label: t('settings:navGroupDeveloper'),
       items: [
-        { tab: 'api-docs', label: 'API docs', icon: <BookOpen size={16} /> },
-        { tab: 'usb-driver', label: 'USB driver', icon: <Usb size={16} /> },
+        { tab: 'api-docs', label: t('settings:navApiDocs'), icon: <BookOpen size={16} /> },
+        { tab: 'usb-driver', label: t('settings:navUsbDriver'), icon: <Usb size={16} /> },
       ],
     },
   ];
 
+  // API docs are admin-only; drop the entry (and any group it empties) when
+  // not in admin mode. Operator-only devices have no reader/driver role, so the
+  // Hardware + USB Driver tabs are hidden entirely.
+  const hiddenTabs = new Set<SettingsTab>(operatorOnly ? ['hardware', 'usb-driver'] : []);
+  const visibleGroups = groups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter(
+        (item) => (item.tab !== 'api-docs' || isAdminMode) && !hiddenTabs.has(item.tab)
+      ),
+    }))
+    .filter((group) => group.items.length > 0);
+
   return (
     <nav className="space-y-6 sticky top-24">
-      {groups.map((group) => (
+      {visibleGroups.map((group) => (
         <div key={group.label}>
-          <div className="text-xs uppercase tracking-wider text-slate-500 px-3 mb-2">
+          <div className="text-xs uppercase tracking-wider text-[var(--pg-text-dim)] px-3 mb-2">
             {group.label}
           </div>
           <div className="space-y-1">
@@ -1193,8 +1442,8 @@ function SettingsNav({ active, onChange }: SettingsNavProps) {
                   onClick={() => onChange(item.tab)}
                   className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg transition text-left text-sm ${
                     isActive
-                      ? 'bg-blue-600 text-white'
-                      : 'text-slate-300 hover:bg-slate-700/60'
+                      ? 'bg-[var(--pg-accent)] text-white'
+                      : 'text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)]'
                   }`}
                 >
                   {item.icon}

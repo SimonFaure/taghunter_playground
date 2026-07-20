@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { loadConfig } from '../utils/config';
 import { hasPin } from '../services/pinStore';
@@ -7,7 +8,7 @@ import { PinExitPrompt } from './PinExitPrompt';
 // Mounted once at the app root (main.tsx), outside AuthProvider, so it
 // overlays both the LoginScreen and the App. Two jobs:
 //   1. F11 toggles the window in/out of fullscreen at runtime. This is a
-//      pure window action — it does NOT rewrite the saved `fullscreenOnLaunch`
+//      pure window action - it does NOT rewrite the saved `fullscreenOnLaunch`
 //      preference (browser-style). When the "Require PIN to exit fullscreen"
 //      kiosk gate is on, LEAVING fullscreen first asks for the device PIN
 //      (entering is never gated). Bypassed when no device PIN is set yet, so
@@ -20,6 +21,7 @@ import { PinExitPrompt } from './PinExitPrompt';
 const TOP_BAND_PX = 4;
 
 export function FullscreenHint() {
+  const { t } = useTranslation();
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [cursorAtTop, setCursorAtTop] = useState(false);
   // When the PIN-to-exit-fullscreen gate fires, we surface PinExitPrompt and
@@ -42,7 +44,7 @@ export function FullscreenHint() {
           if (!cancelled) setIsFullscreen(v);
         })
         .catch(() => {
-          /* not in a Tauri runtime — leave as windowed */
+          /* not in a Tauri runtime - leave as windowed */
         });
     };
 
@@ -54,7 +56,7 @@ export function FullscreenHint() {
         else unlisten = fn;
       })
       .catch(() => {
-        /* event listening unavailable — F11 handler still updates state */
+        /* event listening unavailable - F11 handler still updates state */
       });
 
     return () => {
@@ -74,7 +76,7 @@ export function FullscreenHint() {
       .setFullscreen(false)
       .then(() => setIsFullscreen(false))
       .catch(() => {
-        /* not in a Tauri runtime — no-op */
+        /* not in a Tauri runtime - no-op */
       });
   };
 
@@ -85,7 +87,7 @@ export function FullscreenHint() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'F11') return;
       e.preventDefault();
-      // Already prompting for the exit PIN — ignore repeat presses.
+      // Already prompting for the exit PIN - ignore repeat presses.
       if (pinPromptOpenRef.current) return;
       const win = getCurrentWindow();
       void (async () => {
@@ -97,7 +99,7 @@ export function FullscreenHint() {
             setIsFullscreen(true);
             return;
           }
-          // Leaving fullscreen — apply the kiosk gate if enabled and a PIN
+          // Leaving fullscreen - apply the kiosk gate if enabled and a PIN
           // exists (no PIN ⇒ bypass so a new device can't get trapped).
           const cfg = await loadConfig();
           if (cfg.requirePinToExitFullscreen && (await hasPin())) {
@@ -106,7 +108,7 @@ export function FullscreenHint() {
           }
           exitFullscreen();
         } catch {
-          /* not in a Tauri runtime — no-op */
+          /* not in a Tauri runtime - no-op */
         }
       })();
     };
@@ -133,14 +135,14 @@ export function FullscreenHint() {
         }`}
       >
         <div className="mt-2 px-4 py-2 rounded-full bg-black/80 text-white text-sm font-medium shadow-lg border border-white/10">
-          Exit fullscreen by pressing F11
+          {t('fullscreenHint:hint')}
         </div>
       </div>
 
       {pinPromptOpen && (
         <PinExitPrompt
-          title="Enter your PIN"
-          subtitle="Enter the device PIN to exit fullscreen."
+          title={t('fullscreenHint:pinTitle')}
+          subtitle={t('fullscreenHint:pinSubtitle')}
           onSuccess={() => {
             setPromptOpen(false);
             exitFullscreen();

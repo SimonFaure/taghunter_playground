@@ -1,7 +1,7 @@
 // Per-card-type constants. Kept in their own file so adding a new card
 // family is one row in each of these tables plus a CardType variant.
 
-/// Bytes per block (128). Hard-coded throughout the SI protocol — every
+/// Bytes per block (128). Hard-coded throughout the SI protocol - every
 /// 0xEF block read returns exactly this many bytes.
 // Kept for protocol completeness; the parser uses the literal 128 inline.
 #[allow(dead_code)]
@@ -21,16 +21,16 @@ pub struct CardLayout {
 pub const PUNCH_RECORD_LEN: usize = 4;
 
 /// Indexed by `CardType as usize`. Order MUST match the enum declaration
-/// in `mod.rs` — keep them in lockstep.
+/// in `mod.rs` - keep them in lockstep.
 pub const LAYOUTS: [CardLayout; 4] = [
-    // Si8 — 2 blocks (256 bytes), punches start at 136 → (256-136)/4 = 30 max.
+    // Si8 - 2 blocks (256 bytes), punches start at 136 → (256-136)/4 = 30 max.
     CardLayout { punches_offset: 136, max_punches: 30 },
-    // Si9 — 2 blocks (256 bytes), punches start at 56 → (256-56)/4 = 50 max.
+    // Si9 - 2 blocks (256 bytes), punches start at 56 → (256-56)/4 = 50 max.
     CardLayout { punches_offset: 56, max_punches: 50 },
-    // Si10 — 5 blocks (640 bytes), punches start at 128 → enough room for
+    // Si10 - 5 blocks (640 bytes), punches start at 128 → enough room for
     // (640-128)/4 = 128 records, but real SI10 cards cap at 64.
     CardLayout { punches_offset: 128, max_punches: 64 },
-    // Si11 — same buffer shape as Si10, hardware allows 128 punches.
+    // Si11 - same buffer shape as Si10, hardware allows 128 punches.
     CardLayout { punches_offset: 128, max_punches: 128 },
 ];
 

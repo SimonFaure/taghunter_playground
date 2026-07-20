@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 
 interface AdminPasswordModalProps {
@@ -8,6 +9,7 @@ interface AdminPasswordModalProps {
 }
 
 export function AdminPasswordModal({ isOpen, onClose, onSuccess }: AdminPasswordModalProps) {
+  const { t } = useTranslation();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
@@ -19,16 +21,23 @@ export function AdminPasswordModal({ isOpen, onClose, onSuccess }: AdminPassword
   }, [isOpen]);
 
   useEffect(() => {
+    // Only react while the modal is actually open. The component stays mounted
+    // when closed (it just returns null), so without this guard the retained
+    // `password` ('1912') would re-fire onSuccess on every parent re-render -
+    // because onSuccess/onClose get new identities each render - silently
+    // re-entering admin mode and making "exit admin" impossible.
+    if (!isOpen) return;
     if (password.length === 4) {
       if (password === '1912') {
+        setPassword('');
         onSuccess();
         onClose();
       } else {
-        setError('Incorrect password');
+        setError(t('adminPassword:incorrect'));
         setPassword('');
       }
     }
-  }, [password, onSuccess, onClose]);
+  }, [isOpen, password, onSuccess, onClose, t]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,22 +46,23 @@ export function AdminPasswordModal({ isOpen, onClose, onSuccess }: AdminPassword
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
-      <div className="bg-slate-800 rounded-xl shadow-2xl w-full max-w-md mx-4 border border-slate-700">
-        <div className="flex items-center justify-between p-6 border-b border-slate-700">
-          <h2 className="text-xl font-bold text-white">Admin Access</h2>
+    <div className="pg-overlay">
+      <div className="pg-modal max-w-md">
+        <div className="pg-modal-head">
+          <h2 className="pg-modal-title">{t('adminPassword:heading')}</h2>
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-lg transition"
+            aria-label={t('adminPassword:close')}
+            className="pg-modal-close"
           >
             <X size={20} />
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6">
+        <form onSubmit={handleSubmit} className="pg-modal-body">
           <div className="mb-4">
-            <label htmlFor="password" className="block text-sm font-medium text-slate-300 mb-2">
-              Enter Admin Password
+            <label htmlFor="password" className="pg-label">
+              {t('adminPassword:label')}
             </label>
             <input
               type="password"
@@ -60,9 +70,9 @@ export function AdminPasswordModal({ isOpen, onClose, onSuccess }: AdminPassword
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               maxLength={4}
-              className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="pg-input w-full"
               autoFocus
-              placeholder="Enter 4-digit password"
+              placeholder={t('adminPassword:placeholder')}
             />
             {error && <p className="mt-2 text-sm text-red-400">{error}</p>}
           </div>
@@ -71,15 +81,15 @@ export function AdminPasswordModal({ isOpen, onClose, onSuccess }: AdminPassword
             <button
               type="button"
               onClick={onClose}
-              className="flex-1 px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition"
+              className="pg-btn flex-1"
             >
-              Cancel
+              {t('adminPassword:cancel')}
             </button>
             <button
               type="submit"
-              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+              className="pg-btn pg-btn--primary flex-1"
             >
-              Enter
+              {t('adminPassword:submit')}
             </button>
           </div>
         </form>

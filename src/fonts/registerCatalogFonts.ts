@@ -2,12 +2,12 @@
  * Inject `@font-face` rules for every bundled catalog font.
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ DUPLICATED VERBATIM — keep in sync:                                      │
+ * │ DUPLICATED VERBATIM - keep in sync:                                      │
  * │   studio-taghunter/src/fonts/registerCatalogFonts.ts                     │
  * │   taghunter_playground/src/fonts/registerCatalogFonts.ts                 │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
- * System catalog fonts (no `faces`) need nothing — the OS provides them.
+ * System catalog fonts (no `faces`) need nothing - the OS provides them.
  * Bundled fonts ship in `public/fonts/` and are served at `/fonts/<file>`.
  * Call this once at app startup so the picker preview and the rendered text
  * have the faces available.
@@ -16,6 +16,30 @@
  */
 
 import { FONT_CATALOG } from './catalog';
+
+/**
+ * The bundled-font `@font-face` rules as a CSS string, for injecting into an
+ * iframe document (e.g. the report preview / print) which does NOT inherit the
+ * parent page's font faces. `baseUrl` (e.g. window.location.origin) prefixes the
+ * `/fonts/...` path so a srcdoc iframe - which has no base URL - can resolve it.
+ */
+export function catalogFontFaceCss(baseUrl = ''): string {
+  const rules: string[] = [];
+  for (const font of FONT_CATALOG) {
+    for (const face of font.faces ?? []) {
+      rules.push(
+        `@font-face{` +
+          `font-family:"${font.family}";` +
+          `src:url("${baseUrl}/fonts/${face.file}") format("${face.format}");` +
+          `font-weight:${face.weight};` +
+          `font-style:${face.style};` +
+          `font-display:swap;` +
+          `}`,
+      );
+    }
+  }
+  return rules.join('\n');
+}
 
 let registered = false;
 

@@ -1,4 +1,4 @@
-// Reader — top-level state machine that ties transport, framing, and
+// Reader - top-level state machine that ties transport, framing, and
 // card parsing together. Spawns one tokio task that:
 //
 //   1. Sends wakeup + get-system-data at startup.
@@ -7,7 +7,7 @@
 //   4. On `0xE8` (card inserted): looks up CardType from the ID, fires
 //      sequential `0xEF` block reads (per `CardType::blocks_to_read`),
 //      then parses + emits CardRead and ACKs the master.
-//   5. Re-issues the wakeup every `REWAKEUP_INTERVAL_MS` of idle time —
+//   5. Re-issues the wakeup every `REWAKEUP_INTERVAL_MS` of idle time -
 //      this is the fix for root cause #2 in the plan (legacy reader
 //      sent wakeup exactly once, so cards silently stopped triggering
 //      after ~10 s of master idle-sleep).
@@ -15,7 +15,7 @@
 // Notable design choices vs. legacy:
 //   - Writes happen BEFORE the corresponding `StateChanged` event fires.
 //     Tests can therefore observe a state transition and immediately
-//     read `mock.captured_tx()` to confirm the resulting write — no need
+//     read `mock.captured_tx()` to confirm the resulting write - no need
 //     for `yield_now()` dances.
 //   - `Drop` of `ReaderHandle` signals stop. Forgetting to call
 //     `stop()` is a non-issue; the task winds down with the handle.
@@ -52,7 +52,7 @@ pub struct ReaderHandle {
 impl Reader {
     /// Spawn the reader task. Returns the control handle and the event
     /// receiver. The caller is responsible for forwarding events to JS
-    /// (step 5) — the reader itself has no Tauri dependency.
+    /// (step 5) - the reader itself has no Tauri dependency.
     pub fn spawn(
         transport: Arc<dyn SerialTransport>,
         rx_bytes: BytesRx,
@@ -73,7 +73,7 @@ impl Reader {
 }
 
 impl ReaderHandle {
-    /// Explicit shutdown — awaits the reader task to fully exit, which
+    /// Explicit shutdown - awaits the reader task to fully exit, which
     /// in turn awaits the transport's owner task to drop the
     /// SerialStream and release the OS handle. Idempotent: calling on
     /// an already-stopped reader is a no-op.
@@ -91,7 +91,7 @@ impl ReaderHandle {
 
 impl Drop for ReaderHandle {
     fn drop(&mut self) {
-        // Implicit stop on drop — fire the signal but don't (can't) wait
+        // Implicit stop on drop - fire the signal but don't (can't) wait
         // for the task to exit. The reader task will see the dropped
         // sender and shut down asynchronously. Callers that need to
         // observe full teardown (e.g. release-and-reopen a port) must
@@ -143,7 +143,7 @@ async fn reader_task(
 
     loop {
         tokio::select! {
-            // Stop takes priority — if the handle is dropping, no point
+            // Stop takes priority - if the handle is dropping, no point
             // processing more bytes.
             biased;
 
@@ -187,7 +187,7 @@ async fn reader_task(
                     && last_rx_at.elapsed() >= Duration::from_millis(REWAKEUP_INTERVAL_MS);
                 if should_rewake {
                     let _ = transport.write(&commands::build_wakeup()).await;
-                    // Don't reset last_rx_at — we want to retry on the
+                    // Don't reset last_rx_at - we want to retry on the
                     // next tick if still silent, and ANY inbound byte
                     // will reset it anyway.
                     last_rx_at = Instant::now();
@@ -223,7 +223,7 @@ async fn handle_frame(
 ) {
     match frame.cmd {
         CMD_SET_MS_MODE => {
-            // The wakeup ACK. Mostly informational — we don't need to
+            // The wakeup ACK. Mostly informational - we don't need to
             // do anything beyond noting the master is alive.
             if matches!(*state, ReaderState::Awakening) {
                 set_state(state, ReaderState::Listening, event_tx);
@@ -252,7 +252,7 @@ async fn handle_frame(
             // The "printed card number" is the 7-digit ID stamped on the
             // physical card and used in the SI manufacturing ranges
             // (1M-2M = SI9, 2M-3M = SI8, etc.). SI3 is an out-of-band
-            // series tag — we discard it here because the range-based
+            // series tag - we discard it here because the range-based
             // detection in `CardType::from_card_id` works directly off
             // the printed number and matches what `parser.rs` reads
             // from offsets 25-27 of the readout buffer.
@@ -264,7 +264,7 @@ async fn handle_frame(
             // arrived as 18,666,285 with SI3=0x01).
             //
             // Ignore notifications while we're already reading another
-            // card — the legacy code's fake "removed" loop ate the next
+            // card - the legacy code's fake "removed" loop ate the next
             // card's bytes precisely because it didn't gate this way.
             if !matches!(*state, ReaderState::Listening) {
                 return;
@@ -353,7 +353,7 @@ async fn handle_frame(
         }
 
         _ => {
-            // Unknown command — log once and move on. Could be a master
+            // Unknown command - log once and move on. Could be a master
             // firmware extension, an echoed sub-byte, or noise.
         }
     }
@@ -371,12 +371,12 @@ fn set_state(
 }
 
 /// Extract station fields from the `0x83` "get system data" response
-/// payload. Offsets verified against legacy lib.js `Station.parse` —
+/// payload. Offsets verified against legacy lib.js `Station.parse` -
 /// the legacy code uses absolute frame offsets (incl. STX/CMD/LEN), so
 /// subtract 3 to map onto our payload-only slice.
 fn parse_station_info(payload: &[u8]) -> Option<StationInfo> {
     // Need at least the bytes legacy `parse()` reads: 0x0A in full
-    // frame = 7 in payload. Be lenient — short responses surface as
+    // frame = 7 in payload. Be lenient - short responses surface as
     // None rather than panic.
     if payload.len() < 8 {
         return None;
@@ -437,10 +437,10 @@ mod tests {
             1_000_000..=1_999_999 => 0x01,
             2_000_000..=2_999_999 => 0x02,
             7_000_000..=9_999_999 => 0x04,
-            _ => 0x00, // unknown/unsupported — exercised by the negative test below
+            _ => 0x00, // unknown/unsupported - exercised by the negative test below
         };
         // Payload = [CN1, CN0, SI3, SI2, SI1, SI0]. CN values don't
-        // matter — the reader only consumes the SI bytes.
+        // matter - the reader only consumes the SI bytes.
         let payload = vec![
             0x00,
             0x01,
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(
             mock.captured_tx(),
             commands::build_get_card_block(0),
-            "expected SI9 block-0 request — card id was not parsed correctly"
+            "expected SI9 block-0 request - card id was not parsed correctly"
         );
     }
 
@@ -704,7 +704,7 @@ mod tests {
             _ => unreachable!(),
         }
         // No state transition into Reading.
-        // (We don't directly assert this — but the next event the test
+        // (We don't directly assert this - but the next event the test
         // pulls would be the next thing we inject. Implicit by progress.)
     }
 

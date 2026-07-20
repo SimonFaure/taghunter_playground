@@ -1,4 +1,4 @@
-// In-game "Play Video" quick-access modal — plays on THIS device (the
+// In-game "Play Video" quick-access modal - plays on THIS device (the
 // operator's own screen), not satellites. Satellite-targeted playback lives
 // in the Devices modal's action bar.
 //
@@ -8,6 +8,7 @@
 // presentation on top of whatever's currently showing.
 
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Film, Play, StopCircle, Loader2, X } from 'lucide-react';
 import { resolveVideosByKind } from '../services/videoResolution';
 import { emitLocalPlayVideo, emitLocalStopVideo } from '../services/localVideoStore';
@@ -29,6 +30,7 @@ export function VideoControlModal({
   hasTutorial = true,
   onClose,
 }: VideoControlModalProps) {
+  const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,7 +40,7 @@ export function VideoControlModal({
     try {
       const videos = await resolveVideosByKind(kinds, gameUniqid, gameType, gameLanguage);
       if (videos.length === 0) {
-        setError(`No ${kinds.join(' / ')} video available for this scenario.`);
+        setError(t('videoControl:noVideoAvailable', { kinds: kinds.join(' / ') }));
         return;
       }
       emitLocalPlayVideo(videos);
@@ -57,56 +59,56 @@ export function VideoControlModal({
 
   return (
     <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-[130] p-4"
+      className="pg-overlay z-[130]"
       onClick={onClose}
     >
       <div
-        className="bg-slate-800 border-2 border-slate-700 rounded-lg p-6 max-w-md w-full"
+        className="pg-modal max-w-md"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-xl font-bold text-white flex items-center gap-2">
+        <div className="pg-modal-head">
+          <h3 className="pg-modal-title flex items-center gap-2">
             <Film size={22} className="text-purple-400" />
-            Play video
+            {t('videoControl:playVideo')}
           </h3>
           <button
             onClick={onClose}
-            className="text-slate-400 hover:text-white p-1"
-            aria-label="Close"
+            className="pg-modal-close"
+            aria-label={t('videoControl:close')}
           >
             <X size={22} />
           </button>
         </div>
 
-        <p className="text-sm text-slate-400 mb-4">
-          Pick a video to play on <span className="text-slate-200 font-medium">this device</span>.
-          (To send to satellites, use the Devices modal.)
+        <div className="pg-modal-body">
+        <p className="text-sm text-[var(--pg-text-dim)] mb-4">
+          {t('videoControl:pickVideoPrefix')} <span className="text-[var(--pg-text-muted)] font-medium">{t('videoControl:thisDevice')}</span>{t('videoControl:pickVideoSuffix')}
         </p>
 
         <div className="grid grid-cols-1 gap-2">
           <ActionButton
-            label="Intro"
+            label={t('videoControl:intro')}
             color="blue"
             disabled={!hasIntro || busy}
             onClick={() => play(['intro'])}
             icon={<Play size={16} />}
           />
           <ActionButton
-            label="Tutorial"
+            label={t('videoControl:tutorial')}
             color="blue"
             disabled={!hasTutorial || busy}
             onClick={() => play(['tutorial'])}
             icon={<Play size={16} />}
           />
           <ActionButton
-            label="Intro + Tutorial"
+            label={t('videoControl:introTutorial')}
             color="blue"
             disabled={!hasIntro || !hasTutorial || busy}
             onClick={() => play(['intro', 'tutorial'])}
             icon={<Play size={16} />}
           />
           <ActionButton
-            label="Stop video"
+            label={t('videoControl:stopVideo')}
             color="orange"
             disabled={busy}
             onClick={stop}
@@ -115,9 +117,9 @@ export function VideoControlModal({
         </div>
 
         {busy && (
-          <div className="text-xs text-slate-400 flex items-center gap-1.5 justify-center mt-3">
+          <div className="text-xs text-[var(--pg-text-dim)] flex items-center gap-1.5 justify-center mt-3">
             <Loader2 size={12} className="animate-spin" />
-            Resolving…
+            {t('videoControl:resolving')}
           </div>
         )}
         {error && (
@@ -125,6 +127,7 @@ export function VideoControlModal({
             {error}
           </p>
         )}
+        </div>
       </div>
     </div>
   );
@@ -145,14 +148,14 @@ function ActionButton({
 }) {
   const base =
     color === 'blue'
-      ? 'bg-blue-600 hover:bg-blue-500'
+      ? 'bg-[var(--pg-accent)] hover:bg-[var(--pg-accent-hover)]'
       : 'bg-orange-600 hover:bg-orange-500';
   return (
     <button
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className={`flex items-center justify-center gap-2 px-4 py-3 ${base} disabled:bg-slate-700 disabled:text-slate-500 text-white rounded-lg text-sm font-medium`}
+      className={`flex items-center justify-center gap-2 px-4 py-3 ${base} disabled:bg-[var(--pg-surface-3)] disabled:text-[var(--pg-text-dim)] text-[var(--pg-text)] rounded-lg text-sm font-medium`}
     >
       {icon}
       {label}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation, Trans } from 'react-i18next';
 import {
   LogOut,
   Loader2,
@@ -8,11 +9,13 @@ import {
   CheckCircle2,
   AlertTriangle,
   WifiOff,
+  CloudOff,
 } from 'lucide-react';
 import { useAuth } from '../auth/AuthProvider';
 import { isOnline, onConnectivityChange } from '../../services/connectivity';
+import { offlineGraceInfo, OFFLINE_WARNING_THRESHOLD_DAYS } from '../../services/authStore';
 
-// Account tab — read-only summary of the signed-in client + the destructive
+// Account tab - read-only summary of the signed-in client + the destructive
 // "sign out of this device" action.
 //
 // The everyday "stepping away from the tablet" verb is the nav-bar Lock
@@ -22,8 +25,9 @@ import { isOnline, onConnectivityChange } from '../../services/connectivity';
 //
 // Online-only by design: signing out revokes the device server-side, and
 // without internet the revoke call would no-op while local state still
-// got wiped — that's worth avoiding so the device cap stays consistent.
+// got wiped - that's worth avoiding so the device cap stays consistent.
 export function AccountScreen() {
+  const { t } = useTranslation();
   const { user, signOut } = useAuth();
   const [signingOut, setSigningOut] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -32,6 +36,9 @@ export function AccountScreen() {
   useEffect(() => onConnectivityChange(setOnline), []);
 
   if (!user) return null;
+
+  const grace = offlineGraceInfo(user);
+  const graceLow = grace.remainingDays <= OFFLINE_WARNING_THRESHOLD_DAYS;
 
   const handleConfirmSignOut = async () => {
     setSigningOut(true);
@@ -44,19 +51,19 @@ export function AccountScreen() {
   };
 
   return (
-    <div className="max-w-2xl mx-auto p-6 space-y-6">
-      <h1 className="text-2xl font-semibold text-white">Account</h1>
+    <div className="max-w-2xl mx-auto p-6 pb-20 space-y-6">
+      <h1 className="text-2xl font-semibold text-[var(--pg-text)]">{t('accountSettings:title')}</h1>
 
-      <div className="bg-slate-800 border border-slate-700 rounded-xl p-6 space-y-4">
-        <Row icon={<UserIcon className="w-4 h-4 text-slate-400" />} label="Name">
-          <span className="text-white">{user.name || <em className="text-slate-500">Not set</em>}</span>
+      <div className="pg-panel p-6 space-y-4">
+        <Row icon={<UserIcon className="w-4 h-4 text-[var(--pg-text-dim)]" />} label={t('accountSettings:name')}>
+          <span className="text-[var(--pg-text)]">{user.name || <em className="text-[var(--pg-text-dim)]">{t('accountSettings:notSet')}</em>}</span>
         </Row>
-        <Row icon={<Mail className="w-4 h-4 text-slate-400" />} label="Email">
-          <span className="text-white">{user.email}</span>
+        <Row icon={<Mail className="w-4 h-4 text-[var(--pg-text-dim)]" />} label={t('accountSettings:email')}>
+          <span className="text-[var(--pg-text)]">{user.email}</span>
         </Row>
-        <Row icon={<Award className="w-4 h-4 text-slate-400" />} label="License">
-          <span className="px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/40 text-sm capitalize">
-            {user.license_type || 'unknown'}
+        <Row icon={<Award className="w-4 h-4 text-[var(--pg-text-dim)]" />} label={t('accountSettings:license')}>
+          <span className="pg-badge pg-badge--accent capitalize">
+            {user.license_type || t('accountSettings:unknown')}
           </span>
         </Row>
         <Row
@@ -67,10 +74,27 @@ export function AccountScreen() {
               <AlertTriangle className="w-4 h-4 text-amber-400" />
             )
           }
-          label="Billing"
+          label={t('accountSettings:billing')}
         >
           <span className={user.billing_up_to_date ? 'text-emerald-300' : 'text-amber-300'}>
-            {user.billing_up_to_date ? 'Up to date' : 'Payment needed'}
+            {user.billing_up_to_date ? t('accountSettings:billingUpToDate') : t('accountSettings:billingPaymentNeeded')}
+          </span>
+        </Row>
+        <Row
+          icon={<CloudOff className={`w-4 h-4 ${graceLow ? 'text-amber-400' : 'text-[var(--pg-text-dim)]'}`} />}
+          label={t('accountSettings:offlineAccess')}
+        >
+          <span className={graceLow ? 'text-amber-300' : 'text-[var(--pg-text)]'}>
+            {grace.remainingDays > 0 ? (
+              <Trans
+                i18nKey="accountSettings:daysLeft"
+                count={grace.remainingDays}
+                values={{ count: grace.remainingDays, total: grace.graceDays }}
+                components={{ dim: <span className="text-[var(--pg-text-dim)]" /> }}
+              />
+            ) : (
+              t('accountSettings:offlineExpired')
+            )}
           </span>
         </Row>
       </div>
@@ -79,16 +103,16 @@ export function AccountScreen() {
         <button
           onClick={() => setConfirming(true)}
           disabled={!online || signingOut}
-          className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-medium disabled:opacity-50 disabled:hover:bg-red-600"
-          title={online ? undefined : 'Connect to the internet to sign out'}
+          className="pg-btn pg-btn--danger"
+          title={online ? undefined : t('accountSettings:signOutOfflineTitle')}
         >
           {signingOut ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogOut className="w-4 h-4" />}
-          Sign out of this device
+          {t('accountSettings:signOutDevice')}
         </button>
         {!online && (
-          <p className="text-xs text-slate-500 flex items-center gap-1">
+          <p className="text-xs text-[var(--pg-text-dim)] flex items-center gap-1">
             <WifiOff className="w-3 h-3" />
-            Connect to the internet to sign out.
+            {t('accountSettings:signOutOfflineHint')}
           </p>
         )}
       </div>
@@ -113,35 +137,38 @@ interface ConfirmSignOutModalProps {
 }
 
 function ConfirmSignOutModal({ email, busy, onConfirm, onCancel }: ConfirmSignOutModalProps) {
+  const { t } = useTranslation();
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm">
-      <div className="w-full max-w-md bg-slate-800 border border-slate-700 rounded-2xl p-6 space-y-4">
+    <div className="pg-overlay">
+      <div className="pg-modal max-w-md p-6 space-y-4">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-full bg-red-500/20 border border-red-500/40 flex items-center justify-center">
             <AlertTriangle className="w-5 h-5 text-red-300" />
           </div>
-          <h2 className="text-lg font-semibold text-white">Sign out of this device?</h2>
+          <h2 className="text-lg font-semibold text-[var(--pg-text)]">{t('accountSettings:confirmTitle')}</h2>
         </div>
-        <p className="text-sm text-slate-300">
-          You’re signed in as <span className="text-white font-medium">{email}</span>. Signing out
-          revokes this device, clears the PIN, and removes the local account data. You’ll need
-          internet to sign back in.
+        <p className="text-sm text-[var(--pg-text-muted)]">
+          <Trans
+            i18nKey="accountSettings:confirmBody"
+            values={{ email }}
+            components={{ strong: <span className="text-[var(--pg-text)] font-medium" /> }}
+          />
         </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onCancel}
             disabled={busy}
-            className="px-4 py-2 rounded-lg text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+            className="pg-btn pg-btn--ghost"
           >
-            Cancel
+            {t('accountSettings:cancel')}
           </button>
           <button
             onClick={onConfirm}
             disabled={busy}
-            className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg font-medium disabled:opacity-50"
+            className="pg-btn pg-btn--danger"
           >
             {busy && <Loader2 className="w-4 h-4 animate-spin" />}
-            Sign out
+            {t('accountSettings:signOut')}
           </button>
         </div>
       </div>
@@ -160,7 +187,7 @@ function Row({
 }) {
   return (
     <div className="flex items-center justify-between gap-4">
-      <div className="flex items-center gap-2 text-sm text-slate-400 min-w-0">
+      <div className="flex items-center gap-2 text-sm text-[var(--pg-text-dim)] min-w-0">
         {icon}
         <span>{label}</span>
       </div>

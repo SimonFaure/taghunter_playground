@@ -5,6 +5,10 @@ import type { PunchAnimationData } from '../services/tagquestPunchLogic';
 interface Props {
   data: PunchAnimationData;
   onDone: () => void;
+  /** When true, draw the ✓/✗ marks over matched/missed images - a colorblind
+   *  aid layered on top of the green/red colour coding. Off by default so the
+   *  marks only appear when the launch config enables colorblind mode. */
+  colorblind?: boolean;
 }
 
 type Phase =
@@ -19,7 +23,7 @@ const MAIN_IMAGE_HOLD_MS = 1800;
 const UPDATE_HOLD_MS = 2000;
 const EXIT_MS = 600;
 
-export function PunchAnimationOverlay({ data, onDone }: Props) {
+export function PunchAnimationOverlay({ data, onDone, colorblind = false }: Props) {
   const { displayQuest, prevScore, newScore, prevCombos, newCombos, prevQuestDetails, newQuestDetails, teamName } = data;
 
   const [phase, setPhase] = useState<Phase>('enter');
@@ -167,7 +171,7 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
 
         <div style={{ display: 'flex', gap: '24px', width: '100%', alignItems: 'flex-start', justifyContent: 'center', flexWrap: 'wrap' }}>
 
-          {/* Left panel — score + combos + quest details */}
+          {/* Left panel - score + combos + quest details */}
           <div
             style={{
               background: 'rgba(15,23,42,0.9)',
@@ -246,7 +250,7 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
             )}
           </div>
 
-          {/* Right panel — quest image reveal */}
+          {/* Right panel - quest image reveal */}
           {displayQuest && (
             <div
               style={{
@@ -289,26 +293,28 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
                     alt={displayQuest.name}
                     style={{ width: '100%', display: 'block', maxHeight: '240px', objectFit: 'cover' }}
                   />
-                  <div style={{
-                    position: 'absolute',
-                    inset: 0,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: 'rgba(0,0,0,0.2)',
-                  }}>
+                  {colorblind && (
                     <div style={{
-                      background: 'rgba(74,222,128,0.9)',
-                      borderRadius: '50%',
-                      width: '56px',
-                      height: '56px',
+                      position: 'absolute',
+                      inset: 0,
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
+                      background: 'rgba(0,0,0,0.2)',
                     }}>
-                      <Check size={32} color="#fff" strokeWidth={3} />
+                      <div style={{
+                        background: 'rgba(74,222,128,0.9)',
+                        borderRadius: '50%',
+                        width: '56px',
+                        height: '56px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }}>
+                        <Check size={32} color="#fff" strokeWidth={3} />
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               )}
 
@@ -363,23 +369,25 @@ export function PunchAnimationOverlay({ data, onDone }: Props) {
                               background: slot.matched ? 'rgba(74,222,128,0.12)' : 'rgba(248,113,113,0.18)',
                             }}
                           >
-                            <div
-                              style={{
-                                background: slot.matched ? 'rgba(74,222,128,0.85)' : 'rgba(248,113,113,0.85)',
-                                borderRadius: '50%',
-                                width: '36px',
-                                height: '36px',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
-                              }}
-                            >
-                              {slot.matched
-                                ? <Check size={20} color="#fff" strokeWidth={3} />
-                                : <X size={20} color="#fff" strokeWidth={3} />
-                              }
-                            </div>
+                            {colorblind && (
+                              <div
+                                style={{
+                                  background: slot.matched ? 'rgba(74,222,128,0.85)' : 'rgba(248,113,113,0.85)',
+                                  borderRadius: '50%',
+                                  width: '36px',
+                                  height: '36px',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
+                                }}
+                              >
+                                {slot.matched
+                                  ? <Check size={20} color="#fff" strokeWidth={3} />
+                                  : <X size={20} color="#fff" strokeWidth={3} />
+                                }
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>

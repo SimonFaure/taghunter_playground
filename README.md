@@ -12,7 +12,7 @@ npm run tauri:dev
 ## App self-update
 
 Desktop builds (Windows/macOS/Linux) update themselves via `tauri-plugin-updater`.
-Mobile builds (Android/iOS) cannot self-install — they show the same update
+Mobile builds (Android/iOS) cannot self-install - they show the same update
 screens but deep-link to the app stores.
 
 ### Building a release
@@ -35,7 +35,7 @@ The matching public key is committed in `src-tauri/tauri.conf.json`
 > **Pre-launch note:** the updater key currently has no password. Before real
 > distribution, regenerate it *with* a password (`tauri signer generate` then
 > `-p <password>`), update the `pubkey` in `tauri.conf.json`, and ship that
-> build manually — auto-update only works forward from a build that already
+> build manually - auto-update only works forward from a build that already
 > carries the new public key.
 
 ### Publishing
@@ -53,7 +53,7 @@ backend; artifacts are stored under `backend/releases/`.
 
 The app binary is **not** OS-code-signed yet. Windows SmartScreen and macOS
 Gatekeeper will warn on first install and on each update install. The Tauri
-updater signature still guarantees the artifact's authenticity — the OS just
+updater signature still guarantees the artifact's authenticity - the OS just
 doesn't recognise the publisher. Acquiring OS code-signing certificates is a
 deferred follow-up.
 

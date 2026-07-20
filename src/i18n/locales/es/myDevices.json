@@ -1,0 +1,21 @@
+{
+  "title": "Mis dispositivos",
+  "refresh": "Actualizar",
+  "signOut": "Cerrar sesión",
+  "noDevices": "No se encontraron dispositivos.",
+  "deviceNamePlaceholder": "Nombre del dispositivo",
+  "deviceNameFallback": "Dispositivo {{os}}",
+  "unknownOs": "Desconocido",
+  "save": "Guardar",
+  "cancel": "Cancelar",
+  "rename": "Cambiar nombre",
+  "thisDevice": "Este dispositivo",
+  "loggedOut": "Sesión cerrada",
+  "appVersion": "app {{version}}",
+  "lastSeen": "visto por última vez {{time}}",
+  "signOutThisDevice": "Cerrar sesión en este dispositivo",
+  "revokeDevice": "Revocar dispositivo",
+  "nameTooLong": "El nombre no debe superar los {{max}} caracteres",
+  "requestFailed": "La solicitud falló ({{status}})",
+  "genericError": "Algo salió mal."
+}

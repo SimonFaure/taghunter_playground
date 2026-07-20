@@ -15,7 +15,7 @@
 //
 // Delivery is invisible and non-blocking: enqueue is synchronous from the
 // caller's perspective (SQLite write), the drainer runs on a 5-min interval
-// AND on app boot. Devices that stay offline for months are fine — there's
+// AND on app boot. Devices that stay offline for months are fine - there's
 // no TTL; the local outbox is FIFO-capped at MAX_QUEUE_ROWS.
 //
 // Idempotency: every row carries a UUIDv4 event_uuid generated at enqueue.
@@ -28,6 +28,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { apiCall, ApiError } from './api';
 import { loadJwt } from './strongholdStore';
 import { getDeviceMetadata } from './device';
+import { loadConfig } from '../utils/config';
+import { reprieveUntilForHeartbeat } from './deviceLock';
 
 // ─── tunables ────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,32 @@ export type TelemetryEventType =
   | 'error'
   | 'launch'
   | 'game_summary'
-  | 'recovery_code_used';
+  | 'recovery_code_used'
+  | 'sync_item_failed'
+  | 'sync_item_resolved';
+
+/** Wire shape of a sync_item_failed event (a content-sync item that has failed
+ * to download 2+ consecutive cycles). Studio upserts the current-state row on
+ * (client, device, item_key). See services/syncFailures.ts. */
+export interface SyncItemFailedPayload {
+  item_key: string;
+  kind: string;
+  label: string;
+  version: number | null;
+  error_type: string | null;
+  http_status: number | null;
+  error_message: string | null;
+  consecutive_failures: number;
+  first_failed_at: string | null;
+  last_failed_at: string | null;
+}
+
+/** Wire shape of a sync_item_resolved event (a previously-reported failing item
+ * that finally downloaded, or whose content was removed in studio). */
+export interface SyncItemResolvedPayload {
+  item_key: string;
+  resolution: 'downloaded' | 'removed';
+}
 
 /** Wire shape of a game_summary event payload (matches the mother's
  * sync_summaries rows and the studio game_summaries ingest branch). */
@@ -53,7 +80,7 @@ export interface GameSummaryPayload {
   name: string | null;
   game_type: string;
   scenario_uniqid: string | null;
-  /** UTC "YYYY-MM-DD HH:MM:SS" — start_time, falling back to created_at. */
+  /** UTC "YYYY-MM-DD HH:MM:SS" - start_time, falling back to created_at. */
   played_at: string | null;
   teams_launched: number | null;
   teams_played: number;
@@ -67,7 +94,7 @@ export interface ErrorContext {
 
 /**
  * Capture a JS error (caught or uncaught) into the outbox. Always swallows
- * its own failures — telemetry must never break the caller.
+ * its own failures - telemetry must never break the caller.
  */
 export async function captureError(err: unknown, context?: ErrorContext): Promise<void> {
   try {
@@ -95,18 +122,35 @@ export async function captureError(err: unknown, context?: ErrorContext): Promis
 /**
  * Send a device heartbeat, but only if the app_version has changed since the
  * last heartbeat (or if no heartbeat was ever sent). Safe to call every boot.
+ *
+ * `force` bypasses the app_version-equality gate - used when a device attribute
+ * carried by the heartbeat (e.g. the operator-only flag) changes without an app
+ * upgrade, so studio learns about it right away.
  */
-export async function sendHeartbeat(): Promise<void> {
+export async function sendHeartbeat(force = false): Promise<void> {
   try {
     const meta = await getDeviceMetadata();
     const db = await getDb();
 
     const lastVersion = await readSchemaMeta(db, META_LAST_HEARTBEAT_VERSION);
-    if (lastVersion === meta.app_version) {
+    if (!force && lastVersion === meta.app_version) {
       // Nothing changed. The server's last_seen_at gets bumped by every
       // authenticated request anyway (DeviceManager::bumpLastSeen).
       return;
     }
+
+    // Device role: whether this machine is operator-only (manage but never
+    // play). Studio reflects it as a read-only badge so a near-empty device
+    // doesn't look broken. Best-effort read - default false.
+    const operatorOnly = await loadConfig()
+      .then((c) => c.operatorOnlyDevice === true)
+      .catch(() => false);
+
+    // Active recovery-code reprieve deadline (device-lock), so the admin Devices
+    // view can show a "Reprieve until …" badge. null clears a lapsed one. A
+    // grantReprieve() call forces a heartbeat so this lands promptly. Design:
+    // project_client_device_lock.
+    const reprieveUntil = await reprieveUntilForHeartbeat().catch(() => null);
 
     await enqueue('heartbeat', {
       device_uniq: meta.device_uniq,
@@ -114,6 +158,8 @@ export async function sendHeartbeat(): Promise<void> {
       os: meta.os,
       os_version: meta.os_version,
       app_version: meta.app_version,
+      operator_only: operatorOnly,
+      billing_reprieve_until: reprieveUntil,
     });
 
     // Persist optimistically: if delivery fails we won't try again until the
@@ -164,6 +210,9 @@ export async function captureGameSummary(summary: GameSummaryPayload): Promise<v
 export async function captureRecoveryCodeUsed(used: {
   code_index: number;
   pool_version: number;
+  // Which gate burned the code: 'pin' (forgot-PIN) or 'billing' (device-lock
+  // reprieve). Defaults to 'pin' for back-compat. project_client_device_lock.
+  context?: 'pin' | 'billing';
 }): Promise<void> {
   try {
     const meta = await getDeviceMetadata().catch(() => null);
@@ -171,9 +220,34 @@ export async function captureRecoveryCodeUsed(used: {
       code_index: used.code_index,
       pool_version: used.pool_version,
       device_label: meta?.device_label ?? null,
+      context: used.context ?? 'pin',
     });
   } catch (err) {
     console.warn('[telemetry] captureRecoveryCodeUsed failed:', err);
+  }
+}
+
+/**
+ * Report a content-sync item that has become persistently stuck (failed 2+
+ * consecutive cycles). Best-effort; the studio upserts the current-state row.
+ */
+export async function captureSyncItemFailed(payload: SyncItemFailedPayload): Promise<void> {
+  try {
+    await enqueue('sync_item_failed', payload);
+  } catch (err) {
+    console.warn('[telemetry] captureSyncItemFailed failed:', err);
+  }
+}
+
+/**
+ * Report that a previously-reported stuck sync item has recovered (downloaded
+ * successfully, or its content was removed in studio). Best-effort.
+ */
+export async function captureSyncItemResolved(payload: SyncItemResolvedPayload): Promise<void> {
+  try {
+    await enqueue('sync_item_resolved', payload);
+  } catch (err) {
+    console.warn('[telemetry] captureSyncItemResolved failed:', err);
   }
 }
 
@@ -420,7 +494,7 @@ async function drainOnce(): Promise<void> {
       const acked = new Set(response.results.map((r) => r.event_uuid));
       const idsToDelete = rows.filter((r) => acked.has(r.event_uuid)).map((r) => r.id);
       if (idsToDelete.length === 0) {
-        // Server returned no statuses — pathological case. Don't loop forever.
+        // Server returned no statuses - pathological case. Don't loop forever.
         return;
       }
       await deleteRows(db, idsToDelete);
@@ -483,7 +557,7 @@ const TEXT_ENCODER = new TextEncoder();
 /**
  * sha256(message + first 5 stack frames). Hex-encoded. The fingerprint
  * survives line-number drift only insofar as the first 5 frames keep their
- * file:fn shape — close enough for client-side dedup; the server can group
+ * file:fn shape - close enough for client-side dedup; the server can group
  * by it for the admin view.
  */
 async function fingerprintError(message: string, stack: string | null): Promise<string> {

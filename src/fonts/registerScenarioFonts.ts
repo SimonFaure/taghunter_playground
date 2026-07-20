@@ -7,7 +7,7 @@
  * Each face in `game_meta.custom_fonts` becomes a `FontFace` registered under
  * the family name; `resolveFontFamily()` then maps `game_meta.font` onto it.
  *
- * Playground-only — Studio has its own preview-side equivalent.
+ * Playground-only - Studio has its own preview-side equivalent.
  *
  * Plan: C:\Users\faure\.claude\plans\studio-custom-fonts-typography.md
  */

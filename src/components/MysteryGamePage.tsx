@@ -4,9 +4,14 @@ import { sportidentService as siReader, CardData, StationData, detectReaderPort 
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
+import { PendingTeamsBar } from './PendingTeamsBar';
+import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import { applyTeamName } from '../services/gameMessages';
 import type { GameMessageType } from '../services/gameMessages';
 import {
   getLaunchedGameState,
+  getLaunchedGameMeta,
+  updateLaunchedGameMeta,
   recordPunch,
   updateTeam,
   deleteTeam,
@@ -50,6 +55,13 @@ interface GameData {
     }>;
     score_full_game: string;
     points_units?: string;
+    // Signed maluses applied once per enigma in the matching outcome state
+    // (default 0; negative = penalty, positive = bonus).
+    malus_both_answers_biped?: string;
+    malus_no_answer?: string;
+    // Game-level images for the "both answers" / "no answer" enigma states.
+    both_answers_image?: string;
+    no_answer_image?: string;
     levels: Record<string, { points: string; name: string; description: string }>;
     gauge_filling: string;
     background_image: string;
@@ -77,6 +89,7 @@ interface GameData {
     answer_type: string;
     good_answer?: string;
     good_answer_image: string;
+    wrong_answer_image?: string;
     good_answer_points: string;
     wrong_answer_points?: string;
   }>;
@@ -92,12 +105,30 @@ interface GameData {
         sound_id: string;
       }>
     | Record<string, string>;
+  // Per-language envelope synthesized by playground.php (LocalizedCompat). Lets
+  // the per-team reveal render level name/description in the team's language;
+  // falls back to the flattened (default-language) game_meta when absent.
+  translations?: Record<string, {
+    levels?: Record<string, { name?: string; description?: string }>;
+  }>;
+}
+
+/** Read a Localized<string> map (or plain string) at the given language. Returns
+ *  '' when absent so callers can `.trim()` and fall back. */
+function pickLocalized(v: unknown, lang: string): string {
+  if (!v) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'object') {
+    const map = v as Record<string, string>;
+    return map[lang] || Object.values(map)[0] || '';
+  }
+  return '';
 }
 
 export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd }: MysteryGamePageProps) {
   const [gameData, setGameData] = useState<GameData | null>(null);
   const gameDataRef = useRef<GameData | null>(null);
-  // Legacy single-player "endgame" screen — never entered in the per-team
+  // Legacy single-player "endgame" screen - never entered in the per-team
   // base-station flow, kept wired so the renderer's endgame branch still
   // type-checks. The per-team reveal happens on the 'ingame' screen.
   const [gameEnded] = useState(false);
@@ -106,19 +137,32 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // its first bip and is scored on its second. There's no single "active" team
   // between bips, so we don't run a live clock. `resultDurationSec` holds the
   // finishing team's elapsed time (end − start) and is the ONLY thing that
-  // makes the timer text appear — null = hidden (idle screen + during play).
+  // makes the timer text appear - null = hidden (idle screen + during play).
   const [resultDurationSec, setResultDurationSec] = useState<number | null>(null);
   // The finishing team's name, shown in the right-column name card only while
   // its results are on screen (null = hidden). Replaces the old display of
   // `config.name` (the launched-game name), which we never want there.
   const [resultTeamName, setResultTeamName] = useState<string | null>(null);
+  // The finishing team's display language, used to render the reveal's level
+  // name/description (and any team-facing text) in that team's language. Empty
+  // ⇒ fall back to the launch language. Set on the finishing bip, cleared on reset.
+  const [resultLanguage, setResultLanguage] = useState('');
   // Holding-vs-reveal gate. The in-game board is hidden until a team's second
   // bip plays the reveal. `revealStarted` true = the board is shown and the
-  // tally animation is running/done. With "use Enter/click to reveal results"
-  // ON, the second bip arms `pendingRevealRef` and an instructions screen holds
-  // until the operator presses Enter or clicks; OFF, the reveal fires at once.
+  // tally animation is running/done. Until then the board stays hidden (idle
+  // layout / background) and the reveal fires automatically on the finishing bip.
   const [revealStarted, setRevealStarted] = useState(false);
-  const pendingRevealRef = useRef<(() => void) | null>(null);
+  // End-of-run summary shown in the centre column (in place of the big enigma
+  // image) once a reveal has finished - or instantly, with no animation, when a
+  // finished team's card is bipped again. Holds the final score / level / team
+  // name; cleared on reset or when a newer reveal starts.
+  const [summary, setSummary] = useState<{
+    teamName: string;
+    finalScoreText: string;
+    levelName?: string;
+    levelDescription?: string;
+    note?: string;
+  } | null>(null);
   // Per-card snapshot of the punches already on a card at its first bip (keyed
   // by card id; value = `${code}@${time}` for each punch whose time isn't
   // 00:00:00). If the operator forgets to wipe a card, these stale punches must
@@ -129,7 +173,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // Punches read by THIS device's USB reader are processed immediately in
   // saveCardData; the 1s state poll then echoes those same raw_data rows back
   // (the server returns every row since the cursor, with no own-device filter).
-  // Track the row ids we've already handled locally so the poll skips them —
+  // Track the row ids we've already handled locally so the poll skips them -
   // otherwise each own-reader bip runs twice (now + ~1s later), which would
   // start AND finish a mystery team on its very first bip.
   const processedRawIdsRef = useRef<Set<number>>(new Set());
@@ -146,28 +190,35 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // every enigma as it tallies the score.
   const [revealEnigmaNumber, setRevealEnigmaNumber] = useState<string | null>(null);
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
-  const [stations, setStations] = useState<StationData[]>([]);
+  // Stations reported by the reader are logged (see setStationsDetectedCallback)
+  // but not otherwise consumed by this page.
   const [showCardAlert, setShowCardAlert] = useState(false);
   const [gameMessage, setGameMessage] = useState('');
   const [gameMessageType, setGameMessageType] = useState<GameMessageType>('info');
   const msgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Serialises on-screen presentations. Game messages AND the reveal animation
-  // share this one chain, so a new message/animation only starts once the
-  // previous one has fully finished — never overlapping. Tasks are appended in
-  // call order and run strictly in sequence. It's a ref so every code path
-  // (USB callback captured at mount, the state-poll, the reveal) appends to the
-  // same live queue regardless of which render's closure they were created in.
-  const presentationChainRef = useRef<Promise<void>>(Promise.resolve());
+  // share this one queue, so a new message/animation only starts once the
+  // previous one has fully finished - never overlapping. The labels of the
+  // not-yet-started items feed the bottom waiting-teams line.
+  const queue = usePresentationQueue();
   // Monotonic id of the reveal currently playing. A previous run's pending
   // auto-reset timer checks this before resetting, so it no-ops once a newer
-  // reveal has started — otherwise that stale timer wipes the new animation's
+  // reveal has started - otherwise that stale timer wipes the new animation's
   // board mid-play (the visuals vanish while the loop keeps firing sounds).
   const revealRunIdRef = useRef(0);
-  const [showLoading, setShowLoading] = useState(false);
+  // Held while a finished team's results board is on screen. Its `resolve` keeps
+  // the presentation-queue slot open so the NEXT team/message can't appear over
+  // the current player's summary - until the page is reset (auto timer or the
+  // operator's reset button). `runId` ties the held slot to the reveal that
+  // owns it, so a stale auto-reset timer never releases a newer team's board.
+  const pendingResetRef = useRef<{ runId: number; resolve: () => void } | null>(null);
+  // Nothing sets this anymore (legacy loading overlay at the bottom of the
+  // page keys off it); kept as a constant rather than deleting the overlay.
+  const [showLoading] = useState(false);
   // Loaded scenario audio keyed by sound role (e.g. 'enigma_success'). A ref,
   // not state, because `playSound` is reached through the bip handlers'
   // closures (USB callback set at mount, handleNewBip's useCallback) which are
-  // created BEFORE the async audio load finishes — a state value would be
+  // created BEFORE the async audio load finishes - a state value would be
   // captured empty there and the reveal would play no sound.
   const audioElementsRef = useRef<Record<string, HTMLAudioElement>>({});
   // First-bip video overlay state. Captures the team to finalize once the
@@ -179,10 +230,10 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // any videos. `finalize(name)` persists the name + proceeds to videos/start;
   // `abort()` cancels the start (and deletes the team if this bip created it).
   const [selfReg, setSelfReg] = useState<{
-    finalize: (name: string) => Promise<void>;
+    finalize: (name: string, language: string) => Promise<void>;
     abort: () => Promise<void>;
   } | null>(null);
-  // Banner shown when the SportIdent reader isn't plugged in — the game
+  // Banner shown when the SportIdent reader isn't plugged in - the game
   // page autobinds via 'reader:status' once detection flips.
   const detectedReader = useDetectedReaderPort();
 
@@ -215,6 +266,9 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           game_meta: gameMeta,
           game_enigmas: inner.game_enigmas || [],
           game_sounds: inner.game_sounds,
+          // Keep the per-language envelope so the per-team reveal can localize
+          // level name/description (playground.php ships it; we used to drop it).
+          translations: inner.translations,
         };
 
         setGameData(data);
@@ -267,23 +321,270 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     }
   };
 
-  // Append a presentation task to the serial chain; it runs only after every
-  // earlier message/animation has finished. Resolves when the task itself
-  // completes (not the whole future chain), so callers that await it (the
-  // reveal) advance as soon as their own slot is done. The chain survives a
-  // throwing task so one failure can't wedge the queue.
-  const enqueuePresentation = (task: () => Promise<void>): Promise<void> => {
-    const run = presentationChainRef.current.then(task, task);
-    presentationChainRef.current = run.then(
-      () => {},
-      () => {},
-    );
-    return run;
+  // Resolve one of the scenario's authored "UI text strings" (game_meta.text_*)
+  // at the given (team) language. Returns '' when the string is empty/absent so
+  // callers can decide whether to show a message or keep the built-in default.
+  const resolveMetaText = (key: string, lang?: string, teamName?: string | null): string => {
+    const meta = gameDataRef.current?.game_meta as Record<string, unknown> | undefined;
+    if (!meta) return '';
+    const raw = pickLocalized(meta[key], lang || config.language || '').trim();
+    // Authored strings may embed `%team%` to position the team name inside the
+    // sentence - substitute it (stripped when no team is in context).
+    return applyTeamName(raw, teamName);
+  };
+
+  // Format a score the same way the endgame line does: a percentage when the
+  // scenario uses percentage units, else "score / full".
+  const formatScore = (s: number): string => {
+    const meta = gameDataRef.current?.game_meta;
+    if (!meta) return `${Math.round(s)}`;
+    return meta.points_units === 'percentage'
+      ? `${Math.round(s)}%`
+      : `${Math.round(s)}`;
+  };
+
+  // Highest level whose points threshold is ≤ `scoreValue`, localized to `lang`.
+  // Mirrors the render-time `reachedLevel` computation but for an arbitrary
+  // score/language (used to build the end-of-run summary).
+  const reachedLevelFor = (
+    scoreValue: number,
+    lang: string,
+  ): { name: string; description: string } | null => {
+    const data = gameDataRef.current;
+    if (!data) return null;
+    const levels = data.game_meta.levels ?? {};
+    const localizedLevels = lang ? data.translations?.[lang]?.levels : undefined;
+    let bestKey: string | null = null;
+    let bestPts = -Infinity;
+    for (const [key, lvl] of Object.entries(levels)) {
+      const pts = parseFloat(lvl?.points ?? '0') || 0;
+      if (pts <= scoreValue && pts > bestPts) {
+        bestKey = key;
+        bestPts = pts;
+      }
+    }
+    if (bestKey === null) return null;
+    const flat = levels[bestKey];
+    const loc = localizedLevels?.[bestKey];
+    return {
+      name: loc?.name ?? flat?.name ?? '',
+      description: loc?.description ?? flat?.description ?? '',
+    };
+  };
+
+  // Per-enigma reveal outcome (id + semantic result + signed points). Shared by
+  // the animated reveal and the no-animation final-state render.
+  type EnigmaReveal = { enigma_id: string; result: EnigmaStatusKind; points: number };
+
+  // Score a card against the pattern's enigmas, dropping punches that were on the
+  // card at the first bip (baseline). Pure given the baseline ref - used by both
+  // the finishing-bip reveal and the finished-card re-bip (which has no baseline,
+  // so it scores every punch the same way the original finish did).
+  const scoreCardEnigmas = (
+    card: CardData,
+    data: GameData,
+    patternEnigmas: patternStore.PatternEnigma[],
+  ): { enigmaResults: EnigmaReveal[]; totalScore: number } => {
+    const baseline = preExistingPunchesRef.current.get(card.id) ?? new Set<string>();
+    const livePunches = card.punches.filter((p) => !baseline.has(`${p.code}@${p.time}`));
+    const cardPunchCodes = livePunches.map((p) => p.code.toString());
+    // Game-level signed maluses (default 0; negative = penalty, positive = bonus),
+    // applied once per enigma in the matching outcome state.
+    const bothMalus = parseInt(data.game_meta.malus_both_answers_biped || '0') || 0;
+    const noAnswerMalus = parseInt(data.game_meta.malus_no_answer || '0') || 0;
+    let totalScore = 0;
+    const enigmaResults = patternEnigmas.map((enigma) => {
+      const gameEnigma = data.game_enigmas.find((ge) => ge.number === enigma.enigma_id);
+      const goodPoints = parseInt(gameEnigma?.good_answer_points || '0');
+      const wrongPoints = parseInt(gameEnigma?.wrong_answer_points || '0');
+      const hasGoodAnswer = enigma.good_answers.some((a) => cardPunchCodes.includes(a));
+      const hasWrongAnswer = enigma.wrong_answers.some((a) => cardPunchCodes.includes(a));
+      let result: EnigmaStatusKind;
+      let points = 0;
+      if (hasGoodAnswer && hasWrongAnswer) {
+        result = 'both_answers';
+        points = bothMalus;
+        totalScore += bothMalus;
+      } else if (hasGoodAnswer) {
+        result = 'correct';
+        points = goodPoints;
+        totalScore += goodPoints;
+      } else if (hasWrongAnswer) {
+        result = 'incorrect';
+        points = -wrongPoints;
+        totalScore -= wrongPoints;
+      } else {
+        result = 'no_answer';
+        points = noAnswerMalus;
+        totalScore += noAnswerMalus;
+      }
+      return { enigma_id: enigma.enigma_id, result, points };
+    });
+    return { enigmaResults, totalScore };
+  };
+
+  // Map the Team-Details override vocabulary (found / wrong / not_found / both)
+  // onto the renderer's status kinds. The Team Details modal persists per-enigma
+  // overrides in this vocabulary; the board renders the kinds below.
+  const OVERRIDE_TO_KIND: Record<string, EnigmaStatusKind> = {
+    found: 'correct',
+    wrong: 'incorrect',
+    not_found: 'no_answer',
+    both: 'both_answers',
+  };
+
+  // Per-team enigma status overrides set in the Team Details modal, stored in
+  // launched-game meta under `enigma_overrides` = { "<teamId>": { "<enigmaId>": status } }.
+  // Returned already mapped to the renderer's status kinds so the finished-card
+  // re-bip can show the operator-corrected statuses (not the raw card scoring).
+  const readEnigmaOverridesForTeam = async (
+    teamId: number,
+  ): Promise<Record<string, EnigmaStatusKind>> => {
+    if (!launchedGameId) return {};
+    try {
+      const meta = await getLaunchedGameMeta(launchedGameId);
+      const all = JSON.parse(meta.enigma_overrides || '{}');
+      const forTeam = all?.[String(teamId)];
+      if (!forTeam || typeof forTeam !== 'object') return {};
+      const out: Record<string, EnigmaStatusKind> = {};
+      for (const [enigmaId, status] of Object.entries(forTeam)) {
+        const kind = OVERRIDE_TO_KIND[String(status)];
+        if (kind) out[enigmaId] = kind;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  };
+
+  // Reveal-overlay colour for a semantic enigma result.
+  const enigmaResultColor = (result: EnigmaStatusKind): string =>
+    result === 'correct'
+      ? 'rgba(0, 255, 0, 0.3)'
+      : result === 'incorrect'
+        ? 'rgba(255, 0, 0, 0.3)'
+        : result === 'no_answer'
+          ? 'rgba(128, 128, 128, 0.3)'
+          : 'rgba(255, 165, 0, 0.3)';
+
+  // Late-malus points for a run of `durationSec`: `malusPerMinute` × each started
+  // minute past the launch time limit (`config.duration`, minutes). 0 when no
+  // malus is configured, no limit is set, or the run finished on time.
+  const lateMalusForDuration = (durationSec: number): number => {
+    const perMin = config.malusPerMinute ?? 0;
+    const limitSec = (config.duration ?? 0) * 60;
+    if (perMin <= 0 || limitSec <= 0 || durationSec <= limitSec) return 0;
+    return Math.ceil((durationSec - limitSec) / 60) * perMin;
+  };
+
+  // Persist the auto-computed late malus for a finished team into launched-game
+  // meta (read-modify-write the single `late_malus` JSON map) so the Team Details
+  // modal can show it and offer a per-team override. Best-effort.
+  const persistLateMalus = async (teamId: number, malus: number) => {
+    try {
+      const meta = await getLaunchedGameMeta(launchedGameId!);
+      let map: Record<string, number>;
+      try {
+        map = JSON.parse(meta.late_malus || '{}');
+        if (!map || typeof map !== 'object') map = {};
+      } catch {
+        map = {};
+      }
+      map[String(teamId)] = malus;
+      await updateLaunchedGameMeta(launchedGameId!, { ...meta, late_malus: JSON.stringify(map) });
+    } catch (err) {
+      console.error('Error persisting late malus:', err);
+    }
+  };
+
+  // Re-display a finished team's result board in its FINAL state, instantly and
+  // without the walk animation (a finished card's 3rd+ bip). The per-enigma cell
+  // colours are recomputed from the card for the visuals, but the score shown is
+  // the team's PERSISTED score (which already folds in the late malus and any
+  // Team-Details overrides) so it matches the original reveal.
+  const showFinishedTeamFinalState = async (
+    finishedTeam: {
+      id: number;
+      team_name?: string | null;
+      language?: string | null;
+      start_time: number | null;
+      end_time: number | null;
+      score?: number;
+    },
+    card: CardData,
+    note?: string,
+    // Optional transient banner flashed over the re-displayed board (e.g. the
+    // scenario's "team ended" string), shown inside the held slot so it appears
+    // with the final board rather than after the page is reset.
+    banner?: { text: string; type?: GameMessageType },
+  ) => {
+    const data = gameDataRef.current;
+    if (!data) return;
+    const patternEnigmas = await patternStore.getMysteryEnigmas(config.pattern);
+    const { enigmaResults, totalScore } = scoreCardEnigmas(card, data, patternEnigmas);
+    // Apply the operator's per-enigma status corrections (Team Details modal) so
+    // the recap statuses match the persisted, override-applied score below -
+    // otherwise the board would show the raw card scoring and disagree with it.
+    const statusOverrides = await readEnigmaOverridesForTeam(finishedTeam.id);
+    const duration =
+      finishedTeam.end_time != null && finishedTeam.start_time != null
+        ? finishedTeam.end_time - finishedTeam.start_time
+        : 0;
+    // Prefer the persisted score; fall back to a fresh recompute (− late malus)
+    // for legacy rows finished before scores were stored.
+    const finalScore =
+      typeof finishedTeam.score === 'number'
+        ? finishedTeam.score
+        : totalScore - lateMalusForDuration(duration);
+    const lang = finishedTeam.language ?? config.language ?? '';
+    const teamName = finishedTeam.team_name ?? '';
+
+    await queue.enqueue(teamName, async () => {
+      // Claim this as the current run so any prior auto-reset timer no-ops.
+      const myRunId = ++revealRunIdRef.current;
+      setSummary(null);
+      setRevealStarted(true);
+      setResultDurationSec(duration);
+      setResultTeamName(teamName);
+      setResultLanguage(lang);
+
+      const colors: Record<string, string> = {};
+      const kinds: Record<string, EnigmaStatusKind> = {};
+      const completed = new Set<number>();
+      for (const r of enigmaResults) {
+        const effective = statusOverrides[r.enigma_id] ?? r.result;
+        colors[r.enigma_id] = enigmaResultColor(effective);
+        kinds[r.enigma_id] = effective;
+        completed.add(parseInt(r.enigma_id, 10));
+      }
+      setEnigmaStatusColors(colors);
+      setEnigmaStatusKinds(kinds);
+      setCompletedEnigmas(completed);
+      setRevealEnigmaNumber(null);
+      setScore(finalScore);
+
+      const level = reachedLevelFor(finalScore, lang);
+      setSummary({
+        teamName,
+        finalScoreText: formatScore(finalScore),
+        levelName: level?.name || undefined,
+        levelDescription: level?.description || undefined,
+        note: note || undefined,
+      });
+
+      // Flash the optional banner (e.g. "team ended") over the board first.
+      if (banner?.text) await displayMessage(banner.text, banner.type ?? 'info');
+
+      // Keep this slot (and thus the next team/message) on hold until the
+      // operator resets the page (or auto-reset fires) - the re-displayed
+      // final board must not be overwritten by the next bip's presentation.
+      await waitForReset(myRunId);
+    });
   };
 
   // Low-level message presentation: show the banner (+ optional sound) and
   // resolve once it has been on screen for the full display duration. NOT
-  // queued — used directly inside an already-running queue slot (the reveal's
+  // queued - used directly inside an already-running queue slot (the reveal's
   // result banner) where re-entering the queue would deadlock.
   const displayMessage = (
     message: string,
@@ -304,12 +605,17 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
 
   // Public message API: serialise behind any in-flight message/animation so it
   // only appears once the previous one is over. Fire-and-forget at call sites
-  // (the enqueue happens synchronously, preserving order).
+  // (the enqueue happens synchronously, preserving order). `label` is the team
+  // name shown in the waiting line while this message is deferred (null for
+  // team-agnostic messages like "card not registered").
   const showMessage = (
     message: string,
     type: GameMessageType = 'info',
     sound?: string,
-  ): Promise<void> => enqueuePresentation(() => displayMessage(message, type, sound));
+    label: string | null = null,
+  ): void => {
+    queue.enqueue(label, () => displayMessage(message, type, sound));
+  };
 
   const saveCardData = async (card: CardData) => {
     if (!launchedGameId) {
@@ -346,20 +652,56 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     }
   };
 
+  // Always dispatch punches to the LATEST saveCardData without re-binding the
+  // reader. The reader effect binds once per launched game (see below); binding
+  // the callback to the mount-time `saveCardData` closure captured a stale
+  // `launchedGameId` on the JOIN path (device joins a game launched elsewhere),
+  // so every punch hit the `!launchedGameId` guard and was silently dropped.
+  // Mirror Tracks/Clash: bind once per game, call through a ref.
+  const saveCardDataRef = useRef(saveCardData);
+  useEffect(() => {
+    saveCardDataRef.current = saveCardData;
+  });
+
   // Return the display to the ready 'ingame' screen without a page reload.
   // Triggered by "Auto-reset page" after a run's results have shown.
   const resetToReady = () => {
     setScore(0);
     setResultDurationSec(null);
     setResultTeamName(null);
+    setResultLanguage('');
     setRevealStarted(false);
+    setSummary(null);
     setCompletedEnigmas(new Set());
     setEnigmaStatusColors({});
     setEnigmaStatusKinds({});
     setRevealEnigmaNumber(null);
     setGameMessage('');
     setShowCardAlert(false);
+    // Release the presentation queue: the results board is gone, so the next
+    // waiting team/message may now appear. No-op when nothing was holding.
+    const pending = pendingResetRef.current;
+    if (pending) {
+      pendingResetRef.current = null;
+      pending.resolve();
+    }
   };
+
+  // Hold the current presentation-queue slot open until the results board is
+  // reset - manually (the summary's reset button → resetToReady) or, when
+  // "Auto-reset page" is on, automatically after `delayBeforeReset`. This is
+  // what keeps the next player's "C'est parti" / reveal from appearing over the
+  // previous player's summary. `myRunId` guards the auto timer so a stale run's
+  // timer never wipes a newer team's board (and never blocks the queue forever).
+  const waitForReset = (myRunId: number): Promise<void> =>
+    new Promise<void>((resolve) => {
+      pendingResetRef.current = { runId: myRunId, resolve };
+      if (config.autoResetTeam) {
+        setTimeout(() => {
+          if (revealRunIdRef.current === myRunId) resetToReady();
+        }, (config.delayBeforeReset || 0) * 1000);
+      }
+    });
 
   const handleCardPunchLogic = async (card: CardData) => {
     if (!launchedGameId) return;
@@ -378,7 +720,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       const state = await getLaunchedGameState(launchedGameId, 0);
       const teamsForCard = state.teams.filter((t) => t.key_id === card.id);
       let team = teamsForCard.find((t) => t.end_time == null) ?? null;
-      // True when *this* bip created the team — drives the self-register abort
+      // True when *this* bip created the team - drives the self-register abort
       // cleanup (delete a just-created team, never a rostered one).
       let createdNow = false;
 
@@ -387,24 +729,47 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         if (!finished) {
           if (!config.autoRegisterTeam && !config.selfRegisterTeam) {
             console.warn('No team for card (dynamic team modes off):', card.id);
+            // Bipped card belongs to no team and dynamic registration is off:
+            // show the scenario's "card not corresponding" UI string if authored.
+            const msg = resolveMetaText('text_card_not_corresponding');
+            if (msg) showMessage(msg, 'warning');
             return;
           }
           team = await ensureTeamForCard(launchedGameId, card.id, state, !!config.useNamePool);
           if (!team) {
-            showMessage('Carte non enregistrée', 'warning');
+            showMessage('Puce non enregistrée', 'warning');
             return;
           }
           createdNow = true;
         } else {
           if (!config.reuseCards) {
-            console.log('Team has already finished the game');
+            // A finished card bipped again (no reuse): re-display the finished
+            // team's final result board WITHOUT replaying the walk animation,
+            // and flash the "team ended" UI string if authored.
+            const finishedTeam = teamsForCard.reduce((a, b) =>
+              (b.end_time ?? 0) > (a.end_time ?? 0) ? b : a,
+            );
+            const ended = resolveMetaText('text_team_ended', finishedTeam.language ?? '', finishedTeam.team_name ?? null);
+            await showFinishedTeamFinalState(
+              finishedTeam,
+              card,
+              undefined,
+              ended ? { text: ended, type: 'info' } : undefined,
+            );
             return;
           }
           const lastEnd = Math.max(...teamsForCard.map((t) => t.end_time ?? 0));
           const cooldownSec = (config.reuseDelayMinutes ?? 5) * 60;
           if (Date.now() / 1000 < lastEnd + cooldownSec) {
+            // Reuse is on but this card is still cooling down (3rd+ bip): re-show
+            // the finished team's results board WITHOUT replaying the walk, and
+            // carry the cooldown notice as a small footnote at the bottom.
             const remainingMin = Math.max(1, Math.ceil((lastEnd + cooldownSec - Date.now() / 1000) / 60));
-            showMessage(`Ce doigt sera remis en jeu dans ${remainingMin} minute${remainingMin > 1 ? 's' : ''}`, 'warning');
+            const cooldownNote = `Ce doigt sera remis en jeu dans ${remainingMin} minute${remainingMin > 1 ? 's' : ''}`;
+            const finishedTeam = teamsForCard.reduce((a, b) =>
+              (b.end_time ?? 0) > (a.end_time ?? 0) ? b : a,
+            );
+            await showFinishedTeamFinalState(finishedTeam, card, cooldownNote);
             return;
           }
           team = await ensureTeamForCard(launchedGameId, card.id, state, !!config.useNamePool);
@@ -418,12 +783,18 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         // The start sequence, parameterised by the effective team name: persist
         // a self-registered rename, then gate the clock on any first-bip videos.
         // Runs directly when self-register is off, or from the overlay's submit.
-        const proceedAfterName = async (effectiveName: string) => {
-          if (effectiveName && effectiveName !== teamName) {
+        const proceedAfterName = async (effectiveName: string, teamLanguage?: string) => {
+          // The team's effective display language: the player's overlay pick, else
+          // the launch language. Drives in-game text + first-bip video track.
+          const effLang = teamLanguage || config.language;
+          if ((effectiveName && effectiveName !== teamName) || teamLanguage) {
             try {
-              await updateTeam(team.id, { team_name: effectiveName });
+              await updateTeam(team.id, {
+                ...(effectiveName && effectiveName !== teamName ? { team_name: effectiveName } : {}),
+                ...(teamLanguage ? { language: teamLanguage } : {}),
+              });
             } catch (err) {
-              console.error('Error saving self-registered name:', err);
+              console.error('Error saving self-registered name/language:', err);
             }
           }
 
@@ -436,7 +807,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               // A fresh run wants an empty card. Punches with a real time
               // (not the 00:00:00 placeholder) mean the card wasn't wiped.
               // Snapshot them as `${code}@${time}` so scoring can subtract
-              // them at the second bip — the operator gets a heads-up but the
+              // them at the second bip - the operator gets a heads-up but the
               // run still starts (we just won't count the stale punches).
               const stalePunches = (card.punches ?? []).filter(
                 (p) => p.time && p.time !== '00:00:00'
@@ -454,12 +825,23 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
                 preExistingPunchesRef.current.delete(card.id);
               }
 
-              const startMsg = `C'est parti ! ${effectiveName}`;
-              const warnMsg =
-                stalePunches.length > 0
-                  ? ` — ⚠️ Carte non vide : ${stalePunches.length} ancien${stalePunches.length > 1 ? 's' : ''} passage${stalePunches.length > 1 ? 's' : ''} ignoré${stalePunches.length > 1 ? 's' : ''}`
-                  : '';
-              showMessage(startMsg + warnMsg, warnMsg ? 'warning' : 'success', 'game_start');
+              // Start message: prefer the scenario's authored UI strings (resolved
+              // in the team's language), falling back to the built-in French text.
+              // When the card wasn't empty, the "team starts card not empty"
+              // string (or the default warning suffix) is shown instead.
+              const startLang = teamLanguage || config.language || '';
+              const cardNotEmpty = stalePunches.length > 0;
+              const playerStartsTxt = resolveMetaText('text_player_starts', startLang, effectiveName);
+              const cardNotEmptyTxt = resolveMetaText('text_team_starts_card_not_empty', startLang, effectiveName);
+              let startMessage: string;
+              if (cardNotEmpty) {
+                startMessage = cardNotEmptyTxt
+                  ? cardNotEmptyTxt
+                  : `C'est parti ! ${effectiveName} - ⚠️ Puce non vide : ${stalePunches.length} ancien${stalePunches.length > 1 ? 's' : ''} passage${stalePunches.length > 1 ? 's' : ''} ignoré${stalePunches.length > 1 ? 's' : ''}`;
+              } else {
+                startMessage = playerStartsTxt ? playerStartsTxt : `C'est parti ! ${effectiveName}`;
+              }
+              showMessage(startMessage, cardNotEmpty ? 'warning' : 'success', 'game_start', effectiveName);
             } catch (err) {
               console.error('Error updating team start time:', err);
             }
@@ -472,7 +854,12 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           if (wantsVideos) {
             const gameTypeCode = (currentGameData.game?.type || 'mystery').toLowerCase();
             const rawForResolve = await scenarioStore.getGameData(gameUniqid);
-            const videos = await resolveFirstBipVideos(config, gameUniqid, gameTypeCode, rawForResolve);
+            const videos = await resolveFirstBipVideos(
+              { ...config, language: effLang },
+              gameUniqid,
+              gameTypeCode,
+              rawForResolve
+            );
             if (videos.length > 0) {
               pendingFirstBipFinalizeRef.current = finalizeStart;
               setFirstBipVideos(videos);
@@ -488,7 +875,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         // the team if this bip created it.
         if (config.selfRegisterTeam) {
           setSelfReg({
-            finalize: (name: string) => proceedAfterName(name),
+            finalize: (name: string, language: string) => proceedAfterName(name, language),
             abort: async () => {
               setSelfReg(null);
               if (createdNow) {
@@ -506,81 +893,20 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         await proceedAfterName(teamName);
       } else if (!team.end_time) {
         const endTime = Math.floor(Date.now() / 1000);
+        const duration = endTime - team.start_time;
 
         const patternEnigmas = await patternStore.getMysteryEnigmas(config.pattern);
-        console.log('Loaded pattern enigmas:', patternEnigmas);
+        const { enigmaResults, totalScore: enigmaTotal } = scoreCardEnigmas(card, currentGameData, patternEnigmas);
 
-        // Drop punches that were already on the card at the first bip (matched
-        // on code+time, so a station legitimately re-punched during the run —
-        // new time — still counts). Keeps a forgotten-to-wipe card from
-        // scoring its leftover punches.
+        // Late malus: subtract the configured per-minute penalty for every minute
+        // past the launch time limit. The persisted score includes it.
+        const lateMalus = lateMalusForDuration(duration);
+        const totalScore = enigmaTotal - lateMalus;
+        const finishLang = team.language ?? config.language ?? '';
+        // Did the team bip any answers this run? Drives the "card empty" notice
+        // (mirrors the baseline subtraction scoreCardEnigmas applies).
         const baseline = preExistingPunchesRef.current.get(card.id) ?? new Set<string>();
-        const livePunches = card.punches.filter(p => !baseline.has(`${p.code}@${p.time}`));
-        if (baseline.size > 0) {
-          console.log(`Ignoring ${card.punches.length - livePunches.length} pre-existing punch(es) for card ${card.id}`);
-        }
-        const cardPunchCodes = livePunches.map(p => p.code.toString());
-        console.log('Card punch codes (after removing pre-existing):', cardPunchCodes);
-
-        let totalScore = 0;
-
-        console.log('=== MATCHING ENIGMAS ===');
-        console.log('Game enigmas:', currentGameData.game_enigmas.map(ge => ({ number: ge.number, id: ge.id, good_points: ge.good_answer_points, wrong_points: ge.wrong_answer_points })));
-
-        const enigmaResults = patternEnigmas.map((enigma) => {
-          const gameEnigma = currentGameData.game_enigmas.find(ge => ge.number === enigma.enigma_id);
-          console.log(`Looking for enigma_id "${enigma.enigma_id}":`, gameEnigma ? `Found (number: ${gameEnigma.number}, good: ${gameEnigma.good_answer_points}, wrong: ${gameEnigma.wrong_answer_points})` : 'NOT FOUND');
-
-          const goodPoints = parseInt(gameEnigma?.good_answer_points || '0');
-          const wrongPoints = parseInt(gameEnigma?.wrong_answer_points || '0');
-
-          const hasGoodAnswer = enigma.good_answers.some(answer => cardPunchCodes.includes(answer));
-          const hasWrongAnswer = enigma.wrong_answers.some(answer => cardPunchCodes.includes(answer));
-
-          let result: 'correct' | 'incorrect' | 'no_answer' | 'both_answers';
-          let points = 0;
-
-          if (hasGoodAnswer && hasWrongAnswer) {
-            result = 'both_answers';
-            points = 0;
-          } else if (hasGoodAnswer && !hasWrongAnswer) {
-            result = 'correct';
-            points = goodPoints;
-            totalScore += goodPoints;
-          } else if (hasWrongAnswer && !hasGoodAnswer) {
-            result = 'incorrect';
-            points = -wrongPoints;
-            totalScore -= wrongPoints;
-          } else {
-            result = 'no_answer';
-            points = 0;
-          }
-
-          return {
-            enigma_id: enigma.enigma_id,
-            good_answers: enigma.good_answers,
-            wrong_answers: enigma.wrong_answers,
-            result,
-            points,
-            hasGoodAnswer,
-            hasWrongAnswer,
-          };
-        });
-
-        console.log('=== ENIGMA RESULTS ===');
-        enigmaResults.forEach((result) => {
-          console.log(`Enigma ${result.enigma_id}:`, {
-            expected_good: result.good_answers,
-            expected_wrong: result.wrong_answers,
-            result: result.result,
-            points: result.points,
-            hasGoodAnswer: result.hasGoodAnswer,
-            hasWrongAnswer: result.hasWrongAnswer,
-          });
-        });
-
-        console.log('=== FINAL SCORE ===');
-        console.log('Total Score:', totalScore);
+        const livePunchCount = card.punches.filter(p => !baseline.has(`${p.code}@${p.time}`)).length;
 
         let updateOk = true;
         try {
@@ -590,12 +916,11 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           updateOk = false;
         }
         if (updateOk) {
-          console.log('✓ Team finished:', teamName);
-          console.log('✓ Score:', totalScore);
-          const duration = endTime - team.start_time;
           // The run is scored; drop the card's start-time baseline so a later
           // reuse of the same card starts clean.
           preExistingPunchesRef.current.delete(card.id);
+          // Persist the auto late malus so the Team Details modal can show + override it.
+          if (lateMalus > 0) void persistLateMalus(team.id, lateMalus);
 
           // Play the reveal: show the board (the finishing team's name +
           // elapsed time), start from a hidden/zeroed state, then walk each
@@ -604,39 +929,41 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
             // Claim this as the current reveal run; the auto-reset timer below
             // captures it so a previous run's reset can't wipe this board.
             const myRunId = ++revealRunIdRef.current;
+            setSummary(null);
             setRevealStarted(true);
             setResultDurationSec(duration);
             setResultTeamName(teamName);
+            setResultLanguage(finishLang);
             setScore(0);
             setCompletedEnigmas(new Set());
             setEnigmaStatusColors({});
             setEnigmaStatusKinds({});
             setRevealEnigmaNumber(null);
 
+            // Card-empty / late-malus notices (authored UI strings, if any) shown
+            // before the walk so the operator sees why the run scored as it did.
+            const cardEmptyTxt = livePunchCount === 0 ? resolveMetaText('text_card_empty', finishLang, teamName) : '';
+            if (cardEmptyTxt) await displayMessage(cardEmptyTxt, 'warning');
+            const lateMalusTxt = lateMalus > 0 ? resolveMetaText('text_late_malus', finishLang, teamName) : '';
+            if (lateMalusTxt) await displayMessage(lateMalusTxt, 'warning');
+
+            // The board elements (team name, timer, blurred enigmas, gauge) are
+            // now on screen - hold a 1s beat before the tally walk begins.
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
             let currentScore = 0;
             for (const enigmaResult of enigmaResults) {
               const gameEnigma = currentGameData.game_enigmas.find(ge => ge.number === enigmaResult.enigma_id);
               if (!gameEnigma) continue;
 
-              let backgroundColor = '';
-              switch (enigmaResult.result) {
-                case 'correct':
-                  backgroundColor = 'rgba(0, 255, 0, 0.3)';
-                  playSound('enigma_success');
-                  break;
-                case 'incorrect':
-                  backgroundColor = 'rgba(255, 0, 0, 0.3)';
-                  playSound('enigma_error');
-                  break;
-                case 'no_answer':
-                  backgroundColor = 'rgba(128, 128, 128, 0.3)';
-                  playSound('enigma_no_answer');
-                  break;
-                case 'both_answers':
-                  backgroundColor = 'rgba(255, 165, 0, 0.3)';
-                  playSound('enigma_error');
-                  break;
-              }
+              const backgroundColor = enigmaResultColor(enigmaResult.result);
+              playSound(
+                enigmaResult.result === 'correct'
+                  ? 'enigma_success'
+                  : enigmaResult.result === 'no_answer'
+                    ? 'enigma_no_answer'
+                    : 'enigma_error',
+              );
 
               setRevealEnigmaNumber(enigmaResult.enigma_id);
               setEnigmaStatusColors(prev => ({ ...prev, [enigmaResult.enigma_id]: backgroundColor }));
@@ -664,43 +991,38 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               await new Promise(resolve => setTimeout(resolve, stepSec * 1000));
             }
 
-            // The result banner belongs to THIS animation slot: await it so the
-            // queue only advances to the next team's message/animation once the
-            // banner has shown for its full duration (animation + banner are one
-            // atomic, non-overlapping unit). displayMessage is used directly
-            // here — we're already inside the queue slot, so re-enqueuing would
-            // deadlock.
-            await displayMessage(`Terminé! ${teamName} - Score: ${totalScore} - Temps: ${formatTime(duration)}`, 'success', 'game_end');
-
-            // Auto-reset page: after results have shown, return the display to
-            // the ready/holding screen automatically — but only if no newer
-            // reveal has started since (otherwise we'd wipe ITS board mid-play).
-            if (config.autoResetTeam) {
-              setTimeout(() => {
-                if (revealRunIdRef.current === myRunId) resetToReady();
-              }, (config.delayBeforeReset || 0) * 1000);
+            // Apply the late malus to the running tally so the final figure
+            // matches the persisted score, then play the end sound.
+            if (lateMalus > 0) {
+              currentScore -= lateMalus;
+              setScore(currentScore);
             }
+            playSound('game_end');
+
+            // Replace the centre enigma image with the end-of-run summary:
+            // final score, level reached + description, team name, reset button.
+            const level = reachedLevelFor(currentScore, finishLang);
+            setSummary({
+              teamName,
+              finalScoreText: formatScore(currentScore),
+              levelName: level?.name || undefined,
+              levelDescription: level?.description || undefined,
+            });
+
+            // Hold this slot open until the page is reset - automatically after
+            // `delayBeforeReset` when "Auto-reset page" is on, or until the
+            // operator hits the reset button otherwise. This is what makes the
+            // next player's "C'est parti" / reveal wait until THIS team's
+            // results have been cleared, instead of appearing over them.
+            await waitForReset(myRunId);
           };
 
-          // Queue the whole hold→reveal→banner as ONE slot: it waits for any
-          // in-flight message/animation before starting and holds the queue
-          // until done. The Enter/click hold lives INSIDE the slot too —
-          // "Use Enter/click to reveal results" (default on) shows the
-          // instructions holding screen and arms the reveal (the global
-          // Enter/click listener fires it); off reveals immediately. Keeping the
-          // hold inside the slot is what stops a later team's bip from flipping
-          // the holding screen on (setRevealStarted(false)) in the middle of the
-          // team that's currently animating.
-          await enqueuePresentation(async () => {
-            if (config.revealResultsOnInput !== false) {
-              setRevealStarted(false); // instructions holding screen until reveal
-              console.log('⌨️  Awaiting Enter/click to reveal results...');
-              await new Promise<void>((resolve) => {
-                pendingRevealRef.current = () => { pendingRevealRef.current = null; resolve(); };
-              });
-            }
-            await runReveal();
-          });
+          // Queue the reveal→banner as ONE slot: it waits for any in-flight
+          // message/animation before starting and holds the queue until done.
+          // The reveal fires automatically on the finishing bip (no holding
+          // screen). Keeping it inside the slot is what stops a later team's bip
+          // from disturbing the team that's currently animating.
+          await queue.enqueue(teamName, runReveal);
         }
       } else {
         console.log('Team has already finished the game');
@@ -710,29 +1032,30 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     }
   };
 
-  // Clicking the holding/instructions screen fires the armed reveal (same as
-  // pressing Enter / clicking anywhere). No-op if nothing is armed.
-  const handleStartGame = () => {
-    pendingRevealRef.current?.();
-  };
+  // Live handles for the Enter key. Kept in refs so the once-registered listener
+  // never closes over stale state: it fires only while a results summary is on
+  // screen and "use Enter to refresh the page" is on.
+  const summaryShowingRef = useRef(false);
+  summaryShowingRef.current = summary != null;
+  const enterToResetRef = useRef(false);
+  enterToResetRef.current = config.enterToReset === true;
+  const resetToReadyRef = useRef(resetToReady);
+  resetToReadyRef.current = resetToReady;
 
-  // Reveal gate (only relevant when "use Enter/click to reveal results" is on):
-  // a finishing bip arms `pendingRevealRef`, and pressing Enter or clicking
-  // anywhere fires the held reveal. No-op when nothing is armed, so it never
-  // interferes with the idle/holding screen.
+  // Enter mirrors the summary's refresh button: once a team's results are on
+  // screen, pressing Enter resets the page (gated by `enterToReset`). NOTE:
+  // there is intentionally NO window-wide click listener - only the on-screen
+  // refresh button resets by click.
   useEffect(() => {
-    const fireReveal = () => {
-      const run = pendingRevealRef.current;
-      if (run) run();
-    };
     const handleKeyPress = (event: KeyboardEvent) => {
-      if (event.key === 'Enter') fireReveal();
+      if (event.key !== 'Enter') return;
+      if (summaryShowingRef.current && enterToResetRef.current) {
+        resetToReadyRef.current();
+      }
     };
     window.addEventListener('keydown', handleKeyPress);
-    window.addEventListener('click', fireReveal);
     return () => {
       window.removeEventListener('keydown', handleKeyPress);
-      window.removeEventListener('click', fireReveal);
     };
   }, []);
 
@@ -744,9 +1067,12 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         console.log('ℹ️  USB not available in this runtime - reader disabled');
         return;
       }
+      // Don't bind the reader until we know which game we're in - the effect
+      // re-runs when launchedGameId lands (join path) and binds then.
+      if (!launchedGameId) return;
       const detected = await detectReaderPort();
       if (cancelled || !detected) {
-        if (!detected) console.log('⚠️  No SportIdent reader detected — waiting for hotplug');
+        if (!detected) console.log('⚠️  No SportIdent reader detected - waiting for hotplug');
         return;
       }
       try {
@@ -771,7 +1097,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               console.log('  Punches:', card.punches);
               console.log('  Full card data:', JSON.stringify(card, null, 2));
 
-              saveCardData(card);
+              void saveCardDataRef.current(card);
 
               setLastCardData(card);
               setShowCardAlert(true);
@@ -800,7 +1126,6 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
                 });
               });
               console.log('  Full stations data:', JSON.stringify(detectedStations, null, 2));
-              setStations(detectedStations);
             });
 
             console.log('▶️  Starting USB reader...');
@@ -831,34 +1156,36 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         });
       }
     };
-  }, []);
+    // Re-bind when the joined game's id is established (mirrors Tracks/Clash),
+    // so a device that joins a game launched elsewhere records its punches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [launchedGameId]);
 
   const handleNewBip = useCallback((row: { id?: number; raw_data: any }) => {
-    // Skip rows this device already processed locally via the USB reader; the
-    // poll echoes our own punches back ~1s later and re-running the logic would
-    // start+finish a team on one bip. Remote (satellite) punches aren't in the
-    // set, so they still flow through here.
+    // Own punches are processed live in the USB-reader callback, which records
+    // the row id here; the poll echoes them back ~1s later - skip our own echo.
     if (row.id != null && processedRawIdsRef.current.has(row.id)) return;
-    const card = row.raw_data;
-    if (card && gameDataRef.current) {
-      console.log('🏷️  CARD DETECTED (test/simulation)');
-      console.log('  Card ID:', card.id);
-      console.log('  Series:', card.series);
-      console.log('  Number of punches:', card.nbPunch);
-      console.log('  Punches:', card.punches);
-      console.log('  Full card data:', JSON.stringify(card, null, 2));
-      setLastCardData(card);
-      setShowCardAlert(true);
-      setTimeout(() => setShowCardAlert(false), 5000);
-      handleCardPunchLogic(card);
-    }
-  }, [launchedGameId]);
+    // Anything else is a punch read on ANOTHER device, reaching us through the
+    // shared state poll. Each station animates only the cards it physically
+    // read, so we must NOT replay a remote bip here - doing so was animating a
+    // single bip on every device in the game.
+  }, []);
 
   useGameStatePolling({
     launchedGameId,
     numberOfTeams: config.numberOfTeams,
     onGameEnded: () => onGameEnd?.(),
-    onAllTeamsFinished: () => onGameEnd?.(),
+    onAllTeamsFinished: () => {
+      // Show the scenario's "all teams ended" UI string (if authored), then end
+      // the game once it has had its display time; otherwise end immediately.
+      const msg = resolveMetaText('text_all_team_ended');
+      if (msg) {
+        showMessage(msg, 'info');
+        setTimeout(() => onGameEnd?.(), (config.messageDisplayDuration || 5) * 1000 + 500);
+      } else {
+        onGameEnd?.();
+      }
+    },
     onNewBip: handleNewBip,
     disableAllFinishedEnd: !!(config.autoRegisterTeam || config.reuseCards || config.selfRegisterTeam),
   });
@@ -880,18 +1207,11 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // root so all mystery text inherits it.
   const scenarioFontFamily = resolveFontFamily(gameData.game_meta.font);
 
-  // Holding-vs-reveal display model. The in-game board is only shown once a
-  // team's reveal is playing (`revealStarted`). Until then we hold:
-  //   • "use Enter/click to reveal results" ON  → show the instructions screen
-  //     (operator presses Enter/clicks to play the reveal);
-  //   • OFF → stay on 'ingame' but blank the board (boardHidden) so everything
-  //     is hidden and only appears when the reveal fires on the finishing bip.
-  const holdWithInstructions = !revealStarted && config.revealResultsOnInput !== false;
-  const screen: MysteryScreen = gameEnded
-    ? 'endgame'
-    : holdWithInstructions
-      ? 'instructions'
-      : 'ingame';
+  // Display model. The in-game board is only shown once a team's reveal is
+  // playing (`revealStarted`). Until then the board is blanked (boardHidden) so
+  // the idle layout / background shows; everything appears when the reveal fires
+  // automatically on the finishing bip.
+  const screen: MysteryScreen = gameEnded ? 'endgame' : 'ingame';
   const boardHidden = screen === 'ingame' && !revealStarted;
 
   // Centre column focuses the next uncompleted enigma; during the end-of-game
@@ -913,21 +1233,32 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
 
   const finalScoreText = gameData.game_meta.points_units === 'percentage'
     ? `${Math.round(score)}%`
-    : `${Math.round(score)} / ${gameData.game_meta.score_full_game}`;
+    : `${Math.round(score)}`;
 
-  // Highest level whose points threshold is ≤ current score — drives the
-  // endgame screen's level name + description.
+  // Highest level whose points threshold is ≤ current score - drives the
+  // endgame screen's level name + description. Resolved in the finishing team's
+  // language when available (translations envelope), else the flattened default.
   const reachedLevel = (() => {
-    let best: { name: string; description: string } | null = null;
+    const levels = gameData.game_meta.levels ?? {};
+    // The team's language for this reveal; empty ⇒ use the flat default text.
+    const lang = resultLanguage || config.language || '';
+    const localizedLevels = lang ? gameData.translations?.[lang]?.levels : undefined;
+    let bestKey: string | null = null;
     let bestPts = -Infinity;
-    for (const lvl of Object.values(gameData.game_meta.levels ?? {})) {
+    for (const [key, lvl] of Object.entries(levels)) {
       const pts = parseFloat(lvl?.points ?? '0') || 0;
       if (pts <= score && pts > bestPts) {
-        best = { name: lvl?.name ?? '', description: lvl?.description ?? '' };
+        bestKey = key;
         bestPts = pts;
       }
     }
-    return best;
+    if (bestKey === null) return null;
+    const flat = levels[bestKey];
+    const loc = localizedLevels?.[bestKey];
+    return {
+      name: loc?.name ?? flat?.name ?? '',
+      description: loc?.description ?? flat?.description ?? '',
+    };
   })();
 
   return (
@@ -938,10 +1269,14 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       {selfReg && (
         <SelfRegisterOverlay
           language={config.language || 'fr'}
-          onSubmit={(name) => {
+          scenarioLanguages={config.scenarioLanguages ?? []}
+          scenarioAudience={config.namePoolAudience ?? 'kids'}
+          allowLanguageChoice={!!config.allowPlayerLanguageChoice}
+          addRandomName={!!config.addRandomNameOption}
+          onSubmit={(name, language) => {
             const s = selfReg;
             setSelfReg(null);
-            void s.finalize(name);
+            void s.finalize(name, language);
           }}
           onAbort={() => {
             void selfReg.abort();
@@ -959,12 +1294,12 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           }}
         />
       )}
-      {/* Dev-only punch/hardware debug indicator — removed from production builds. */}
+      {/* Dev-only punch/hardware debug indicator - removed from production builds. */}
       {import.meta.env.DEV && (
         <CardDetectionAlert cardData={lastCardData} show={showCardAlert} />
       )}
 
-      {/* No title/back chrome — the in-game screen is full-bleed. Exit is via
+      {/* No title/back chrome - the in-game screen is full-bleed. Exit is via
           GamePage's 4-tap top-right corner → operator panel (PIN-gated when
           "use PIN to exit" is on). Only the operational banners below render,
           and only while their condition holds, so there's no permanent top bar. */}
@@ -973,7 +1308,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           {config.testMode && (
             <div className="flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/20 backdrop-blur-sm border-b border-amber-500/30">
               <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode — Max 5 Teams</span>
+              <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode - Max 5 Teams</span>
               <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
             </div>
           )}
@@ -981,7 +1316,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
             <div className="flex items-center justify-center gap-3 px-4 py-2 bg-orange-500/20 backdrop-blur-sm border-b border-orange-500/40">
               <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
               <span className="text-orange-300 text-sm">
-                Reader not connected — waiting for SportIdent dongle. Punches will start landing as soon as you plug it in.
+                Reader not connected - waiting for SportIdent dongle. Punches will start landing as soon as you plug it in.
               </span>
             </div>
           )}
@@ -1003,17 +1338,30 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         colorblind={config.colorblindMode}
         selectedEnigmaIndex={selectedEnigmaIndex}
         gaugePercent={gaugePercent}
-        onStartGame={handleStartGame}
         onRestart={() => window.location.reload()}
+        summary={summary}
+        onReset={resetToReady}
         finalScoreText={finalScoreText}
         endLevelName={reachedLevel?.name}
         endLevelDescription={reachedLevel?.description}
         fontFamily={scenarioFontFamily || undefined}
+        scenarioTitle={gameData.game.title}
+        showIdleLayout={config.showIdleLayout}
+        idleSubtitle={config.idleSubtitle}
       />
 
       <GameMessageOverlay
         message={gameMessage || null}
         type={gameMessageType}
+        fontFamily={scenarioFontFamily || undefined}
+      />
+
+      {/* While a full-screen message ("C'est parti …" etc.) is on screen, hide
+          the waiting line so it doesn't show through; it reappears once the
+          message clears. */}
+      <PendingTeamsBar
+        labels={queue.pending}
+        hidden={!!gameMessage}
         fontFamily={scenarioFontFamily || undefined}
       />
 

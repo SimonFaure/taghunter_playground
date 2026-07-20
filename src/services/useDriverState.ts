@@ -5,7 +5,7 @@
 // isReaderConnected poll flips. This way the USB driver screen and the
 // Hardware tab both react to hotplug without each running its own poll.
 //
-// `recheck()` forces an immediate re-detection — useful after a manual
+// `recheck()` forces an immediate re-detection - useful after a manual
 // driver install attempt completes, where we want the card to flip from
 // blocked_by_policy → healthy without waiting for the next polling tick.
 

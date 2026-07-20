@@ -1,0 +1,9 @@
+{
+  "title": "Saisissez votre code PIN",
+  "subtitle": "Saisissez le code PIN de l’appareil pour continuer.",
+  "wrongPin": "Code PIN incorrect. Réessayez.",
+  "checkFailed": "Impossible de vérifier le code PIN. Réessayez.",
+  "checking": "Vérification…",
+  "forgotPin": "Code PIN oublié ?",
+  "cancel": "Annuler"
+}

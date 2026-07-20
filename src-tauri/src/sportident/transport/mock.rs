@@ -1,4 +1,4 @@
-// MockTransport — in-memory SerialTransport for hardware-free integration
+// MockTransport - in-memory SerialTransport for hardware-free integration
 // tests of the reader state machine (step 4 onwards).
 //
 // Usage shape:
@@ -39,11 +39,11 @@ impl MockTransport {
     }
 
     /// Simulate the peer sending bytes to us. Bytes appear in the same
-    /// chunking the caller passes here — tests use this to assert the
+    /// chunking the caller passes here - tests use this to assert the
     /// decoder is robust to fragmentation (1-byte chunks vs full frames).
     pub fn inject_rx(&self, bytes: &[u8]) {
         if let Some(tx) = self.rx_sender.lock().unwrap().as_ref() {
-            // Bytes::copy_from_slice — owned snapshot, safe across awaits.
+            // Bytes::copy_from_slice - owned snapshot, safe across awaits.
             let _ = tx.send(Ok(Bytes::copy_from_slice(bytes)));
         }
     }

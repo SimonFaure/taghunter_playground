@@ -21,7 +21,7 @@ const SALT_BYTES = 16;
 
 // Progressive backoff. After a run of wrong attempts hits one of these
 // thresholds, the next attempt is gated until `locked_until_at` (unix
-// seconds). The counter never resets on its own — only a correct PIN
+// seconds). The counter never resets on its own - only a correct PIN
 // (or an OTP-driven reset) clears it. We never wipe state.
 const BACKOFF_STEPS: ReadonlyArray<{ threshold: number; delaySeconds: number }> = [
   { threshold: 5, delaySeconds: 30 },

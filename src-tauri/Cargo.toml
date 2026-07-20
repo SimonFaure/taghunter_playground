@@ -9,6 +9,14 @@ edition = "2021"
 name = "taghunter_playground_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Compiles the WebView2 inspector (DevTools) into the binary AND auto-opens it
+# at boot (see the #[cfg(feature = "devtools")] block in lib.rs setup). OFF for
+# stable/production bundles - DevTools is stripped out. The Tester channel build
+# is produced with `tauri build --features devtools`, so QA devices can inspect
+# the running app. Re-exports tauri's own `devtools` feature.
+devtools = ["tauri/devtools"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,6 +48,11 @@ tokio-serial = "5"
 async-trait = "0.1"
 bytes = "1"
 
+# Streaming SHA-256 for the content-addressed scenario blob pool: verify a
+# downloaded media blob's bytes against the studio-advertised hash without
+# buffering a multi-hundred-MB video in the WebView heap (sha256_file command).
+sha2 = "0.10"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Foundation",
@@ -59,7 +72,7 @@ windows = { version = "0.58", features = [
 
 # Desktop-only: app self-update + OS autostart. The Tauri updater cannot
 # self-install on mobile (Android/iOS go through the app stores), and
-# launch-on-boot is a desktop-only concept — so these are gated to desktop
+# launch-on-boot is a desktop-only concept - so these are gated to desktop
 # targets and registered behind #[cfg(desktop)] in lib.rs.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
@@ -69,3 +82,11 @@ tauri-plugin-autostart = "2"
 # Tauri 2 mobile entry-point (compiled in for android/ios targets).
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri = { version = "2", features = [] }
+
+# SportIdent Android transport: raw JNI bridge to SportIdentSerial.kt.
+# Rust → Kotlin (list/open/write/close) and Kotlin → Rust (rx-bytes/rx-error/
+# rx-closed callbacks) both cross JNI directly - ByteArray ↔ Vec<u8> is the
+# native exchange shape. See sportident/transport/android.rs.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"

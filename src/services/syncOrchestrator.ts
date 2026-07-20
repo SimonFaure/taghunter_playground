@@ -2,7 +2,7 @@
 //
 // Responsibilities (per slice 2 plan):
 //   - Trigger cycles: startup, foreground (>=5min), network-up, 30-min timer,
-//     manual. All debounced — at most one cycle in flight; subsequent triggers
+//     manual. All debounced - at most one cycle in flight; subsequent triggers
 //     within 60s of the last cycle start are dropped.
 //   - On each cycle:
 //       1. Fetch get_user_data_update manifest.
@@ -20,32 +20,53 @@
 // Q9 escape hatch: if mobile profiling shows JS-heap pressure on big media
 // downloads, lift this whole orchestrator into Rust.
 
-import { ApiError, apiCall, apiDownloadBytesStream } from './api';
+import { ApiError, apiCall, apiDownloadBytesStream, apiDownloadStreamed } from './api';
 import { withRetry } from './apiRetry';
 import { AuthUser } from './authStore';
 import {
   ensureDir,
-  scenarioVersionDirRel,
   onDemandCardsFileRel,
   teamNamesFileRel,
   writeJson,
   writeBinary,
+  streamBinary,
   writeText,
+  blobExists,
+  blobPathRel,
+  blobTmpPathRel,
+  commitBlobFromTemp,
+  removeRecursive,
 } from './contentFs';
+import { invoke } from '@tauri-apps/api/core';
+import { appDataDir, join } from '@tauri-apps/api/path';
 import * as scenarioStore from './scenarioStore';
 import * as patternStore from './patternStore';
-import * as layoutStore from './layoutStore';
 import * as cardsStore from './cardsStore';
 import * as namePoolsStore from './namePoolsStore';
 import * as recoveryCodesStore from './recoveryCodesStore';
+import * as reportLayoutsStore from './reportLayoutsStore';
+import { setSyncedDefaultPrintPrefs } from './printPrefsStore';
 import * as translationsStore from './translationsStore';
+import { hydrateIngameFromStore } from '../i18n/ingame';
 import * as gameTypesStore from './gameTypesStore';
+import * as lanNetworks from './lanNetworks';
+import * as wifiNetworksStore from './wifiNetworksStore';
+import { isGameActive } from './activeSession';
 import * as clientPreferencesStore from './clientPreferencesStore';
 import {
   gameTypeAdminVersionDirRel,
   gameTypeClientVersionDirRel,
 } from './contentFs';
 import { startConnectivityMonitor, onConnectivityChange, isOnline } from './connectivity';
+import {
+  syncItemKey,
+  recordFailure,
+  recordSuccess,
+  reconcileObsolete,
+  recordScenarioComplete,
+} from './syncFailures';
+import { captureError } from './telemetry';
+import { loadConfig } from '../utils/config';
 import { emit } from './syncEvents';
 import type { CyclePhase, CycleFailureDetail } from './syncEvents';
 import { getDb } from './db';
@@ -66,15 +87,16 @@ const CYCLE_HARD_CAP_MS = 10 * 60 * 1000;
 export type Trigger = 'startup' | 'foreground' | 'network_up' | 'timer' | 'manual';
 
 interface ManifestResponse {
-  custom_scenarios: Array<{ uniqid: string; title: string; version: number; game_type: string }>;
-  product_scenarios: Array<{ uniqid: string; title: string; version: number; game_type: string }>;
+  custom_scenarios: Array<{ uniqid: string; title: string; version: number; game_type: string; content_hash?: string | null }>;
+  product_scenarios: Array<{ uniqid: string; title: string; version: number; game_type: string; content_hash?: string | null }>;
   default_patterns: Array<{ pattern_uniqid: string; name: string; version: number; game_type: string }>;
   custom_patterns: Array<{ pattern_uniqid: string; name: string; version: number; game_type: string }>;
   cards_version: number | null;
   has_on_demand_cards: boolean;
   team_names_version?: number;
   recovery_codes_version?: number;
-  layouts: Array<{ id: number; version: number; game_type: string }>;
+  report_layouts_version?: number;
+  lan_networks_version?: number;
   translations?: Array<{ key: string; value: unknown; version: number }>;
   game_types?: gameTypesStore.GameTypeManifestRow[];
   client_game_type_overrides?: gameTypesStore.GameTypeOverrideManifestRow[];
@@ -85,6 +107,11 @@ interface ScenarioMetaResponse {
   scenario: { uniqid: string; name: string; scenario_type: string };
   game_data: unknown;
   medias: string[] | null;
+  // CAS manifest. `files` is authoritative: per-file content hashes incl. the
+  // game-data.json entry (keyed by data_hash). `data_hash` is also surfaced
+  // top-level. Both present once the studio hash migration has run.
+  data_hash?: string | null;
+  files?: Array<{ rel_path: string; hash: string; size: number }> | null;
 }
 
 interface PatternDownloadResponse {
@@ -92,18 +119,20 @@ interface PatternDownloadResponse {
   pattern_slug: string | null;
   description: string | null;
   pattern_data: unknown;
+  stations?: Record<string, string> | null;
   version: number;
 }
 
-type WorkItem =
+export type WorkItem =
   | { kind: 'cards'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'on_demand'; priority: 1; clientId: number; label: string }
   | { kind: 'team_names'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'recovery_codes'; priority: 1; clientId: number; remoteVersion: number; label: string }
+  | { kind: 'report_layouts'; priority: 1; remoteVersion: number; label: string }
+  | { kind: 'lan_networks'; priority: 1; remoteVersion: number; label: string }
   | { kind: 'pattern'; priority: 2; uniqid: string; remoteVersion: number; label: string }
-  | { kind: 'layout'; priority: 3; id: number; remoteVersion: number; label: string }
-  | { kind: 'scenario_meta'; priority: 4; uniqid: string; remoteVersion: number; label: string }
-  | { kind: 'scenario_media'; priority: 5; uniqid: string; remoteVersion: number; filename: string; label: string }
+  | { kind: 'scenario_meta'; priority: 4; uniqid: string; remoteVersion: number; remoteContentHash: string; label: string }
+  | { kind: 'scenario_media'; priority: 5; uniqid: string; filename: string; hash: string; label: string }
   | { kind: 'game_type_admin_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; label: string }
   | { kind: 'game_type_override_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; label: string };
 
@@ -120,15 +149,37 @@ let disposers: Array<() => void> = [];
 let timerHandle: ReturnType<typeof setInterval> | null = null;
 let lastVisibleAtMs = Date.now();
 
-// Per-cycle scratch — used by the catch block to attach diagnostic context to
+// Per-cycle scratch - used by the catch block to attach diagnostic context to
 // cycle:failed events. Reset at the top of every cycle. Mirrors what the UI
 // would otherwise have to track itself by listening to events.
 let currentTrigger: Trigger | null = null;
 let currentPhase: CyclePhase | null = null;
 let lastCurrentLabel: string | null = null;
 
-// Per-scenario bookkeeping inside a cycle. Cleared between cycles.
-const scenarioProgress = new Map<string, { remaining: Set<string>; failed: Set<string> }>();
+// Operator-only device (AppConfig.operatorOnlyDevice): read once at the top of
+// every cycle. When true, the cycle downloads only each scenario's game-data +
+// its single visual image and skips all game-type tutorial videos - this device
+// manages games but never plays them. See project_operator_only_device.
+let operatorOnly = false;
+
+// Per-scenario bookkeeping inside a cycle. `manifest` is the full target file
+// set (rel_path -> hash, incl. game-data.json) to commit once `remaining`
+// (the media files still being fetched) drains with no failures. Cleared
+// between cycles.
+interface ScenarioProgress {
+  remaining: Set<string>;
+  failed: Set<string>;
+  manifest: scenarioStore.ManifestFile[];
+  remoteContentHash: string;
+  remoteVersion: number;
+}
+const scenarioProgress = new Map<string, ScenarioProgress>();
+
+// Monotonic disambiguator for in-flight blob temp filenames, so two workers
+// fetching the same missing blob (e.g. a file shared by two scenarios) don't
+// collide on one temp path before the verify+rename. Module-lived; the value
+// is irrelevant, only its uniqueness within a run.
+let blobTmpSeq = 0;
 
 // ---------- public API ----------
 
@@ -227,6 +278,13 @@ export async function runCycleNow(trigger: Trigger = 'manual'): Promise<void> {
 async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Promise<void> {
   if (!started || !currentUser) return;
   if (cycleInFlight) return;
+  // Offline → don't even attempt a cycle. Every request would just time out
+  // and surface as a spurious "Sync failed" banner. The 'network_up' trigger
+  // (fired by the connectivity monitor when the radio recovers) is the proper
+  // resumption path, so nothing is lost by skipping here. A user-initiated
+  // 'manual' sync is still honoured - they may know connectivity is back even
+  // when navigator.onLine hasn't caught up (captive-portal lag, etc.).
+  if (!isOnline() && trigger !== 'manual') return;
   if (
     !opts.force &&
     lastCycleStartedAtMs !== null &&
@@ -245,6 +303,12 @@ async function runCycle(trigger: Trigger): Promise<void> {
   lastCycleStartedAtMs = Date.now();
   cycleAbort = new AbortController();
   scenarioProgress.clear();
+
+  // Operator-only download policy - read once for the whole cycle (cheap FS
+  // read). Drives the slim scenario-media filter + tutorial-video skip below.
+  operatorOnly = await loadConfig()
+    .then((c) => c.operatorOnlyDevice === true)
+    .catch(() => false);
 
   // Hard cap (see CYCLE_HARD_CAP_MS). Firing aborts the cycle: the pool stops
   // dispatch, Promise.all resolves, and the cycle ends as a recoverable
@@ -266,7 +330,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
   let failed = 0;
 
   // The terminal event (cycle:finished / cycle:failed) is captured here and
-  // fired from the finally block — AFTER cycleInFlight is cleared — so a
+  // fired from the finally block - AFTER cycleInFlight is cleared - so a
   // listener that calls getState() inside its handler sees the orchestrator
   // already idle. Emitting it inline (while still inside this try) left
   // cycleInFlight=true at notification time, which froze the UI's "Syncing…".
@@ -283,7 +347,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
       try {
         await cardsStore.pushPendingMutations();
       } catch (err) {
-        // Auth failures bubble up — same as any other phase.
+        // Auth failures bubble up - same as any other phase.
         if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
           throw err;
         }
@@ -310,7 +374,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     // Pull counts BEFORE checking for auth error. The pool returns partial
     // progress on auth failure (used to throw, which discarded the counts
     // and skipped the post-pool sweep). This keeps lastCycleStats accurate
-    // — "1 of 12 downloaded" rather than the stale "0 of 3" the catch
+    // - "1 of 12 downloaded" rather than the stale "0 of 3" the catch
     // block used to record.
     completed = result.completed;
     failed = result.failed;
@@ -348,6 +412,15 @@ async function runCycle(trigger: Trigger): Promise<void> {
         lastLabel: lastCurrentLabel,
         counters: { total, completed, failed },
       });
+      // Whole-cycle failure (manifest fetch died, hard-cap/abort, etc.) has no
+      // per-item key - report it via the generic error-telemetry path so the
+      // admin sees "device X's sync cycle is failing entirely". Best-effort.
+      void captureError(err, {
+        source: 'sync_cycle',
+        trigger: detail.trigger,
+        phase: detail.phase ?? undefined,
+        last_label: detail.lastLabel ?? undefined,
+      });
       emitTerminal = () =>
         emit('cycle:failed', {
           reason: detail.errorType
@@ -363,7 +436,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     cycleAbort = null;
     currentPhase = null;
     currentTrigger = null;
-    // Orchestrator is idle again — now fire the terminal event so any
+    // Orchestrator is idle again - now fire the terminal event so any
     // getState() call inside a listener observes the consistent idle state.
     emitTerminal?.();
   }
@@ -371,7 +444,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
 
 // Build a serializable diagnostic snapshot for cycle:failed. The catch block
 // receives an arbitrary thrown value (Error subclass, string, plain object,
-// undefined — anything). We normalize to strings so the UI can render and
+// undefined - anything). We normalize to strings so the UI can render and
 // the user can copy-paste a complete diagnostic without listeners having to
 // JSON.stringify a circular value themselves.
 function buildFailureDetail(err: unknown): CycleFailureDetail {
@@ -421,12 +494,12 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   if (!currentUser) throw new Error('orchestrator: no current user');
   const clientId = currentUser.client_id;
 
-  // NOTE: push_pending lives in runCycle (its own phase) — by the time we
+  // NOTE: push_pending lives in runCycle (its own phase) - by the time we
   // get here, any outgoing card mutations have been pushed and studio's
   // cards_version reflects this device's writes.
 
   // apiCall applies a default 30s per-request timeout internally (see
-  // api.ts DEFAULT_REQUEST_TIMEOUT_MS) — pass only the cycle abort signal.
+  // api.ts DEFAULT_REQUEST_TIMEOUT_MS) - pass only the cycle abort signal.
   const manifest = await withRetry(() =>
     apiCall<ManifestResponse>('playground', 'get_user_data_update', {
       method: 'GET',
@@ -435,13 +508,18 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     })
   );
 
+  // Best-effort replay of any deferred onboarding/Network "default hotspot" /
+  // "default mother" writes (grill Q13). We're guaranteed online + authed here,
+  // so this is the natural retry tick. Fire-and-forget - it never blocks sync.
+  void lanNetworks.flushPendingLanOps();
+
   const seenAt = new Date().toISOString();
   // db handle was used here for an explicit BEGIN/COMMIT transaction. That
   // pattern is unsafe with tauri-plugin-sql v2: the plugin's only API is
   // `execute(sql)` running on a sqlx::Pool, which acquires a fresh
   // connection per call. A `BEGIN` executed on connection A is invisible to
   // subsequent statements that get connection B, and the BEGIN'd connection
-  // is returned to the pool with an open transaction — surfacing later as
+  // is returned to the pool with an open transaction - surfacing later as
   // "cannot start a transaction within a transaction" on a totally
   // unrelated cycle. The plugin exposes no transaction-binding API.
   //
@@ -454,13 +532,22 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
 
   // Scenarios: combine custom + product into a single set, distinguish via flag.
   const allScenarioRows = [
-    ...manifest.custom_scenarios.map((s) => ({ ...s, is_product: false })),
-    ...manifest.product_scenarios.map((s) => ({ ...s, is_product: true })),
+    ...manifest.custom_scenarios.map((s) => ({ ...s, content_hash: s.content_hash ?? null, is_product: false })),
+    ...manifest.product_scenarios.map((s) => ({ ...s, content_hash: s.content_hash ?? null, is_product: true })),
   ];
   await scenarioStore.upsertFromManifest(allScenarioRows, seenAt);
-  const removedScenarios = await scenarioStore.tombstoneMissing(allScenarioRows.map((s) => s.uniqid));
-  if (removedScenarios.length) {
-    emit('content:updated', { kind: 'scenarios', ids: [], removed: removedScenarios });
+
+  // Never prune local content out from under a running game. Tombstoning hard-deletes
+  // rows + on-disk media, which would yank a scenario the live game is rendering (e.g.
+  // an admin disables its game type mid-event). Upserts above still apply; the prune is
+  // deferred until the next cycle after the game ends. See activeSession.isGameActive.
+  const pruneAllowed = !isGameActive();
+
+  if (pruneAllowed) {
+    const removedScenarios = await scenarioStore.tombstoneMissing(allScenarioRows.map((s) => s.uniqid));
+    if (removedScenarios.length) {
+      emit('content:updated', { kind: 'scenarios', ids: [], removed: removedScenarios });
+    }
   }
 
   // Patterns: default + custom.
@@ -469,20 +556,23 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     ...manifest.custom_patterns.map((p) => ({ ...p, is_default: false })),
   ];
   await patternStore.upsertFromManifest(allPatternRows, seenAt);
-  const removedPatterns = await patternStore.tombstoneMissing(allPatternRows.map((p) => p.pattern_uniqid));
-  if (removedPatterns.length) {
-    emit('content:updated', { kind: 'patterns', ids: [], removed: removedPatterns });
+  if (pruneAllowed) {
+    const removedPatterns = await patternStore.tombstoneMissing(allPatternRows.map((p) => p.pattern_uniqid));
+    if (removedPatterns.length) {
+      emit('content:updated', { kind: 'patterns', ids: [], removed: removedPatterns });
+    }
   }
 
-  // Layouts are NO LONGER synced. They were only ever consumed by tagquest's
-  // HUD positioning, which now falls back to its bundled default layout; tracks
-  // places its elements via game_meta.checkpoints[].position (synced with the
-  // scenario), and mystery doesn't use layouts. Skipping the manifest apply +
-  // download keeps the cycle lean. (manifest.layouts is intentionally ignored.)
+  // The per-game-type `layouts` pipeline was retired (studio dropped it too):
+  // tagquest falls back to its bundled default layout, tracks places elements
+  // via game_meta.checkpoints[].position (synced with the scenario), clash uses
+  // scenario_layout, and mystery has no layout. Nothing to sync here.
 
   // Global admin translations (inline JSON, no separate download pool).
   await translationsStore.upsertFromManifest(manifest.translations ?? [], seenAt);
   await translationsStore.tombstoneMissing(translationsStore.KNOWN_TRANSLATION_KEYS);
+  // Overlay the freshly-synced in-game text (bucket 2) onto the i18next baselines.
+  await hydrateIngameFromStore();
 
   // Game types (admin defaults + per-client overrides). Inline manifest +
   // separate video/subtitle downloads queued via the same pool.
@@ -493,7 +583,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   await gameTypesStore.upsertOverridesFromManifest(overrides);
   await gameTypesStore.tombstoneMissingOverrides(overrides.map((o) => o.game_type_code));
 
-  // Client preferences (inline JSON only — no version, just last-write-wins).
+  // Client preferences (inline JSON only - no version, just last-write-wins).
   await clientPreferencesStore.setFromManifest(clientId, manifest.client_preferences ?? {});
 
   // Cards (single-row state).
@@ -510,6 +600,11 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   // Offline PIN-recovery codes (single-row state, incremental version compare).
   await recoveryCodesStore.upsertFromManifest(clientId, {
     recovery_codes_version: manifest.recovery_codes_version ?? null,
+  });
+
+  // Mission-report PDF layout defaults (global, single-row state).
+  await reportLayoutsStore.upsertFromManifest({
+    report_layouts_version: manifest.report_layouts_version ?? null,
   });
 
   // Build the work list from each store's pending-downloads view.
@@ -554,6 +649,43 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       });
     }
   }
+  if (await reportLayoutsStore.needsDownload()) {
+    const row = await reportLayoutsStore.getState();
+    if (row && row.remote_version !== null) {
+      work.push({
+        kind: 'report_layouts',
+        priority: 1,
+        remoteVersion: row.remote_version,
+        label: `Report layouts v${row.remote_version}`,
+      });
+    }
+  }
+
+  // Relayed default-hotspot networks (Feature B download side). A simple
+  // version-compare against the schema_meta-stored local version - when studio's
+  // advances, re-pull get_lan_networks and upsert into wifi_networks. Siblings
+  // that never paired thus learn the SSID/password to auto-join.
+  {
+    const remoteVersion = manifest.lan_networks_version ?? 0;
+    const localVersion = await lanNetworks.getLocalLanVersion();
+    // Re-pull when the version advanced OR when studio advertises networks but
+    // we hold none locally. The latter self-heals the trap where an earlier
+    // empty pull (studio had nothing yet) advanced the local version + tombstoned
+    // any rows: a flat seed version of 1 would never exceed it, so the device
+    // would stay creds-less forever. Cheap COUNT, only when there's something to
+    // pull and we're not already up to date.
+    const needPull =
+      remoteVersion > localVersion ||
+      (remoteVersion > 0 && (await wifiNetworksStore.countStudio()) === 0);
+    if (needPull) {
+      work.push({
+        kind: 'lan_networks',
+        priority: 1,
+        remoteVersion,
+        label: `LAN networks v${remoteVersion}`,
+      });
+    }
+  }
 
   for (const p of await patternStore.listPendingDownloads()) {
     work.push({
@@ -564,44 +696,60 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       label: `Pattern: ${p.name}`,
     });
   }
-  // Layouts intentionally not enqueued — see the manifest-apply note above.
+  // Layouts intentionally not enqueued - see the manifest-apply note above.
   for (const s of await scenarioStore.listPendingDownloads()) {
+    if (!s.remote_content_hash) continue; // gate guarantees non-null, belt-and-braces
     work.push({
       kind: 'scenario_meta',
       priority: 4,
       uniqid: s.uniqid,
       remoteVersion: s.remote_version,
+      remoteContentHash: s.remote_content_hash,
       label: `Scenario: ${s.title}`,
     });
   }
 
-  for (const g of await gameTypesStore.listPendingAdminDownloads()) {
-    if (!g.tutorial_video_filename) continue;
-    work.push({
-      kind: 'game_type_admin_video',
-      priority: 6,
-      code: g.code,
-      remoteVersion: g.remote_version,
-      filename: g.tutorial_video_filename,
-      subtitleFilenames: g.tutorial_subtitles,
-      label: `Tutorial video (${g.name})`,
-    });
-  }
-  for (const o of await gameTypesStore.listPendingOverrideDownloads()) {
-    if (!o.tutorial_video_filename) continue;
-    work.push({
-      kind: 'game_type_override_video',
-      priority: 6,
-      code: o.game_type_code,
-      remoteVersion: o.remote_version,
-      filename: o.tutorial_video_filename,
-      subtitleFilenames: o.tutorial_subtitles,
-      label: `Tutorial override (${o.game_type_code})`,
-    });
+  // Game-type tutorial videos are play-only (shown to players in-game) and the
+  // heaviest assets on disk. An operator-only device never plays, so skip them
+  // entirely - the game-type rows are still upserted above (for labels/metadata),
+  // just not enqueued for the big video download.
+  if (!operatorOnly) {
+    for (const g of await gameTypesStore.listPendingAdminDownloads()) {
+      if (!g.tutorial_video_filename) continue;
+      work.push({
+        kind: 'game_type_admin_video',
+        priority: 6,
+        code: g.code,
+        remoteVersion: g.remote_version,
+        filename: g.tutorial_video_filename,
+        subtitleFilenames: g.tutorial_subtitles,
+        label: `Tutorial video (${g.name})`,
+      });
+    }
+    for (const o of await gameTypesStore.listPendingOverrideDownloads()) {
+      if (!o.tutorial_video_filename) continue;
+      work.push({
+        kind: 'game_type_override_video',
+        priority: 6,
+        code: o.game_type_code,
+        remoteVersion: o.remote_version,
+        filename: o.tutorial_video_filename,
+        subtitleFilenames: o.tutorial_subtitles,
+        label: `Tutorial override (${o.game_type_code})`,
+      });
+    }
   }
 
   // Stable priority sort.
   work.sort((a, b) => a.priority - b.priority);
+
+  // Reconcile the failure tracker against reality: any previously-failing item
+  // that's no longer pending (its content was unassigned/removed in studio)
+  // left the work list without succeeding - resolve-by-removal so the admin's
+  // view doesn't show it stuck forever. Dynamic scenario_media keys aren't in
+  // `work` yet; reconcileObsolete keeps them alive via their parent scenario.
+  await reconcileObsolete(new Set(work.map((w) => syncItemKey(w))));
+
   return work;
 }
 
@@ -611,7 +759,7 @@ async function runDownloadPool(
   initial: WorkItem[],
   signal: AbortSignal
 ): Promise<{ completed: number; failed: number; total: number; authError: ApiError | null }> {
-  // Dynamic queue — scenario_meta tasks enqueue scenario_media items mid-cycle.
+  // Dynamic queue - scenario_meta tasks enqueue scenario_media items mid-cycle.
   const queue: WorkItem[] = [...initial];
   let completed = 0;
   let failed = 0;
@@ -639,6 +787,9 @@ async function runDownloadPool(
           total += enqueued.length;
         }
         completed += 1;
+        // Item downloaded OK - if it was being tracked as failing, clear the
+        // row (and report resolved to studio if it had been promoted).
+        await recordSuccess(item).catch(() => {});
         emit('cycle:progress', {
           total,
           completed,
@@ -655,8 +806,8 @@ async function runDownloadPool(
         // 403 is NOT auth-invalid: the token is fine, the client just lacks
         // access to THIS one resource (e.g. an un-owned product scenario the
         // manifest still advertised). It must fall through to the per-item
-        // failure path below so the rest of the work — scenarios the client
-        // *can* access — still downloads, and so it does not trigger a
+        // failure path below so the rest of the work - scenarios the client
+        // *can* access - still downloads, and so it does not trigger a
         // spurious auth refresh.
         if (err instanceof ApiError && err.status === 401) {
           authInvalid = true;
@@ -677,6 +828,11 @@ async function runDownloadPool(
         // never streamed (the listener just removes a key it didn't know).
         emitItemProgress(item.label, item.kind, 0, null, true);
         await markFailed(item).catch(() => {});
+        // Persistent per-item failure tracker: records the file/label + error
+        // for the operator panel, and promotes to a studio report after 2
+        // consecutive failing cycles. 403 (un-owned resource) lands here too,
+        // which is intentional - the admin wants to see those.
+        await recordFailure(item, err).catch(() => {});
       }
     }
   });
@@ -684,17 +840,23 @@ async function runDownloadPool(
   await Promise.all(workers);
 
   // Mark scenarios that have completed all their media items. We run this
-  // sweep UNCONDITIONALLY — even when an auth_invalid bubbled up — so any
+  // sweep UNCONDITIONALLY - even when an auth_invalid bubbled up - so any
   // scenario whose media all completed before the auth blip still gets
   // committed. Without this, an auth-interrupted cycle leaves the DB at
   // 0-downloaded even though bytes are already on disk.
   for (const [uniqid, progress] of scenarioProgress) {
     if (progress.remaining.size === 0 && progress.failed.size === 0) {
-      const row = await scenarioStore.get(uniqid);
-      if (row) {
-        await scenarioStore.markDownloaded(uniqid, row.remote_version);
-        emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
-      }
+      // All target blobs are in the pool - atomically swap in the new manifest
+      // and mark the scenario reconciled at the remote content hash.
+      await scenarioStore.commitManifest(
+        uniqid,
+        progress.manifest,
+        progress.remoteContentHash,
+        progress.remoteVersion
+      );
+      emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
+      // Scenario fully downloaded - clear any stale media failure rows for it.
+      await recordScenarioComplete(uniqid).catch(() => {});
     } else if (progress.failed.size > 0) {
       await scenarioStore.incrementFailedAttempts(uniqid).catch(() => {});
     }
@@ -746,11 +908,15 @@ async function markFailed(item: WorkItem): Promise<void> {
     case 'recovery_codes':
       await recoveryCodesStore.incrementFailedAttempts(item.clientId);
       break;
+    case 'report_layouts':
+      await reportLayoutsStore.incrementFailedAttempts();
+      break;
+    case 'lan_networks':
+      // No retry-counter store; a failed pull simply leaves the local version
+      // behind, so the next cycle re-enqueues it. Nothing to mark.
+      break;
     case 'pattern':
       await patternStore.incrementFailedAttempts(item.uniqid);
-      break;
-    case 'layout':
-      await layoutStore.incrementFailedAttempts(item.id);
       break;
     case 'scenario_meta':
       await scenarioStore.incrementFailedAttempts(item.uniqid);
@@ -772,7 +938,7 @@ async function markFailed(item: WorkItem): Promise<void> {
   }
 }
 
-// Returns work items to enqueue (only scenario_meta produces non-empty —
+// Returns work items to enqueue (only scenario_meta produces non-empty -
 // it discovers media files to fetch). `bytes` is a best-effort size of the
 // payload that was just downloaded (binary length for media, JSON byte
 // length for API responses, 0 when not measurable). The pool aggregates
@@ -789,10 +955,12 @@ async function downloadOne(item: WorkItem, signal: AbortSignal): Promise<Downloa
       return downloadTeamNames(item, signal);
     case 'recovery_codes':
       return downloadRecoveryCodes(item, signal);
+    case 'report_layouts':
+      return downloadReportLayouts(item, signal);
+    case 'lan_networks':
+      return downloadLanNetworks(item, signal);
     case 'pattern':
       return downloadPattern(item, signal);
-    case 'layout':
-      return downloadLayout(item, signal);
     case 'scenario_meta':
       return downloadScenarioMeta(item, signal);
     case 'scenario_media':
@@ -872,7 +1040,7 @@ async function downloadTeamNames(
 
 // Offline PIN-recovery codes: download the client's plaintext pool and hash it
 // into the local recovery_codes table (replaceRecoveryPool resets used flags).
-// Version-gated like team names — only runs when the admin regenerated. Unlike
+// Version-gated like team names - only runs when the admin regenerated. Unlike
 // team names, this is NOT written to disk: the codes go straight into SQLite as
 // salted hashes (the plaintext exists only in transit).
 async function downloadRecoveryCodes(
@@ -909,6 +1077,74 @@ async function downloadRecoveryCodes(
   return { enqueued: null, bytes: bytes.byteLength };
 }
 
+// Mission-report PDF layouts: download the per-game-type set (studio merges the
+// client's own overrides over the admin defaults server-side) and cache it
+// locally (replaceLayouts). The payload also carries the studio-defined default
+// print format - recorded as the fallback for devices whose operator never set
+// Settings → Printing. Version-gated; the advertised version bumps on both
+// admin and client-side saves.
+async function downloadReportLayouts(
+  item: Extract<WorkItem, { kind: 'report_layouts' }>,
+  signal: AbortSignal
+): Promise<DownloadOutcome> {
+  const bytes = await withRetry(() =>
+    apiDownloadBytesStream('playground', 'get_report_layouts', {
+      bearer: true,
+      signal,
+      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+    })
+  );
+  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+
+  let layouts: Record<string, unknown> = {};
+  let version = item.remoteVersion;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+      version?: number;
+      layouts?: unknown;
+      print_format?: unknown;
+    };
+    if (parsed.layouts && typeof parsed.layouts === 'object') {
+      layouts = parsed.layouts as Record<string, unknown>;
+    }
+    if (typeof parsed.version === 'number') version = parsed.version;
+    setSyncedDefaultPrintPrefs(parsed.print_format ?? null);
+  } catch (err) {
+    console.error('[sync] report layouts parse failed:', err);
+  }
+
+  await reportLayoutsStore.replaceLayouts(layouts, version);
+  await reportLayoutsStore.markDownloaded(version);
+  emit('content:updated', { kind: 'report_layouts', ids: [] });
+  return { enqueued: null, bytes: bytes.byteLength };
+}
+
+async function downloadLanNetworks(
+  item: Extract<WorkItem, { kind: 'lan_networks' }>,
+  signal: AbortSignal
+): Promise<DownloadOutcome> {
+  const networks = await withRetry(() => lanNetworks.getLanNetworks(signal));
+  for (const n of networks) {
+    // Only hotspot creds are ever relayed; upsert preserves the operator's
+    // auto-connect consent and never resets it.
+    await wifiNetworksStore.upsert({
+      ssid: n.ssid,
+      password: n.password,
+      source: n.source === 'router' ? 'router' : 'hotspot',
+      origin: 'studio',
+      // Admin-defined venue network → auto-consent new rows so satellites join
+      // it silently (no per-device prompt). Existing consent is preserved.
+      autoConnectOnInsert: true,
+    });
+  }
+  // Studio is the sole author: drop any studio-origin row that's no longer
+  // relayed (e.g. an admin renamed the hotspot - the old SSID must disappear so
+  // the picker / mother-raise stop offering it). Paired rows are untouched.
+  await wifiNetworksStore.tombstoneMissingStudio(networks.map((n) => n.ssid));
+  await lanNetworks.setLocalLanVersion(item.remoteVersion);
+  return { enqueued: null, bytes: jsonByteLength(networks) };
+}
+
 async function downloadPattern(
   item: Extract<WorkItem, { kind: 'pattern' }>,
   signal: AbortSignal
@@ -925,33 +1161,29 @@ async function downloadPattern(
     pattern_slug: res.pattern_slug,
     description: res.description,
     pattern_data: res.pattern_data,
+    stations: res.stations ?? null,
   });
   emit('content:updated', { kind: 'patterns', ids: [item.uniqid] });
   return { enqueued: null, bytes: jsonByteLength(res) };
 }
 
-async function downloadLayout(
-  item: Extract<WorkItem, { kind: 'layout' }>,
-  signal: AbortSignal
-): Promise<DownloadOutcome> {
-  // download_layout returns JSON via header()+echo, no auth_state wrap.
-  // apiCall handles JSON parsing fine; the lack of an auth_state field just
-  // means no implicit auth_user refresh happens for this response.
-  const res = await withRetry(() =>
-    apiCall<{ id: number; layout_data: unknown; game_type: string; version: number }>(
-      'playground',
-      'download_layout',
-      {
-        method: 'GET',
-        bearer: true,
-        query: { layout_id: item.id },
-        signal,
-      }
-    )
-  );
-  await layoutStore.markDownloaded(item.id, item.remoteVersion, res.layout_data);
-  emit('content:updated', { kind: 'layouts', ids: [item.id] });
-  return { enqueued: null, bytes: jsonByteLength(res) };
+// Operator-only media filter: from a scenario's full media filename list, return
+// just the visual the launch UI uses as a thumbnail. Mirrors GameList's
+// resolution: game_media_images.game_visual → background_image. The reference in
+// game-data may carry a leading `media/`, and the medias[] entries may be nested
+// (e.g. `images/foo.png`), so we match on exact path OR basename. Returns [] when
+// no visual is defined (the scenario then keeps only game-data.json).
+function operatorVisualKeepSet(gameData: unknown, medias: string[]): string[] {
+  const mediaImages = (gameData as {
+    game_media_images?: { game_visual?: string; background_image?: string };
+  } | null)?.game_media_images;
+  const raw = mediaImages?.game_visual ?? mediaImages?.background_image;
+  if (!raw) return [];
+  const target = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
+  const base = (p: string): string => p.split('/').pop() ?? p;
+  const targetBase = base(target);
+  const keep = medias.filter((m) => m === target || base(m) === targetBase);
+  return keep;
 }
 
 async function downloadScenarioMeta(
@@ -966,65 +1198,118 @@ async function downloadScenarioMeta(
       signal,
     })
   );
-  // Write game-data.json to the new version dir.
-  const dirRel = scenarioVersionDirRel(item.uniqid, item.remoteVersion);
-  await ensureDir(dirRel);
-  await writeJson(`${dirRel}/game-data.json`, res.game_data);
 
-  const medias = Array.isArray(res.medias) ? res.medias : [];
-  const remaining = new Set(medias);
-  scenarioProgress.set(item.uniqid, { remaining, failed: new Set() });
-
-  const bytes = jsonByteLength(res);
-
-  // No media → mark immediately.
-  if (medias.length === 0) {
-    await scenarioStore.markDownloaded(item.uniqid, item.remoteVersion);
-    emit('content:updated', { kind: 'scenarios', ids: [item.uniqid] });
-    return { enqueued: null, bytes };
+  const files = Array.isArray(res.files) ? res.files : [];
+  const dataHash = res.data_hash ?? null;
+  // CAS requires the per-file hashes + a data_hash. A studio that predates the
+  // hash migration won't supply them - treat as a (retryable) failure rather
+  // than silently committing an empty manifest.
+  if (!dataHash || files.length === 0) {
+    throw new Error(`scenario ${item.uniqid} missing CAS manifest (data_hash/files)`);
   }
 
-  // Enqueue one work item per media file.
-  const enqueued: WorkItem[] = medias.map((filename) => ({
-    kind: 'scenario_media',
-    priority: 5,
-    uniqid: item.uniqid,
+  const gameDataEntry =
+    files.find((f) => f.rel_path === 'game-data.json') ?? { rel_path: 'game-data.json', hash: dataHash, size: 0 };
+  const mediaEntries = files.filter((f) => f.rel_path !== 'game-data.json');
+
+  // Operator-only: keep only the single visual image the launch list shows as a
+  // thumbnail (game_media_images.game_visual → background_image). game-data.json
+  // is always kept. Everything else is play-only and skipped to save disk.
+  let targetMedia = mediaEntries;
+  if (operatorOnly) {
+    const keep = new Set(operatorVisualKeepSet(res.game_data, mediaEntries.map((f) => f.rel_path)));
+    targetMedia = mediaEntries.filter((f) => keep.has(f.rel_path));
+  }
+
+  // game-data.json → blob. NOT hash-verified: data_hash is a change token over
+  // the studio source columns, not sha256 of these (compat-transformed) bytes.
+  // Skip the write if the blob already exists (dedup across revisions).
+  if (!(await blobExists(gameDataEntry.hash))) {
+    await writeJson(blobPathRel(gameDataEntry.hash), res.game_data);
+  }
+
+  // The manifest committed once all target blobs are present (post-pool sweep,
+  // or here when nothing needs downloading).
+  const manifest: scenarioStore.ManifestFile[] = [
+    { rel_path: 'game-data.json', content_hash: gameDataEntry.hash },
+    ...targetMedia.map((f) => ({ rel_path: f.rel_path, content_hash: f.hash })),
+  ];
+
+  // Enqueue downloads only for media blobs not already in the pool - the dedup
+  // that makes a content change carry just the changed bytes over the network.
+  const remaining = new Set<string>();
+  const enqueued: WorkItem[] = [];
+  for (const f of targetMedia) {
+    if (await blobExists(f.hash)) continue;
+    remaining.add(f.rel_path);
+    enqueued.push({
+      kind: 'scenario_media',
+      priority: 5,
+      uniqid: item.uniqid,
+      filename: f.rel_path,
+      hash: f.hash,
+      label: `Scenario media: ${f.rel_path}`,
+    });
+  }
+
+  scenarioProgress.set(item.uniqid, {
+    remaining,
+    failed: new Set(),
+    manifest,
+    remoteContentHash: item.remoteContentHash,
     remoteVersion: item.remoteVersion,
-    filename,
-    label: `Scenario media: ${filename}`,
-  }));
-  return { enqueued, bytes };
+  });
+
+  // The post-pool sweep commits every scenario whose remaining+failed are both
+  // empty - including this one when no media needed downloading. No separate
+  // immediate-commit path needed.
+  return { enqueued: enqueued.length ? enqueued : null, bytes: jsonByteLength(res) };
 }
 
 async function downloadScenarioMedia(
   item: Extract<WorkItem, { kind: 'scenario_media' }>,
   signal: AbortSignal
 ): Promise<DownloadOutcome> {
-  const bytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_media', {
-      bearer: true,
-      query: { uniqid: item.uniqid, filename: item.filename },
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
-  );
-  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
-  const dirRel = scenarioVersionDirRel(item.uniqid, item.remoteVersion);
-  // The media filename can be a nested path like 'images/foo.png'; ensureDir
-  // is called on the immediate parent only.
-  const slash = item.filename.lastIndexOf('/');
-  if (slash > 0) {
-    await ensureDir(`${dirRel}/${item.filename.slice(0, slash)}`);
-  } else {
-    await ensureDir(dirRel);
-  }
-  await writeBinary(`${dirRel}/${item.filename}`, bytes);
+  // Download to a unique temp, verify its SHA-256 against the studio hash, then
+  // atomically move it into the pool under that hash. Stream straight to disk -
+  // a scenario video can be hundreds of MB and buffering it OOMs the Android
+  // WebView heap; the native sha256_file command hashes on disk for the same
+  // reason. The whole download+verify+commit is one retryable unit: a corrupt
+  // body fails the check and retries from a freshly-truncated temp.
+  const tmpRel = blobTmpPathRel(`${item.hash}.${blobTmpSeq++}`);
+  const tmpAbs = await join(await appDataDir(), tmpRel);
 
-  // Bookkeeping: drop from remaining set; the post-pool sweep marks the
-  // scenario downloaded once all media for it succeeded.
+  const total = await withRetry(async () => {
+    const n = await streamBinary(tmpRel, (write) =>
+      apiDownloadStreamed(
+        'playground',
+        'get_media',
+        {
+          bearer: true,
+          query: { uniqid: item.uniqid, filename: item.filename },
+          signal,
+          onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+        },
+        write
+      )
+    );
+    const got = await invoke<string>('sha256_file', { path: tmpAbs });
+    if (got !== item.hash) {
+      await removeRecursive(tmpRel);
+      throw new Error(
+        `hash mismatch for ${item.uniqid}/${item.filename}: expected ${item.hash}, got ${got}`
+      );
+    }
+    await commitBlobFromTemp(tmpRel, item.hash);
+    return n;
+  });
+  emitItemProgress(item.label, item.kind, total, total, true);
+
+  // Bookkeeping: drop from remaining set; the post-pool sweep commits the
+  // scenario's manifest once all its target media succeeded.
   const p = scenarioProgress.get(item.uniqid);
   if (p) p.remaining.delete(item.filename);
-  return { enqueued: null, bytes: bytes.byteLength };
+  return { enqueued: null, bytes: total };
 }
 
 async function downloadGameTypeAdminVideo(
@@ -1034,26 +1319,32 @@ async function downloadGameTypeAdminVideo(
   const dirRel = gameTypeAdminVersionDirRel(item.code, item.remoteVersion);
   await ensureDir(dirRel);
 
-  // Video file.
-  const videoBytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_game_type_media', {
-      bearer: true,
-      query: {
-        code: item.code,
-        variant: 'admin',
-        version: String(item.remoteVersion),
-        filename: item.filename,
-      },
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
+  // Video file - stream to disk (can be hundreds of MB; buffering OOMs Android).
+  const videoBytesLen = await withRetry(() =>
+    streamBinary(`${dirRel}/${item.filename}`, (write) =>
+      apiDownloadStreamed(
+        'playground',
+        'get_game_type_media',
+        {
+          bearer: true,
+          query: {
+            code: item.code,
+            variant: 'admin',
+            version: String(item.remoteVersion),
+            filename: item.filename,
+          },
+          signal,
+          onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+        },
+        write
+      )
+    )
   );
-  emitItemProgress(item.label, item.kind, videoBytes.byteLength, videoBytes.byteLength, true);
-  await writeBinary(`${dirRel}/${item.filename}`, videoBytes);
+  emitItemProgress(item.label, item.kind, videoBytesLen, videoBytesLen, true);
 
-  let totalBytes = videoBytes.byteLength;
+  let totalBytes = videoBytesLen;
 
-  // Subtitle files (one .vtt per language). Failures are non-fatal — a
+  // Subtitle files (one .vtt per language). Failures are non-fatal - a
   // missing subtitle just means playback runs without that language.
   if (Object.keys(item.subtitleFilenames).length > 0) {
     await ensureDir(`${dirRel}/subtitles`);
@@ -1091,23 +1382,29 @@ async function downloadGameTypeOverrideVideo(
   const dirRel = gameTypeClientVersionDirRel(item.code, item.remoteVersion);
   await ensureDir(dirRel);
 
-  const videoBytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_game_type_media', {
-      bearer: true,
-      query: {
-        code: item.code,
-        variant: 'client',
-        version: String(item.remoteVersion),
-        filename: item.filename,
-      },
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
+  const videoBytesLen = await withRetry(() =>
+    streamBinary(`${dirRel}/${item.filename}`, (write) =>
+      apiDownloadStreamed(
+        'playground',
+        'get_game_type_media',
+        {
+          bearer: true,
+          query: {
+            code: item.code,
+            variant: 'client',
+            version: String(item.remoteVersion),
+            filename: item.filename,
+          },
+          signal,
+          onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+        },
+        write
+      )
+    )
   );
-  emitItemProgress(item.label, item.kind, videoBytes.byteLength, videoBytes.byteLength, true);
-  await writeBinary(`${dirRel}/${item.filename}`, videoBytes);
+  emitItemProgress(item.label, item.kind, videoBytesLen, videoBytesLen, true);
 
-  let totalBytes = videoBytes.byteLength;
+  let totalBytes = videoBytesLen;
 
   if (Object.keys(item.subtitleFilenames).length > 0) {
     await ensureDir(`${dirRel}/subtitles`);

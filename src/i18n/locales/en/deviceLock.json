@@ -1,0 +1,13 @@
+{
+  "disabledTitle": "Devices disabled",
+  "disabledSubtitle": "An administrator has disabled this device. Enter a recovery code to run one event.",
+  "billingTitle": "Payment required",
+  "billingSubtitle": "This subscription is overdue, so launching and joining games is disabled. Enter a recovery code to run one event.",
+  "recoveryTitle": "Enter a recovery code",
+  "recoverySubtitle": "Ask your administrator for an 8-digit recovery code.",
+  "reprieveGranted": "Unlocked for {{days}} day(s).",
+  "close": "Close",
+  "bannerOverdue": "Payment overdue - games will be disabled in {{days}} day(s).",
+  "bannerLocked": "Payment overdue - launching games is disabled. Use a recovery code to run an event.",
+  "bannerDisabled": "Devices disabled by your administrator. Use a recovery code to run an event."
+}

@@ -1,0 +1,14 @@
+{
+  "title": "Team names",
+  "intro": "These are the lists of team names used when teams get an automatic name (auto-register or reuse-cards). They are managed in the studio.",
+  "loading": "Loading team names…",
+  "ownOnlyLabel": "Use my own lists only",
+  "ownOnlyDesc": "Draw names only from your custom lists. If you have no list for an age, the default lists are used instead.",
+  "saveError": "Couldn't save the change. Check your connection and try again.",
+  "defaultListsTitle": "Default lists",
+  "defaultListsSubtitle": "The shared catalog of names available to everyone.",
+  "defaultListsEmpty": "No default lists yet.",
+  "customListsTitle": "My custom lists",
+  "customListsSubtitle": "Names added for your account in the studio.",
+  "customListsEmpty": "You have no custom lists yet - the default lists are used."
+}

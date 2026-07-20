@@ -18,6 +18,7 @@ import { platform, arch } from '@tauri-apps/plugin-os';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { getAuthUser } from './authStore';
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -80,6 +81,23 @@ export function isDesktopPlatform(): boolean {
   return ['windows', 'darwin', 'linux'].includes(currentTarget());
 }
 
+// The app-update channel this device resolved (device override -> client ->
+// stable), cached in auth_user by the bootstrap/login auth_state. The update
+// endpoints are unauthenticated, so we send this resolved value ourselves: the
+// custom `check` call appends ?channel=, and the Tauri plugin's own request
+// carries it as the X-Update-Channel header (the plugin URL template can't take
+// a query string). Defaults to 'stable' before the first bootstrap / offline.
+// Design: project_client_tester_update_channel.
+export async function resolveUpdateChannel(): Promise<string> {
+  try {
+    const user = await getAuthUser();
+    const ch = user?.update_channel;
+    return ch === 'test' ? 'test' : 'stable';
+  } catch {
+    return 'stable';
+  }
+}
+
 // Compare two "x.y.z" semver strings. Returns -1 / 0 / 1.
 function compareSemver(a: string, b: string): number {
   const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
@@ -111,11 +129,13 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
   };
 
   try {
+    const channel = await resolveUpdateChannel();
     const url =
       `${API_BASE}/playground_update.php?action=check` +
       `&target=${encodeURIComponent(target)}` +
       `&arch=${encodeURIComponent(currentArch())}` +
-      `&current_version=${encodeURIComponent(currentVersion)}`;
+      `&current_version=${encodeURIComponent(currentVersion)}` +
+      `&channel=${encodeURIComponent(channel)}`;
 
     const res = await tauriFetch(url, { method: 'GET' });
     if (!res.ok) return { ...base, state: 'error' };
@@ -161,7 +181,11 @@ let pendingUpdate: Update | null = null;
 export async function downloadUpdate(
   onProgress: (p: DownloadProgress) => void
 ): Promise<void> {
-  const update = await check();
+  // Route the plugin's own manifest request to the resolved channel. The plugin
+  // builds its URL from the tauri.conf template (no query string), so the only
+  // channel hook is a request header the server also reads.
+  const channel = await resolveUpdateChannel();
+  const update = await check({ headers: { 'X-Update-Channel': channel } });
   if (!update) throw new Error('No update available to download');
   pendingUpdate = update;
 

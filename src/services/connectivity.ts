@@ -17,6 +17,26 @@ export function isOnline(): boolean {
   return lastKnown;
 }
 
+// Active reachability probe against studio's unauthenticated health check
+// (`playground.php?action=test`). Unlike isOnline()/navigator.onLine - which
+// lie on captive portals - this confirms the studio API actually answers, so
+// the first-launch onboarding gate can guarantee the OTP step will work before
+// showing the login screen. Short timeout; any failure resolves false.
+export async function probeStudioReachable(timeoutMs = 8000): Promise<boolean> {
+  try {
+    // Lazy import keeps connectivity.ts free of a static dependency on the API
+    // layer (which several low-level modules import in turn).
+    const { apiCall } = await import('./api');
+    const res = await apiCall<{ status?: string }>('playground', 'test', {
+      bearer: false,
+      timeoutMs,
+    });
+    return res?.status === 'ok';
+  } catch {
+    return false;
+  }
+}
+
 export function startConnectivityMonitor(): void {
   if (started) return;
   started = true;

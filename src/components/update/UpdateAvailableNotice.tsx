@@ -3,6 +3,7 @@
 // the session only; the next launch re-checks.
 
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { ArrowUpCircle, X, ExternalLink } from 'lucide-react';
 import type { UpdateStatus } from '../../services/updateService';
 import { openStoreUpdate } from '../../services/updateService';
@@ -19,6 +20,7 @@ export function UpdateAvailableNotice({
   onDismiss,
   onOpenUpdates,
 }: UpdateAvailableNoticeProps) {
+  const { t } = useTranslation();
   const [opening, setOpening] = useState(false);
 
   const handleUpdate = async () => {
@@ -36,27 +38,28 @@ export function UpdateAvailableNotice({
   };
 
   return (
-    <div className="bg-blue-500/15 border-b border-blue-500/30 px-4 py-2 flex items-center justify-between text-sm">
-      <div className="flex items-center gap-2 text-blue-200">
+    <div className="animate-drop-in bg-[var(--pg-accent-tint)] border-b border-[var(--pg-accent-line)] px-4 py-2 flex items-center justify-between text-sm">
+      <div className="flex items-center gap-2 text-[var(--pg-accent-bright)]">
         <ArrowUpCircle className="w-4 h-4" />
         <span>
-          Version {status.latestVersion} is available
-          {status.isDesktop ? '' : ' on the app store'}.
+          {status.isDesktop
+            ? t('update:availableDesktop', { version: status.latestVersion })
+            : t('update:availableStore', { version: status.latestVersion })}
         </span>
       </div>
       <div className="flex items-center gap-3">
         <button
           onClick={handleUpdate}
           disabled={opening}
-          className="text-blue-100 hover:text-white underline inline-flex items-center gap-1 disabled:opacity-50"
+          className="text-[var(--pg-accent-bright)] hover:text-[var(--pg-text)] underline inline-flex items-center gap-1 disabled:opacity-50"
         >
-          {status.isDesktop ? 'Update' : 'Open store'}
+          {status.isDesktop ? t('update:updateButton') : t('update:openStoreButton')}
           {!status.isDesktop && <ExternalLink className="w-3 h-3" />}
         </button>
         <button
           onClick={onDismiss}
-          className="text-blue-300/70 hover:text-white"
-          aria-label="Dismiss"
+          className="text-[var(--pg-text-dim)] hover:text-[var(--pg-text)]"
+          aria-label={t('update:dismiss')}
         >
           <X className="w-4 h-4" />
         </button>

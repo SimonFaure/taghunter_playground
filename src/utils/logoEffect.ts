@@ -6,7 +6,7 @@
 // the `.logo-shimmer` overlay). The glow colour is passed down as the
 // `--logo-glow` custom property on the wrapper, so one keyframe set serves any
 // colour. The glow uses `filter: drop-shadow`, which follows the logo's alpha
-// silhouette — transparent logos glow by their shape, opaque ones by their
+// silhouette - transparent logos glow by their shape, opaque ones by their
 // bounding rectangle (an accepted limitation; "transparent works best").
 
 import type { CSSProperties } from 'react';

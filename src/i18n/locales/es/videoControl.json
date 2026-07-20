@@ -1,0 +1,13 @@
+{
+  "playVideo": "Reproducir vídeo",
+  "close": "Cerrar",
+  "pickVideoPrefix": "Elige un vídeo para reproducir en",
+  "thisDevice": "este dispositivo",
+  "pickVideoSuffix": ". (Para enviarlo a los satélites, usa la ventana de Dispositivos.)",
+  "intro": "Intro",
+  "tutorial": "Tutorial",
+  "introTutorial": "Intro + Tutorial",
+  "stopVideo": "Detener vídeo",
+  "resolving": "Resolviendo…",
+  "noVideoAvailable": "No hay vídeo {{kinds}} disponible para este escenario."
+}

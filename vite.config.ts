@@ -24,7 +24,7 @@ export default defineConfig(({ command }) => ({
         }
       : undefined,
     watch: {
-      // Don't reload Vite when Rust code changes — that's tauri dev's job.
+      // Don't reload Vite when Rust code changes - that's tauri dev's job.
       ignored: ['**/src-tauri/**'],
     },
   },

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { readLaunchLogoUrl } from '../utils/launchLogo';
 import { resolveLogoEffect, type LogoAnimation } from '../utils/logoEffect';
 import { PinExitPrompt } from './PinExitPrompt';
@@ -9,7 +10,7 @@ import { PinExitPrompt } from './PinExitPrompt';
 // click/tap or keypress dismisses it and reveals the home page.
 //
 // When `requirePin` is set (the "Require PIN to exit the logo screen" pref),
-// an interaction reveals a PIN prompt over the logo instead of dismissing —
+// an interaction reveals a PIN prompt over the logo instead of dismissing -
 // turning the screen into a step-away kiosk lock. Correct PIN dismisses;
 // Cancel returns to the clean logo. F11 still toggles fullscreen either way.
 
@@ -33,6 +34,7 @@ export function LogoLaunchScreen({
   requirePin = false,
   onDismiss,
 }: LogoLaunchScreenProps) {
+  const { t } = useTranslation();
   const [logoUrl, setLogoUrl] = useState<string>(FALLBACK_LOGO);
   const [showPin, setShowPin] = useState(false);
 
@@ -63,7 +65,7 @@ export function LogoLaunchScreen({
   }, [logoFile]);
 
   // Any key (other than the fullscreen F11 toggle) leaves the screen: it
-  // dismisses directly, or — when a PIN is required — reveals the PIN prompt.
+  // dismisses directly, or - when a PIN is required - reveals the PIN prompt.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'F11') return;
@@ -111,7 +113,7 @@ export function LogoLaunchScreen({
 
       {showPin && (
         <PinExitPrompt
-          subtitle="Enter the device PIN to exit."
+          subtitle={t('logoScreen:pinSubtitle')}
           onSuccess={onDismiss}
           onCancel={() => setShowPin(false)}
         />

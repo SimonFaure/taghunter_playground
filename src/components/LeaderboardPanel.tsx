@@ -35,7 +35,7 @@ function getRankColor(index: number): string {
   if (index === 0) return 'text-yellow-400';
   if (index === 1) return 'text-slate-300';
   if (index === 2) return 'text-amber-500';
-  return 'text-slate-400';
+  return 'text-[var(--pg-text-muted)]';
 }
 
 function getRankBg(index: number, movingUp: boolean, movingDown: boolean): string {
@@ -44,14 +44,14 @@ function getRankBg(index: number, movingUp: boolean, movingDown: boolean): strin
   if (index === 0) return 'bg-yellow-400/10 border-yellow-400/30';
   if (index === 1) return 'bg-slate-300/10 border-slate-300/20';
   if (index === 2) return 'bg-amber-500/10 border-amber-500/25';
-  return 'bg-slate-700/40 border-slate-600/30';
+  return 'bg-[var(--pg-surface-2)] border-[var(--pg-line)]';
 }
 
 function RankIcon({ index, size = 18 }: { index: number; size?: number }) {
   if (index === 0) return <Trophy size={size} className="text-yellow-400" />;
   if (index === 1) return <Medal size={size} className="text-slate-300" />;
   if (index === 2) return <Medal size={size} className="text-amber-500" />;
-  return <span className="text-slate-400 font-bold text-xs w-4 text-center inline-block">#{index + 1}</span>;
+  return <span className="text-[var(--pg-text-dim)] font-bold text-xs w-4 text-center inline-block">#{index + 1}</span>;
 }
 
 function sortTeams(teams: TeamResult[], victoryType: string): TeamResult[] {
@@ -206,10 +206,10 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className={`shrink-0 ${compact ? 'px-3 pt-3 pb-2' : 'px-4 pt-4 pb-3'} border-b border-slate-700/50`}>
+      <div className={`shrink-0 ${compact ? 'px-3 pt-3 pb-2' : 'px-4 pt-4 pb-3'} border-b border-[var(--pg-line)]`}>
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <div className={`font-bold text-white truncate ${compact ? 'text-xs' : 'text-sm'}`}>{gameName}</div>
+            <div className={`font-bold text-[var(--pg-text)] truncate ${compact ? 'text-xs' : 'text-sm'}`}>{gameName}</div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
             {playMode === 'team' && (
@@ -218,7 +218,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                 Team
               </span>
             )}
-            <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-slate-700/60 border border-slate-600/40 text-slate-400 text-xs">
+            <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block" />
               Live
             </span>
@@ -227,7 +227,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                 <Zap size={11} />
               </span>
             ) : (
-              <span className="flex items-center gap-1 text-blue-400 text-xs font-semibold">
+              <span className="flex items-center gap-1 text-[var(--pg-accent-bright)] text-xs font-semibold">
                 <Star size={11} />
               </span>
             )}
@@ -238,11 +238,11 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
       <div className="flex-1 overflow-y-auto min-h-0 p-2 space-y-1.5">
         {loading ? (
           <div className="flex items-center justify-center h-full">
-            <div className="text-slate-500 text-xs">Loading...</div>
+            <div className="text-[var(--pg-text-dim)] text-xs">Loading...</div>
           </div>
         ) : teams.length === 0 ? (
           <div className="flex items-center justify-center h-full">
-            <div className="text-slate-500 text-xs text-center">No teams yet</div>
+            <div className="text-[var(--pg-text-dim)] text-xs text-center">No teams yet</div>
           </div>
         ) : (
           teams.map(team => {
@@ -279,7 +279,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                         {Math.abs(team.rankDelta)}
                       </span>
                     ) : (
-                      <span className="text-slate-700 text-xs"><Minus size={9} /></span>
+                      <span className="text-[var(--pg-text-dim)] text-xs"><Minus size={9} /></span>
                     )}
                   </div>
 
@@ -287,7 +287,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                     <div className={`font-bold leading-tight truncate ${nameSize} ${movingUp ? 'text-emerald-300' : getRankColor(index)}`}>
                       {team.team_name}
                     </div>
-                    <div className="text-slate-600 text-xs mt-0.5">
+                    <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">
                       {team.end_time ? (
                         <span className="flex items-center gap-0.5"><Clock size={9} /> Done</span>
                       ) : team.start_time ? 'In progress' : 'Not started'}
@@ -295,7 +295,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                     {!compact && teammates.length > 1 && (
                       <div className="flex flex-wrap gap-1 mt-1.5">
                         {teammates.map((mate, mi) => (
-                          <span key={mi} className="px-1.5 py-0.5 bg-white/5 rounded-full text-xs text-slate-500">
+                          <span key={mi} className="px-1.5 py-0.5 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-dim)]">
                             {mate.name}
                           </span>
                         ))}
@@ -305,19 +305,19 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
 
                   <div className="text-right shrink-0">
                     {victoryType === 'score' ? (
-                      <div className={`font-bold ${scoreSize} ${movingUp ? 'text-emerald-400' : 'text-white'}`}>
+                      <div className={`font-bold ${scoreSize} ${movingUp ? 'text-emerald-400' : 'text-[var(--pg-text)]'}`}>
                         {team.score}
-                        <span className="text-slate-500 text-xs font-normal ml-0.5">pts</span>
+                        <span className="text-[var(--pg-text-dim)] text-xs font-normal ml-0.5">pts</span>
                       </div>
                     ) : duration !== null ? (
                       <div className={`font-bold ${scoreSize} ${movingUp ? 'text-emerald-400' : getRankColor(index)}`}>
                         {formatDuration(duration)}
                       </div>
                     ) : (
-                      <div className="text-slate-600 text-sm">&mdash;</div>
+                      <div className="text-[var(--pg-text-dim)] text-sm">&mdash;</div>
                     )}
                     {victoryType === 'speed' && team.score > 0 && (
-                      <div className="text-slate-600 text-xs">{team.score} pts</div>
+                      <div className="text-[var(--pg-text-dim)] text-xs">{team.score} pts</div>
                     )}
                   </div>
                 </div>
