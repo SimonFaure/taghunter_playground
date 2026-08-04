@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { ArrowLeft, Users, Trophy } from 'lucide-react';
 import { GameConfig } from './LaunchGameModal';
-import { sportidentService as usbReaderService, CardData, detectReaderPort } from '../services/sportidentService';
+import { sportidentService as usbReaderService, CardData, detectReaderPort, isReaderConnected } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
 import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
@@ -601,6 +601,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   useEffect(() => {
     if (!launchedGameId) return;
     let cancelled = false;
+    let retryTimer: number | undefined;
 
     // Start the game ONCE and record a persistent start timestamp on the game
     // row. Re-entering the page must NOT reset it - previously startAllTeams
@@ -610,12 +611,37 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       try {
         let state = await getLaunchedGameState(launchedGameId, 0);
         const alreadyStarted = !!state.start_time;
+        // Self-register is decided by the launched game's META, not by the
+        // config prop. A satellite driven here by a join_game push builds its
+        // config from a meta read that can come back EMPTY (getLaunchedGameMeta
+        // fails open to `{}` when the LAN route isn't pointed at the mother
+        // yet) - the prop then says "not self-register" and this device both
+        // skipped registration AND auto-started the mother's game underneath
+        // the operator. Read meta here and OR the two sources.
+        let metaSelfRegister: boolean | null = null;
+        try {
+          const m = await getLaunchedGameMeta(launchedGameId);
+          if (Object.keys(m).length > 0) metaSelfRegister = m.tagquestSelfRegister === 'true';
+        } catch {
+          /* leave null - unknown, handled below */
+        }
+        // Unknown meta ⇒ never auto-start. Falling through would stamp
+        // start_time on a game that may well be mid-registration elsewhere.
+        if (metaSelfRegister === null && !alreadyStarted && !config.tagquestSelfRegister) {
+          console.warn('[TagQuest] launched-game meta unreadable - holding, will retry');
+          if (!cancelled) retryTimer = window.setTimeout(() => { if (!cancelled) void init(); }, 1500);
+          return;
+        }
+        const isSelfRegister = metaSelfRegister ?? !!config.tagquestSelfRegister;
         // Self-register (Clash-style): hold on the registration screen until the
         // operator hits Start (handleRegistrationStart). Do NOT auto-start the
         // game or its teams here. A game that's already started (resume/join)
         // falls through to 'playing' and skips registration.
-        if (config.tagquestSelfRegister && !alreadyStarted) {
-          if (!cancelled) setPhase('register');
+        if (isSelfRegister && !alreadyStarted) {
+          if (!cancelled) {
+            setSelfRegister(true);
+            setPhase('register');
+          }
           return;
         }
         if (!alreadyStarted) {
@@ -652,6 +678,9 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     const fetchMeta = async () => {
       try {
         const map = await getLaunchedGameMeta(launchedGameId);
+        // An empty map means the read fell open (wrong LAN route / unknown id),
+        // not "every option is off" - don't let it clear self-register.
+        if (Object.keys(map).length === 0) return;
         if (map.victoryType === 'score' || map.victoryType === 'speed') {
           setVictoryType(map.victoryType);
         }
@@ -677,7 +706,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
     init();
     fetchMeta();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
   }, [launchedGameId]);
 
   // A roster/config edit made on another device (e.g. the mother adding a
@@ -796,13 +828,26 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   };
 
   // ── Station assignment: resolve this device's paired id while registering,
-  // so meta.regAssignments can be keyed against it. ───────────────────────────
+  // so meta.regAssignments can be keyed against it, and (re-)read the map on
+  // entering the register phase. The mount-time fetchMeta can land before a
+  // satellite's LAN route is pointed at the mother, which would leave this
+  // station unrestricted; re-reading here (as ClashGamePage does) fixes that.
   useEffect(() => {
     if (!launchedGameId || phase !== 'register') return;
     let cancelled = false;
     void getSelfDeviceId(launchedGameId).then((id) => {
       if (!cancelled) setSelfDeviceId(id);
     });
+    void (async () => {
+      try {
+        const map = await getLaunchedGameMeta(launchedGameId);
+        if (!cancelled && Object.keys(map).length > 0) {
+          setRegAssignMap(parseRegAssignments(map[REG_ASSIGNMENTS_META_KEY]));
+        }
+      } catch (err) {
+        console.error('[TagQuest] regAssignments read failed', err);
+      }
+    })();
     return () => { cancelled = true; };
   }, [launchedGameId, phase]);
 
@@ -1105,6 +1150,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     onGameEnded: () => onGameEnd?.(),
     onAllTeamsFinished: () => onGameEnd?.(),
     onNewBip: handleNewBip,
+    // A device sitting on the self-register inscription screen follows the one
+    // that pressed "Start game": the mother's start flag flips, the poll sees
+    // it, and we leave the register phase for play. Idempotent for the device
+    // that started the game itself (its handleStart already set phase).
+    onGameStarted: () => setPhase('playing'),
     // Self-register builds its roster dynamically (solo) or leaves empty teams
     // (team mode), so a momentary "all current teams finished" - including the
     // 0-teams state during registration - must not end the game. It ends via
@@ -1186,6 +1236,28 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       }
     };
   }, []);
+
+  // ── Fast reader hotplug on the inscription screen ──────────────────────────
+  // The reader effect above (re)binds on the global 'reader:status' event, but
+  // that only fires off the footer's 10s poll - a dongle plugged in mid-
+  // registration then takes up to 10s to come alive, which reads as broken.
+  // While registering, actively probe every 2s and re-emit 'reader:status' as
+  // soon as a reader appears so the bind path fires within ~2s. Once bound,
+  // initializePort no-ops, so re-emitting is cheap. Scoped to the register
+  // phase so reader-less devices don't probe serial forever during play.
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'register') return;
+    if (!usbReaderService.isAvailable()) return;
+    let cancelled = false;
+    const id = setInterval(() => {
+      void isReaderConnected().then((ok) => {
+        if (ok && !cancelled) {
+          window.dispatchEvent(new CustomEvent('reader:status', { detail: { state: 'ok' } }));
+        }
+      });
+    }, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [launchedGameId, phase]);
 
   // The HUD lives in a fixed 16:9 "stage" centered in the viewport.
   // Background image is a separate full-bleed layer underneath that fills
@@ -1479,7 +1551,16 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       // rather than a broken-image glyph.
       imageVisible = !!imageSrc;
     } else if (isQuestIcon && questIndexForElement >= 0) {
-      const qd = getQuestDetail(lastKnownQuestDetails, questIndexForElement);
+      // Same live-during-animation source as quest points/multiplicator below:
+      // lastKnownQuestDetails alone is only committed at exit (when the HUD is
+      // already hidden), so the icon of a quest completed during THIS animation
+      // would never show. The icon "earns" at the update phase, together with
+      // the multiplier flipping to x1.
+      const isActiveQuest = questIndexForElement === activeQuestIndex;
+      const details = isAnimating
+        ? (animShowUpdated && isActiveQuest ? (punchAnimation?.newQuestDetails ?? []) : (punchAnimation?.prevQuestDetails ?? []))
+        : lastKnownQuestDetails;
+      const qd = getQuestDetail(details, questIndexForElement);
       imageVisible = valuesShow && !!qd && qd.timesCompleted > 0;
     } else {
       imageVisible = isTimer || (isAnimating && (

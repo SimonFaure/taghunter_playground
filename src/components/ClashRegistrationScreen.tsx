@@ -2,19 +2,19 @@
 //
 // Self mode: select a clan on this station, then players bip to join it (a
 // dedicated "join reader" is just a station left on one clan). Full clans grey
-// out. Bulk mode: hand out contiguous chip blocks from the local card DB,
-// skipping gaps. Both call the server-authoritative clashRegister.
+// out, calling the server-authoritative clashRegister.
+//
+// Bulk mode ("Équipes prédéfinies"): the clans were already dealt contiguous
+// chip blocks at launch (see GameList), so this screen is read-only - it just
+// shows the formed clans and a Start button.
 //
 // Design: project_clash_game_type_design.
 
-import { useState } from 'react';
 import { Check, Play, Users } from 'lucide-react';
-import * as cardsRepo from '../services/cardsRepo';
-import { clashRegister, type ClashStandings } from '../services/clash';
+import { type ClashStandings } from '../services/clash';
 import type { ClashClanVisual } from './ClashGameRenderer';
 
 interface ClashRegistrationScreenProps {
-  launchedGameId: number;
   standings: ClashStandings | null;
   clanByTeamId: Record<number, ClashClanVisual>;
   mode: 'self' | 'bulk';
@@ -40,7 +40,6 @@ function clanIsFull(memberCount: number, maxPerClan: number): boolean {
 }
 
 export function ClashRegistrationScreen({
-  launchedGameId,
   standings,
   clanByTeamId,
   mode,
@@ -69,43 +68,6 @@ export function ClashRegistrationScreen({
         .map((c) => clanByTeamId[c.team_id]?.banner)
         .filter((b): b is string => !!b)
         .map(resolveMedia);
-
-  const [firstKeyNumber, setFirstKeyNumber] = useState(1);
-  const [headcounts, setHeadcounts] = useState<Record<number, number>>({});
-  const [bulkBusy, setBulkBusy] = useState(false);
-  const [bulkResult, setBulkResult] = useState<{ assigned: number; full: number; failed: number } | null>(null);
-
-  const handleBulkAssign = async () => {
-    if (!standings || bulkBusy) return;
-    setBulkBusy(true);
-    setBulkResult(null);
-    try {
-      const cards = await cardsRepo.list(); // ordered by key_number ASC
-      const eligible = cards.filter((c) => c.key_number >= firstKeyNumber);
-      let cursor = 0;
-      let assigned = 0;
-      let full = 0;
-      let failed = 0;
-      for (const clan of clans) {
-        const need = headcounts[clan.team_id] ?? 0;
-        for (let k = 0; k < need && cursor < eligible.length; k++) {
-          const card = eligible[cursor++];
-          try {
-            const res = await clashRegister(launchedGameId, clan.team_id, card.id);
-            if (res.status === 'ok') assigned++;
-            else if (res.status === 'clan_full') full++;
-            else if (res.status === 'already_in_clan' || res.status === 'already_in_other_clan') assigned++;
-            else failed++;
-          } catch {
-            failed++;
-          }
-        }
-      }
-      setBulkResult({ assigned, full, failed });
-    } finally {
-      setBulkBusy(false);
-    }
-  };
 
   const lastJoinClan = lastJoin ? clanByTeamId[lastJoin.teamId] : undefined;
 
@@ -143,7 +105,7 @@ export function ClashRegistrationScreen({
               : 'This station registers the clans below only - pick one, then players bip their chip to join it.'
             : mode === 'self'
               ? 'Select a clan on this station, then players bip their chip to join it. Leave a station on one clan to use it as a dedicated join reader.'
-              : 'Hand out contiguous chip blocks from the card list. Gaps are skipped automatically.'}
+              : 'Clans were formed at launch (predetermined teams). Review the counts below, then start the game.'}
         </p>
 
         {restricted && clans.length === 0 && (
@@ -265,51 +227,11 @@ export function ClashRegistrationScreen({
         )}
 
         {mode === 'bulk' && (
-          <div className="rounded-xl bg-slate-800/50 p-4 space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm text-slate-300 mb-1">First chip number</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={firstKeyNumber}
-                  onChange={(e) => setFirstKeyNumber(parseInt(e.target.value) || 0)}
-                  className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg"
-                />
-              </div>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              {clans.map((c) => (
-                <div key={c.team_id}>
-                  <label className="block text-xs text-slate-400 mb-1 truncate">
-                    {clanByTeamId[c.team_id]?.name ?? `Clan ${c.team_number}`}
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={headcounts[c.team_id] ?? 0}
-                    onChange={(e) =>
-                      setHeadcounts((h) => ({ ...h, [c.team_id]: Math.max(0, parseInt(e.target.value) || 0) }))
-                    }
-                    className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg"
-                  />
-                </div>
-              ))}
-            </div>
-            <button
-              onClick={handleBulkAssign}
-              disabled={bulkBusy}
-              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg disabled:opacity-50"
-            >
-              {bulkBusy ? 'Assigning…' : 'Assign chips'}
-            </button>
-            {bulkResult && (
-              <p className="text-sm text-white/70">
-                Assigned {bulkResult.assigned}
-                {bulkResult.full > 0 ? ` · ${bulkResult.full} hit clan cap` : ''}
-                {bulkResult.failed > 0 ? ` · ${bulkResult.failed} failed` : ''}
-              </p>
-            )}
+          <div className="rounded-xl bg-slate-800/50 p-4 text-center">
+            <p className="text-lg">
+              Predetermined clans — chips were dealt at launch. The counts above are
+              final; press <span className="font-semibold">Start game</span> when ready.
+            </p>
           </div>
         )}
       </div>

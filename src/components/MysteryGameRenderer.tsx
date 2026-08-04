@@ -29,6 +29,8 @@ import {
   type IngameLayout,
   type IngameRoleKey,
 } from './mysteryIngameLayout';
+import type { MysteryBonusTier } from '../services/mysteryBonuses';
+import { reachedMysteryBonuses } from '../services/mysteryBonuses';
 
 type Localized = Record<string, string>;
 
@@ -143,6 +145,11 @@ export interface MysteryGameRendererProps {
   showIdleLayout?: boolean;
   /** Per-launch subtitle - text of the idle screen's subtitle element. */
   idleSubtitle?: string;
+  /** Bonus ("overscore") tiers authored for this scenario, names already
+   *  localized (see `services/mysteryBonuses`). The renderer shows the ones
+   *  whose threshold `score` has passed - i.e. only teams that beat
+   *  `score_full_game` ever see anything here. */
+  bonuses?: readonly MysteryBonusTier[];
 }
 
 const DEFAULT_CANONICAL_WIDTH = 1920;
@@ -322,6 +329,7 @@ export function MysteryGameRenderer({
   scenarioTitle,
   showIdleLayout = true,
   idleSubtitle,
+  bonuses,
 }: MysteryGameRendererProps) {
   const fitWrapperRef = useRef<HTMLDivElement>(null);
   const [stage, setStage] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
@@ -365,6 +373,12 @@ export function MysteryGameRenderer({
   const gaugeInset = gaugeIconHeight / 2 + 8;
   const gaugeInsetPx = `${gaugeInset}px`;
   const gaugeDoubleInsetPx = `${gaugeInset * 2}px`;
+
+  // Bonus tiers unlocked by the score currently on the board. Empty for every
+  // run that stays at or under `score_full_game`, so the left column keeps its
+  // old spacer behaviour; during the reveal each tier appears at the exact
+  // moment the running tally crosses its threshold.
+  const reachedBonuses = reachedMysteryBonuses(bonuses ?? [], score);
 
   return (
     <div
@@ -485,10 +499,88 @@ export function MysteryGameRenderer({
                   minHeight: 0,
                 }}
               >
-                {/* Left column: kept as an empty 1fr spacer so the centre
-                    enigma image + right recap stay in their fixed positions.
-                    Timer + score are now author-placed overlays (see below). */}
-                <div />
+                {/* Left column: the bonus ("overscore") badges a team unlocks
+                    by scoring ABOVE score_full_game. Stays an empty 1fr spacer
+                    for every run that doesn't beat the maximum, so the centre
+                    enigma image + right recap keep their fixed positions.
+                    Timer + score are author-placed overlays (see below). */}
+                <div
+                  style={{
+                    display: 'grid',
+                    // One column up to 2 badges, then 2, then 3 - a perfect run
+                    // on a 9-tier scenario still fits without scrolling.
+                    gridTemplateColumns: `repeat(${
+                      reachedBonuses.length <= 2 ? 1 : reachedBonuses.length <= 6 ? 2 : 3
+                    }, minmax(0, 1fr))`,
+                    gap: `${stage.height * 0.015}px`,
+                    alignContent: 'center',
+                    justifyItems: 'center',
+                    minHeight: 0,
+                    overflow: 'hidden',
+                  }}
+                >
+                  {reachedBonuses.map((bonus) => {
+                    const imgUrl = bonus.image ? resolveMediaUrl(bonus.image) : '';
+                    return (
+                      <div
+                        // Keyed by tier index so each badge mounts exactly once,
+                        // when it is unlocked - that's what makes the pop-in
+                        // animation fire per tier instead of on every re-render.
+                        key={`bonus-${bonus.index}`}
+                        className="mystery-game-bonus"
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: `${stage.height * 0.006}px`,
+                          minWidth: 0,
+                          maxWidth: '100%',
+                        }}
+                      >
+                        {imgUrl && (
+                          <img
+                            src={imgUrl}
+                            alt=""
+                            style={{
+                              maxWidth: '100%',
+                              maxHeight: `${stage.height * (reachedBonuses.length <= 2 ? 0.24 : 0.16)}px`,
+                              width: 'auto',
+                              height: 'auto',
+                              objectFit: 'contain',
+                            }}
+                          />
+                        )}
+                        {bonus.name && (
+                          <div
+                            style={{
+                              fontSize: `${stage.height * 0.018}px`,
+                              textAlign: 'center',
+                              lineHeight: 1.15,
+                              // Authored names run long ("Champion de la lutte
+                              // contre les Zombies") and the column is narrow.
+                              overflowWrap: 'anywhere',
+                              textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+                              color: gameMeta.level_font_color || '#ffffff',
+                              // Name-only tiers (no authored image) still read as
+                              // a badge rather than floating text.
+                              ...(imgUrl
+                                ? {}
+                                : {
+                                    padding: `${stage.height * 0.008}px ${stage.width * 0.008}px`,
+                                    border: '2px solid rgba(255,255,255,0.65)',
+                                    borderRadius: 8,
+                                    background: 'rgba(0,0,0,0.35)',
+                                  }),
+                            }}
+                          >
+                            {bonus.name}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
 
                 {/* Centre column: ONE big enigma - text on top, image below.
                     Once a run's reveal has finished, the end-of-run summary

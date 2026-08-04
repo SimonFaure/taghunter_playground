@@ -57,7 +57,7 @@ import {
   gameTypeAdminVersionDirRel,
   gameTypeClientVersionDirRel,
 } from './contentFs';
-import { startConnectivityMonitor, onConnectivityChange, isOnline } from './connectivity';
+import { startConnectivityMonitor, onConnectivityChange, isOnline, studioReachableFresh } from './connectivity';
 import {
   syncItemKey,
   recordFailure,
@@ -284,7 +284,17 @@ async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Pr
   // resumption path, so nothing is lost by skipping here. A user-initiated
   // 'manual' sync is still honoured - they may know connectivity is back even
   // when navigator.onLine hasn't caught up (captive-portal lag, etc.).
-  if (!isOnline() && trigger !== 'manual') return;
+  //
+  // navigator.onLine is only trusted as a fast NEGATIVE: on the normal venue
+  // setup (satellite on the mother's internet-less hotspot) it reads TRUE, and
+  // scheduled cycles used to fire and die at the manifest fetch (up to a 30s
+  // timeout each) all event long. The truthful signal is the studio HTTP
+  // probe's shared cache - consult it (one live probe at most when stale)
+  // before spending a cycle.
+  if (trigger !== 'manual') {
+    if (!isOnline()) return;
+    if (!(await studioReachableFresh())) return;
+  }
   if (
     !opts.force &&
     lastCycleStartedAtMs !== null &&
@@ -667,17 +677,13 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   // that never paired thus learn the SSID/password to auto-join.
   {
     const remoteVersion = manifest.lan_networks_version ?? 0;
-    const localVersion = await lanNetworks.getLocalLanVersion();
-    // Re-pull when the version advanced OR when studio advertises networks but
-    // we hold none locally. The latter self-heals the trap where an earlier
-    // empty pull (studio had nothing yet) advanced the local version + tombstoned
-    // any rows: a flat seed version of 1 would never exceed it, so the device
-    // would stay creds-less forever. Cheap COUNT, only when there's something to
-    // pull and we're not already up to date.
-    const needPull =
-      remoteVersion > localVersion ||
-      (remoteVersion > 0 && (await wifiNetworksStore.countStudio()) === 0);
-    if (needPull) {
+    // Pull EVERY sync whenever studio has networks (version-INDEPENDENT), so the
+    // local mirror is reconciled to studio's authoritative set each time - this
+    // drops stale rows (e.g. an old auto-generated hotspot SSID a device learned
+    // via a past ping) even when the version hasn't advanced. The payload is a
+    // tiny GET; studio is the source of truth. When studio has nothing
+    // (remoteVersion 0 / table not migrated) we skip and leave the mirror alone.
+    if (remoteVersion > 0) {
       work.push({
         kind: 'lan_networks',
         priority: 1,
@@ -1096,22 +1102,29 @@ async function downloadReportLayouts(
   );
   emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
 
+  // Unparseable payload -> throw to the pool's failure path (markFailed) so
+  // the cached layouts survive, instead of replacing them with an empty set.
+  const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+    version?: number;
+    layouts?: unknown;
+    print_format?: unknown;
+  };
   let layouts: Record<string, unknown> = {};
   let version = item.remoteVersion;
-  try {
-    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
-      version?: number;
-      layouts?: unknown;
-      print_format?: unknown;
-    };
-    if (parsed.layouts && typeof parsed.layouts === 'object') {
-      layouts = parsed.layouts as Record<string, unknown>;
-    }
-    if (typeof parsed.version === 'number') version = parsed.version;
-    setSyncedDefaultPrintPrefs(parsed.print_format ?? null);
-  } catch (err) {
-    console.error('[sync] report layouts parse failed:', err);
+  if (parsed.layouts && typeof parsed.layouts === 'object') {
+    layouts = parsed.layouts as Record<string, unknown>;
   }
+  if (typeof parsed.version === 'number') version = parsed.version;
+  // {version: 0, layouts: {}} is the server's degraded fallback (a DB error
+  // on its side). The manifest advertised a real version, so treat it as a
+  // failure and keep the cache - marking it downloaded would pin
+  // local_version to 0 and re-trigger this download on every sync.
+  if (version <= 0 && item.remoteVersion > 0) {
+    throw new Error(
+      `report layouts: server returned degraded payload (version ${version}) while manifest advertised v${item.remoteVersion}`
+    );
+  }
+  setSyncedDefaultPrintPrefs(parsed.print_format ?? null);
 
   await reportLayoutsStore.replaceLayouts(layouts, version);
   await reportLayoutsStore.markDownloaded(version);
@@ -1120,7 +1133,7 @@ async function downloadReportLayouts(
 }
 
 async function downloadLanNetworks(
-  item: Extract<WorkItem, { kind: 'lan_networks' }>,
+  _item: Extract<WorkItem, { kind: 'lan_networks' }>,
   signal: AbortSignal
 ): Promise<DownloadOutcome> {
   const networks = await withRetry(() => lanNetworks.getLanNetworks(signal));
@@ -1137,11 +1150,11 @@ async function downloadLanNetworks(
       autoConnectOnInsert: true,
     });
   }
-  // Studio is the sole author: drop any studio-origin row that's no longer
-  // relayed (e.g. an admin renamed the hotspot - the old SSID must disappear so
-  // the picker / mother-raise stop offering it). Paired rows are untouched.
-  await wifiNetworksStore.tombstoneMissingStudio(networks.map((n) => n.ssid));
-  await lanNetworks.setLocalLanVersion(item.remoteVersion);
+  // Reconcile the local mirror to studio's authoritative set: keep exactly the
+  // relayed networks (+ manual entries) and drop everything else - stale studio
+  // rows (renamed hotspot) AND stale paired rows (e.g. an old auto-generated
+  // hotspot SSID from a past ping that nothing refreshes). Runs every sync.
+  await wifiNetworksStore.reconcileToStudioSet(networks.map((n) => n.ssid));
   return { enqueued: null, bytes: jsonByteLength(networks) };
 }
 

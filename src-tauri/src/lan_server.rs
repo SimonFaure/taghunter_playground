@@ -143,27 +143,231 @@ fn try_open_firewall() {
         Err(_) => return,
     };
     let name = "name=TagHunter Playground LAN";
-    let _ = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let name_ports = "name=TagHunter Playground LAN Ports";
+    for n in [name, name_ports] {
+        let _ = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", n])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    // Remove ANY inbound rules bound to our exe - crucially the auto-created BLOCK
+    // rules Windows adds when a "Windows Security Alert" prompt is declined. A
+    // Block rule overrides every Allow rule, so the adds below do nothing until
+    // these are gone (the "port allow rule has no effect, only turning the whole
+    // firewall off works" symptom). Best-effort - only bites when already elevated.
     let _ = std::process::Command::new("netsh")
         .args([
-            "advfirewall", "firewall", "add", "rule", name,
-            "dir=in", "action=allow", "enable=yes", "profile=any",
-            "protocol=TCP", &format!("program={exe}"),
+            "advfirewall", "firewall", "delete", "rule", "name=all", "dir=in",
+            &format!("program={exe}"),
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
+    // TCP for the mother's axum server AND UDP for mDNS discovery (port 5353):
+    // a satellite can't even DISCOVER the mother if the Public profile blocks
+    // inbound mDNS, so both protocols must be allowed for our exe.
+    for proto in ["TCP", "UDP"] {
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "advfirewall", "firewall", "add", "rule", name,
+                "dir=in", "action=allow", "enable=yes", "profile=any",
+                &format!("protocol={proto}"), &format!("program={exe}"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    // Also allow the well-known LAN ports by NUMBER, independent of the exe path.
+    // A program-scoped rule silently fails to cover inbound TCP when the stored
+    // image path diverges from the running one (rebuild / reinstall to a new
+    // location / 8.3 short name / junction) - the child then sees the mother over
+    // mDNS but its TCP connect is dropped ("deadline has elapsed"). A port rule
+    // has no such dependency, so this is the reliable inbound path to the server.
+    for (proto, ports) in [("TCP", "47800-47803"), ("UDP", "5353")] {
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "advfirewall", "firewall", "add", "rule", name_ports,
+                "dir=in", "action=allow", "enable=yes", "profile=any",
+                &format!("protocol={proto}"), &format!("localport={ports}"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn try_open_firewall() {}
 
+// Add the inbound firewall rules WITH ELEVATION. The plain `try_open_firewall`
+// above only works when the app already runs as admin (rare); on a normal install
+// the rule is never added, so satellites on the hotspot's "Public" profile can't
+// open a TCP connection to the mother's server (mDNS multicast still works, which
+// is why the mother is *discoverable* but *unreachable*). This escalates via a
+// single UAC prompt (an elevated PowerShell script).
+//
+// CRITICAL: it does not just ADD allow rules - it first DELETES any inbound BLOCK
+// rules that cover our exe. Windows auto-creates program-scoped inbound *block*
+// rules when the user clicks "Cancel"/"Block" on the "Windows Security Alert"
+// firewall prompt, and a Block rule OVERRIDES every Allow rule - so allow rules
+// (program- or port-scoped) never take effect until the blocks are removed. That
+// is the exact "an explicit port allow rule does nothing, only turning the whole
+// firewall off works" symptom. We match block rules by full exe path OR by exe
+// leaf name (so blocks left over from a previous install location are cleared too).
+#[cfg(target_os = "windows")]
+fn add_firewall_rule_elevated() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => return false,
+    };
+    let exe_ps = exe.replace('\'', "''");
+    let name = "TagHunter Playground LAN";
+    // All-cmdlet (NetSecurity) so a path with spaces needs no netsh quoting.
+    //  1) remove inbound BLOCK rules covering our exe (the override that made
+    //     allow rules useless),
+    //  2) clear our own named rules for an idempotent re-add,
+    //  3) add program-scoped (TCP+UDP) AND port-scoped (TCP 47800-47803 + UDP
+    //     5353) allow rules - the port rule is path-independent, so it survives a
+    //     rebuild/reinstall to a new location.
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'\r\n\
+         $exe='{exe_ps}'\r\n\
+         $leaf=Split-Path $exe -Leaf\r\n\
+         Get-NetFirewallRule -Direction Inbound -Action Block | ForEach-Object {{\r\n\
+         $f = $_ | Get-NetFirewallApplicationFilter\r\n\
+         if ($f -and $f.Program -and ($f.Program -eq $exe -or $f.Program -like ('*\\' + $leaf))) {{ $_ | Remove-NetFirewallRule }}\r\n\
+         }}\r\n\
+         Remove-NetFirewallRule -DisplayName '{name}'\r\n\
+         Remove-NetFirewallRule -DisplayName '{name} Ports'\r\n\
+         New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Allow -Profile Any -Protocol TCP -Program $exe -Enabled True | Out-Null\r\n\
+         New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Allow -Profile Any -Protocol UDP -Program $exe -Enabled True | Out-Null\r\n\
+         New-NetFirewallRule -DisplayName '{name} Ports' -Direction Inbound -Action Allow -Profile Any -Protocol TCP -LocalPort 47800-47803 -Enabled True | Out-Null\r\n\
+         New-NetFirewallRule -DisplayName '{name} Ports' -Direction Inbound -Action Allow -Profile Any -Protocol UDP -LocalPort 5353 -Enabled True | Out-Null\r\n\
+         exit 0\r\n"
+    );
+    matches!(run_elevated_powershell(&script), Ok(0))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn add_firewall_rule_elevated() -> bool {
+    true
+}
+
+/// Ensure the mother's inbound LAN port is allowed through the firewall, with a
+/// one-time UAC elevation if needed. Returns true if the elevated rule was added
+/// (or we're not on Windows). Callers persist the result so the prompt appears at
+/// most once per machine; the Network-tab "repair" button calls it on demand.
+#[tauri::command]
+pub async fn mother_open_firewall_elevated() -> Result<bool, String> {
+    // Cheap best-effort first (works if already elevated), then the UAC path.
+    let _ = tokio::task::spawn_blocking(try_open_firewall).await;
+    let ok = tokio::task::spawn_blocking(add_firewall_rule_elevated)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ok)
+}
+
+// Read-only check that the "TagHunter Playground LAN" rule exists in the live
+// firewall AND still points at the CURRENTLY-running exe. The persisted
+// 'firewall_rule_added' flag alone was untrustworthy: the NSIS uninstaller
+// deletes the rule while app data (+ the flag) survive a reinstall, GPO/AV
+// cleanups delete rules, and - crucially - the rule is program-scoped to an
+// exact .exe PATH, so a rebuild/reinstall to a NEW location leaves a rule that
+// exists by name but no longer covers the running app: mother discoverable over
+// mDNS, unreachable over TCP, and Diagnostics falsely reads "OK".
+//
+// We query the rule's program path via PowerShell Get-NetFirewallApplicationFilter
+// (structured, proper Unicode) rather than netsh's LOCALIZED + OEM-codepage
+// verbose dump - the codepage is why a plain substring match missed accented
+// install paths (common in France). No elevation needed.
+//
+// Some(true) = rule present and covers this exe (or is program=Any, or we
+// couldn't read either path so we don't nag); Some(false) = absent OR stale
+// (points at a different exe) → the caller clears the flag and re-adds it for
+// the current exe; None = could not run the check (callers keep trusting the flag).
+#[cfg(target_os = "windows")]
+fn firewall_rule_status_sync() -> Option<bool> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ps = "$ErrorActionPreference='SilentlyContinue';\
+        $r = Get-NetFirewallRule -DisplayName 'TagHunter Playground LAN';\
+        if (-not $r) { Write-Output 'ABSENT'; exit 0 };\
+        $p = ($r | Get-NetFirewallApplicationFilter | Select-Object -First 1 -ExpandProperty Program);\
+        Write-Output ('PROGRAM=' + $p)";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.contains("ABSENT") {
+        return Some(false); // no rule with that name → re-add
+    }
+    let rule_prog = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("PROGRAM="))
+        .map(|s| s.trim().to_lowercase());
+    let cur = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_lowercase());
+    match (rule_prog, cur) {
+        (Some(rp), Some(cur)) if !rp.is_empty() => {
+            if rp == cur || rp == "any" {
+                Some(true) // covers the running exe (or any program)
+            } else {
+                eprintln!(
+                    "[lan_server] firewall rule points at a different exe (stale): '{rp}' != '{cur}' - flagging for re-add"
+                );
+                Some(false) // stale rule from a previous build/install location
+            }
+        }
+        // Rule exists but we couldn't read its program path (or ours) - don't
+        // nag-loop the UAC prompt; assume it's fine.
+        _ => Some(true),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn firewall_rule_status_sync() -> Option<bool> {
+    Some(true)
+}
+
+/// `Some(true)` rule present and covers the running exe, `Some(false)` absent OR
+/// stale (points at a different exe - the caller should clear its persisted flag
+/// and re-run the one-time UAC add), `None` indeterminate (keep trusting the flag).
+#[tauri::command]
+pub async fn mother_firewall_rule_status() -> Result<Option<bool>, String> {
+    tokio::task::spawn_blocking(firewall_rule_status_sync)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // Slice 6 sentinel: `mother_start_local_server` returns this (recognizable by
 // the TS `ensureMotherServer`) when it stands down because another device is
 // already the mother at a higher epoch. Not a real error - a deliberate refusal.
 pub const MOTHER_SUPERSEDED: &str = "mother_superseded: another device is the current mother (higher epoch)";
+
+// F13: preferred well-known ports for the mother's axum server. Binding a
+// predictable port lets a child probe the hotspot gateway (192.168.137.1)
+// DIRECTLY over HTTP when mDNS multicast is filtered on the Windows "Public"
+// profile - the direct-probe fallback (client_probe_gateway_mother). The
+// server still advertises its ACTUAL bound port over mDNS, so a rare conflict
+// that forces the OS-picked fallback below only loses the gateway fast-path,
+// never discovery itself.
+pub const PREFERRED_PORTS: [u16; 4] = [47800, 47801, 47802, 47803];
+
+/// Bind the axum listener. `requested == 0` means "OS picks" from the caller,
+/// but we first try the PREFERRED_PORTS in order (so the gateway direct-probe
+/// has a known port to hit) and fall back to an OS-assigned port only if they
+/// are all taken. A non-zero `requested` is honored verbatim (tests / explicit).
+async fn bind_mother_listener(requested: u16) -> std::io::Result<TcpListener> {
+    if requested != 0 {
+        return TcpListener::bind(format!("0.0.0.0:{requested}")).await;
+    }
+    for p in PREFERRED_PORTS {
+        if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{p}")).await {
+            return Ok(l);
+        }
+    }
+    TcpListener::bind("0.0.0.0:0").await
+}
 
 #[tauri::command]
 pub async fn mother_start_local_server(
@@ -233,16 +437,53 @@ pub async fn mother_start_local_server(
     // model) wrongly keep hosting instead of deferring to the real mother.
     //
     // Known edge: two willing mothers powered on simultaneously can both see each
-    // other and both stand down (→ no mother); recover with the Network-tab
-    // "Make this device the mother" button. Operators stagger boots in practice.
+    // other and both stand down (→ no mother). The TS boot path now schedules a
+    // delayed re-check after a stand-down (re-runs ensureMotherServer if no
+    // mother materialized), so this self-recovers; the Network-tab "Make this
+    // device the mother" button remains the manual override.
     {
-        if let Ok(mothers) = run_mdns_discovery(Duration::from_millis(2500)).await {
-            let my_uuid = &self_pair.mother_device_uuid;
-            let superseded = mothers.iter().any(|m| {
-                &m.mother_uuid != my_uuid && m.client_id == Some(client_id)
-            });
-            if superseded {
-                return Err(MOTHER_SUPERSEDED.into());
+        // Whether this device still holds a live game - used by the error path
+        // below: a game-holding device must keep serving even when the browse is
+        // broken (never strand a live game); a willing-but-idle one fails closed.
+        let has_active_game = conn
+            .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+                let n: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM lg_launched_games WHERE client_id = ? AND ended = 0",
+                    params![client_id],
+                    |r| r.get(0),
+                )?;
+                Ok(n > 0)
+            })
+            .await
+            .unwrap_or(false);
+        // A browse ERROR (mdns daemon failure, blocked inbound UDP 5353) used to
+        // skip the fence entirely - a silent split-brain enabler. Treat it as
+        // indeterminate instead: retry once, then fail closed while idle.
+        let browsed = match run_mdns_discovery(Duration::from_millis(2500)).await {
+            Ok(m) => Ok(m),
+            Err(_) => run_mdns_discovery(Duration::from_millis(2000)).await,
+        };
+        match browsed {
+            Ok(mothers) => {
+                let my_uuid = &self_pair.mother_device_uuid;
+                let superseded = mothers.iter().any(|m| {
+                    &m.mother_uuid != my_uuid && m.client_id == Some(client_id)
+                });
+                if superseded {
+                    return Err(MOTHER_SUPERSEDED.into());
+                }
+            }
+            Err(e) => {
+                if !has_active_game {
+                    // Sentinel prefix kept so the TS caller treats this as a calm
+                    // stand-down (and its delayed re-check retries once mDNS works).
+                    return Err(format!(
+                        "{MOTHER_SUPERSEDED} [fence browse failed twice: {e} - refusing to start a possibly-duplicate mother while idle]"
+                    ));
+                }
+                eprintln!(
+                    "[lan_server] fence browse failed twice ({e}) - serving anyway: this device holds a live game."
+                );
             }
         }
     }
@@ -257,10 +498,9 @@ pub async fn mother_start_local_server(
     };
 
     let app_router = build_router(app_state);
-    let bind_addr = format!("0.0.0.0:{port}");
-    let listener = TcpListener::bind(&bind_addr)
+    let listener = bind_mother_listener(port)
         .await
-        .map_err(|e| format!("bind {bind_addr}: {e}"))?;
+        .map_err(|e| format!("bind mother listener (requested {port}): {e}"))?;
     let actual = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
@@ -279,9 +519,11 @@ pub async fn mother_start_local_server(
     });
 
     // Register mDNS broadcast (best-effort: failure shouldn't kill the server).
-    // No explicit addrs at boot - the hotspot interface doesn't exist yet;
-    // mother_refresh_mdns re-announces with it once the hotspot starts.
-    let mdns = match start_mdns(&self_pair.mother_device_uuid, mdns_label.as_deref(), actual_port, client_id, epoch, &[]) {
+    // No explicit addrs at boot - in hotspot mode the AP interface doesn't exist
+    // yet (start_mdns advertises nothing until mother_refresh_mdns runs once the
+    // hotspot is up); in router mode start_mdns picks up the router IPv4 now.
+    let boot_source = read_lan_network_source(&app).await;
+    let mdns = match start_mdns(&self_pair.mother_device_uuid, mdns_label.as_deref(), actual_port, client_id, epoch, &[], &boot_source) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("[lan_server] mDNS start failed: {e} (continuing without)");
@@ -374,6 +616,28 @@ struct CqRow {
     quest_id: Option<i64>,
     quest_number: String,
     points_awarded: i64,
+    created_at: String,
+}
+// Clash V2 per-game state (empty vecs for non-clash games and for snapshots
+// taken before these tables were captured).
+struct ClashMemberRow { id: i64, team_id: i64, chip_id: i64, created_at: String }
+struct ClashValidationRow {
+    id: i64,
+    team_id: i64,
+    chip_id: i64,
+    combo_index: i64,
+    territory_index: i64,
+    seq: i64,
+    created_at: String,
+}
+struct ClashConsumedRow { id: i64, chip_id: i64, punch_key: String, created_at: String }
+struct ClashEffectifRow { team_id: i64, size: i64 }
+struct ClashPurgeRow {
+    id: i64,
+    team_id: i64,
+    chip_id: i64,
+    territory_index: i64,
+    seq: i64,
     created_at: String,
 }
 
@@ -536,6 +800,54 @@ pub async fn become_mother(
             created_at: vstr(&v, "created_at").unwrap_or_default(),
         });
     }
+    let mut clash_members = Vec::new();
+    for v in arr("clash_members") {
+        clash_members.push(ClashMemberRow {
+            id: req_i64(&v, "id")?,
+            team_id: req_i64(&v, "team_id")?,
+            chip_id: req_i64(&v, "chip_id")?,
+            created_at: vstr(&v, "created_at").unwrap_or_default(),
+        });
+    }
+    let mut clash_validations = Vec::new();
+    for v in arr("clash_validations") {
+        clash_validations.push(ClashValidationRow {
+            id: req_i64(&v, "id")?,
+            team_id: req_i64(&v, "team_id")?,
+            chip_id: req_i64(&v, "chip_id")?,
+            combo_index: req_i64(&v, "combo_index")?,
+            territory_index: req_i64(&v, "territory_index")?,
+            seq: req_i64(&v, "seq")?,
+            created_at: vstr(&v, "created_at").unwrap_or_default(),
+        });
+    }
+    let mut clash_consumed = Vec::new();
+    for v in arr("clash_consumed") {
+        clash_consumed.push(ClashConsumedRow {
+            id: req_i64(&v, "id")?,
+            chip_id: req_i64(&v, "chip_id")?,
+            punch_key: req_str(&v, "punch_key")?,
+            created_at: vstr(&v, "created_at").unwrap_or_default(),
+        });
+    }
+    let mut clash_effectif = Vec::new();
+    for v in arr("clash_effectif") {
+        clash_effectif.push(ClashEffectifRow {
+            team_id: req_i64(&v, "team_id")?,
+            size: req_i64(&v, "size")?,
+        });
+    }
+    let mut clash_purges = Vec::new();
+    for v in arr("clash_purges") {
+        clash_purges.push(ClashPurgeRow {
+            id: req_i64(&v, "id")?,
+            team_id: req_i64(&v, "team_id")?,
+            chip_id: req_i64(&v, "chip_id")?,
+            territory_index: req_i64(&v, "territory_index")?,
+            seq: req_i64(&v, "seq")?,
+            created_at: vstr(&v, "created_at").unwrap_or_default(),
+        });
+    }
 
     // 3. Content guard - refuse if this device hasn't synced the scenario.
     let game_uniqid_for_guard = game.game_uniqid.clone();
@@ -589,6 +901,19 @@ pub async fn become_mother(
     let new_self_secret = random_token(32);
     let game_id = game.id;
     let adopt_label = mdns_label.clone();
+    // Network creds from the snapshot, to be mirrored into schema_meta inside
+    // the adoption transaction. The JS boot raise path does this via
+    // saveHotspotCreds, but a promoted mother never runs that path - without
+    // the mirror, read_mother_wifi relays null after a failover (late children
+    // can't learn the SSID offline) and our own snapshots carry no wifi block,
+    // so a SECOND failover could not re-raise the AP at all.
+    let wifi_mirror: Option<(String, String, String)> = snap.get("wifi").and_then(|w| {
+        let source = vstr(w, "source").unwrap_or_else(|| "hotspot".to_string());
+        match (vstr(w, "ssid"), vstr(w, "password")) {
+            (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => Some((s, p, source)),
+            _ => None,
+        }
+    });
     let (self_peer_id, self_peer_secret) = conn
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(i64, String)> {
             let tx = c.transaction()?;
@@ -681,6 +1006,45 @@ pub async fn become_mother(
                     params![q.id, game_id, q.team_id, q.teammate_chip_id, q.quest_id, q.quest_number, q.points_awarded, q.created_at],
                 )?;
             }
+            // 5b-bis. Clash V2 state (empty for non-clash games / older
+            // snapshots). Ordered after lg_teams - these rows FK onto it.
+            for m in &clash_members {
+                tx.execute(
+                    "INSERT INTO lg_clash_members (id, launched_game_id, team_id, chip_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
+                    params![m.id, game_id, m.team_id, m.chip_id, m.created_at],
+                )?;
+            }
+            for vr in &clash_validations {
+                tx.execute(
+                    "INSERT INTO lg_clash_validations
+                       (id, launched_game_id, team_id, chip_id, combo_index, territory_index, seq, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(NULLIF(?8,''), CURRENT_TIMESTAMP))",
+                    params![vr.id, game_id, vr.team_id, vr.chip_id, vr.combo_index, vr.territory_index, vr.seq, vr.created_at],
+                )?;
+            }
+            for cr in &clash_consumed {
+                tx.execute(
+                    "INSERT INTO lg_clash_consumed (id, launched_game_id, chip_id, punch_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
+                    params![cr.id, game_id, cr.chip_id, cr.punch_key, cr.created_at],
+                )?;
+            }
+            for e in &clash_effectif {
+                tx.execute(
+                    "INSERT INTO lg_clash_effectif (launched_game_id, team_id, size)
+                     VALUES (?1, ?2, ?3)",
+                    params![game_id, e.team_id, e.size],
+                )?;
+            }
+            for p in &clash_purges {
+                tx.execute(
+                    "INSERT INTO lg_clash_purges
+                       (id, launched_game_id, team_id, chip_id, territory_index, seq, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(NULLIF(?7,''), CURRENT_TIMESTAMP))",
+                    params![p.id, game_id, p.team_id, p.chip_id, p.territory_index, p.seq, p.created_at],
+                )?;
+            }
 
             // 5c. Our mother identity == our client_device_uuid (keeps the
             // self-row peer_uuid == mother_uuid convention).
@@ -689,6 +1053,28 @@ pub async fn become_mother(
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![self_uuid],
             )?;
+            // 5c-bis. Mirror the adopted network creds so read_mother_wifi keeps
+            // relaying them post-failover and our own snapshots keep carrying a
+            // wifi block (second-generation failover). Router-mode snapshots
+            // carry router creds - route them to the router keys.
+            if let Some((ssid, password, source)) = &wifi_mirror {
+                let (ssid_key, pw_key) = if source == "router" {
+                    ("lan_router_ssid", "lan_router_password")
+                } else {
+                    ("hotspot_ssid", "hotspot_password")
+                };
+                for (k, v) in [
+                    ("lan_network_source", source.as_str()),
+                    (ssid_key, ssid.as_str()),
+                    (pw_key, password.as_str()),
+                ] {
+                    tx.execute(
+                        "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![k, v],
+                    )?;
+                }
+            }
             // With the identity keys settled, collapse any leftover rows for
             // OUR previous identity and drop self-referential mother links
             // (see heal_self_identity).
@@ -717,9 +1103,9 @@ pub async fn become_mother(
         last_bump: Arc::new(Mutex::new(HashMap::new())),
     };
     let app_router = build_router(app_state);
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = bind_mother_listener(port)
         .await
-        .map_err(|e| format!("bind 0.0.0.0:{port}: {e}"))?;
+        .map_err(|e| format!("bind mother listener (requested {port}): {e}"))?;
     let actual = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
     let actual_port = actual.port();
     let _ = tokio::task::spawn_blocking(try_open_firewall).await;
@@ -731,7 +1117,14 @@ pub async fn become_mother(
             })
             .await;
     });
-    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game.client_id, new_epoch, &[]) {
+    // Adopt the OLD mother's network mode from the snapshot so a router-mode
+    // failover advertises its router IPv4 immediately (a hotspot-mode failover
+    // stays address-less until the AP is re-raised + mDNS refreshed below).
+    let boot_source = snap
+        .get("wifi")
+        .and_then(|w| vstr(w, "source"))
+        .unwrap_or_else(|| "hotspot".to_string());
+    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game.client_id, new_epoch, &[], &boot_source) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("[lan_server] become_mother mDNS start failed: {e} (continuing)");
@@ -784,6 +1177,9 @@ pub async fn become_mother(
                             running.client_id,
                             running.epoch,
                             &addrs,
+                            // This branch only runs for hotspot-mode failover, so
+                            // lock advertisement to the AP subnet.
+                            "hotspot",
                         )
                         .ok();
                     }
@@ -1028,16 +1424,22 @@ pub async fn fetch_snapshot_from_mother(
 /// isn't running.
 #[tauri::command]
 pub async fn mother_refresh_mdns(
+    app: AppHandle,
     state: tauri::State<'_, MotherServerState>,
     addresses: Vec<String>,
 ) -> Result<(), String> {
+    // Read the LAN source BEFORE taking the server lock (it opens its own db
+    // connection). start_mdns then locks `addresses` + our interface IPs down to
+    // the designated isolated LAN, so a hotspot-mode mother re-announces ONLY its
+    // AP subnet - never the office/upstream IP the caller may have passed.
+    let source = read_lan_network_source(&app).await;
     let mut guard = state.inner.lock().await;
     let running = match guard.as_mut() {
         Some(r) => r,
         None => return Ok(()),
     };
-    // Drop loopback; keep usable LAN/link-local addrs (the client picks the
-    // reachable one). Tear down the old announcement before re-registering.
+    // Drop loopback; keep usable LAN/link-local addrs (start_mdns filters to the
+    // designated LAN). Tear down the old announcement before re-registering.
     let addrs: Vec<String> = addresses
         .into_iter()
         .filter(|a| a != "127.0.0.1" && a != "::1")
@@ -1046,10 +1448,80 @@ pub async fn mother_refresh_mdns(
         let _ = old.daemon.unregister(&old.full_name);
         let _ = old.daemon.shutdown();
     }
-    match start_mdns(&running.mother_uuid, running.mdns_label.as_deref(), running.port, running.client_id, running.epoch, &addrs) {
+    match start_mdns(&running.mother_uuid, running.mdns_label.as_deref(), running.port, running.client_id, running.epoch, &addrs, &source) {
         Ok(h) => {
             running.mdns = Some(h);
             Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Self-healing mDNS keepalive for the mother. The hotspot's APIPA address
+/// (169.254.*) self-assigns a few seconds AFTER the AP interface comes up, so the
+/// `refreshMdns` fired right after `startHotspot` can register while there's still
+/// no designated address (inert). A cheap periodic call from JS re-registers the
+/// announcement the moment a designated address exists - and ONLY then, so a
+/// healthy announcement is never churned. Returns true if it (re)registered.
+#[tauri::command]
+pub async fn mother_ensure_mdns_live(
+    app: AppHandle,
+    state: tauri::State<'_, MotherServerState>,
+) -> Result<bool, String> {
+    // Not-a-mother check FIRST: this command is polled on EVERY device every
+    // 10s, but only a running mother with an INERT announcement can act on it.
+    // Bail under a short lock before paying for read_lan_network_source's SQLite
+    // open + the if_addrs interface scan - a pure satellite (the common case)
+    // used to do both every 10s for a guaranteed Ok(false).
+    {
+        let guard = state.inner.lock().await;
+        match guard.as_ref() {
+            None => return Ok(false), // not a mother
+            Some(r) => {
+                let is_inert = r.mdns.as_ref().map(|m| m.full_name.is_empty()).unwrap_or(true);
+                if !is_inert {
+                    return Ok(false); // already advertising - don't churn discovery
+                }
+            }
+        }
+    }
+    let source = read_lan_network_source(&app).await;
+    let locals: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
+    let designated = designated_lan_addrs(&source, &locals);
+    if designated.is_empty() {
+        return Ok(false); // nothing to advertise yet (AP has no address)
+    }
+    // Re-acquire to mutate; re-check the state we dropped the lock on.
+    let mut guard = state.inner.lock().await;
+    let running = match guard.as_mut() {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    let is_inert = running
+        .mdns
+        .as_ref()
+        .map(|m| m.full_name.is_empty())
+        .unwrap_or(true);
+    if !is_inert {
+        return Ok(false);
+    }
+    if let Some(old) = running.mdns.take() {
+        let _ = old.daemon.unregister(&old.full_name);
+        let _ = old.daemon.shutdown();
+    }
+    // Pass no extra_addrs: start_mdns merges the live interface IPs itself.
+    match start_mdns(
+        &running.mother_uuid,
+        running.mdns_label.as_deref(),
+        running.port,
+        running.client_id,
+        running.epoch,
+        &[],
+        &source,
+    ) {
+        Ok(h) => {
+            running.mdns = Some(h);
+            Ok(true)
         }
         Err(e) => Err(e),
     }
@@ -1590,11 +2062,10 @@ async fn read_state_version(state: &AppState) -> i64 {
 /// header + meta + devices + all raw_data/teams/completed_quests, the
 /// `paired_devices` table (peer secrets, so satellites keep authenticating to
 /// the new mother), the mother's Wi-Fi creds (so the new mother raises the
-/// same-named AP), plus `state_version` + `mother_epoch` for staleness +
-/// fencing. Returns None if the game id is unknown.
-///
-/// NOTE: clash_* tables are not yet captured here - a clash game would restore
-/// without its territory/validation rows. Tracked as a slice-1 follow-up.
+/// same-named AP), the clash_* per-game state (members / validations /
+/// consumed punches / effectif / purges - a Clash failover used to restore
+/// with those silently amputated), plus `state_version` + `mother_epoch` for
+/// staleness + fencing. Returns None if the game id is unknown.
 async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> Option<Value> {
     let wifi = read_mother_wifi(state).await;
     let mother_uuid = state.mother_uuid.clone();
@@ -1736,6 +2207,83 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
+            // Clash V2 per-game state. Cheap for non-clash games (indexed
+            // lookups over empty tables); required for Clash - a promotion
+            // without these rows silently zeroes territory domination,
+            // banked punches, effectif weighting and purge history.
+            let clash_members: Vec<Value> = c
+                .prepare(
+                    "SELECT id, team_id, chip_id, created_at
+                     FROM lg_clash_members WHERE launched_game_id = ? ORDER BY id ASC",
+                )?
+                .query_map(params![game_id], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "team_id": r.get::<_, i64>(1)?,
+                        "chip_id": r.get::<_, i64>(2)?,
+                        "created_at": r.get::<_, String>(3)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let clash_validations: Vec<Value> = c
+                .prepare(
+                    "SELECT id, team_id, chip_id, combo_index, territory_index, seq, created_at
+                     FROM lg_clash_validations WHERE launched_game_id = ? ORDER BY id ASC",
+                )?
+                .query_map(params![game_id], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "team_id": r.get::<_, i64>(1)?,
+                        "chip_id": r.get::<_, i64>(2)?,
+                        "combo_index": r.get::<_, i64>(3)?,
+                        "territory_index": r.get::<_, i64>(4)?,
+                        "seq": r.get::<_, i64>(5)?,
+                        "created_at": r.get::<_, String>(6)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let clash_consumed: Vec<Value> = c
+                .prepare(
+                    "SELECT id, chip_id, punch_key, created_at
+                     FROM lg_clash_consumed WHERE launched_game_id = ? ORDER BY id ASC",
+                )?
+                .query_map(params![game_id], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "chip_id": r.get::<_, i64>(1)?,
+                        "punch_key": r.get::<_, String>(2)?,
+                        "created_at": r.get::<_, String>(3)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let clash_effectif: Vec<Value> = c
+                .prepare(
+                    "SELECT team_id, size FROM lg_clash_effectif WHERE launched_game_id = ?",
+                )?
+                .query_map(params![game_id], |r| {
+                    Ok(json!({
+                        "team_id": r.get::<_, i64>(0)?,
+                        "size": r.get::<_, i64>(1)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let clash_purges: Vec<Value> = c
+                .prepare(
+                    "SELECT id, team_id, chip_id, territory_index, seq, created_at
+                     FROM lg_clash_purges WHERE launched_game_id = ? ORDER BY id ASC",
+                )?
+                .query_map(params![game_id], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "team_id": r.get::<_, i64>(1)?,
+                        "chip_id": r.get::<_, i64>(2)?,
+                        "territory_index": r.get::<_, i64>(3)?,
+                        "seq": r.get::<_, i64>(4)?,
+                        "created_at": r.get::<_, String>(5)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
             Ok(Some(json!({
                 "schema": 1,
                 "state_version": state_version,
@@ -1749,6 +2297,11 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
                 "teams": teams,
                 "completed_quests": completed_quests,
                 "paired_devices": paired_devices,
+                "clash_members": clash_members,
+                "clash_validations": clash_validations,
+                "clash_consumed": clash_consumed,
+                "clash_effectif": clash_effectif,
+                "clash_purges": clash_purges,
             })))
         })
         .await
@@ -1805,7 +2358,9 @@ async fn dispatch_launched_games(
         ("GET", "list_archived_summaries") => list_archived_summaries(&state).await,
         ("POST", "register_device") => register_device(&state, peer_id, body).await,
         ("GET", "get_devices") => get_devices(&state, &q.rest).await,
-        ("GET", "list_paired_with_status") => list_paired_with_status(&state, &q.rest).await,
+        ("GET", "list_paired_with_status") => {
+            list_paired_with_status(&state, peer_id, &q.rest).await
+        }
         ("GET", "list_paired_for_launch") => list_paired_for_launch(&state).await,
         ("POST", "queue_command") => queue_command(&state, peer_id, body).await,
         ("POST", "queue_command_bulk") => queue_command_bulk(&state, peer_id, body).await,
@@ -1861,7 +2416,15 @@ async fn dispatch_pair(
 
     let result: Result<Value, ApiErr> = match (method.as_str(), action) {
         ("POST", "request") => pair_request_handler(&state, body).await,
-        ("GET", "status") => pair_status_handler(&state, &q.rest).await,
+        // Unauthenticated identity probe: lets a child that reached this server
+        // by a KNOWN address (the hotspot gateway 192.168.137.1 at a fixed port)
+        // confirm a mother is here and learn its uuid/client_id/epoch WITHOUT
+        // mDNS - the direct-probe fallback for when multicast is filtered on the
+        // Windows "Public" profile (the #1 discovery failure). Same shape a
+        // resolved mDNS record yields.
+        ("GET", "hello") => pair_hello_handler(&state).await,
+        // ("GET", "status") retired with the manual-approval ceremony: this
+        // mother never returns 'pending', so nothing has a request_id to poll.
         ("", _) | (_, "") => Err(ApiErr::bad("action is required")),
         _ => Err(ApiErr::status(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1973,36 +2536,6 @@ async fn read_mother_wifi(state: &AppState) -> Option<Value> {
     let ssid = ssid.filter(|s| !s.is_empty())?;
     let password = password.filter(|s| !s.is_empty())?;
     Some(json!({ "ssid": ssid, "password": password, "source": source }))
-}
-
-#[allow(dead_code)]
-async fn verify_peer_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
-    let Some(token) = token else {
-        return Err(error(StatusCode::UNAUTHORIZED, "Missing bearer"));
-    };
-    let exists: bool = state
-        .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
-            Ok(c.query_row(
-                "SELECT 1 FROM paired_devices WHERE peer_secret = ?",
-                params![token],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false))
-        })
-        .await
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if exists {
-        Ok(())
-    } else {
-        Err(error(StatusCode::UNAUTHORIZED, "Unauthorized"))
-    }
 }
 
 // ─── error type ──────────────────────────────────────────────────────────────
@@ -3468,6 +4001,7 @@ async fn get_devices(
 // staleness - that's a client concern; we just return raw timestamps.
 async fn list_paired_with_status(
     state: &AppState,
+    caller_device_id: i64,
     rest: &HashMap<String, String>,
 ) -> Result<Value, ApiErr> {
     let launched_game_id = parse_i64(rest, "launched_game_id")?;
@@ -3556,6 +4090,12 @@ async fn list_paired_with_status(
         "in_game": in_game,
         "available_online": available_online,
         "offline": offline,
+        // Who is ASKING, resolved from the bearer secret. `is_self` on the rows
+        // is this DB owner's own row (the mother), which is meaningless to a
+        // satellite reading the mother's list - every satellite would resolve
+        // itself to the mother's device_id and pick up the mother's station
+        // assignment. Callers that need "my device_id" must use this.
+        "caller_device_id": caller_device_id,
     }))
 }
 
@@ -3827,14 +4367,17 @@ async fn queue_command_inner(
             if let Some(gid) = preempt_gid {
                 let needle = format!("\"launched_game_id\":{gid}");
                 let alt_needle = format!("\"launched_game_id\": {gid}");
+                // All-numbered placeholders: a bare `?` here would also bind
+                // index 1, so `?1` would alias it and SQLite would see a
+                // 2-parameter statement against 3 bound values (hard error).
                 c.execute(
                     "UPDATE pending_commands
                         SET acked_at = CURRENT_TIMESTAMP
-                      WHERE target_device_id = ?
+                      WHERE target_device_id = ?1
                         AND kind = 'play_video'
                         AND acked_at IS NULL
-                        AND (payload_json LIKE '%' || ?1 || '%'
-                             OR payload_json LIKE '%' || ?2 || '%')",
+                        AND (payload_json LIKE '%' || ?2 || '%'
+                             OR payload_json LIKE '%' || ?3 || '%')",
                     params![target_device_id, needle, alt_needle],
                 )?;
             }
@@ -4895,6 +5438,32 @@ async fn clash_state(state: &AppState, rest: &HashMap<String, String>) -> Result
 
 // ─── action handlers: pair ───────────────────────────────────────────────────
 
+/// Unauthenticated identity for the gateway direct-probe (F13). Returns the
+/// same identity fields the mDNS TXT record carries so a child can build a
+/// DiscoveredMother without multicast. Epoch is computed live (MAX over this
+/// client's active games, mirroring the value advertised at server start).
+async fn pair_hello_handler(state: &AppState) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    let epoch: i64 = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
+            Ok(c.query_row(
+                "SELECT COALESCE(MAX(mother_epoch), 1)
+                 FROM lg_launched_games WHERE client_id = ? AND ended = 0",
+                params![client_id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap_or(1);
+    Ok(json!({
+        "status": "ok",
+        "mother_uuid": state.mother_uuid,
+        "client_id": client_id,
+        "epoch": epoch,
+    }))
+}
+
 async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let peer_uuid = json_str(&body, "peer_uuid")?.to_string();
     let peer_label = json_str(&body, "peer_label")?.to_string();
@@ -4989,12 +5558,11 @@ async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, Ap
         }));
     }
 
-    let proposed_secret = random_token(32);
-
     // Auto-pair fast path: trusted same-client joiner. Create the paired_devices
     // row now and hand the secret back immediately (no pair_requests row, no
     // polling - the joiner reads "approved" straight from this response).
     if peer_client_id == Some(state.client_id) {
+        let proposed_secret = random_token(32);
         let secret = proposed_secret.clone();
         state
             .db
@@ -5016,76 +5584,24 @@ async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, Ap
             .await?;
         return Ok(json!({ "status": "approved", "peer_secret": proposed_secret }));
     }
-    let request_id = state
-        .db
-        .call({
-            let peer_uuid = peer_uuid.clone();
-            let peer_label = peer_label.clone();
-            let proposed_secret = proposed_secret.clone();
-            move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
-                c.execute(
-                    "INSERT INTO pair_requests
-                       (peer_uuid, peer_label, peer_os, peer_app_version, proposed_secret)
-                     VALUES (?, ?, ?, ?, ?)",
-                    params![peer_uuid, peer_label, peer_os, peer_app_version, proposed_secret],
-                )?;
-                Ok(c.last_insert_rowid())
-            }
-        })
-        .await?;
-
+    // Cross-client (or no-client_id) requests used to file a pair_requests row
+    // the mother's operator approved from a 4s-polled list while the child
+    // polled a 120s status loop. That ceremony is retired: it bought no
+    // security (any LAN host claiming the client_id was auto-approved above,
+    // bypassing it) and no durable control (a revoked same-client child
+    // silently re-pairs via the 401-reauth path). Tablets from another client
+    // have no business pairing here - moving a device between clients is a
+    // studio operation. Flat deny, with a message the joining UI can show.
+    // (The pair_requests table remains in the schema but is no longer written;
+    // the child-side 'pending' polling in client_pair_with_mother stays for
+    // compatibility with OLD mothers that still issue it.)
     Ok(json!({
-        "status": "pending",
-        "request_id": request_id,
+        "status": "denied",
+        "message": "This device belongs to a different client. Reassign it in the studio, then pair again."
     }))
 }
 
-async fn pair_status_handler(
-    state: &AppState,
-    rest: &HashMap<String, String>,
-) -> Result<Value, ApiErr> {
-    let request_id = parse_i64(rest, "request_id")?;
-    let peer_uuid = rest
-        .get("peer_uuid")
-        .cloned()
-        .ok_or_else(|| ApiErr::bad("peer_uuid is required"))?;
-    let row: Option<(String, String, String)> = state
-        .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<(String, String, String)>> {
-            Ok(c.query_row(
-                "SELECT status, peer_uuid, proposed_secret FROM pair_requests WHERE id = ?",
-                params![request_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
-            )
-            .optional()?)
-        })
-        .await?;
-    let Some((status, row_peer_uuid, secret)) = row else {
-        return Err(ApiErr::not_found("Pair request not found"));
-    };
-    // Defensive: only the peer that made the request gets to read the secret.
-    if row_peer_uuid != peer_uuid {
-        return Err(ApiErr::status(StatusCode::FORBIDDEN, "peer_uuid mismatch"));
-    }
-    let payload = match status.as_str() {
-        "approved" => json!({ "status": "approved", "peer_secret": secret }),
-        "denied" => json!({ "status": "denied" }),
-        _ => json!({ "status": "pending" }),
-    };
-    Ok(payload)
-}
-
 // ─── tauri commands: pair management on mother ───────────────────────────────
-
-#[derive(Serialize)]
-pub struct PendingPairRequest {
-    pub id: i64,
-    pub peer_uuid: String,
-    pub peer_label: String,
-    pub peer_os: Option<String>,
-    pub peer_app_version: Option<String>,
-    pub created_at: String,
-}
 
 async fn open_db_for_command(app: &AppHandle) -> Result<DbConnection, String> {
     let path = resolve_db_path(app)?;
@@ -5101,123 +5617,10 @@ async fn open_db_for_command(app: &AppHandle) -> Result<DbConnection, String> {
     Ok(conn)
 }
 
-#[tauri::command]
-pub async fn mother_list_pending_pair_requests(
-    app: AppHandle,
-) -> Result<Vec<PendingPairRequest>, String> {
-    let conn = open_db_for_command(&app).await?;
-    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<PendingPairRequest>> {
-        let mut stmt = c.prepare(
-            "SELECT id, peer_uuid, peer_label, peer_os, peer_app_version, created_at
-             FROM pair_requests
-             WHERE status = 'pending'
-             ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(PendingPairRequest {
-                id: r.get(0)?,
-                peer_uuid: r.get(1)?,
-                peer_label: r.get(2)?,
-                peer_os: r.get(3)?,
-                peer_app_version: r.get(4)?,
-                created_at: r.get(5)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn mother_approve_pair_request(
-    app: AppHandle,
-    request_id: i64,
-) -> Result<i64, String> {
-    let conn = open_db_for_command(&app).await?;
-    conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
-        let tx = c.transaction()?;
-        let row: Option<(String, String, Option<String>, Option<String>, String, String)> = tx
-            .query_row(
-                "SELECT peer_uuid, peer_label, peer_os, peer_app_version, proposed_secret, status
-                 FROM pair_requests WHERE id = ?",
-                params![request_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((peer_uuid, peer_label, peer_os, peer_app_version, proposed_secret, status)) = row
-        else {
-            return Err(tokio_rusqlite::Error::Other(
-                format!("pair request {request_id} not found").into(),
-            ));
-        };
-        if status != "pending" {
-            return Err(tokio_rusqlite::Error::Other(
-                format!("pair request {request_id} already {status}").into(),
-            ));
-        }
-
-        tx.execute(
-            "INSERT INTO paired_devices
-               (peer_uuid, peer_label, peer_os, peer_app_version, peer_secret, is_self)
-             VALUES (?, ?, ?, ?, ?, 0)
-             ON CONFLICT(peer_uuid) DO UPDATE SET
-               peer_label = excluded.peer_label,
-               peer_os = excluded.peer_os,
-               peer_app_version = excluded.peer_app_version,
-               peer_secret = excluded.peer_secret",
-            params![peer_uuid, peer_label, peer_os, peer_app_version, proposed_secret],
-        )?;
-        let peer_id: i64 = tx.query_row(
-            "SELECT id FROM paired_devices WHERE peer_uuid = ?",
-            params![peer_uuid],
-            |r| r.get(0),
-        )?;
-
-        tx.execute(
-            "UPDATE pair_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
-            params![request_id],
-        )?;
-        tx.commit()?;
-        Ok(peer_id)
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn mother_deny_pair_request(
-    app: AppHandle,
-    request_id: i64,
-) -> Result<(), String> {
-    let conn = open_db_for_command(&app).await?;
-    conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-        let n = c.execute(
-            "UPDATE pair_requests
-             SET status = 'denied', decided_at = CURRENT_TIMESTAMP
-             WHERE id = ? AND status = 'pending'",
-            params![request_id],
-        )?;
-        if n == 0 {
-            return Err(tokio_rusqlite::Error::Other(
-                format!("pair request {request_id} not pending").into(),
-            ));
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
+// The mother_list_pending_pair_requests / mother_approve_pair_request /
+// mother_deny_pair_request commands were retired with the manual-approval
+// ceremony (pair_request_handler now flat-denies cross-client joins; the
+// pair_requests table survives in the schema but is never written).
 
 #[derive(Serialize)]
 pub struct PairedDeviceRow {
@@ -5706,15 +6109,42 @@ fn start_mdns(
     // serving their client and prefer the highest epoch when re-pointing.
     client_id: i64,
     epoch: i64,
-    // Addresses to advertise EXPLICITLY in addition to auto-detected ones. The
-    // Windows hotspot interface (192.168.x.x) only appears *after* the hotspot
-    // is started - well after the server booted and first registered mDNS - so
-    // `enable_addr_auto()` alone leaves clients resolving only the stale
-    // pre-hotspot addresses (link-local fe80::/APIPA 169.254.x). Passing the
-    // hotspot IPv4 here guarantees clients can reach the mother on the AP subnet.
+    // Extra addresses to advertise (e.g. the hotspot AP IPv4 once it exists),
+    // merged with this host's interface IPv4s. The combined set is then LOCKED
+    // to the mother's DESIGNATED isolated LAN via `designated_lan_addrs` before
+    // it is advertised - see that fn and `source` below.
     extra_addrs: &[String],
+    // The mother's LAN source ('hotspot' | 'router', schema_meta
+    // `lan_network_source`). Selects which of our IPs count as the designated
+    // isolated network so we NEVER advertise the mother on its internet-connected
+    // office/upstream interface (that would let an off-hotspot child join).
+    source: &str,
 ) -> Result<MdnsHandle, String> {
     let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
+
+    // Gather every candidate IPv4 (explicit extras + this host's interfaces),
+    // then lock down to the designated isolated LAN. We deliberately do NOT call
+    // `enable_addr_auto()`: it re-adds ALL interfaces at register time, which is
+    // exactly how the mother used to leak its office/upstream IP.
+    let mut candidates: Vec<String> = extra_addrs.to_vec();
+    for ip in local_ipv4s() {
+        candidates.push(ip.to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+    let advertised = designated_lan_addrs(source, &candidates);
+    if advertised.is_empty() {
+        // Designated LAN not up yet (hotspot mode before the AP is raised). Don't
+        // advertise a reachable service at all - a child must never resolve the
+        // mother on the office/upstream network. `mother_refresh_mdns` re-registers
+        // once the AP IPv4 exists. Inert handle: empty full_name -> unregister/
+        // shutdown are safe no-ops.
+        return Ok(MdnsHandle {
+            daemon,
+            full_name: String::new(),
+        });
+    }
+
     let host = format!("{}.local.", mother_uuid);
     let instance = format!("taghunter-{}", &mother_uuid[..8]);
     let mut props: HashMap<String, String> = HashMap::new();
@@ -5724,9 +6154,7 @@ fn start_mdns(
     if let Some(l) = label {
         props.insert("label".into(), l.to_string());
     }
-    // Comma-joined explicit IPs ("" when none). enable_addr_auto() additionally
-    // fills in the host's other interface addresses at register time.
-    let ip_arg = extra_addrs.join(",");
+    let ip_arg = advertised.join(",");
     let svc = ServiceInfo::new(
         MDNS_SERVICE_TYPE,
         &instance,
@@ -5735,8 +6163,7 @@ fn start_mdns(
         port,
         props,
     )
-    .map_err(|e| e.to_string())?
-    .enable_addr_auto();
+    .map_err(|e| e.to_string())?;
     let full_name = svc.get_fullname().to_string();
     daemon.register(svc).map_err(|e| e.to_string())?;
     Ok(MdnsHandle { daemon, full_name })
@@ -5806,12 +6233,437 @@ async fn run_mdns_discovery(timeout: Duration) -> Result<Vec<DiscoveredMother>, 
     Ok(found.into_values().collect())
 }
 
+/// F13 direct-probe fallback: on a hotspot lease (192.168.137.x), hit the ICS
+/// gateway (192.168.137.1) over HTTP at the preferred ports and, if a mother
+/// answers `pair.php?action=hello`, return it as a DiscoveredMother. This finds
+/// the mother even when mDNS multicast is filtered on the Windows "Public"
+/// profile. Returns None when not on the hotspot subnet or nothing answers.
+async fn probe_gateway_mother() -> Option<DiscoveredMother> {
+    const GATEWAY: &str = "192.168.137.1";
+    // Only meaningful when WE hold a hotspot-subnet lease; otherwise the gateway
+    // isn't ours to probe (and a router-mode mother is found via mDNS anyway).
+    let on_hotspot = local_ipv4s()
+        .iter()
+        .any(|ip| ip.to_string().starts_with("192.168.137."));
+    if !on_hotspot {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .connect_timeout(Duration::from_millis(400))
+        .build()
+        .ok()?;
+    for port in PREFERRED_PORTS {
+        let url = format!("http://{GATEWAY}:{port}/pair.php?action=hello");
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        let Ok(body) = resp.json::<Value>().await else { continue };
+        let Some(uuid) = body.get("mother_uuid").and_then(|v| v.as_str()) else { continue };
+        if uuid.is_empty() {
+            continue;
+        }
+        return Some(DiscoveredMother {
+            mother_uuid: uuid.to_string(),
+            host: format!("{GATEWAY}.local."),
+            addresses: vec![GATEWAY.to_string()],
+            port,
+            label: None,
+            client_id: body.get("client_id").and_then(|v| v.as_i64()),
+            epoch: body.get("epoch").and_then(|v| v.as_i64()),
+        });
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn client_discover_mothers(
     timeout_ms: Option<u64>,
 ) -> Result<Vec<DiscoveredMother>, String> {
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(2500));
-    run_mdns_discovery(timeout).await
+    // Run the mDNS browse and the gateway direct-probe concurrently, then merge.
+    // mDNS wins on a uuid collision (it carries the full advertised address list);
+    // the gateway probe only ADDS a mother multicast filtering would have hidden.
+    let (mdns_res, gw) = tokio::join!(run_mdns_discovery(timeout), probe_gateway_mother());
+    let mut mothers = mdns_res?;
+    if let Some(g) = gw {
+        if !mothers.iter().any(|m| m.mother_uuid == g.mother_uuid) {
+            mothers.push(g);
+        }
+    }
+    Ok(mothers)
+}
+
+/// Result of a manual reachability probe (Step 3 of the hand-driven connect
+/// flow). `ok` distinguishes "discoverable" (mDNS answered in Step 2) from
+/// "reachable" (the TCP connect actually completed) - the exact split that tells
+/// a MOTHER firewall block apart from a wrong-subnet child.
+#[derive(Serialize)]
+pub struct MotherProbe {
+    /// true = at least one advertised address answered the hello.
+    pub ok: bool,
+    /// The address (host:port) that answered, when ok.
+    pub reached_addr: Option<String>,
+    /// The mother's uuid from the hello body, when ok.
+    pub mother_uuid: Option<String>,
+    /// The mother's client_id from the hello body, when ok.
+    pub client_id: Option<i64>,
+    /// Round-trip of the successful probe in milliseconds, when ok.
+    pub latency_ms: Option<u64>,
+    /// Per-address failure detail (technical, "addr:port : real OS error"), for
+    /// when nothing answered. The frontend shows this verbatim under the headline.
+    pub errors: Vec<String>,
+    /// Coarse cause of the failure, chosen from the REAL OS error (not a guess):
+    /// "refused" (RST / errno 10061 - port closed / server not listening on that
+    /// address), "timeout" (drop / errno 10060 - firewall silently blocking),
+    /// "unreachable" (no route / net-unreachable), "http" (answered but not a
+    /// mother), or "other". None when ok. Drives which headline the child shows.
+    pub category: Option<String>,
+}
+
+/// Walk a reqwest error's whole `source()` chain into one string, so the REAL
+/// OS error ("Connection refused (os error 10061)", "(os error 10060)", …) is
+/// visible instead of reqwest's generic "error sending request" wrapper.
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    use std::error::Error as _; // bring `.source()` into scope for method resolution
+    let mut chain: Vec<String> = vec![e.to_string()];
+    let mut src: Option<&(dyn std::error::Error + 'static)> = e.source();
+    while let Some(s) = src {
+        let msg = s.to_string();
+        if chain.last().map(|l| l != &msg).unwrap_or(true) {
+            chain.push(msg);
+        }
+        src = s.source();
+    }
+    chain.join(" → ")
+}
+
+/// Classify a connect failure from its real text + reqwest's own flags. RST
+/// (refused) and DROP (timeout) look identical in the UI otherwise but need
+/// opposite fixes (restart the mother's server vs allow the firewall).
+fn classify_probe_error(e: &reqwest::Error, described: &str) -> &'static str {
+    let low = described.to_lowercase();
+    if low.contains("10061") || low.contains("refused") || low.contains("reset") || low.contains("10054") {
+        "refused"
+    } else if e.is_timeout()
+        || low.contains("10060")
+        || low.contains("timed out")
+        || low.contains("timeout")
+        || low.contains("deadline")
+        || low.contains("elapsed")
+    {
+        "timeout"
+    } else if low.contains("10065") || low.contains("10051") || low.contains("no route") || low.contains("unreachable") {
+        "unreachable"
+    } else {
+        "other"
+    }
+}
+
+/// UNAUTHENTICATED reachability test against a discovered mother's advertised
+/// addresses: `GET /pair.php?action=hello` on each candidate until one answers.
+/// Confirms the actual TCP path is open (the half mDNS discovery can't prove) so
+/// a child can tell a firewall block from a routing problem BEFORE pairing.
+/// Never mutates state; safe to run repeatedly.
+#[tauri::command]
+pub async fn client_probe_mother(
+    addresses: Vec<String>,
+    port: u16,
+) -> Result<MotherProbe, String> {
+    let candidates = order_pair_candidates(&addresses);
+    if candidates.is_empty() {
+        return Ok(MotherProbe {
+            ok: false,
+            reached_addr: None,
+            mother_uuid: None,
+            client_id: None,
+            latency_ms: None,
+            errors: vec!["mother advertised no usable IPv4 address".into()],
+            category: Some("other".into()),
+        });
+    }
+    // Generous timeouts: a working-but-slow path (busy ICS host, first connect)
+    // must not be cut off and mislabeled as a firewall block.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(4000))
+        .connect_timeout(Duration::from_millis(3000))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut errors: Vec<String> = Vec::new();
+    // Rank the categories seen so the headline reflects the most specific cause
+    // ("refused" is more actionable than a bare "timeout").
+    let rank = |c: &str| match c { "refused" => 3, "unreachable" => 2, "timeout" => 1, _ => 0 };
+    let mut best_cat: &'static str = "other";
+    for addr in candidates {
+        let target = format!("{addr}:{port}");
+        let url = format!("http://{target}/pair.php?action=hello");
+        let started = std::time::Instant::now();
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    errors.push(format!("{target} : HTTP {}", status.as_u16()));
+                    if rank("http") >= rank(best_cat) { best_cat = "http"; }
+                    continue;
+                }
+                match resp.json::<Value>().await {
+                    Ok(body) => {
+                        let uuid = body.get("mother_uuid").and_then(|v| v.as_str()).unwrap_or("");
+                        if uuid.is_empty() {
+                            errors.push(format!("{target} : unexpected response (not a mother)"));
+                            if rank("http") >= rank(best_cat) { best_cat = "http"; }
+                            continue;
+                        }
+                        return Ok(MotherProbe {
+                            ok: true,
+                            reached_addr: Some(target),
+                            mother_uuid: Some(uuid.to_string()),
+                            client_id: body.get("client_id").and_then(|v| v.as_i64()),
+                            latency_ms: Some(started.elapsed().as_millis() as u64),
+                            errors: Vec::new(),
+                            category: None,
+                        });
+                    }
+                    Err(e) => {
+                        errors.push(format!("{target} : unreadable response ({e})"));
+                        if rank("http") >= rank(best_cat) { best_cat = "http"; }
+                    }
+                }
+            }
+            Err(e) => {
+                let desc = describe_reqwest_error(&e);
+                let cat = classify_probe_error(&e, &desc);
+                errors.push(format!("{target} : {desc}"));
+                if rank(cat) >= rank(best_cat) { best_cat = cat; }
+            }
+        }
+    }
+    Ok(MotherProbe {
+        ok: false,
+        reached_addr: None,
+        mother_uuid: None,
+        client_id: None,
+        latency_ms: None,
+        errors,
+        category: Some(best_cat.to_string()),
+    })
+}
+
+/// Force a fresh DHCP lease. When a child connects to the mother's hotspot before
+/// the mother's ICS DHCP server is ready (or a DISCOVER is lost), Windows falls
+/// back to an APIPA address (169.254.*) that can't reach the mother's 192.168.137.1
+/// gateway - the device is "connected" but on the wrong subnet. `ipconfig /renew`
+/// re-runs DHCP on the current association, pulling a real 192.168.137.x lease.
+/// Returns the device's IPv4s after the renew so the caller can confirm it worked.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn wifi_renew_dhcp() -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("ipconfig")
+            .arg("/renew")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn wifi_renew_dhcp() -> Result<Vec<String>, String> {
+    Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
+}
+
+/// This device's non-loopback IPv4 addresses (no side effects). Used to detect
+/// the APIPA-stuck condition (all 169.254.* / no 192.168.137.*) cheaply.
+#[tauri::command]
+pub async fn get_local_ipv4s() -> Result<Vec<String>, String> {
+    Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
+}
+
+// Run a PowerShell script ELEVATED via a single UAC prompt, returning its exit
+// code. Writes the script to a temp .ps1 (no command-line quoting to get wrong)
+// and launches it with `Start-Process -Verb RunAs`. Used for the static-IP
+// fallback below - changing a NIC's IP config requires admin.
+#[cfg(target_os = "windows")]
+fn run_elevated_powershell(script: &str) -> Result<i32, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut path = std::env::temp_dir();
+    path.push(format!("taghunter_net_{}.ps1", std::process::id()));
+    std::fs::write(&path, script).map_err(|e| format!("write script: {e}"))?;
+    let ps_path = path.to_string_lossy().replace('\'', "''");
+    let outer = format!(
+        "try {{ $p = Start-Process -FilePath powershell -Verb RunAs -Wait -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{ps_path}'; exit $p.ExitCode }} catch {{ exit 1 }}"
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &outer])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(s) => Ok(s.code().unwrap_or(-1)),
+        Err(e) => Err(format!("spawn powershell: {e}")),
+    }
+}
+
+/// Static-IP fallback: give this device's Wi-Fi adapter reachability to the
+/// mother's subnet when the mother's ICS DHCP won't hand out a lease (child stuck
+/// on APIPA). Derives the /24 from `gateway` (the mother's advertised address,
+/// e.g. 192.168.137.1) and adds a pseudo-random host in .100-.249 as a SECONDARY
+/// address. Crucially it does NOT disable DHCP and does NOT clear the existing
+/// addresses: the static IP just rides alongside, so the moment the device joins
+/// any OTHER Wi-Fi it still pulls a normal DHCP internet lease automatically - no
+/// manual "Obtain an IP address automatically" step, no auto-revert UAC. No
+/// default gateway is set (we never route the child's internet through the
+/// offline AP; reaching the mother on the same /24 is a direct L2 hop). We first
+/// drop any static WE previously added on this /24 so repeats don't pile up.
+/// Returns the assigned IP. Elevated (UAC).
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn wifi_assign_static_ip(gateway: String) -> Result<String, String> {
+    let parts: Vec<&str> = gateway.split('.').collect();
+    if parts.len() != 4 || parts.iter().any(|p| p.parse::<u8>().is_err()) {
+        return Err(format!("invalid gateway address: {gateway}"));
+    }
+    let prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    let host = 100
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            % 150);
+    let ip = format!("{prefix}.{host}");
+    let script = format!(
+        "$ErrorActionPreference='Stop'\r\n\
+         $a = Get-NetAdapter -Physical | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\\.11') }} | Select-Object -First 1\r\n\
+         if (-not $a) {{ exit 2 }}\r\n\
+         # Repair: if an older build left this adapter DHCP-Disabled, turn it back on.\r\n\
+         Set-NetIPInterface -InterfaceIndex $a.ifIndex -Dhcp Enabled -ErrorAction SilentlyContinue\r\n\
+         # Drop only OUR prior static on this /24 (leave DHCP leases + everything else).\r\n\
+         Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |\r\n\
+           Where-Object {{ $_.PrefixOrigin -eq 'Manual' -and $_.IPAddress -like '{prefix}.*' }} |\r\n\
+           Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n\
+         # Add the static as a SECONDARY address; DHCP stays enabled for internet elsewhere.\r\n\
+         New-NetIPAddress -InterfaceIndex $a.ifIndex -IPAddress {ip} -PrefixLength 24 -ErrorAction Stop | Out-Null\r\n\
+         exit 0\r\n"
+    );
+    let code = tokio::task::spawn_blocking(move || run_elevated_powershell(&script))
+        .await
+        .map_err(|e| e.to_string())??;
+    match code {
+        0 => Ok(ip),
+        2 => Err("no active Wi-Fi adapter found".into()),
+        c => Err(format!("static IP assignment failed (exit {c}) - the UAC prompt may have been declined")),
+    }
+}
+
+/// Remove the static-IP fallback: drop the manually-added address(es) and make
+/// sure DHCP is enabled (also repairs a device left DHCP-Disabled by an older
+/// build). Only touches MANUAL addresses - a real DHCP lease is never removed.
+/// Elevated (UAC). Idempotent.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub async fn wifi_restore_dhcp() -> Result<(), String> {
+    let script = "$ErrorActionPreference='SilentlyContinue'\r\n\
+        $a = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\\.11') } | Select-Object -First 1\r\n\
+        if (-not $a) { exit 2 }\r\n\
+        Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 |\r\n\
+          Where-Object { $_.PrefixOrigin -eq 'Manual' } |\r\n\
+          Remove-NetIPAddress -Confirm:$false\r\n\
+        Set-NetIPInterface -InterfaceIndex $a.ifIndex -Dhcp Enabled\r\n\
+        Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses\r\n\
+        ipconfig /renew | Out-Null\r\n\
+        exit 0\r\n"
+        .to_string();
+    let code = tokio::task::spawn_blocking(move || run_elevated_powershell(&script))
+        .await
+        .map_err(|e| e.to_string())??;
+    if code != 0 && code != 2 {
+        return Err(format!("restore DHCP failed (exit {code})"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn wifi_assign_static_ip(_gateway: String) -> Result<String, String> {
+    Err("static IP fallback is Windows-only".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn wifi_restore_dhcp() -> Result<(), String> {
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct LanDiag {
+    /// This device's mother server is running (it IS a mother right now).
+    server_running: bool,
+    port: u16,
+    /// The mDNS announcement's full name. EMPTY = the announcement is INERT
+    /// (advertising no reachable address - the #1 reason a child can't discover
+    /// this mother). Populated only once the designated-LAN address is up.
+    mdns_full_name: String,
+    /// LAN source ('hotspot' | 'router') from schema_meta.
+    source: String,
+    /// Every non-loopback IPv4 on this host right now.
+    local_ipv4s: Vec<String>,
+    /// The subset of local_ipv4s the mother WOULD advertise after the LAN lock
+    /// (`designated_lan_addrs`). EMPTY here while server_running is true is the
+    /// smoking gun: the hotspot interface has no 192.168.137.* address, so the
+    /// mother advertises nothing and is undiscoverable.
+    designated_addrs: Vec<String>,
+    /// Raw mDNS browse result from THIS device (what a child would see). On a
+    /// child this reveals whether the mother is discovered at all + its addresses.
+    discovered: Vec<DiscoveredMother>,
+    /// Live firewall verification: Some(true) rule present, Some(false)
+    /// DEFINITIVELY absent (the "discoverable but unreachable" smoking gun -
+    /// use the repair button), None = could not check.
+    firewall_rule_ok: Option<bool>,
+}
+
+/// One-shot LAN diagnostics for the Network tab - surfaces exactly why discovery
+/// might fail (inert mDNS / empty designated addrs / what the browse returns)
+/// without needing device logs.
+#[tauri::command]
+pub async fn lan_diag(
+    app: AppHandle,
+    state: tauri::State<'_, MotherServerState>,
+) -> Result<LanDiag, String> {
+    let source = read_lan_network_source(&app).await;
+    let local_ipv4s: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
+    let designated_addrs = designated_lan_addrs(&source, &local_ipv4s);
+    let (server_running, port, mdns_full_name) = {
+        let guard = state.inner.lock().await;
+        match &*guard {
+            Some(r) => (
+                true,
+                r.port,
+                r.mdns.as_ref().map(|m| m.full_name.clone()).unwrap_or_default(),
+            ),
+            None => (false, 0, String::new()),
+        }
+    };
+    let discovered = run_mdns_discovery(Duration::from_millis(2500))
+        .await
+        .unwrap_or_default();
+    let firewall_rule_ok = tokio::task::spawn_blocking(firewall_rule_status_sync)
+        .await
+        .unwrap_or(None);
+    Ok(LanDiag {
+        server_running,
+        port,
+        mdns_full_name,
+        source,
+        local_ipv4s,
+        designated_addrs,
+        discovered,
+        firewall_rule_ok,
+    })
 }
 
 // Pick the best address out of a DiscoveredMother record. Prefer IPv4 (the
@@ -5832,6 +6684,74 @@ fn local_ipv4s() -> Vec<Ipv4Addr> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Lock a candidate IPv4 list down to the mother's DESIGNATED isolated LAN, so
+/// the mother never advertises (nor hands children) its internet-connected
+/// office/upstream IP. A child must only ever be able to reach the mother over
+/// the isolated network - otherwise it can join "over the internet" while off the
+/// hotspot, which is exactly what we forbid (the app is built to run offline).
+///
+/// - `hotspot` (default): keep ONLY the Windows soft-AP subnet, 192.168.137.0/24.
+///   Windows ICS pins the tethering gateway at 192.168.137.1, so this is a stable
+///   constant (matches `select_address`'s and lanMotherBoot's assumptions). Empty
+///   until the AP is raised - correct: there is nothing to join before then, and
+///   `start_mdns` advertises no reachable service in that window.
+/// - `router`: the operator deliberately runs over a dedicated Wi-Fi router
+///   instead of the hotspot (router mode). Keep the routable private IPv4s,
+///   dropping the hotspot subnet, APIPA/link-local (169.254) and loopback. The
+///   router IP IS the designated LAN here.
+fn designated_lan_addrs(source: &str, candidates: &[String]) -> Vec<String> {
+    let is_ics = |a: &str| a.starts_with("192.168.137.");
+    // 169.254.* (APIPA / link-local): when Windows ICS doesn't assign the soft-AP
+    // its 192.168.137.1 subnet (common - ICS service off/misconfigured), the AP
+    // adapter and every connected client fall back to link-local addressing and
+    // still talk over the AP. Link-local is INHERENTLY non-routable off the
+    // physical link, so advertising it can't leak the mother to the office LAN
+    // (an off-hotspot child on a different link can never reach a 169.254.* addr) -
+    // which is exactly the isolation the LAN lock wants.
+    let is_link_local = |a: &str| a.starts_with("169.254.");
+    let is_loopback = |a: &str| a.starts_with("127.") || a == "::1";
+    match source {
+        "router" => candidates
+            .iter()
+            .filter(|a| !is_ics(a) && !is_link_local(a) && !is_loopback(a))
+            .cloned()
+            .collect(),
+        // "hotspot" and any unknown/legacy value default to hotspot semantics: the
+        // AP is EITHER the ICS subnet (192.168.137.*) OR a link-local (169.254.*)
+        // address. Both are AP-local; the routable office/upstream IP is excluded.
+        _ => candidates
+            .iter()
+            .filter(|a| is_ics(a) || is_link_local(a))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Read the mother's LAN source ('hotspot' | 'router') from schema_meta
+/// (`lan_network_source`, authored by services/lanCredentials.ts). Opens a fresh
+/// read connection - safe alongside the running mother server under SQLite WAL,
+/// same pattern as `mother_get_server_info`. Defaults to 'hotspot' when unset or
+/// unreadable (the common case).
+async fn read_lan_network_source(app: &AppHandle) -> String {
+    let Ok(db_path) = resolve_db_path(app) else {
+        return "hotspot".to_string();
+    };
+    let Ok(conn) = DbConnection::open(db_path).await else {
+        return "hotspot".to_string();
+    };
+    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<String> {
+        Ok(c
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'lan_network_source'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "hotspot".to_string()))
+    })
+    .await
+    .unwrap_or_else(|_| "hotspot".to_string())
 }
 
 /// Choose which advertised mother address to talk to. A mother that hosts a

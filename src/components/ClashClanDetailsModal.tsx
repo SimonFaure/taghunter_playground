@@ -72,6 +72,21 @@ export function ClashClanDetailsModal({
     [cards, t],
   );
 
+  // "Alice - (n°12 - id 8012345)": who punched, plus the chip's number and id.
+  // Mirrors TeamDetailsModal's punch rows; falls back to the clan name when the
+  // chip isn't in the card registry (so it has no carrier name).
+  const chipHolderLabel = useCallback(
+    (chipId: number) => {
+      const c = cards.find((x) => x.id === chipId);
+      const name =
+        c?.key_name || clanTeam.team_name || t('clashClanDetails:clanFallback', { number: clanTeam.team_number });
+      return c
+        ? t('clashClanDetails:chipHolder', { name, number: c.key_number, id: chipId })
+        : t('clashClanDetails:chipHolderNoNumber', { name, id: chipId });
+    },
+    [cards, clanTeam.team_name, clanTeam.team_number, t],
+  );
+
   const refresh = useCallback(async () => {
     try {
       const [members, state, gameState] = await Promise.all([
@@ -291,11 +306,15 @@ export function ClashClanDetailsModal({
                         onClick={() => setExpandedPunch(isExpanded ? null : rec.id)}
                       >
                         <div className="flex items-center gap-2 min-w-0">
-                          <span className="text-[var(--pg-text-dim)] text-xs">#{i + 1}</span>
-                          <span className="text-[var(--pg-text)] text-sm font-medium">{t('clashClanDetails:punchCount', { count: rec.punches.length })}</span>
-                          {rec.chipId != null && (
-                            <span className="text-[var(--pg-text-dim)] text-xs truncate">{cardLabel(rec.chipId)}</span>
-                          )}
+                          <span className="text-[var(--pg-text-dim)] text-xs shrink-0">#{i + 1}</span>
+                          <span className="text-[var(--pg-text)] text-sm font-medium truncate">
+                            {rec.chipId != null
+                              ? chipHolderLabel(rec.chipId)
+                              : clanTeam.team_name || t('clashClanDetails:clanFallback', { number: clanTeam.team_number })}
+                          </span>
+                          <span className="text-[var(--pg-text-dim)] text-sm shrink-0">
+                            - {t('clashClanDetails:stationCount', { count: rec.punches.length })}
+                          </span>
                           {rec.end && (
                             <span className="px-1.5 py-0.5 bg-green-900/50 border border-green-700/50 rounded text-green-400 text-xs shrink-0">
                               {t('clashClanDetails:end')}

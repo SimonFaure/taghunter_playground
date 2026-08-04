@@ -123,8 +123,10 @@ export function extractTracksOptions(rawGameData: unknown): TracksLaunchOptions 
     const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
     return Number.isFinite(n) ? n : fallback;
   };
+  // "Tous les checkpoints" (`default`) is always offered, listed first and
+  // pre-selected at launch, even when the studio's route subset omits it.
   return {
-    routes: enabledKeys(gm.routes),
+    routes: ['default', ...enabledKeys(gm.routes).filter((k) => k !== 'default')],
     displays: enabledKeys(gm.displays),
     playModes: enabledKeys(gm.play_modes),
     scoreTypes,
@@ -145,13 +147,17 @@ function teamModeOf(config: Pick<GameConfig, 'playMode'>, gameTypeName: string):
  * `handleNextStep`. Solo: one chip per team. TagQuest team-mode: `chipsPerTeam`
  * consecutive chips per team, the first chip naming the team. Stops early if
  * the chip array runs out.
+ *
+ * `firstChipIndex` is 1-based: value N means "start at the Nth available chip"
+ * (so N=1 uses the very first chip, N=10 the tenth). We convert to the 0-based
+ * array offset with `-1` right here so every caller can speak in 1-based terms.
  */
 export function buildRoster(
   config: Pick<GameConfig, 'firstChipIndex' | 'numberOfTeams' | 'playMode' | 'teammatesPerTeam'>,
   chips: RosterChip[],
   gameTypeName: string
 ): Team[] {
-  const startIndex = config.firstChipIndex;
+  const startIndex = Math.max(0, config.firstChipIndex - 1);
   const numberOfTeams = config.numberOfTeams;
   const isTeamMode = teamModeOf(config, gameTypeName);
   const chipsPerTeam = isTeamMode ? (config.teammatesPerTeam ?? 2) : 1;
@@ -189,6 +195,35 @@ export function buildRoster(
 export function chipsRequired(config: Pick<GameConfig, 'numberOfTeams' | 'playMode' | 'teammatesPerTeam'>, gameTypeName: string): number {
   const chipsPerTeam = teamModeOf(config, gameTypeName) ? (config.teammatesPerTeam ?? 2) : 1;
   return Math.max(1, config.numberOfTeams) * chipsPerTeam;
+}
+
+/**
+ * Clash "Équipes prédéfinies" (predetermined clans): deal contiguous blocks of
+ * `chipsPerClan` chips to each of `numClans` clans, starting at the 1-based
+ * `firstChipIndex` in the (key_number-ordered) free chip list. Mirrors
+ * TagQuest's predetermined roster - uniform block size per clan - and produces
+ * the same {chipId, clanIndex} shape the operator's Excel import yields, so
+ * GameList's existing deferred `clashRegister` apply loop handles both.
+ * clanIndex is 1-based (matches a clan's team_number). Stops if chips run out.
+ */
+export function buildClashContiguousAssignments(
+  freeChips: RosterChip[],
+  firstChipIndex: number,
+  chipsPerClan: number,
+  numClans: number,
+): Array<{ chipId: number; clanIndex: number }> {
+  const perClan = Math.max(0, Math.floor(chipsPerClan));
+  const clans = Math.max(1, Math.floor(numClans));
+  if (perClan === 0) return [];
+  const start = Math.max(0, firstChipIndex - 1);
+  const out: Array<{ chipId: number; clanIndex: number }> = [];
+  for (let clan = 0; clan < clans; clan++) {
+    const from = start + clan * perClan;
+    const block = freeChips.slice(from, from + perClan);
+    if (block.length === 0) break;
+    for (const chip of block) out.push({ chipId: chip.id, clanIndex: clan + 1 });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- devices
@@ -302,7 +337,8 @@ export function validateForHeadless(config: ResolvableConfig, world: HeadlessWor
     } else {
       // Clamp the saved start index so buildRoster can take `required` chips
       // from the free list (mirrors the wizard's maxFirstChipIndex clamp).
-      resolved.firstChipIndex = Math.max(0, Math.min(config.firstChipIndex, free - required));
+      // 1-based: the last valid start is `free - required + 1`, floored at 1.
+      resolved.firstChipIndex = Math.max(1, Math.min(config.firstChipIndex, free - required + 1));
     }
   }
 

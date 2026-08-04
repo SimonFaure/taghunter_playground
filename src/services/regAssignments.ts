@@ -49,22 +49,34 @@ export function serializeRegAssignments(map: RegAssignmentMap): string {
 }
 
 /**
- * Auto-assign: deal team_number 1..teamCount round-robin over the eligible
- * devices, in order. Teams > devices ⇒ devices get several teams; devices >
- * teams ⇒ the leftover devices stay unassigned (full grid). The caller decides
- * eligibility (the default deal excludes the mother and reader-less devices -
- * both stay manually assignable).
+ * Auto-assign: spread team_number 1..teamCount over the eligible devices so
+ * EVERY eligible device ends up with at least one team (operators expect the
+ * switch to fill the whole list, not leave rows empty).
+ *
+ * - teams >= devices: contiguous balanced blocks, biggest first. 6 teams / 4
+ *   devices ⇒ [1,2] [3,4] [5] [6]. Contiguous (not round-robin) so a station
+ *   reads as "Équipe 1 + Équipe 2" rather than "Équipe 1 + Équipe 4".
+ * - devices > teams: teams cycle, one per device, so the extra stations double
+ *   up on a team (allowed by design - the server's max_per_clan arbitrates).
  */
 export function computeAutoRegAssignments(
   deviceIds: number[],
   teamCount: number,
 ): RegAssignmentMap {
   const out: RegAssignmentMap = {};
-  if (deviceIds.length === 0 || teamCount <= 0) return out;
-  for (let teamNumber = 1; teamNumber <= teamCount; teamNumber++) {
-    const id = deviceIds[(teamNumber - 1) % deviceIds.length];
-    (out[id] ??= []).push(teamNumber);
+  const n = deviceIds.length;
+  if (n === 0 || teamCount <= 0) return out;
+  if (teamCount < n) {
+    deviceIds.forEach((id, i) => { out[id] = [(i % teamCount) + 1]; });
+    return out;
   }
+  const base = Math.floor(teamCount / n);
+  const extra = teamCount % n;
+  let next = 1;
+  deviceIds.forEach((id, i) => {
+    const size = base + (i < extra ? 1 : 0);
+    out[id] = Array.from({ length: size }, () => next++);
+  });
   return out;
 }
 
@@ -80,11 +92,21 @@ export function assignedTeamNumbersFor(
 
 /**
  * Resolve THIS device's paired_devices.id (the device_id the assignment map is
- * keyed by) via the bucketed devices view - the self row carries is_self.
+ * keyed by) via the bucketed devices view.
+ *
+ * Uses `caller_device_id`, which the server derives from OUR bearer secret.
+ * The rows' `is_self` flag is NOT usable here: a satellite reads this list off
+ * the mother's server, where `is_self` marks the MOTHER's row - so every
+ * satellite used to resolve itself to the mother's id and inherit the mother's
+ * station assignment (or none at all). The `is_self` fallback below only exists
+ * for a mother still running an older build, where the caller IS the DB owner
+ * and the two agree.
  */
 export async function getSelfDeviceId(launchedGameId: number): Promise<number | null> {
   try {
     const buckets = await listPairedWithStatus(launchedGameId);
+    if (typeof buckets.caller_device_id === 'number') return buckets.caller_device_id;
+    console.warn('[regAssignments] mother did not report caller_device_id - falling back to is_self');
     const all = [...buckets.in_game, ...buckets.available_online, ...buckets.offline];
     return all.find((r) => r.is_self)?.id ?? null;
   } catch {

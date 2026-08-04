@@ -11,6 +11,10 @@ interface UseGameStatePollingOptions {
   onGameEnded: () => void;
   onAllTeamsFinished: () => void;
   onNewBip: (row: RawPunchRow & { launched_game_id: number }) => void;
+  // Fires once when the mother flips the game to started (start_time set). Lets
+  // a device sitting on the registration/inscription screen follow the device
+  // that pressed "Start game" into play without the operator touching it.
+  onGameStarted?: () => void;
   enabled?: boolean;
   // When true, suppress the all-teams-finished auto-end. Used by auto-register
   // / reuse-cards modes where teams are created dynamically, so a momentary
@@ -25,15 +29,18 @@ export function useGameStatePolling({
   onGameEnded,
   onAllTeamsFinished,
   onNewBip,
+  onGameStarted,
   enabled = true,
   disableAllFinishedEnd = false,
 }: UseGameStatePollingOptions) {
   const lastRawIdRef = useRef<number>(0);
   const gameEndedRef = useRef(false);
+  const gameStartedRef = useRef(false);
   const tickRunningRef = useRef(false);
   const onGameEndedRef = useRef(onGameEnded);
   const onAllTeamsFinishedRef = useRef(onAllTeamsFinished);
   const onNewBipRef = useRef(onNewBip);
+  const onGameStartedRef = useRef(onGameStarted);
   const launchedGameIdRef = useRef(launchedGameId);
   const numberOfTeamsRef = useRef(numberOfTeams);
   const disableAllFinishedEndRef = useRef(disableAllFinishedEnd);
@@ -41,6 +48,7 @@ export function useGameStatePolling({
   useEffect(() => { onGameEndedRef.current = onGameEnded; }, [onGameEnded]);
   useEffect(() => { onAllTeamsFinishedRef.current = onAllTeamsFinished; }, [onAllTeamsFinished]);
   useEffect(() => { onNewBipRef.current = onNewBip; }, [onNewBip]);
+  useEffect(() => { onGameStartedRef.current = onGameStarted; }, [onGameStarted]);
   useEffect(() => { launchedGameIdRef.current = launchedGameId; }, [launchedGameId]);
   useEffect(() => { numberOfTeamsRef.current = numberOfTeams; }, [numberOfTeams]);
   useEffect(() => { disableAllFinishedEndRef.current = disableAllFinishedEnd; }, [disableAllFinishedEnd]);
@@ -49,8 +57,20 @@ export function useGameStatePolling({
     if (!launchedGameId || !enabled) return;
 
     gameEndedRef.current = false;
+    gameStartedRef.current = false;
     lastRawIdRef.current = 0;
     tickRunningRef.current = false;
+
+    // Fire onGameStarted exactly once, the first tick that sees the mother's
+    // start flag flip. Idempotent for consumers whose "start" handler just sets
+    // an already-current phase (e.g. a device that pressed Start itself).
+    const signalStartedIfNeeded = (state: { started?: boolean; start_time?: string | null }) => {
+      if (gameStartedRef.current) return;
+      if (state.started || state.start_time) {
+        gameStartedRef.current = true;
+        onGameStartedRef.current?.();
+      }
+    };
 
     // Initial state fetch primes the cursor so we don't replay every historical
     // punch as a "new bip" on first tick.
@@ -58,6 +78,7 @@ export function useGameStatePolling({
       try {
         const state = await getLaunchedGameState(launchedGameId, 0);
         lastRawIdRef.current = state.last_raw_id;
+        signalStartedIfNeeded(state);
         if (state.ended) {
           gameEndedRef.current = true;
           onGameEndedRef.current();
@@ -75,6 +96,8 @@ export function useGameStatePolling({
       tickRunningRef.current = true;
       try {
         const state = await getLaunchedGameState(gid, lastRawIdRef.current);
+
+        signalStartedIfNeeded(state);
 
         if (state.ended) {
           gameEndedRef.current = true;

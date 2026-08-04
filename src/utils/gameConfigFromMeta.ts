@@ -52,6 +52,12 @@ export function gameConfigFromMeta(
     // Missing key ⇒ false: games launched before the option keep raw scores.
     tagquestScoreWeighting: metaMap.tagquestScoreWeighting === 'true',
     cluesPage: metaMap.cluesPage ? JSON.parse(metaMap.cluesPage) : undefined,
+    // Mystery/tracks first-bip videos. Re-derived here so re-entering a game
+    // (Play button) or reloading after a config edit doesn't silently drop the
+    // overlay. Missing key ⇒ false: games launched before the keys existed
+    // behave exactly as they did.
+    playTutorialOnBip: metaMap.playTutorialOnBip === 'true',
+    playIntroOnBip: metaMap.playIntroOnBip === 'true',
     // Tracks: the route (primary + enabled set) and display/play/score modes.
     // Read here so an in-game config edit re-derives the live tracks config.
     route: metaMap.route || undefined,

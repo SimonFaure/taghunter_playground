@@ -12,6 +12,7 @@ import * as launchConfigsStore from '../services/launchConfigsStore';
 import * as namePoolsStore from '../services/namePoolsStore';
 import {
   buildRoster,
+  buildClashContiguousAssignments,
   extractTracksOptions,
   extractDefaultPatternId,
   resolveDefaultPattern,
@@ -50,7 +51,10 @@ export interface LaunchDeviceSelection {
   satellite_targets: number[];
   /** Station-based self-register modes only: the resolved device_id →
    *  team_numbers registration assignment (persisted as meta.regAssignments).
-   *  Absent ⇒ the launch path auto-assigns (headless Quick Launch). */
+   *  An EMPTY map means "deliberately no assignment" (the step-3 toggle is off)
+   *  and must be honoured as-is. Only `undefined` means "nobody decided" ⇒ the
+   *  launch path auto-assigns (headless Quick Launch). The wizard always sets
+   *  it, so it never leaves this ambiguous. */
   reg_assignments?: RegAssignmentMap;
 }
 
@@ -142,7 +146,9 @@ export const TRACKS_SCORE_TYPE_LABELS: Record<string, string> = {
   points: 'launchModal:scoreTypePoints',
 };
 
-/** Compact radio group for a tracks launch option. Hidden when ≤1 option (auto-selected). */
+/** Compact radio group for a tracks launch option. Hidden when ≤1 option (auto-selected).
+ *  `disabledKeys` greys out choices that don't apply to the current setup (kept
+ *  visible, with `hint` explaining why, instead of silently disappearing). */
 export function TracksRadioGroup({
   label,
   name,
@@ -150,6 +156,8 @@ export function TracksRadioGroup({
   value,
   onChange,
   helpDot,
+  disabledKeys,
+  hint,
 }: {
   label: string;
   name: string;
@@ -157,6 +165,8 @@ export function TracksRadioGroup({
   value: string;
   onChange: (key: string) => void;
   helpDot?: React.ReactNode;
+  disabledKeys?: string[];
+  hint?: string;
 }) {
   if (options.length <= 1) return null;
   return (
@@ -166,27 +176,36 @@ export function TracksRadioGroup({
         {helpDot}
       </div>
       <div className="flex flex-wrap gap-2">
-        {options.map((o) => (
-          <label
-            key={o.key}
-            className={`px-3 py-2 rounded-lg border-2 cursor-pointer text-sm transition-all ${
-              value === o.key
-                ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]'
-                : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] hover:border-[var(--pg-line-strong)]'
-            }`}
-          >
-            <input
-              type="radio"
-              name={name}
-              value={o.key}
-              checked={value === o.key}
-              onChange={() => onChange(o.key)}
-              className="sr-only"
-            />
-            {o.label}
-          </label>
-        ))}
+        {options.map((o) => {
+          const disabled = !!disabledKeys?.includes(o.key);
+          return (
+            <label
+              key={o.key}
+              className={`px-3 py-2 rounded-lg border-2 text-sm transition-all ${
+                disabled
+                  ? 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)] opacity-50 cursor-not-allowed'
+                  : value === o.key
+                    ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)] cursor-pointer'
+                    : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] hover:border-[var(--pg-line-strong)] cursor-pointer'
+              }`}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={o.key}
+                checked={value === o.key}
+                disabled={disabled}
+                onChange={() => {
+                  if (!disabled) onChange(o.key);
+                }}
+                className="sr-only"
+              />
+              {o.label}
+            </label>
+          );
+        })}
       </div>
+      {hint && <p className="text-xs text-[var(--pg-text-dim)]">{hint}</p>}
     </div>
   );
 }
@@ -369,7 +388,13 @@ export interface GameConfig {
   clashNumClans?: number;
   /** Clash: max players per clan; 0/undefined ⇒ unlimited. */
   clashMaxPerClan?: number;
-  /** Clash: how players bind to a clan at runtime. Stored for the registration UX. */
+  /** Clash "Équipes prédéfinies" (clashRegistrationMode==='bulk'): how many
+   *  contiguous chips to deal to EACH clan, uniformly (mirrors TagQuest's
+   *  teammatesPerTeam). 0/undefined ⇒ none pre-dealt. Consumed at launch to
+   *  build the clan blocks; not needed by the runtime. */
+  clashChipsPerClan?: number;
+  /** Clash: how players bind to a clan at runtime. 'self' = live on the
+   *  registration screen; 'bulk' = predefined clans dealt at launch. */
   clashRegistrationMode?: 'self' | 'bulk';
   /** Clash: per-territory physical balise station codes, pre-filled from the
    *  scenario and overridable per venue at launch (replaces the old pattern). */
@@ -544,6 +569,12 @@ export function LaunchGameModal({
   const [prefTutorialDefault, setPrefTutorialDefault] = useState(false);
   const [prefIntroDefault, setPrefIntroDefault] = useState(false);
   const [teams, setTeams] = useState<Team[]>([]);
+  // Clash "Équipes prédéfinies": the operator's hand-edited chip→clan allocation
+  // (step 2). null = follow the automatic contiguous deal (or an Excel import),
+  // recomputed live from the numbers; the first manual edit pins the whole list.
+  const [clashManualAssignments, setClashManualAssignments] = useState<
+    Array<{ chipId: number; chipNumber: number; clanIndex: number; name?: string }> | null
+  >(null);
   // Candidate pooled team names for the scenario's audience + launch language,
   // split into the client's own list and the default catalog so the bulk
   // "Utiliser les noms de la liste" assignment prefers the client's names and
@@ -790,8 +821,12 @@ export function LaunchGameModal({
         // Clues page on team return - off by default; the operator opts in per launch.
         cluesPage: { enabled: false, show_title: true, show_text: true, show_image: true },
         // Clash defaults - 2 clans, unlimited per clan, self-registration.
+        // Équipes prédéfinies deals 10 chips per clan out of the box (the
+        // operator adjusts the number, or edits the blocks chip by chip, on
+        // step 2). A saved config's own value overrides this below.
         clashNumClans: 2,
         clashMaxPerClan: 0,
+        clashChipsPerClan: 10,
         clashRegistrationMode: 'self',
         clashBalises: clashBalisesSeed,
         // The Purge - ON by default when the scenario has a purge image.
@@ -832,6 +867,7 @@ export function LaunchGameModal({
       });
       setStep(1);
       setTeams([]);
+      setClashManualAssignments(null);
       setPairedDevices([]);
       setSelectedDeviceIds(new Set());
       setMotherChecked(true);
@@ -911,16 +947,25 @@ export function LaunchGameModal({
   // that create teams on bip (mystery, tracks) - not tagquest.
   const supportsDynamicTeams = isMystery || isTracks;
   const isTeamMode = isTagQuest && config.playMode === 'team';
+  // Clash 'bulk' (Équipes prédéfinies) uses step 2 the way mass-start Mystery
+  // does: the chip-block numbers (puces par clan / indice de la première puce)
+  // live there, with a preview of what each clan gets.
+  const isClashBulk = isClash && (config.clashRegistrationMode ?? 'self') === 'bulk';
   // Dynamic-team launches build no roster, so step 2 (Configure teams) is
   // skipped: step 1 advances straight to the device picker, and the device
   // picker's Back button must return to step 1 (not the never-visited step 2).
   // Clash self-register is the same: clans come from the scenario and players
   // bind chips on the registration screen, so there is no roster to edit.
   const skipsRosterStep =
-    !!config.autoRegisterTeam ||
+    // Multi-route Tracks ALWAYS stops on step 2 - that's where each team gets
+    // its parcours - so a stale auto/self-register flag can't skip it.
+    !multipleRoutes &&
+    (!!config.autoRegisterTeam ||
     !!config.selfRegisterTeam ||
     (isTagQuest && !!config.tagquestSelfRegister) ||
-    (isClash && (config.clashRegistrationMode ?? 'self') === 'self');
+    // Clash 'self' binds chips live on the registration screen - nothing to
+    // configure up front. 'bulk' does stop on step 2 (chip blocks per clan).
+    (isClash && !isClashBulk));
   // Station-based self-register: step 3 lets the operator pin each selected
   // device to specific team(s) for registration (a hard-locked kiosk). Clash
   // 'self' mode + TagQuest self-register team mode only - bulk hands out chip
@@ -943,22 +988,26 @@ export function LaunchGameModal({
           number: i + 1,
           name: config.tagquestTeamNames?.[i] || `Équipe ${i + 1}`,
         }));
-  // The live auto-deal: teams round-robin over the selected satellites that
-  // have a reader, in listing order. The mother and reader-less devices are
-  // excluded from the deal by default but stay manually assignable.
+  // The live auto-deal: every device that actually takes part in this launch
+  // gets teams, in listing order (mother first when it participates, then the
+  // selected satellites). Reader-less devices are included too - the flag is
+  // only knowable while a device is online, so filtering on it used to leave
+  // the whole list unassigned. Rows stay individually editable either way.
+  const autoRegDeviceIds: number[] = (() => {
+    const selfRow = pairedDevices.find((d) => d.is_self);
+    const ids: number[] = [];
+    if (selfRow && motherChecked && !busyDeviceIds.has(selfRow.id) && !operatorOnly) {
+      ids.push(selfRow.id);
+    }
+    for (const d of pairedDevices) {
+      if (d.is_self) continue;
+      if (!selectedDeviceIds.has(d.id) || busyDeviceIds.has(d.id)) continue;
+      ids.push(d.id);
+    }
+    return ids;
+  })();
   const autoRegAssignments: RegAssignmentMap = regAssignOn
-    ? computeAutoRegAssignments(
-        pairedDevices
-          .filter(
-            (d) =>
-              !d.is_self &&
-              selectedDeviceIds.has(d.id) &&
-              !busyDeviceIds.has(d.id) &&
-              d.has_reader,
-          )
-          .map((d) => d.id),
-        regTeamDefs.length,
-      )
+    ? computeAutoRegAssignments(autoRegDeviceIds, regTeamDefs.length)
     : {};
   // Auto-until-touched: an override pins the operator's explicit choice (team
   // numbers beyond the current team count are dropped, not persisted); no
@@ -993,8 +1042,10 @@ export function LaunchGameModal({
   const totalChipsNeeded = config.numberOfTeams * chipsPerTeam;
   const maxTeams = allChips.length > 0 ? Math.floor(allChips.length / chipsPerTeam) : undefined;
   const totalMaxTeams = maxTeams;
+  // 1-based: value N = "start at the Nth chip", so the last valid start that
+  // still leaves room for every team is `length - needed + 1` (floored at 1).
   const maxFirstChipIndex = allChips.length > 0
-    ? Math.max(0, allChips.length - totalChipsNeeded)
+    ? Math.max(1, allChips.length - totalChipsNeeded + 1)
     : undefined;
 
   useEffect(() => {
@@ -1129,6 +1180,13 @@ export function LaunchGameModal({
   };
 
   const handleNextStep = () => {
+    // Clash never edits a roster: clans are dealt numerically at launch, so
+    // step 2 only carries the chip-block numbers (and their preview).
+    if (isClash) {
+      setTeams([]);
+      setStep(2);
+      return;
+    }
     // Roster build lives in launchResolve so the headless Quick Launch path
     // produces an identical roster from the same inputs.
     const combinedChips = [...availableChips, ...onDemandChips];
@@ -1147,16 +1205,23 @@ export function LaunchGameModal({
     setStep(2);
   };
 
-  // Mass-start Mystery/Tracks registers its roster on step 2: the team-count
-  // and first-chip controls live there and rebuild the roster in place on change.
-  // Rebuilding discards manual name edits (like adjusting the count on step 1
-  // would), so the operator sets counts first, then names.
+  // Mass-start Mystery/Tracks and predetermined TagQuest register their roster
+  // on step 2: the team-count and first-chip controls live there and rebuild the
+  // roster in place on change. Rebuilding discards manual name edits (like
+  // adjusting the count on step 1 would), so the operator sets counts first,
+  // then names.
   const rebuildRosterFromCounts = (patch: Partial<GameConfig>) => {
     const next: GameConfig = { ...config, ...patch };
     setConfig(next);
     const combinedChips = [...availableChips, ...onDemandChips];
     let roster = buildRoster(next, combinedChips, gameTypeName);
     if (next.useNamePool || next.nameFromPool) roster = applyPoolNames(roster);
+    // Same in-order route pre-assignment handleNextStep does - rebuilding here
+    // must not leave a multi-route roster without routes.
+    if (multipleRoutes) {
+      const sel = next.routes ?? [];
+      if (sel.length > 0) roster = roster.map((team, i) => ({ ...team, route: sel[i % sel.length] }));
+    }
     setTeams(roster);
   };
 
@@ -1338,6 +1403,83 @@ export function LaunchGameModal({
       .map((c) => ({ clan: c.name, max: cap, count: counts.get(c.index) ?? 0 }));
   })();
 
+  // Clash "Équipes prédéfinies" (step 2): what each clan gets, chip by chip.
+  // Unedited, it IS the block GameList would deal at launch - same free-chip
+  // list (client cards minus chips held by an active game) and same helper, so
+  // the operator sees exactly what will happen. Touching any chip pins the whole
+  // allocation into `clashManualAssignments`, which is sent as
+  // config.clashChipAssignments at launch (the path the Excel import uses).
+  const clashChipById = new Map(allChips.map((c) => [c.id, c]));
+  const clashBulkAllocation = (() => {
+    if (!isClashBulk) return null;
+    const free = availableChips.filter((c) => !usedChipIds.has(c.id));
+    const numClans = Math.max(2, Math.min(config.clashNumClans ?? 2, 4));
+    const perClan = Math.max(0, config.clashChipsPerClan ?? 10);
+    const imported = config.clashChipAssignments ?? [];
+    const source: Array<{ chipId: number; clanIndex: number }> =
+      clashManualAssignments ??
+      (imported.length > 0
+        ? imported
+        : buildClashContiguousAssignments(free, config.firstChipIndex, perClan, numClans));
+    // Group by clan, dropping duplicates and clans that no longer exist (the
+    // clan count can shrink after an import).
+    const byClan = new Map<number, number[]>();
+    const seen = new Set<number>();
+    for (const a of source) {
+      if (a.clanIndex < 1 || a.clanIndex > numClans || seen.has(a.chipId)) continue;
+      seen.add(a.chipId);
+      byClan.set(a.clanIndex, [...(byClan.get(a.clanIndex) ?? []), a.chipId]);
+    }
+    const clans = Array.from({ length: numClans }, (_, i) => ({
+      index: i + 1,
+      name: clashClanNames[i] || `Clan ${i + 1}`,
+      chipIds: byClan.get(i + 1) ?? [],
+    }));
+    return {
+      clans,
+      free,
+      freeCount: free.length,
+      needed: perClan * numClans,
+      assignedIds: seen,
+      isManual: clashManualAssignments !== null,
+      isImported: clashManualAssignments === null && imported.length > 0,
+    };
+  })();
+
+  // Pin the current allocation as the manual one (chipNumber/name carried along
+  // for the summary UI - the launch path only reads chipId + clanIndex).
+  const commitClashClans = (clans: Array<{ index: number; chipIds: number[] }>) => {
+    setClashManualAssignments(
+      clans.flatMap((c) =>
+        c.chipIds.map((id) => {
+          const chip = clashChipById.get(id);
+          return {
+            chipId: id,
+            chipNumber: chip?.key_number ?? 0,
+            clanIndex: c.index,
+            name: chip?.key_name ?? undefined,
+          };
+        }),
+      ),
+    );
+  };
+
+  const editClashClan = (clanIndex: number, edit: (chipIds: number[]) => number[]) => {
+    if (!clashBulkAllocation) return;
+    commitClashClans(
+      clashBulkAllocation.clans.map((c) =>
+        c.index === clanIndex ? { ...c, chipIds: edit(c.chipIds) } : c,
+      ),
+    );
+  };
+
+  // Add the next unassigned free chip to a clan (no-op when everything is taken).
+  const addClashChip = (clanIndex: number) => {
+    if (!clashBulkAllocation) return;
+    const next = clashBulkAllocation.free.find((c) => !clashBulkAllocation.assignedIds.has(c.id));
+    if (!next) return;
+    editClashClan(clanIndex, (ids) => [...ids, next.id]);
+  };
   const updateTeamRoute = (index: number, route: string) => {
     setTeams(prev => {
       const updated = [...prev];
@@ -1451,8 +1593,12 @@ export function LaunchGameModal({
   const renderRegAssignRow = (deviceId: number) => {
     if (!regAssignOn || regTeamDefs.length === 0) return null;
     const { teams: assigned, manual } = effectiveRegAssignment(deviceId);
+    const assignedNames = assigned
+      .map((n) => regTeamDefs.find((d) => d.number === n)?.name)
+      .filter((n): n is string => !!n);
     return (
-      <div className="flex flex-wrap items-center gap-2 px-3 pb-3 pl-10">
+      <div className="px-3 pb-3 pl-10">
+      <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-[var(--pg-text-dim)] shrink-0">
           {t('launchModal:regAssignLabel')}
         </span>
@@ -1491,6 +1637,14 @@ export function LaunchGameModal({
             </>
           }
         />
+      </div>
+      {/* Plain-language restatement of the chips - the operator scans this
+          column to check the whole plan without decoding chip states. */}
+      {assignedNames.length > 0 && (
+        <div className="mt-1 text-xs text-[var(--pg-accent-bright)]">
+          {t('launchModal:regAssignSummary', { teams: assignedNames.join(', ') })}
+        </div>
+      )}
       </div>
     );
   };
@@ -1532,6 +1686,16 @@ export function LaunchGameModal({
       ...config,
       name: config.name.trim() || getDefaultName(),
       teams,
+      // Clash "Équipes prédéfinies": a hand-edited allocation travels as
+      // clashChipAssignments (the path the Excel import already uses). An
+      // emptied allocation also zeroes chipsPerClan, otherwise the launch would
+      // read "no assignments" and re-deal the very blocks the operator cleared.
+      ...(isClashBulk && clashManualAssignments
+        ? {
+            clashChipAssignments: clashManualAssignments,
+            ...(clashManualAssignments.length === 0 ? { clashChipsPerClan: 0 } : {}),
+          }
+        : {}),
       // Always derive the name-pool audience from the scenario (no manual
       // override), and carry the scenario's languages for the self-register
       // overlay's flag radios.
@@ -1548,9 +1712,11 @@ export function LaunchGameModal({
     // Station-based self-register: resolve the auto/manual per-device teams
     // into the final map persisted as meta.regAssignments. Devices with no
     // teams get no entry (they keep the pick-any-team grid).
-    let reg_assignments: RegAssignmentMap | undefined;
+    // ALWAYS sent, even when the toggle is off - an empty map is this wizard
+    // stating "no assignment". Omitting the key made the toggle a no-op: the
+    // launch path reads a missing key as "headless Quick Launch" and auto-deals.
+    const reg_assignments: RegAssignmentMap = {};
     if (regAssignOn) {
-      reg_assignments = {};
       const participantIds = [
         ...(includeSelf && selfRow ? [selfRow.id] : []),
         ...satellite_targets,
@@ -1563,7 +1729,7 @@ export function LaunchGameModal({
     onLaunch(finalConfig, {
       include_self: includeSelf,
       satellite_targets,
-      ...(reg_assignments ? { reg_assignments } : {}),
+      reg_assignments,
     });
   };
 
@@ -1735,10 +1901,12 @@ export function LaunchGameModal({
                 </div>
               </div>
 
-              {/* Merged "Mode de jeu" card - play mode + team registration +
-                  the team-count controls (Number of teams / teammates / first
-                  chip) all live here. Pattern moved to Advanced (Mystery-style);
-                  Duration + Language keep the Mystery-style two-column row below. */}
+              {/* Merged "Mode de jeu" card - play mode + team registration.
+                  The predetermined roster's counts (Number of teams / teammates /
+                  first chip) live on step 2, Mystery mass-start style; only
+                  self-register team mode keeps its count here (it never reaches
+                  step 2). Pattern moved to Advanced (Mystery-style); Duration +
+                  Language keep the Mystery-style two-column row below. */}
               <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
                 <label className="pg-label">
                   {t('launchModal:playMode')}
@@ -1784,11 +1952,10 @@ export function LaunchGameModal({
                   </button>
                 </div>
 
-                {/* Team registration - Predetermined roster (default, built on
-                    the next step) vs Self-register (players bind their chip to a
-                    team at game start on the registration screen, mirroring
-                    Clash's clashRegistrationMode='self'). The team-count controls
-                    live in this subsection. */}
+                {/* Team registration - Predetermined roster (default, sized and
+                    built on the next step) vs Self-register (players bind their
+                    chip to a team at game start on the registration screen,
+                    mirroring Clash's clashRegistrationMode='self'). */}
                 <div className="pt-3 border-t border-[var(--pg-line)] space-y-3">
                   <label className="pg-label">{t('launchModal:teamRegistrationHeading', { defaultValue: 'Team registration' })}</label>
                   <div className="pg-pill-group">
@@ -1810,11 +1977,13 @@ export function LaunchGameModal({
                     {t('launchModal:tagquestRegHint', { defaultValue: 'Predetermined: you assign chips to teams on the next step. Self-register: players bip their chip to join a team on the registration screen at game start - just like Clash.' })}
                   </p>
 
-                  {/* Team-count controls (moved out of the shared grid). Number of
-                      teams shows unless solo self-register (no predefined teams);
-                      teammates/first-chip are predetermined-roster only. */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {!(config.tagquestSelfRegister && config.playMode === 'solo') && (
+                  {/* Team-count controls. Self-register team mode keeps them here
+                      (it never reaches step 2, and the team-name inputs below are
+                      driven by the count). The predetermined roster moves its
+                      count / teammates / first-chip fields to step 2, Mystery
+                      mass-start style, so they sit next to the roster they build. */}
+                  {config.tagquestSelfRegister && config.playMode === 'team' && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-2">
                         <label htmlFor="numberOfTeams" className="pg-label">
                           {t('launchModal:numberOfTeams')}
@@ -1837,7 +2006,7 @@ export function LaunchGameModal({
                               : maxTeams;
                             const clampedTeams = effectiveMax !== undefined ? Math.min(val, effectiveMax) : val;
                             const clampedFirst = maxTeams !== undefined
-                              ? Math.min(config.firstChipIndex, maxTeams - clampedTeams)
+                              ? Math.max(1, Math.min(config.firstChipIndex, maxTeams - clampedTeams + 1))
                               : config.firstChipIndex;
                             setConfig({ ...config, numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
                           }}
@@ -1847,60 +2016,11 @@ export function LaunchGameModal({
                         {maxTeams !== undefined && config.numberOfTeams > maxTeams && (
                           <p className="text-xs text-red-400">{t('launchModal:exceedsAvailableCards', { max: maxTeams })}</p>
                         )}
-                        {isTeamMode && !config.tagquestSelfRegister && (
-                          <div className="mt-3 space-y-2">
-                            <label htmlFor="teammatesPerTeam" className="pg-label">
-                              {t('launchModal:teammatesPerTeam')}
-                              {allChips.length > 0 && (
-                                <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
-                                  {t('launchModal:chipsNeededAvailable', { needed: totalChipsNeeded, available: allChips.length })}
-                                </span>
-                              )}
-                            </label>
-                            <input
-                              type="number"
-                              id="teammatesPerTeam"
-                              min="2"
-                              value={config.teammatesPerTeam ?? 2}
-                              onChange={(e) => {
-                                const val = Math.max(2, parseInt(e.target.value) || 2);
-                                const newMax = allChips.length > 0 ? Math.floor(allChips.length / val) : undefined;
-                                const clampedTeams = newMax !== undefined ? Math.min(config.numberOfTeams, newMax) : config.numberOfTeams;
-                                setConfig({ ...config, teammatesPerTeam: val, numberOfTeams: clampedTeams });
-                              }}
-                              className="pg-input"
-                            />
-                          </div>
-                        )}
                       </div>
-                    )}
 
-                    {!config.tagquestSelfRegister && (
-                      <div className="space-y-2">
-                        <label htmlFor="firstChipIndex" className="pg-label">
-                          {t('launchModal:indexOfFirstChip')}
-                        </label>
-                        <input
-                          type="number"
-                          id="firstChipIndex"
-                          min="0"
-                          {...(maxFirstChipIndex !== undefined ? { max: maxFirstChipIndex } : {})}
-                          value={config.firstChipIndex}
-                          onChange={(e) => {
-                            let val = parseInt(e.target.value) || 0;
-                            if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
-                            setConfig({ ...config, firstChipIndex: val });
-                          }}
-                          className="pg-input"
-                          required
-                        />
-                      </div>
-                    )}
-
-                    {/* Self-register team mode: "Joueurs max par équipe" sits on
-                        the same line as "Nombre d'équipes" (the first-chip index
-                        column is hidden in this mode). */}
-                    {config.tagquestSelfRegister && config.playMode === 'team' && (
+                      {/* Self-register team mode: "Joueurs max par équipe" sits on
+                          the same line as "Nombre d'équipes" (the first-chip index
+                          column is hidden in this mode). */}
                       <div className="space-y-2">
                         <label htmlFor="tagquestMaxPerTeam" className="pg-label">
                           {t('launchModal:maxPerTeam', { defaultValue: 'Max players per team' })}
@@ -1915,8 +2035,8 @@ export function LaunchGameModal({
                         />
                         <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:zeroUnlimited', { defaultValue: '0 = unlimited' })}</p>
                       </div>
-                    )}
-                  </div>
+                    </div>
+                  )}
 
                   {config.tagquestSelfRegister && config.playMode === 'team' && (
                     <div className="space-y-3 pt-1">
@@ -1963,9 +2083,10 @@ export function LaunchGameModal({
             </>
           )}
 
-          {/* TagQuest renders Duration + Language under the title (below) and its
-              team-count controls in the merged "Mode de jeu" card, with the pattern
-              in Advanced - so this whole shared grid is skipped for TagQuest. */}
+          {/* TagQuest renders Duration + Language under the title (below), its
+              registration mode in the merged "Mode de jeu" card and its roster
+              counts on step 2, with the pattern in Advanced - so this whole
+              shared grid is skipped for TagQuest. */}
           {!isTagQuest && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Mass-start Mystery/Tracks registers teams before launch, so its
@@ -1994,7 +2115,7 @@ export function LaunchGameModal({
                     : maxTeams;
                   const clampedTeams = effectiveMax !== undefined ? Math.min(val, effectiveMax) : val;
                   const clampedFirst = maxTeams !== undefined
-                    ? Math.min(config.firstChipIndex, maxTeams - clampedTeams)
+                    ? Math.max(1, Math.min(config.firstChipIndex, maxTeams - clampedTeams + 1))
                     : config.firstChipIndex;
                   setConfig({ ...config, numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
                 }}
@@ -2038,11 +2159,11 @@ export function LaunchGameModal({
               <input
                 type="number"
                 id="firstChipIndex"
-                min="0"
+                min="1"
                 {...(maxFirstChipIndex !== undefined ? { max: maxFirstChipIndex } : {})}
                 value={config.firstChipIndex}
                 onChange={(e) => {
-                  let val = parseInt(e.target.value) || 0;
+                  let val = Math.max(1, parseInt(e.target.value) || 1);
                   if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
                   setConfig({ ...config, firstChipIndex: val });
                 }}
@@ -2146,7 +2267,12 @@ export function LaunchGameModal({
                   <label className="pg-label">{t('launchModal:numberOfClans')}</label>
                   <select
                     value={config.clashNumClans ?? 2}
-                    onChange={(e) => setConfig({ ...config, clashNumClans: parseInt(e.target.value) })}
+                    onChange={(e) => {
+                      // The clan count reshapes the deal, so any hand-edited
+                      // allocation is dropped back to the automatic one.
+                      setClashManualAssignments(null);
+                      setConfig({ ...config, clashNumClans: parseInt(e.target.value) });
+                    }}
                     className="pg-select"
                   >
                     {[2, 3, 4].map((n) => (
@@ -2154,17 +2280,21 @@ export function LaunchGameModal({
                     ))}
                   </select>
                 </div>
-                <div className="space-y-1">
-                  <label className="pg-label">{t('launchModal:maxPlayersPerClan')}</label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={config.clashMaxPerClan ?? 0}
-                    onChange={(e) => setConfig({ ...config, clashMaxPerClan: Math.max(0, parseInt(e.target.value) || 0) })}
-                    className="pg-input"
-                  />
-                  <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:zeroUnlimited')}</p>
-                </div>
+                {/* Max-per-clan is a live self-register cap; predefined clans get
+                    a fixed block per clan instead, so it's hidden in that mode. */}
+                {(config.clashRegistrationMode ?? 'self') === 'self' && (
+                  <div className="space-y-1">
+                    <label className="pg-label">{t('launchModal:maxPlayersPerClan')}</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={config.clashMaxPerClan ?? 0}
+                      onChange={(e) => setConfig({ ...config, clashMaxPerClan: Math.max(0, parseInt(e.target.value) || 0) })}
+                      className="pg-input"
+                    />
+                    <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:zeroUnlimited')}</p>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-2">
@@ -2176,12 +2306,23 @@ export function LaunchGameModal({
                     { key: 'bulk', label: t('launchModal:clashRegBulk') },
                   ]}
                   value={config.clashRegistrationMode ?? 'self'}
-                  onChange={(k) => setConfig({ ...config, clashRegistrationMode: k as 'self' | 'bulk' })}
+                  onChange={(k) => {
+                    setClashManualAssignments(null);
+                    setConfig({ ...config, clashRegistrationMode: k as 'self' | 'bulk' });
+                  }}
                 />
                 <p className="text-xs text-[var(--pg-text-dim)]">
                   {t('launchModal:clashRegHint')}
                 </p>
               </div>
+
+              {/* Prédéfinies: the chip-block numbers (puces par clan / indice de
+                  la première puce) live on step 2 - see the clash block there. */}
+              {isClashBulk && (
+                <p className="text-xs text-[var(--pg-text-dim)]">
+                  {t('launchModal:clashBulkNextStepHint')}
+                </p>
+              )}
 
               {/* Import chip→clan assignments from Excel/CSV. Clans only exist
                   after launch, so these are stored in config and applied by
@@ -2235,11 +2376,12 @@ export function LaunchGameModal({
             </div>
           )}
 
-          {/* Mystery + Tracks: chips + team-name handling. Teams always
+          {/* Mystery + Tracks: chips + team-name handling. Teams normally
               auto-register on first bip - the operator only chooses HOW each team
-              is named, and whether a finished chip can start a new game. Hidden
-              for Tracks multi-route launches, which use a fixed roster instead. */}
-          {(isMystery || (isTracks && !multipleRoutes)) && (
+              is named, and whether a finished chip can start a new game. Tracks
+              multi-route keeps this card too (naming + reuse still apply to its
+              fixed roster); only self-registration is unavailable there. */}
+          {(isMystery || isTracks) && (
             <div className="space-y-3 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
               <div className="flex items-center gap-2">
                 <h3 className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:chipsAndTeamNamesHeading')}</h3>
@@ -2247,11 +2389,12 @@ export function LaunchGameModal({
               </div>
               <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:chipsAndTeamNamesIntro')}</p>
 
-              {/* Start mode - Mystery + Tracks (this card already only renders
-                  for single-route Tracks; multi-route has its own fixed-roster
-                  flow). Mass start (all teams begin together) is incompatible
-                  with self-registration, so choosing it forces selfRegisterTeam
-                  off and the team-names radio below hides its "self" option. */}
+              {/* Start mode - Mystery + Tracks. Mass start (all teams begin
+                  together) is incompatible with self-registration, so choosing it
+                  forces selfRegisterTeam off and the team-names radio below drops
+                  its "self" option. Multi-route Tracks needs a pre-built roster to
+                  assign the routes, so staggered must NOT re-enable on-bip
+                  auto-registration there. */}
               <TracksRadioGroup
                 label={t('launchModal:startModeHeading')}
                 name="startMode"
@@ -2266,9 +2409,9 @@ export function LaunchGameModal({
                     massStart: k === 'mass',
                     // Mass start = all teams begin together, so the roster must be
                     // registered before launch (fixed roster on step 2). Staggered
-                    // goes back to on-bip auto-registration. Mass start also can't
-                    // coexist with self-registration.
-                    autoRegisterTeam: k !== 'mass',
+                    // goes back to on-bip auto-registration - except multi-route,
+                    // which stays on its fixed roster.
+                    autoRegisterTeam: multipleRoutes ? false : k !== 'mass',
                     ...(k === 'mass'
                       ? { selfRegisterTeam: false, addRandomNameOption: false, allowPlayerLanguageChoice: false }
                       : {}),
@@ -2276,6 +2419,9 @@ export function LaunchGameModal({
                 }
               />
 
+              {/* Self-registration is unavailable with mass start (hidden) and
+                  with several parcours (shown disabled + why: the roster must
+                  exist before launch so each team can be given a route). */}
               <TracksRadioGroup
                 label={t('launchModal:teamNamesHeading')}
                 name="mysteryNameMode"
@@ -2283,6 +2429,8 @@ export function LaunchGameModal({
                   ...(config.massStart ? [] : [{ key: 'self', label: t('launchModal:nameModeSelf') }]),
                   { key: 'auto', label: t('launchModal:autoDetermineTeamNames') },
                 ]}
+                disabledKeys={multipleRoutes ? ['self'] : undefined}
+                hint={multipleRoutes && !config.massStart ? t('launchModal:selfRegisterMultiRouteHint') : undefined}
                 value={config.selfRegisterTeam ? 'self' : 'auto'}
                 onChange={(k) =>
                   setConfig({
@@ -2383,9 +2531,45 @@ export function LaunchGameModal({
             </div>
           )}
 
+          {/* Parcours (Tracks) - the studio-enabled route set, multi-select, in
+              its own section. Selecting 2+ parcours forces a fixed roster
+              (auto-register off) and each team is assigned a route in order on
+              the team step. Hidden when only one parcours is offered
+              (auto-selected). */}
+          {isTracks && tracksOptions.routes.length > 1 && (
+            <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+              <TracksCheckboxGroup
+                label={t('launchModal:tracksRoute')}
+                options={tracksOptions.routes.map((k) => ({ key: k, label: TRACKS_ROUTE_LABELS[k] ? t(TRACKS_ROUTE_LABELS[k]) : k }))}
+                value={config.routes ?? (config.route ? [config.route] : [])}
+                onChange={(keys) =>
+                  setConfig({
+                    ...config,
+                    routes: keys,
+                    // `route` stays the primary/fallback (first selected).
+                    route: keys[0] ?? config.route,
+                    // Several routes ⇒ a pre-built roster is required to assign
+                    // them in order, so auto-register and self-registration (with
+                    // its children) are off. Start mode and the auto-name source
+                    // stay as chosen - the "Puces et noms d'équipes" card keeps
+                    // rendering for multi-route, minus self-registration.
+                    ...(keys.length > 1
+                      ? {
+                          autoRegisterTeam: false,
+                          selfRegisterTeam: false,
+                          addRandomNameOption: false,
+                          allowPlayerLanguageChoice: false,
+                        }
+                      : {}),
+                  })
+                }
+                hint={t('launchModal:tracksRoutesHint')}
+              />
+            </div>
+          )}
+
           {isTracks && (
             <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
-              {/* Parcours moved into Advanced (below), styled next to the pattern. */}
               <TracksRadioGroup
                 label={t('launchModal:tracksDisplayMode')}
                 name="tracksDisplay"
@@ -2409,7 +2593,8 @@ export function LaunchGameModal({
                 helpDot={<HelpDot topic="launch.score-type" />}
               />
 
-              <div className="pt-3 border-t border-[var(--pg-line)]">
+              <div className="space-y-2">
+                <h3 className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:tracksCluesSectionTitle')}</h3>
                 <label className="flex items-start gap-2 text-sm">
                   <input
                     type="checkbox"
@@ -2490,7 +2675,7 @@ export function LaunchGameModal({
                       if (newMax > 0) {
                         setConfig(prev => {
                           const clampedTeams = Math.min(prev.numberOfTeams, newMax);
-                          const clampedFirst = Math.min(prev.firstChipIndex, newMax - clampedTeams);
+                          const clampedFirst = Math.max(1, Math.min(prev.firstChipIndex, newMax - clampedTeams + 1));
                           return { ...prev, numberOfTeams: clampedTeams, firstChipIndex: clampedFirst };
                         });
                       }
@@ -2623,41 +2808,6 @@ export function LaunchGameModal({
                         </p>
                       )}
                     </div>
-                  )}
-
-                  {/* Parcours (Tracks) - the studio-enabled route set, multi-select.
-                      Selecting 2+ parcours forces a fixed roster (auto-register off)
-                      and each team is assigned a route in order on the team step.
-                      Hidden when the scenario enables ≤1 parcours (auto-selected). */}
-                  {isTracks && (
-                    <TracksCheckboxGroup
-                      label={t('launchModal:tracksRoute')}
-                      options={tracksOptions.routes.map((k) => ({ key: k, label: TRACKS_ROUTE_LABELS[k] ? t(TRACKS_ROUTE_LABELS[k]) : k }))}
-                      value={config.routes ?? (config.route ? [config.route] : [])}
-                      onChange={(keys) =>
-                        setConfig({
-                          ...config,
-                          routes: keys,
-                          // `route` stays the primary/fallback (first selected).
-                          route: keys[0] ?? config.route,
-                          // Several routes ⇒ a pre-built roster is required to assign
-                          // them in order, so auto-register (and its children) is off.
-                          // Mass start is reset too: the multi-route flow keeps its
-                          // own count fields on step 1 (the start-mode card hides).
-                          ...(keys.length > 1
-                            ? {
-                                autoRegisterTeam: false,
-                                selfRegisterTeam: false,
-                                useNamePool: false,
-                                massStart: false,
-                                addRandomNameOption: false,
-                                allowPlayerLanguageChoice: false,
-                              }
-                            : {}),
-                        })
-                      }
-                      hint={t('launchModal:tracksRoutesHint')}
-                    />
                   )}
 
                   {/* Pattern (Mystery + Tracks + TagQuest) - read-only with a Modify
@@ -3066,34 +3216,41 @@ export function LaunchGameModal({
             <>
               <div className="space-y-4">
                 <div className="flex items-center justify-between gap-3 border-b border-[var(--pg-line)] pb-2">
-                  <h3 className="text-xl font-semibold text-[var(--pg-text)]">{t('launchModal:configureTeams')}</h3>
-                  <div className="flex items-center gap-2">
-                    {poolNames.length > 0 && teams.length > 0 && (
+                  <h3 className="text-xl font-semibold text-[var(--pg-text)]">
+                    {isClash ? t('launchModal:clashConfigureClans') : t('launchModal:configureTeams')}
+                  </h3>
+                  {/* Clash deals clan blocks numerically - the roster importer
+                      here builds team rows Clash never reads (its own chip→clan
+                      import lives on step 1), so it's hidden for Clash. */}
+                  {!isClash && (
+                    <div className="flex items-center gap-2">
+                      {poolNames.length > 0 && teams.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setTeams(prev => applyPoolNames(prev))}
+                          className="pg-btn pg-btn--ghost text-sm"
+                        >
+                          🎲 {t('launchModal:fillFromNamePool')}
+                        </button>
+                      )}
                       <button
                         type="button"
-                        onClick={() => setTeams(prev => applyPoolNames(prev))}
-                        className="pg-btn pg-btn--ghost text-sm"
+                        onClick={() => rosterFileInputRef.current?.click()}
+                        className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
                       >
-                        🎲 {t('launchModal:fillFromNamePool')}
+                        <Upload size={16} />
+                        {t('launchModal:importRoster')}
                       </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => rosterFileInputRef.current?.click()}
-                      className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
-                    >
-                      <Upload size={16} />
-                      {t('launchModal:importRoster')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => downloadImportTemplate(teamImportMode)}
-                      className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
-                      title={t('launchModal:downloadTemplate')}
-                    >
-                      <FileDown size={16} />
-                    </button>
-                  </div>
+                      <button
+                        type="button"
+                        onClick={() => downloadImportTemplate(teamImportMode)}
+                        className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
+                        title={t('launchModal:downloadTemplate')}
+                      >
+                        <FileDown size={16} />
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <input
                   ref={rosterFileInputRef}
@@ -3108,13 +3265,13 @@ export function LaunchGameModal({
                   </div>
                 )}
 
-                {/* Mass-start Mystery/Tracks: register the roster before launch.
-                    The team count + first-chip index live here (not on step 1)
-                    and rebuild the roster below on change. */}
-                {(isMystery || isTracks) && config.massStart && (
+                {/* Roster counts live on this step for the launches that build
+                    their teams here: mass-start Mystery/Tracks and predetermined
+                    TagQuest. Each change rebuilds the roster below in place. */}
+                {(((isMystery || isTracks) && config.massStart) || (isTagQuest && !config.tagquestSelfRegister)) && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
                     <div className="space-y-2">
-                      <label htmlFor="massNumberOfTeams" className="pg-label">
+                      <label htmlFor="rosterNumberOfTeams" className="pg-label">
                         {t('launchModal:numberOfTeams')}
                         {totalMaxTeams !== undefined && (
                           <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
@@ -3124,7 +3281,7 @@ export function LaunchGameModal({
                       </label>
                       <input
                         type="number"
-                        id="massNumberOfTeams"
+                        id="rosterNumberOfTeams"
                         min="1"
                         max={config.testMode ? Math.min(maxTeams ?? 5, 5) : maxTeams}
                         value={config.numberOfTeams}
@@ -3133,7 +3290,7 @@ export function LaunchGameModal({
                           const effectiveMax = config.testMode ? Math.min(maxTeams ?? 5, 5) : maxTeams;
                           const clampedTeams = effectiveMax !== undefined ? Math.min(val, effectiveMax) : val;
                           const clampedFirst = maxTeams !== undefined
-                            ? Math.min(config.firstChipIndex, maxTeams - clampedTeams)
+                            ? Math.max(1, Math.min(config.firstChipIndex, maxTeams - clampedTeams + 1))
                             : config.firstChipIndex;
                           rebuildRosterFromCounts({ numberOfTeams: clampedTeams, firstChipIndex: clampedFirst });
                         }}
@@ -3143,25 +3300,236 @@ export function LaunchGameModal({
                       {maxTeams !== undefined && config.numberOfTeams > maxTeams && (
                         <p className="text-xs text-red-400">{t('launchModal:exceedsAvailableCards', { max: maxTeams })}</p>
                       )}
+                      {/* TagQuest team mode: chips per team shapes the roster too,
+                          so it moved here with the counts. */}
+                      {isTeamMode && (
+                        <div className="mt-3 space-y-2">
+                          <label htmlFor="rosterTeammatesPerTeam" className="pg-label">
+                            {t('launchModal:teammatesPerTeam')}
+                            {allChips.length > 0 && (
+                              <span className="ml-2 text-xs text-[var(--pg-text-dim)]">
+                                {t('launchModal:chipsNeededAvailable', { needed: totalChipsNeeded, available: allChips.length })}
+                              </span>
+                            )}
+                          </label>
+                          <input
+                            type="number"
+                            id="rosterTeammatesPerTeam"
+                            min="2"
+                            value={config.teammatesPerTeam ?? 2}
+                            onChange={(e) => {
+                              const val = Math.max(2, parseInt(e.target.value) || 2);
+                              const newMax = allChips.length > 0 ? Math.floor(allChips.length / val) : undefined;
+                              const clampedTeams = newMax !== undefined ? Math.min(config.numberOfTeams, newMax) : config.numberOfTeams;
+                              rebuildRosterFromCounts({ teammatesPerTeam: val, numberOfTeams: clampedTeams });
+                            }}
+                            className="pg-input"
+                          />
+                        </div>
+                      )}
                     </div>
                     <div className="space-y-2">
-                      <label htmlFor="massFirstChipIndex" className="pg-label">
+                      <label htmlFor="rosterFirstChipIndex" className="pg-label">
                         {t('launchModal:indexOfFirstChip')}
                       </label>
                       <input
                         type="number"
-                        id="massFirstChipIndex"
-                        min="0"
+                        id="rosterFirstChipIndex"
+                        min="1"
                         {...(maxFirstChipIndex !== undefined ? { max: maxFirstChipIndex } : {})}
                         value={config.firstChipIndex}
                         onChange={(e) => {
-                          let val = parseInt(e.target.value) || 0;
+                          let val = Math.max(1, parseInt(e.target.value) || 1);
                           if (maxFirstChipIndex !== undefined) val = Math.min(val, maxFirstChipIndex);
                           rebuildRosterFromCounts({ firstChipIndex: val });
                         }}
                         className="pg-input"
                         required
                       />
+                    </div>
+                  </div>
+                )}
+
+                {/* Clash "Équipes prédéfinies": no roster to edit - the block
+                    numbers, then the resulting allocation, chip by chip and
+                    editable. The numbers re-deal (dropping hand edits); the
+                    chip rows below let the operator add / swap / remove. */}
+                {isClashBulk && clashBulkAllocation && (
+                  <div className="space-y-4 p-4 bg-[var(--pg-surface-2)] rounded-[var(--pg-radius-md)]">
+                    {clashBulkAllocation.isImported ? (
+                      // An Excel chip→clan import governs the allocation: the
+                      // block numbers would say nothing about it, so they hide
+                      // until the operator drops back to the automatic deal.
+                      <div className="flex items-center gap-3 flex-wrap text-xs text-[var(--pg-text-dim)]">
+                        <span>{t('launchModal:clashBulkFromImport', { count: config.clashChipAssignments!.length })}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setClashManualAssignments(null);
+                            setConfig({ ...config, clashChipAssignments: undefined });
+                          }}
+                          className="text-[var(--pg-accent-bright)] hover:underline"
+                        >
+                          {t('launchModal:clashBulkUseAutomatic')}
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                          <label htmlFor="clashChipsPerClan" className="pg-label">{t('launchModal:clashChipsPerClan')}</label>
+                          <input
+                            type="number"
+                            id="clashChipsPerClan"
+                            min="0"
+                            value={config.clashChipsPerClan ?? 10}
+                            onChange={(e) => {
+                              // Re-dealing discards hand edits - same rule the
+                              // roster counts follow: numbers first, then details.
+                              setClashManualAssignments(null);
+                              setConfig({ ...config, clashChipsPerClan: Math.max(0, parseInt(e.target.value) || 0) });
+                            }}
+                            className="pg-input"
+                          />
+                          <p className="text-xs text-[var(--pg-text-dim)]">
+                            {t('launchModal:chipsNeededAvailable', {
+                              needed: clashBulkAllocation.needed,
+                              available: clashBulkAllocation.freeCount,
+                            })}
+                          </p>
+                        </div>
+                        <div className="space-y-1">
+                          <label htmlFor="clashFirstChipIndex" className="pg-label">{t('launchModal:indexOfFirstChip')}</label>
+                          <input
+                            type="number"
+                            id="clashFirstChipIndex"
+                            min="1"
+                            value={config.firstChipIndex}
+                            onChange={(e) => {
+                              setClashManualAssignments(null);
+                              setConfig({ ...config, firstChipIndex: Math.max(1, parseInt(e.target.value) || 1) });
+                            }}
+                            className="pg-input"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="pg-label !mb-0">{t('launchModal:clashBulkPreviewHeading')}</div>
+                        {clashBulkAllocation.isManual && (
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className="text-[var(--pg-text-dim)]">{t('launchModal:clashBulkManualNote')}</span>
+                            <button
+                              type="button"
+                              onClick={() => setClashManualAssignments(null)}
+                              className="text-[var(--pg-accent-bright)] hover:underline"
+                            >
+                              {t('launchModal:clashBulkResetAllocation')}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {clashBulkAllocation.clans.map((clan) => {
+                        const short =
+                          !clashBulkAllocation.isManual &&
+                          !clashBulkAllocation.isImported &&
+                          clan.chipIds.length < Math.max(0, config.clashChipsPerClan ?? 10);
+                        const noChipLeft =
+                          !clashBulkAllocation.free.some((c) => !clashBulkAllocation.assignedIds.has(c.id));
+                        return (
+                          <div
+                            key={clan.index}
+                            className="rounded-[var(--pg-radius-md)] bg-[var(--pg-surface-3)] overflow-hidden"
+                          >
+                            <div className="flex items-center gap-3 px-3 py-2 border-b border-[var(--pg-line)]">
+                              <div className="w-7 h-7 rounded-full bg-[var(--pg-accent)] text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                                {clan.index}
+                              </div>
+                              <div className="font-medium text-sm text-[var(--pg-text)] flex-1 min-w-0 truncate">
+                                {clan.name}
+                              </div>
+                              <div className={`text-xs ${short ? 'text-red-400' : 'text-[var(--pg-text-dim)]'}`}>
+                                {t('launchModal:clashBulkChipCount', { count: clan.chipIds.length })}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => addClashChip(clan.index)}
+                                disabled={noChipLeft}
+                                className="pg-btn pg-btn--ghost pg-btn--sm disabled:opacity-40 disabled:cursor-not-allowed"
+                                title={noChipLeft ? t('launchModal:clashBulkNoChipLeft') : undefined}
+                              >
+                                + {t('launchModal:clashBulkAddChip')}
+                              </button>
+                            </div>
+                            {clan.chipIds.length === 0 ? (
+                              <p className="px-3 py-2 text-xs text-red-400">{t('launchModal:clashBulkNoChips')}</p>
+                            ) : (
+                              <div className="p-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+                                {clan.chipIds.map((chipId, pos) => (
+                                  <div key={`${chipId}-${pos}`} className="flex items-center gap-2">
+                                    <select
+                                      value={chipId}
+                                      onChange={(e) => {
+                                        const nextId = parseInt(e.target.value);
+                                        editClashClan(clan.index, (ids) =>
+                                          ids.map((id, i) => (i === pos ? nextId : id)),
+                                        );
+                                      }}
+                                      className="pg-select !py-1.5 text-xs flex-1 min-w-0"
+                                    >
+                                      {/* The current chip may be gone from the
+                                          free list (imported / now in another
+                                          game) - keep it selectable so the row
+                                          shows what it holds. */}
+                                      {!availableChips.some((c) => c.id === chipId) && (
+                                        <option value={chipId}>
+                                          {t('launchModal:chipOption', {
+                                            number: clashChipById.get(chipId)?.key_number ?? chipId,
+                                            name: clashChipById.get(chipId)?.key_name ?? '?',
+                                          })}
+                                        </option>
+                                      )}
+                                      {availableChips.map((chip) => {
+                                        const takenHere =
+                                          clashBulkAllocation.assignedIds.has(chip.id) && chip.id !== chipId;
+                                        const takenElsewhere = usedChipIds.has(chip.id);
+                                        const isDisabled = takenHere || takenElsewhere;
+                                        return (
+                                          <option key={chip.id} value={chip.id} disabled={isDisabled}>
+                                            {t('launchModal:chipOption', { number: chip.key_number, name: chip.key_name })}
+                                            {isDisabled ? t('launchModal:chipInUseSuffix') : ''}
+                                          </option>
+                                        );
+                                      })}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      onClick={() => editClashClan(clan.index, (ids) => ids.filter((_, i) => i !== pos))}
+                                      className="pg-btn pg-btn--ghost pg-btn--sm !px-2 flex-shrink-0"
+                                      title={t('launchModal:clashBulkRemoveChip')}
+                                    >
+                                      <X size={14} />
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      {!clashBulkAllocation.isManual &&
+                        !clashBulkAllocation.isImported &&
+                        clashBulkAllocation.needed > clashBulkAllocation.freeCount && (
+                          <p className="text-xs text-red-400">
+                            {t('launchModal:clashBulkShortfall', {
+                              needed: clashBulkAllocation.needed,
+                              available: clashBulkAllocation.freeCount,
+                            })}
+                          </p>
+                        )}
                     </div>
                   </div>
                 )}

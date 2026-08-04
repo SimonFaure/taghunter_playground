@@ -313,6 +313,22 @@ body::-webkit-scrollbar-corner {
   align-items: center;
   gap: 6px;
 }
+/* Divider between the utility buttons and the status icons. */
+.pg-utils-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--pg-line-strong);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+/* Non-interactive status icon, sized to line up with .pg-icon-btn. */
+.pg-status-icon {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+}
 .pg-icon-btn {
   display: inline-flex;
   width: 32px;
@@ -792,37 +808,6 @@ body::-webkit-scrollbar-corner {
   position: relative;
 }
 
-/* ---------- Status bar ---------- */
-.pg-statusbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 11px 24px;
-  background: var(--pg-surface);
-  border-top: 0.5px solid var(--pg-line);
-}
-.pg-status-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12.5px;
-  color: var(--pg-text-muted);
-}
-.pg-status-item.is-ok {
-  color: #5fd08a;
-}
-.pg-status-item.is-error {
-  color: var(--pg-accent-bright);
-}
-.pg-status-item.is-warn {
-  color: #f0b44a;
-}
-.pg-status-right {
-  color: #6e6e76;
-  font-size: 12px;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
    Shared UI kit - the tactical red/black design generalised for every
    non-in-game surface (modals, settings panels, launched-games, etc.). All
@@ -910,6 +895,10 @@ body::-webkit-scrollbar-corner {
 /* ---------- Underline tabs ---------- */
 .pg-tabs {
   display: flex;
+  /* Wrap instead of clipping: modals are overflow:hidden, so on narrow
+     windows (fr/es labels, 4-tab modals) trailing tabs would otherwise be
+     cut off with no way to reach them. */
+  flex-wrap: wrap;
   border-bottom: 0.5px solid var(--pg-line);
   flex-shrink: 0;
 }

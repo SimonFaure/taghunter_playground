@@ -22,6 +22,11 @@ export function isOnline(): boolean {
 // lie on captive portals - this confirms the studio API actually answers, so
 // the first-launch onboarding gate can guarantee the OTP step will work before
 // showing the login screen. Short timeout; any failure resolves false.
+// Every call stamps the shared cache below, so consumers (the sync gate,
+// studioReachableFresh) can reuse a recent answer without probing again.
+let lastProbe: { ok: boolean; at: number } | null = null;
+const PROBE_FRESH_MS = 90_000;
+
 export async function probeStudioReachable(timeoutMs = 8000): Promise<boolean> {
   try {
     // Lazy import keeps connectivity.ts free of a static dependency on the API
@@ -31,10 +36,24 @@ export async function probeStudioReachable(timeoutMs = 8000): Promise<boolean> {
       bearer: false,
       timeoutMs,
     });
-    return res?.status === 'ok';
+    const ok = res?.status === 'ok';
+    lastProbe = { ok, at: Date.now() };
+    return ok;
   } catch {
+    lastProbe = { ok: false, at: Date.now() };
     return false;
   }
+}
+
+/**
+ * The truthful "is studio reachable" signal: the cached probe result when
+ * fresh, else one live probe. On the normal venue setup - hotspot with no
+ * upstream internet - navigator.onLine reads true while this correctly
+ * reads false.
+ */
+export async function studioReachableFresh(maxAgeMs = PROBE_FRESH_MS): Promise<boolean> {
+  if (lastProbe && Date.now() - lastProbe.at <= maxAgeMs) return lastProbe.ok;
+  return probeStudioReachable();
 }
 
 export function startConnectivityMonitor(): void {

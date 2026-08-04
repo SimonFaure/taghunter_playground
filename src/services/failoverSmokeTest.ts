@@ -15,7 +15,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
-import { setLanOverride } from './api';
+import { setLanOverride, LOCAL_ONLY_ENDPOINTS } from './api';
 import { getDb } from './db';
 import { becomeMother } from './lanMotherBoot';
 import {
@@ -27,7 +27,7 @@ import {
 
 const LAN_PORT = 8743; // distinct from lanSmokeTest's 8742 so both can coexist
 const LAN_BASE = `http://127.0.0.1:${LAN_PORT}`;
-const LAN_ENDPOINTS = new Set(['launched_games']);
+const LAN_ENDPOINTS = LOCAL_ONLY_ENDPOINTS;
 
 interface MotherStartInfo {
   port: number;

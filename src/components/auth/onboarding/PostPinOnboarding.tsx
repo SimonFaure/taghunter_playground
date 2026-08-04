@@ -191,7 +191,7 @@ function HotspotStep({
       // hotspot creds themselves are authored in studio and arrive on sync -
       // nothing is uploaded from here anymore.
       const cfg = await loadConfig();
-      await saveConfig({ ...cfg, beMotherWhenAvailable: true, startHotspotOnLaunch: true });
+      await saveConfig({ ...cfg, beMotherWhenAvailable: true });
     }
     await markStepAnswered(ONBOARDING_KEYS.hotspot);
     setBusy(false);

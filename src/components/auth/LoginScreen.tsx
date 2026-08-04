@@ -6,6 +6,7 @@ import { OtpInput } from './OtpInput';
 import { CapReachedDialog } from './CapReachedDialog';
 import { requestOtp, verifyOtp, evictAndVerify, DeviceListItem } from '../../services/auth';
 import { ApiError } from '../../services/api';
+import { probeStudioReachable } from '../../services/connectivity';
 import type { AuthUser } from '../../services/authStore';
 
 type Phase = 'email' | 'code' | 'cap_reached';
@@ -36,7 +37,7 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
       setPhase('code');
       setCode('');
     } catch (err) {
-      setError(extractErrorMessage(err, t));
+      setError(await resolveLoginError(err, t));
     } finally {
       setBusy(false);
     }
@@ -58,7 +59,7 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
         setPhase('cap_reached');
       }
     } catch (err) {
-      setError(extractErrorMessage(err, t));
+      setError(await resolveLoginError(err, t));
       setCode('');
     } finally {
       setBusy(false);
@@ -188,6 +189,23 @@ export function LoginScreen({ onAuthenticated }: LoginScreenProps) {
       </div>
     </div>
   );
+}
+
+// Login needs studio (the OTP is issued server-side), so a fresh device taken
+// straight to a no-internet venue CANNOT be provisioned on site - and the raw
+// transport error ("request timed out") doesn't say why. When the call fails,
+// confirm whether studio is actually reachable; if not, say plainly that this
+// device must be set up online once before the venue. (F2: the actionable half
+// of "fresh offline install has no auth path".)
+async function resolveLoginError(err: unknown, t: TFunction): Promise<string> {
+  const reachable = await probeStudioReachable(4000).catch(() => false);
+  if (!reachable) {
+    return t('authChrome:errors.offlineFirstLogin', {
+      defaultValue:
+        'No internet connection to the TagHunter server. This device must be set up online at least once before you take it to a venue - connect to the internet and sign in, then it works offline on site.',
+    });
+  }
+  return extractErrorMessage(err, t);
 }
 
 function extractErrorMessage(err: unknown, t: TFunction): string {

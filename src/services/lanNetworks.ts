@@ -45,28 +45,6 @@ export async function getLanNetworks(signal?: AbortSignal): Promise<RelayedNetwo
   return res?.networks ?? [];
 }
 
-// Last-applied lan_networks_version, so the orchestrator only re-pulls when the
-// manifest advances. Kept in schema_meta (device-scoped, like the rest of this
-// store's state).
-const LOCAL_VERSION_KEY = 'lan_networks_local_version';
-
-export async function getLocalLanVersion(): Promise<number> {
-  const db = await getDb();
-  const rows = await db.select<{ value: string }[]>(
-    'SELECT value FROM schema_meta WHERE key = $1',
-    [LOCAL_VERSION_KEY]
-  );
-  return rows.length ? Number(rows[0].value) || 0 : 0;
-}
-
-export async function setLocalLanVersion(version: number): Promise<void> {
-  const db = await getDb();
-  await db.execute(
-    'INSERT INTO schema_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    [LOCAL_VERSION_KEY, String(version)]
-  );
-}
-
 // Local mirror of the "default mother" designation so the Network settings
 // toggle can render its current on/off state instantly + offline. Set alongside
 // the set_default_mother call.

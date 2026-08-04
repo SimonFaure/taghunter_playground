@@ -504,6 +504,12 @@ export interface ListPairedWithStatusResp {
   in_game: PairedDeviceStatusRow[];
   available_online: PairedDeviceStatusRow[];
   offline: PairedDeviceStatusRow[];
+  // paired_devices.id of the CALLER, resolved server-side from the bearer
+  // secret. Not the same as the `is_self` row: these lists come from whichever
+  // device owns the DB (the mother), so `is_self` marks the MOTHER's row no
+  // matter who asked. Anything answering "which device am I?" must use this.
+  // Optional only for compatibility with an older mother build.
+  caller_device_id?: number;
 }
 
 export async function listPairedWithStatus(

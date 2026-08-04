@@ -77,6 +77,21 @@ export async function bootstrap(): Promise<BootstrapOutcome> {
     const cached = await getAuthUser();
     if (!cached) return { kind: 'token_invalid' };
     const inGrace = await isWithinOfflineGrace(cached);
+    if (!inGrace) {
+      // Never hard-lock a device that still holds a LIVE game: on a
+      // deliberately-offline site the lock would kill the mother (server + AP)
+      // and with it every satellite's game, mid-event. Same never-strand-a-
+      // live-game exception the hosting decision applies. The lock lands
+      // normally once the game has ended. (Dynamic import keeps the LAN stack
+      // out of the auth module graph.)
+      const { deviceHasLocalActiveGame } = await import('./lanMotherBoot');
+      if (await deviceHasLocalActiveGame()) {
+        console.warn(
+          '[auth] offline grace expired but a live local game exists - deferring the lock until it ends.'
+        );
+        return { kind: 'offline_in_grace', authUser: cached };
+      }
+    }
     return inGrace
       ? { kind: 'offline_in_grace', authUser: cached }
       : { kind: 'offline_locked', authUser: cached };

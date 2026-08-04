@@ -62,7 +62,6 @@ import { applyOperatorModeChange } from '../services/operatorMode';
 import { listActiveLaunchedGames } from '../services/launchedGames';
 import * as scenarioStore from '../services/scenarioStore';
 import { ConfirmDialog } from './ConfirmDialog';
-import { useAuth } from './auth/AuthProvider';
 import { getStoredTheme, setTheme as applyThemeChoice, type ThemeName } from '../services/theme';
 import { AccountScreen } from './settings/AccountScreen';
 import { SyncStatusScreen } from './settings/SyncStatusScreen';
@@ -117,7 +116,6 @@ interface ConfigurationPageProps {
 
 export function ConfigurationPage({ initialTab, isAdminMode = false }: ConfigurationPageProps = {}) {
   const { t, i18n } = useTranslation();
-  const auth = useAuth();
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? 'account');
 
   // Honor a fresh deep-link request: if the parent passes a new initialTab
@@ -638,7 +636,7 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
             {activeTab === 'images' && <ImagesTab />}
             {activeTab === 'account' && <AccountScreen />}
             {activeTab === 'sync' && <SyncStatusScreen />}
-            {activeTab === 'devices' && <DevicesScreen onLoggedOut={auth.refresh} />}
+            {activeTab === 'devices' && <DevicesScreen />}
             {activeTab === 'updates' && <UpdatesScreen />}
             {activeTab === 'printing' && <PrintingScreen />}
             {activeTab === 'team-names' && <TeamNamesScreen />}

@@ -92,6 +92,14 @@ pub fn run() {
             connect_wifi,
             telemetry::take_pending_panic,
             lan_server::mother_start_local_server,
+            lan_server::mother_open_firewall_elevated,
+            lan_server::mother_firewall_rule_status,
+            lan_server::lan_diag,
+            lan_server::wifi_renew_dhcp,
+            lan_server::get_local_ipv4s,
+            lan_server::wifi_assign_static_ip,
+            lan_server::wifi_restore_dhcp,
+            lan_server::mother_ensure_mdns_live,
             lan_server::mother_refresh_mdns,
             lan_server::mother_stop_local_server,
             lan_server::mother_server_status,
@@ -100,9 +108,6 @@ pub fn run() {
             lan_server::get_takeover_target,
             lan_server::fetch_snapshot_from_mother,
             lan_server::get_self_peer_secret,
-            lan_server::mother_list_pending_pair_requests,
-            lan_server::mother_approve_pair_request,
-            lan_server::mother_deny_pair_request,
             lan_server::mother_list_paired_devices,
             lan_server::mother_revoke_paired_device,
             lan_server::client_save_paired_mother,
@@ -111,6 +116,7 @@ pub fn run() {
             lan_server::client_forget_paired_mother,
             lan_server::client_get_device_identity,
             lan_server::client_discover_mothers,
+            lan_server::client_probe_mother,
             lan_server::client_pair_with_mother,
             lan_server::client_refresh_mother_endpoints,
             lan_server::client_resolve_mother_link,
@@ -1314,6 +1320,20 @@ async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String>
     path.push(format!("taghunter-wlan-{}.xml", ssid.replace(|c: char| !c.is_alphanumeric(), "_")));
     std::fs::write(&path, profile.as_bytes()).map_err(|e| e.to_string())?;
 
+    // A WLAN profile for this SSID may already exist - from a previous connect on
+    // this device, or pushed via Group Policy. `netsh add profile` REFUSES to
+    // overwrite such a profile ("Un profil portant ce nom existe déjà ... et ne
+    // peut pas être remplacé"), which used to abort the whole connect. Delete our
+    // own copy first so the fresh add (carrying the CURRENT password) takes; a
+    // group-policy profile can't be deleted, but then we simply connect using it.
+    // Best-effort: a "profile not found" delete is a harmless no-op.
+    let _ = tokio::process::Command::new("netsh")
+        .args(["wlan", "delete", "profile"])
+        .arg(format!("name={ssid}"))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .await;
+
     let add = tokio::process::Command::new("netsh")
         .args(["wlan", "add", "profile"])
         .arg(format!("filename={}", path.display()))
@@ -1323,12 +1343,14 @@ async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String>
         .await
         .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&path);
-    if !add.status.success() {
-        return Err(format!(
-            "netsh add profile failed: {}",
-            String::from_utf8_lossy(&add.stdout).trim()
-        ));
-    }
+    // Don't fail on an add error: if the profile already existed (Group Policy),
+    // the connect below uses THAT profile. Keep the add error only to enrich a
+    // subsequent connect failure.
+    let add_err = if add.status.success() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&add.stdout).trim().to_string())
+    };
 
     let conn = tokio::process::Command::new("netsh")
         .args(["wlan", "connect"])
@@ -1338,13 +1360,17 @@ async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String>
         .output()
         .await
         .map_err(|e| e.to_string())?;
-    if !conn.status.success() {
-        return Err(format!(
-            "netsh connect failed: {}",
-            String::from_utf8_lossy(&conn.stdout).trim()
-        ));
+    if conn.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    // Connect failed. A failed add (no usable profile) is the more actionable root
+    // cause than the generic connect error, so surface it when present.
+    let conn_err = String::from_utf8_lossy(&conn.stdout).trim().to_string();
+    Err(match add_err {
+        Some(a) => format!("netsh connect failed: {conn_err} (add profile: {a})"),
+        None => format!("netsh connect failed: {conn_err}"),
+    })
 }
 
 #[cfg(target_os = "macos")]

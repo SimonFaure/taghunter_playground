@@ -6,6 +6,7 @@
 //
 // Design: project_clash_game_type_design (V2).
 
+import { useCallback, useState } from 'react';
 import type { ClashStandings, ClashTerritoryStanding, ClashEvent, ClashPurgeState } from '../services/clash';
 
 // Per-clan visuals resolved from the scenario by team_number.
@@ -181,6 +182,19 @@ export function ClashGameRenderer({
 }: ClashGameRendererProps) {
   const now = nowMs ?? Date.now();
   const territories = standings?.territories ?? [];
+
+  // Natural aspect of the map image, learned on load. Used to size the map box
+  // (below) to the contain-fit rect of the screen - including scaling UP a map
+  // smaller than the screen, which is what the studio LayoutEditor canvas does
+  // (width/height 100% + object-fit: contain). Without it a small map rendered
+  // at natural size in a corner of the screen and every authored anchor landed
+  // on that shrunken box instead of the full-bleed map.
+  const [mapRatio, setMapRatio] = useState<number | null>(null);
+  const readMapRatio = useCallback((img: HTMLImageElement | null) => {
+    if (img?.complete && img.naturalWidth && img.naturalHeight) {
+      setMapRatio(img.naturalWidth / img.naturalHeight);
+    }
+  }, []);
   // The Purge visuals only exist with an enabled purge AND a scenario image.
   const purgeActive = !!(purge?.enabled && purgeImageUrl);
   const purgeTarget = purgeActive ? purge!.target_territory_index : null;
@@ -204,14 +218,29 @@ export function ClashGameRenderer({
       {/* Map + map-anchored overlays, centred and letterboxed so the map fits
           without distortion AND the territory / timer / text anchors stay
           aligned to the map bounds (they're percentages of THIS box, not the
-          screen). Ranking + event feed below are screen chrome. */}
+          screen). The wrapper is sized to the contain-fit rect of the map, so
+          it IS the rendered image box - percentages below resolve against the
+          map exactly as they were authored over it in the studio LayoutEditor.
+          Ranking + event feed below are screen chrome. */}
       <div className="absolute inset-0 flex items-center justify-center">
-        <div className="relative">
+        <div
+          className="relative"
+          style={
+            mapRatio
+              ? { width: `min(100vw, ${100 * mapRatio}vh)`, height: `min(100vh, ${100 / mapRatio}vw)` }
+              : undefined
+          }
+        >
           {mapImage ? (
             <img
+              ref={readMapRatio}
               src={resolveMedia(mapImage)}
               alt=""
-              className="block max-w-[100vw] max-h-[100vh] object-contain"
+              // Until the natural size is known the image sizes itself (contained,
+              // never upscaled); once known the wrapper owns the box and the image
+              // fills it. Same rect either way - only the scale changes.
+              className={mapRatio ? 'block w-full h-full' : 'block max-w-[100vw] max-h-[100vh] object-contain'}
+              onLoad={(e) => readMapRatio(e.currentTarget)}
             />
           ) : (
             <div className="w-screen h-screen bg-gradient-to-br from-slate-800 to-slate-900" />

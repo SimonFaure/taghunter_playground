@@ -22,3 +22,25 @@
   .mystery-game-button-hover {
   opacity: 1 !important;
 }
+
+/* Bonus ("overscore") badges - unlocked when a team scores above
+   score_full_game. Each badge is keyed by its tier index in the renderer, so it
+   mounts (and plays this pop-in) exactly when the reveal tally crosses its
+   threshold, then stays put for the rest of the run. */
+@keyframes mystery-game-bonus-in {
+  from {
+    opacity: 0;
+    transform: scale(0.55);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.mystery-game-scope .mystery-game-bonus {
+  animation: mystery-game-bonus-in 0.5s ease-out both;
+}

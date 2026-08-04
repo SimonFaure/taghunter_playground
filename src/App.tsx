@@ -15,14 +15,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { HelpProvider, playgroundOpenPdf, helpManifest } from './help';
 import { GameList } from './components/GameList';
-import { Footer } from './components/Footer';
-import { HotspotConnectButton } from './components/HotspotConnectButton';
+import { TopbarStatus } from './components/TopbarStatus';
+import { DeviceIdentityLine } from './components/DeviceIdentityLine';
 import { ConfigurationPage, type SettingsTab } from './components/ConfigurationPage';
 import { AdminPasswordModal } from './components/AdminPasswordModal';
 import { AdminConfigPage } from './components/AdminConfigPage';
 import { LaunchedGamesList } from './components/LaunchedGamesList';
 import { OperatorVideoOverlay } from './components/OperatorVideoOverlay';
 import { MotherFailoverBanner } from './components/MotherFailoverBanner';
+import { HotspotIssueBanner } from './components/HotspotIssueBanner';
 import { RegainControlPrompt } from './components/RegainControlPrompt';
 import { LeaderboardPage } from './components/LeaderboardPage';
 import { TimeRangeLeaderboard } from './components/TimeRangeLeaderboard';
@@ -30,11 +31,12 @@ import { decodeRankingTarget, type RankingTarget } from './services/rankingTarge
 import { decodeTeamSummarySnapshot, type TeamSummarySnapshot } from './services/teamSummaryTarget';
 import { TeamSummaryOverlay } from './components/TeamSummaryOverlay';
 import { listen } from '@tauri-apps/api/event';
-import { emitPendingJoin, emitPendingLeave, emitPendingConfigReload, emitPendingRejoin } from './services/pendingJoinStore';
-import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, type TakeoverTarget } from './services/lanMotherBoot';
+import { emitPendingJoin, emitPendingLeave, emitPendingConfigReload, emitPendingRejoin, type PendingJoinRoute } from './services/pendingJoinStore';
+import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, motherHotspotWatchdogTick, type TakeoverTarget } from './services/lanMotherBoot';
 import { refreshLaunchedGamesRoute, installLanReauth } from './services/childControlLink';
+import { ensureFirewallRuleOnce } from './services/firewall';
 import { installMotherFailover } from './services/motherFailover';
-import { getPairedMother } from './services/lanPairing';
+import { getPairedMother, describeLocalRole } from './services/lanPairing';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './services/device';
 import { DatabaseInspector } from './components/DatabaseInspector';
 import { FirstLaunchProgress } from './components/sync/FirstLaunchProgress';
@@ -138,14 +140,25 @@ function App() {
     // The mother hosts launched games in ITS SQLite. Repoint our
     // `launched_games` traffic at the mother before any leaderboard/state
     // query, otherwise we hit our own empty local server.
-    const repointAtMother = async (motherUuid?: string, motherAddr?: string) => {
-      if (!motherUuid || !motherAddr) return;
+    // Returns the route it installed so callers can hand it to the subscriber -
+    // a concurrent refreshLaunchedGamesRoute() may restore the local route
+    // before the subscriber runs, and the pushed route is the authoritative one.
+    const repointAtMother = async (
+      motherUuid?: string,
+      motherAddr?: string,
+    ): Promise<PendingJoinRoute | undefined> => {
+      if (!motherUuid || !motherAddr) return undefined;
       try {
         const m = await getPairedMother(motherUuid);
-        if (m) pointLaunchedGamesAtMother(`http://${motherAddr}`, m.peer_secret);
+        if (m) {
+          const route = { baseUrl: `http://${motherAddr}`, token: m.peer_secret };
+          pointLaunchedGamesAtMother(route.baseUrl, route.token);
+          return route;
+        }
       } catch (err) {
         console.error('[App] failed to repoint launched_games at mother:', err);
       }
+      return undefined;
     };
     void (async () => {
       const unlisten = await listen<{
@@ -161,15 +174,20 @@ function App() {
           const gid = cmd.payload.launched_game_id;
           if (typeof gid !== 'number') return;
           void (async () => {
-            await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+            const joinRoute = await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
             if (cancelled) return;
             // Dismiss any pushed overlay first - they render on top of the page
             // tree, so leaving one up would hide the game page we're about to
             // enter (the device would just sit on the ranking/summary).
             setPushedRanking(null);
             setPushedTeamSummary(null);
+            // A device parked on the idle logo screen renders nothing else -
+            // the join would stay buffered until someone dismissed the logo by
+            // hand. The operator selected this device, so pull it off the logo
+            // (disconnect_device sends it back there once the game is over).
+            setLogoPhase((p) => (p === 'show' ? 'done' : p));
             setCurrentPage('launched');
-            emitPendingJoin(gid);
+            emitPendingJoin(gid, joinRoute);
             // If a GamePage for this game is already mounted but showing its
             // own leaderboard / rankings overlay (a device the operator sent to
             // rankings), emitPendingJoin just re-renders it in place and leaves
@@ -182,6 +200,9 @@ function App() {
           void (async () => {
             await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
             if (cancelled) return;
+            // The pushed overlay renders inside the main tree, which the idle
+            // logo screen's early return bypasses entirely - dismiss it.
+            setLogoPhase((p) => (p === 'show' ? 'done' : p));
             setPushedRanking(target);
           })();
         } else if (cmd.kind === 'show_team_summary') {
@@ -189,6 +210,9 @@ function App() {
           // synced scenario) - no mother-repoint needed.
           const snapshot = decodeTeamSummarySnapshot(cmd.payload);
           if (!snapshot) return;
+          // Same as open_ranking: the overlay is invisible behind the idle
+          // logo screen's early return.
+          setLogoPhase((p) => (p === 'show' ? 'done' : p));
           setPushedTeamSummary(snapshot);
         } else if (cmd.kind === 'disconnect_device') {
           // The mother removed this device from the game. Drop any pushed
@@ -450,6 +474,35 @@ function App() {
     };
   }, [auth.user?.client_id]);
 
+  // Open the Windows Firewall (TCP for the server + UDP for mDNS discovery) once
+  // per machine on EVERY device - not just mothers. A satellite that can't receive
+  // inbound mDNS can't DISCOVER the mother at all, so children need the rule too.
+  // Self-gates on a persisted flag + Windows platform (one-time UAC), so it's safe
+  // to run unconditionally after auth.
+  useEffect(() => {
+    if (!auth.user?.client_id) return;
+    void ensureFirewallRuleOnce();
+  }, [auth.user?.client_id]);
+
+  // Keep the mother's mDNS announcement live. Its hotspot address (especially an
+  // APIPA 169.254.* one) can self-assign a few seconds after the AP comes up,
+  // leaving the initial announcement inert; this cheap poll re-registers the
+  // moment a designated address exists (the Rust command no-ops when this device
+  // isn't a mother, has no address yet, or is already advertising - no churn).
+  // The same tick runs the hotspot watchdog: Windows idles the AP off when no
+  // clients are connected, and nothing else ever re-raised it (self-gates to
+  // serving hotspot-mode mothers, with a cooldown after a deliberate stop).
+  useEffect(() => {
+    if (!auth.user?.client_id) return;
+    const tick = () => {
+      void invoke('mother_ensure_mdns_live').catch(() => {});
+      void motherHotspotWatchdogTick();
+    };
+    tick();
+    const id = setInterval(tick, 10_000);
+    return () => clearInterval(id);
+  }, [auth.user?.client_id]);
+
   useEffect(() => {
     if (!auth.user?.client_id) return;
     let cancelled = false;
@@ -483,6 +536,25 @@ function App() {
       // the LAN, then the route-refresh tick points our traffic at it.
       if (!motherInfo && willing) {
         await autoJoinSameClientMother(auth.user!.client_id).catch(() => false);
+        // Mutual stand-down self-recovery: two willing mothers booting at the
+        // same moment can EACH see the other at the fence and BOTH stand down,
+        // leaving the venue with no mother - and nothing used to retry. One
+        // jittered re-check: if by then we neither serve nor managed to pair
+        // with a live mother, try to become the mother again (the fence re-runs,
+        // so a real mother that appeared meanwhile still wins).
+        const recheckMs = 12_000 + Math.floor(Math.random() * 6_000);
+        setTimeout(() => {
+          if (cancelled) return;
+          void (async () => {
+            const role = await describeLocalRole().catch(() => null);
+            if (cancelled || !role) return;
+            if (role.mother_server_running || role.paired_mothers_count > 0) return;
+            console.warn('[App] stand-down re-check: no mother materialized - retrying ensureMotherServer.');
+            const retry = await ensureMotherServer(auth.user!.client_id, label);
+            if (cancelled || !retry) return;
+            await raiseMotherHotspotIfConfigured();
+          })();
+        }, recheckMs);
         return;
       }
 
@@ -625,7 +697,12 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
-      if (!cancelled) void runAutoConnect({ allowPrompt: false }).catch(() => {});
+      if (cancelled) return;
+      // No auto-revert needed: the static-IP fallback is now an ADDITIVE secondary
+      // address that leaves DHCP enabled, so joining any other Wi-Fi restores
+      // internet on its own. The leftover static is harmless (removable from
+      // Settings → Network → Diagnostics if desired).
+      void runAutoConnect({ allowPrompt: false }).catch(() => {});
     };
     const initial = setTimeout(tick, 2500);
     const id = setInterval(tick, 20_000);
@@ -728,7 +805,7 @@ function App() {
       openPdfFile={(pdf) => void playgroundOpenPdf(pdf)}
     >
     <div
-      className={`min-h-screen pb-16 ${
+      className={`min-h-screen flex flex-col ${
         isAdminMode
           ? 'bg-gradient-to-br from-red-900 via-red-800 to-slate-900'
           : 'pg-app-bg'
@@ -815,7 +892,6 @@ function App() {
             branded screen and "Lock" raises the PIN overlay (both keep the app
             running underneath). */}
         <div className="pg-utils">
-          <HotspotConnectButton />
           <button
             onClick={() => setCurrentPage('settings')}
             className={`pg-icon-btn${currentPage === 'settings' ? ' is-active pg-icon-btn--lock' : ' pg-icon-btn--muted'}`}
@@ -850,6 +926,9 @@ function App() {
           >
             <Lock size={16} />
           </button>
+          {/* LAN-role + reader status icons, separated from the action buttons.
+              Also hosts the app-wide reader-presence poll - see TopbarStatus. */}
+          <TopbarStatus />
         </div>
       </header>
 
@@ -859,6 +938,11 @@ function App() {
       {currentPage === 'database' && isAdminMode && <DatabaseInspector />}
       {currentPage === 'admin-config' && isAdminMode && <AdminConfigPage />}
 
+      {/* Version + device name at the very bottom of the page flow (the app
+          container is a flex column, so mt-auto pins it to the viewport bottom
+          on short pages). */}
+      <DeviceIdentityLine />
+
       <AdminPasswordModal
         isOpen={showPasswordModal}
         onClose={() => setShowPasswordModal(false)}
@@ -866,9 +950,9 @@ function App() {
       />
 
       <SyncStatusPill onNavigate={navigateToSync} />
-      <Footer />
       <OperatorVideoOverlay />
       <MotherFailoverBanner />
+      <HotspotIssueBanner />
       <RegainControlPrompt clientId={auth.user?.client_id ?? null} />
 
       {pushedRanking && (

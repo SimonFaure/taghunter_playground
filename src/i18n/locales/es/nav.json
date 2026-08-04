@@ -9,6 +9,13 @@
   "exitAdmin": "Salir de admin",
   "logoScreen": "Pantalla de logo",
   "lock": "Bloquear",
+  "motherThisDevice": "Este dispositivo es la madre",
+  "motherConnected": "Este dispositivo está conectado a la madre",
+  "motherConnectedTo": "Este dispositivo está conectado a la madre: {{label}}",
+  "motherNotConnected": "Este dispositivo no está conectado a la madre",
+  "readerOk": "Lector SI conectado",
+  "readerKo": "Lector SI no detectado",
+  "readerChecking": "Comprobando el lector…",
   "testChannelBadge": "TEST",
   "testChannelHint": "Este dispositivo es un probador: descarga las actualizaciones desde el canal de prueba."
 }

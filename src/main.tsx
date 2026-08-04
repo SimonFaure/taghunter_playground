@@ -10,7 +10,8 @@ import { LeaderboardPage } from './components/LeaderboardPage';
 import { TimeRangeLeaderboard } from './components/TimeRangeLeaderboard';
 import { readProjectorTargetFromUrl } from './services/projectorWindow';
 import type { RankingTarget } from './services/rankingTarget';
-import { ensureMotherServer } from './services/lanMotherBoot';
+import { attachToRunningMotherServer } from './services/lanMotherBoot';
+import { refreshLaunchedGamesRoute } from './services/childControlLink';
 import './index.css';
 // Apply the saved colour theme (tactical red default / blue) synchronously,
 // before the app renders, so a blue-theme device doesn't flash red on boot.
@@ -23,21 +24,19 @@ import './i18n';
 import { installNumberInputLeadingZeroFix } from './utils/numberInputLeadingZeros';
 installNumberInputLeadingZeroFix();
 import { registerCatalogFonts } from './fonts/registerCatalogFonts';
-// Slice A/B LAN-mode smoke test: side-effect import registers
-// `window.__lanSmokeTest` for DevTools-based verification.
-import './services/lanSmokeTest';
-// Mother-failover single-machine smoke test (slices 0–3): registers
-// `window.__failoverSmokeTest` (counter, snapshot delivery/omission, mDNS TXT).
-import './services/failoverSmokeTest';
-// Slice C hotspot manual test: registers `window.__lanHotspotTest`. Kept
-// separate from the auto smoke test because it briefly drops Wi-Fi clients.
-import './services/lanHotspotTest';
-// Footer wifi indicator manual test: registers `window.__wifiIndicatorTest`.
-import './services/wifiIndicatorTest';
-// Offline recovery-codes QA harness: registers `window.__seedRecoveryCodes`
-// (dev builds only) so the recovery prompts can be exercised before the
-// studio + sync slices land.
-import './services/recoveryCodesDevTest';
+// DevTools QA harnesses (window.__lanSmokeTest, __failoverSmokeTest,
+// __lanHotspotTest, __wifiIndicatorTest, __seedRecoveryCodes). Loaded in dev
+// AND in Tester-channel builds (which run the production Vite build with the
+// Rust `devtools` feature - the build script sets VITE_QA_HARNESS=1), but
+// tree-shaken out of stable bundles: __lanHotspotTest can bounce a live AP,
+// and the smoke tests mutate the production LAN override.
+if (import.meta.env.DEV || import.meta.env.VITE_QA_HARNESS === '1') {
+  void import('./services/lanSmokeTest');
+  void import('./services/failoverSmokeTest');
+  void import('./services/lanHotspotTest');
+  void import('./services/wifiIndicatorTest');
+  void import('./services/recoveryCodesDevTest');
+}
 
 // Projector-window wrapper: this is what the secondary Tauri WebviewWindow
 // mounts when launched with `?projector=1`. AuthProvider still wraps so the
@@ -51,13 +50,17 @@ function ProjectorRoot({ target }: { target: RankingTarget }) {
   // The projector is a separate WebviewWindow with its own JS context, so the
   // LAN override installed by <App> in the main window does NOT carry over here.
   // Without it, every launched_games request (the leaderboard's state + meta
-  // poll) falls through to studio, which has no mother-local game → 404.
-  // ensureMotherServer is idempotent: it picks up the already-running mother
-  // via mother_get_server_info (process-global Tauri state, shared across
-  // windows) without restarting it, then installs the override locally.
+  // poll) fails closed. Pickup-only on purpose: on the mother we attach to the
+  // already-running server (process-global Tauri state, shared across windows);
+  // on a satellite we resolve the paired mother's route instead. The projector
+  // must never START a server - the old unconditional ensureMotherServer could
+  // mint a competing mother on a satellite when the boot fence's browse errored.
   useEffect(() => {
     if (!clientId) return;
-    void ensureMotherServer(clientId);
+    void (async () => {
+      const attached = await attachToRunningMotherServer();
+      if (!attached) await refreshLaunchedGamesRoute().catch(() => {});
+    })();
   }, [clientId]);
 
   if (!auth.user) {

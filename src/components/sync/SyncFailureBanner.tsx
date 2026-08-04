@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { AlertTriangle, X, ExternalLink } from 'lucide-react';
 import { on } from '../../services/syncEvents';
 import { runCycleNow } from '../../services/syncOrchestrator';
+import { isOnline, probeStudioReachable } from '../../services/connectivity';
 
 interface SyncFailureBannerProps {
   onAuthInvalid?: () => void;
@@ -23,9 +24,23 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
   const [retrying, setRetrying] = useState(false);
 
   useEffect(() => {
+    let disposed = false;
+
+    // Being offline is not a sync failure - it's the normal state of a
+    // playground running on a field hotspot with no internet, and the footer
+    // already shows it. Only raise the banner when studio is genuinely
+    // reachable: navigator.onLine lies on captive portals / LAN-only networks,
+    // so confirm with the same active probe the footer indicator uses.
+    const showIfReachable = async (next: Exclude<typeof state, { kind: 'hidden' }>) => {
+      if (!isOnline()) return;
+      const reachable = await probeStudioReachable(4000);
+      if (disposed || !reachable) return;
+      setState(next);
+    };
+
     const offFinished = on('cycle:finished', (p) => {
       if (p.failed > 0) {
-        setState({ kind: 'partial', failed: p.failed });
+        void showIfReachable({ kind: 'partial', failed: p.failed });
       } else {
         setState((prev) => (prev.kind === 'hidden' ? prev : { kind: 'hidden' }));
       }
@@ -35,9 +50,10 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
         if (onAuthInvalid) onAuthInvalid();
         return;
       }
-      setState({ kind: 'failed', reason: p.reason });
+      void showIfReachable({ kind: 'failed', reason: p.reason });
     });
     return () => {
+      disposed = true;
       offFinished();
       offFailed();
     };

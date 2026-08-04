@@ -11,6 +11,7 @@ import {
 } from '../services/launchedGames';
 import { checkpointsForRoute, computeScore, type TracksScoreType } from '../services/tracksScoring';
 import { processTagQuestPunch } from '../services/tagquestPunchLogic';
+import { buildMediaMap } from '../utils/questMedia';
 
 interface GameTestModalProps {
   gameId: number;
@@ -127,10 +128,10 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         const gdjRaw = (await scenarioStore.getGameData(state.game_uniqid)) as any;
         const gdj = gdjRaw?.game_data ?? gdjRaw;
         if (gdj) {
-          const rawQuests: any[] = gdj?.quests || gdj?.game_quests || [];
+          const rawQuestsSrc = gdj?.quests || gdj?.game_quests || [];
+          const rawQuests: any[] = Array.isArray(rawQuestsSrc) ? rawQuestsSrc : Object.values(rawQuestsSrc);
           const stripMedia = (name: string) => name.replace(/^media[/\\]/i, '').replace(/^media[/\\]/i, '');
-          const mediaImages: Array<{ id: string; file_name: string }> = gdj?.game_media_images || [];
-          const mediaMap = new Map(mediaImages.map((m) => [String(m.id), stripMedia(m.file_name)]));
+          const mediaMap = buildMediaMap(gdj?.game_media_images, stripMedia);
 
           const parsedQuests: Quest[] = rawQuests.map((q: any, idx: number) => {
             const images: QuestImage[] = [];

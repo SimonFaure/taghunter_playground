@@ -27,6 +27,7 @@ import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { SelfRegisterOverlay } from './SelfRegisterOverlay';
 import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
 import { MysteryGameRenderer, type MysteryScreen, type EnigmaStatusKind } from './MysteryGameRenderer';
+import { resolveMysteryBonuses } from '../services/mysteryBonuses';
 import '../mystery.css';
 
 interface MysteryGamePageProps {
@@ -63,6 +64,16 @@ interface GameData {
     both_answers_image?: string;
     no_answer_image?: string;
     levels: Record<string, { points: string; name: string; description: string }>;
+    // Bonus ("overscore") tiers - rewards unlocked by scoring ABOVE
+    // score_full_game. Studio scenarios carry the array; legacy ones carry the
+    // flat `overscore_step_N` / `name_overscore_step_N` / `image_overscore_step_N`
+    // keys instead. `services/mysteryBonuses` reads both.
+    overscores?: Array<{
+      overscore_step?: string;
+      overscore_score?: string;
+      name_overscore_step?: string;
+      image_overscore_step?: string;
+    }>;
     gauge_filling: string;
     background_image: string;
     game_instructions_image: string;
@@ -110,6 +121,7 @@ interface GameData {
   // falls back to the flattened (default-language) game_meta when absent.
   translations?: Record<string, {
     levels?: Record<string, { name?: string; description?: string }>;
+    overscores?: Array<{ name_overscore_step?: string }>;
   }>;
 }
 
@@ -837,7 +849,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               if (cardNotEmpty) {
                 startMessage = cardNotEmptyTxt
                   ? cardNotEmptyTxt
-                  : `C'est parti ! ${effectiveName} - ⚠️ Puce non vide : ${stalePunches.length} ancien${stalePunches.length > 1 ? 's' : ''} passage${stalePunches.length > 1 ? 's' : ''} ignoré${stalePunches.length > 1 ? 's' : ''}`;
+                  : `C'est parti ! ${effectiveName} - ⚠️ Votre puce n'est pas vide, effacez votre puce`;
               } else {
                 startMessage = playerStartsTxt ? playerStartsTxt : `C'est parti ! ${effectiveName}`;
               }
@@ -1261,6 +1273,17 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     };
   })();
 
+  // Bonus ("overscore") tiers: the rewards a team unlocks by scoring ABOVE
+  // score_full_game. Resolved in the finishing team's language when the
+  // scenario ships a translations envelope, exactly like the level name above.
+  // The renderer decides which ones the current score has reached.
+  const bonusTiers = resolveMysteryBonuses(
+    gameData.game_meta as unknown as Record<string, unknown>,
+    scoreFullGameNum,
+    gameData.translations,
+    resultLanguage || config.language || '',
+  );
+
   return (
     <div
       className="game_page_wrapper game_page_wrapper_mystery"
@@ -1348,6 +1371,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         scenarioTitle={gameData.game.title}
         showIdleLayout={config.showIdleLayout}
         idleSubtitle={config.idleSubtitle}
+        bonuses={bonusTiers}
       />
 
       <GameMessageOverlay

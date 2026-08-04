@@ -48,7 +48,7 @@ export function ForceMotherPanel() {
   };
 
   return (
-    <div className="pg-panel mb-6">
+    <div className="pg-panel">
       <div className="flex items-start gap-3">
         <Crown className="w-5 h-5 mt-0.5 shrink-0 text-yellow-400" />
         <div className="flex-1">

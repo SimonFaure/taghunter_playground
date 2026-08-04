@@ -642,7 +642,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               );
               const warn =
                 staleCount > 0
-                  ? ` - ${cardNotEmptyMsg || `⚠️ Puce non vide : ${staleCount} passage(s) ignoré(s)`}`
+                  ? ` - ${cardNotEmptyMsg || `⚠️ Votre puce n'est pas vide, effacez votre puce`}`
                   : '';
               const startMsg =
                 resolveTracksText(gd.texts, 'text_player_starts', effLang, { team: effectiveName }) ||

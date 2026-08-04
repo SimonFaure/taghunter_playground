@@ -177,7 +177,7 @@
   "colTeams": "Teams",
   "colPlayers": "Players",
   "colSynced": "Synced",
-  "trackRoute_default": "Default (all checkpoints)",
+  "trackRoute_default": "All checkpoints",
   "trackRoute_first_half": "First half",
   "trackRoute_last_half": "Last half",
   "trackRoute_odd": "Odd checkpoints",

@@ -33,6 +33,34 @@ type LocalRole = {
   paired_mothers_count: number;
 };
 
+// useLocalRole (footer pills) and useMotherConnection (connection state machine)
+// both poll client_describe_local_role on the SAME 10s/4s cadence - two round
+// trips per tick for identical data. Coalesce them behind a tiny TTL cache: a
+// call within ROLE_CACHE_TTL_MS of the last one reuses that result (and a
+// concurrent call in-flight is shared), so the pair costs one invoke per tick.
+const ROLE_CACHE_TTL_MS = 1_500;
+let roleCache: { at: number; value: LocalRole } | null = null;
+let roleInFlight: Promise<LocalRole | null> | null = null;
+
+async function describeLocalRoleCached(): Promise<LocalRole | null> {
+  if (roleCache && Date.now() - roleCache.at < ROLE_CACHE_TTL_MS) {
+    return roleCache.value;
+  }
+  if (roleInFlight) return roleInFlight;
+  roleInFlight = (async () => {
+    try {
+      const r = await invoke<LocalRole>('client_describe_local_role');
+      roleCache = { at: Date.now(), value: r };
+      return r;
+    } catch {
+      return null;
+    } finally {
+      roleInFlight = null;
+    }
+  })();
+  return roleInFlight;
+}
+
 type PairedMother = {
   mother_uuid: string;
   mother_label: string | null;
@@ -64,6 +92,10 @@ export type LocalRoleState = {
   isMother: boolean;
   // `is_mother_hosting`: this device's own Wi-Fi hotspot is currently on.
   isHotspot: boolean;
+  // `paired_mothers_count`: how many mothers this device is paired to. Drives the
+  // footer "Mother" pill's paired/not-paired state when this device is NOT itself
+  // the mother.
+  pairedMotherCount: number;
 } | null;
 
 export function useLocalRole(): LocalRoleState {
@@ -75,11 +107,13 @@ export function useLocalRole(): LocalRoleState {
       if (inFlight) return;
       inFlight = true;
       try {
-        const r = await invoke<LocalRole>('client_describe_local_role').catch(
-          () => null as LocalRole | null,
-        );
+        const r = await describeLocalRoleCached();
         if (cancelled || !r) return;
-        setRole({ isMother: r.mother_server_running, isHotspot: r.is_mother_hosting });
+        setRole({
+          isMother: r.mother_server_running,
+          isHotspot: r.is_mother_hosting,
+          pairedMotherCount: r.paired_mothers_count,
+        });
       } finally {
         inFlight = false;
       }
@@ -116,9 +150,7 @@ export function useMotherConnection(): MotherConnectionState {
       if (inFlight) return;
       inFlight = true;
       try {
-        const role = await invoke<LocalRole>('client_describe_local_role').catch(
-          () => null as LocalRole | null,
-        );
+        const role = await describeLocalRoleCached();
         if (cancelled || !role) return;
 
         if (role.is_mother_hosting) {

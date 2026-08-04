@@ -24,8 +24,6 @@
   "fullscreenOnLaunchDesc": "Ouvrir l'application en plein écran à son démarrage. Appuyez sur F11 à tout moment pour quitter ou revenir au plein écran. Prend effet au prochain démarrage.",
   "launchOnStartupLabel": "Lancer au démarrage",
   "launchOnStartupDesc": "Démarrer automatiquement au démarrage de votre ordinateur.",
-  "startHotspotOnLaunchLabel": "Démarrer le point d'accès mère au lancement",
-  "startHotspotOnLaunchDesc": "Démarrer automatiquement le point d'accès Wi-Fi au lancement de l'application, pour que les appareils satellites se reconnectent d'eux-mêmes. Utilise les identifiants de l'onglet Réseau (générés automatiquement à la première utilisation). Prend effet au prochain démarrage.",
   "beMotherLabel": "Faire de cet appareil la mère",
   "beMotherDesc": "Héberger les parties sur cet appareil au démarrage de l'application. Si aucune autre mère n'est déjà active, cet appareil prend le rôle et (en mode point d'accès) démarre le hotspot Wi-Fi pour que les satellites se reconnectent. Plusieurs appareils peuvent activer cette option - le premier démarré devient la mère, les autres le rejoignent. Prend effet au prochain démarrage.",
   "sectionDeviceRole": "Rôle de l'appareil",

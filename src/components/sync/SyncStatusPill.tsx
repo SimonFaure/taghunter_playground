@@ -56,7 +56,7 @@ export function SyncStatusPill({ onNavigate }: SyncStatusPillProps) {
       onClick={onNavigate}
       title={t('sync:clickForDetails')}
       aria-label={t('sync:pillAriaLabel', { label })}
-      className="fixed bottom-14 right-4 z-40 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] border border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] rounded-full px-3 py-1.5 flex items-center gap-2 shadow-lg backdrop-blur cursor-pointer transition-colors"
+      className="fixed bottom-4 right-4 z-40 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] border border-[var(--pg-line)] hover:border-[var(--pg-line-strong)] rounded-full px-3 py-1.5 flex items-center gap-2 shadow-lg backdrop-blur cursor-pointer transition-colors"
     >
       <RefreshCw className="w-3.5 h-3.5 text-[var(--pg-accent-bright)] animate-spin" />
       <span className="text-xs text-[var(--pg-text-muted)]">{label}</span>

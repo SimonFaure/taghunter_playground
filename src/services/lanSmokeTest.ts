@@ -10,7 +10,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
-import { setLanOverride } from './api';
+import { setLanOverride, LOCAL_ONLY_ENDPOINTS } from './api';
 import {
   createLaunchedGame,
   listLaunchedGames,
@@ -32,7 +32,7 @@ import {
 
 const LAN_PORT = 8742;
 const LAN_BASE = `http://127.0.0.1:${LAN_PORT}`;
-const LAN_ENDPOINTS = new Set(['launched_games']);
+const LAN_ENDPOINTS = LOCAL_ONLY_ENDPOINTS;
 
 interface MotherStartInfo {
   port: number;
@@ -225,46 +225,42 @@ export async function runLanSmokeTest(opts?: {
     record('list_completed_quests(after)', true);
 
     // ─── slice-B surface: pair handshake against a simulated second peer ────
+    // The manual-approval ceremony is retired: a cross-client / no-client_id
+    // request is flat-denied, a same-client request is approved inline with
+    // the secret in the same response.
     const fakePeerUuid = `smoke-peer-${crypto.randomUUID()}`;
     const fakePeerLabel = 'Smoke Pretend Phone';
-    const reqResp = await pairRequest(LAN_BASE, {
+    const denied = await pairRequest(LAN_BASE, {
       peer_uuid: fakePeerUuid,
       peer_label: fakePeerLabel,
       peer_os: 'simulated',
       peer_app_version: 'smoke-1',
     });
-    assert(reqResp.status === 'pending', 'pair.request returned pending');
-    assert(typeof reqResp.request_id === 'number', 'pair.request returned request_id');
-    record('pair.request', true, reqResp);
+    assert(denied.status === 'denied', 'no-client_id pair.request is denied');
+    record('pair.request(denied)', true, denied);
 
-    const pollPending = await pairStatus(LAN_BASE, reqResp.request_id, fakePeerUuid);
-    assert(pollPending.status === 'pending', 'pair.status pending before approval');
-    record('pair.status(pending)', true, pollPending);
+    const approved = await pairRequest(LAN_BASE, {
+      peer_uuid: fakePeerUuid,
+      peer_label: fakePeerLabel,
+      peer_os: 'simulated',
+      peer_app_version: 'smoke-1',
+      client_id: 1, // matches runLanSmokeTest's default server clientId
+    });
+    assert(approved.status === 'approved', 'same-client pair.request auto-approved');
+    assert(typeof approved.peer_secret === 'string', 'auto-approve returned peer_secret');
+    record('pair.request(auto-approved)', true, { has_secret: !!approved.peer_secret });
 
-    const pendingList = (await invoke('mother_list_pending_pair_requests')) as Array<{ id: number; peer_uuid: string }>;
-    assert(
-      pendingList.some((r) => r.id === reqResp.request_id),
-      'mother lists the pending request'
-    );
-    record('mother_list_pending_pair_requests', true, { count: pendingList.length });
-
-    const newPeerId = (await invoke('mother_approve_pair_request', {
-      requestId: reqResp.request_id,
-    })) as number;
-    assert(typeof newPeerId === 'number' && newPeerId > 0, 'approve returned new peer_id');
+    const pairedList = (await invoke('mother_list_paired_devices')) as Array<{ id: number; peer_uuid: string }>;
+    const newPeerId = pairedList.find((d) => d.peer_uuid === fakePeerUuid)?.id;
+    assert(typeof newPeerId === 'number' && newPeerId > 0, 'paired_devices row created for the peer');
     assert(newPeerId !== startInfo.mother_peer_id, 'new peer is not the mother itself');
-    record('mother_approve_pair_request', true, { peer_id: newPeerId });
-
-    const pollApproved = await pairStatus(LAN_BASE, reqResp.request_id, fakePeerUuid);
-    assert(pollApproved.status === 'approved', 'pair.status flipped to approved');
-    assert(typeof pollApproved.peer_secret === 'string', 'approved status reveals peer_secret');
-    record('pair.status(approved)', true, { has_secret: !!pollApproved.peer_secret });
+    record('mother_list_paired_devices', true, { peer_id: newPeerId });
 
     // Use the new peer's secret as bearer; confirm a launched_games read
     // works under a non-self bearer.
     setLanOverride({
       baseUrl: LAN_BASE,
-      token: pollApproved.peer_secret!,
+      token: approved.peer_secret!,
       endpoints: LAN_ENDPOINTS,
     });
     const stateAsPeer = await getLaunchedGameState(createdGameId, 0);
@@ -352,14 +348,11 @@ export async function runLanSmokeTest(opts?: {
 // ─── pair endpoint helpers ───────────────────────────────────────────────────
 
 interface PairRequestResp {
-  status: 'pending' | 'already_paired';
-  request_id?: number;
-  message?: string;
-}
-
-interface PairStatusResp {
-  status: 'pending' | 'approved' | 'denied';
+  // 'pending' no longer occurs (the manual-approval ceremony is retired):
+  // same-client requests are approved inline, everything else is denied.
+  status: 'approved' | 'denied' | 'already_paired';
   peer_secret?: string;
+  message?: string;
 }
 
 async function pairRequest(
@@ -369,6 +362,7 @@ async function pairRequest(
     peer_label: string;
     peer_os?: string;
     peer_app_version?: string;
+    client_id?: number;
   }
 ): Promise<PairRequestResp> {
   const res = await tauriFetch(`${base}/pair.php?action=request`, {
@@ -380,19 +374,6 @@ async function pairRequest(
     throw new Error(`pair.request failed: ${res.status} ${await res.text()}`);
   }
   return (await res.json()) as PairRequestResp;
-}
-
-async function pairStatus(
-  base: string,
-  requestId: number,
-  peerUuid: string
-): Promise<PairStatusResp> {
-  const url = `${base}/pair.php?action=status&request_id=${requestId}&peer_uuid=${encodeURIComponent(peerUuid)}`;
-  const res = await tauriFetch(url, { method: 'GET' });
-  if (!res.ok) {
-    throw new Error(`pair.status failed: ${res.status} ${await res.text()}`);
-  }
-  return (await res.json()) as PairStatusResp;
 }
 
 declare global {

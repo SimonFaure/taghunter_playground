@@ -41,6 +41,7 @@
   "clashImportAppliedOk": "{{ok}} affectation(s) de puce appliquée(s) aux clans.",
   "clashImportApplied": "{{ok}} affectation(s) appliquée(s), {{failed}} échec(s) (clan plein ou indisponible).",
   "clashImportFailed": "Impossible d’appliquer les affectations de clan importées.",
+  "joinFailed": "Impossible de rejoindre la partie : configuration illisible. Vérifiez la connexion à l’appareil mère, puis réessayez.",
   "quickLaunchPrepareFailed": "Impossible de préparer un lancement rapide - veuillez vérifier et lancer.",
   "deleteSuccess": "« {{title}} » a été supprimé. Il sera téléchargé à nouveau lors de la prochaine synchronisation.",
   "deleteError": "Impossible de supprimer « {{title}} ». Veuillez réessayer.",

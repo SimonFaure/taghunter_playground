@@ -119,3 +119,9 @@ export const saveConfig = async (config: AppConfig): Promise<void> => {
     baseDir: BaseDirectory.AppData,
   });
 };
+
+// Window event fired by flows that change the config OUTSIDE a settings panel
+// (e.g. NotMotherPanel flipping beMotherWhenAvailable), so panels holding a
+// copy in state (DefaultRolesPanel) can re-read instead of showing stale
+// toggles. Dispatch with `window.dispatchEvent(new Event(CONFIG_CHANGED_EVENT))`.
+export const CONFIG_CHANGED_EVENT = 'taghunter:config-changed';

@@ -22,6 +22,7 @@ import type { LaunchConfigRow } from '../services/launchConfigsStore';
 import {
   validateForHeadless,
   buildRoster,
+  buildClashContiguousAssignments,
   resolveDefaultDeviceSelection,
   extractTracksOptions,
   extractDefaultPatternId,
@@ -274,11 +275,25 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     const active = activeGames.get(uniqid);
     if (!active) return;
 
+    // The entire in-game config below is read off this map, and every lookup
+    // treats a missing key as "off" - so an empty map silently produces a
+    // confidently-wrong config (a TagQuest self-register game joined this way
+    // would skip the registration screen AND auto-start). Retry, and refuse to
+    // enter rather than enter with a fabricated config.
     let meta: Record<string, string> = {};
-    try {
-      meta = await getLaunchedGameMeta(active.id);
-    } catch (err) {
-      console.error('[GameList] failed to load meta for join:', err);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        meta = await getLaunchedGameMeta(active.id);
+      } catch (err) {
+        console.error('[GameList] failed to load meta for join:', err);
+      }
+      if (Object.keys(meta).length > 0) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (Object.keys(meta).length === 0) {
+      console.error('[GameList] join aborted - launched-game meta unreadable', active.id);
+      showAlert('error', t('home:joinFailed'));
+      return;
     }
 
     const config: GameConfig = {
@@ -316,6 +331,10 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       testMode: meta.testMode === 'true' ? true : undefined,
       teams: meta.teamsConfig ? JSON.parse(meta.teamsConfig) : undefined,
       cluesPage: meta.cluesPage ? JSON.parse(meta.cluesPage) : undefined,
+      // First-bip videos (mystery/tracks): a joining device must resolve and
+      // play them locally too, not just the launcher.
+      playTutorialOnBip: meta.playTutorialOnBip === 'true',
+      playIntroOnBip: meta.playIntroOnBip === 'true',
     };
 
     setLaunchedGame({ config, uniqid, launchedGameId: active.id });
@@ -585,6 +604,14 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       // Default on for new launches; a MISSING key reads as off downstream so
       // games launched before the option existed keep their raw scores.
       tagquestScoreWeighting: (config.tagquestScoreWeighting ?? true) ? 'true' : 'false',
+      // Mystery/tracks first-bip videos. Persisted so EVERY device that
+      // re-derives the config from meta keeps them: satellites joining the
+      // mother's game, the mother re-entering via Play, and any device after an
+      // in-game config edit (reload_config). Without these keys the overlay only
+      // ever fired on the launching device, which still held the in-memory
+      // config. Missing key ⇒ false, so pre-existing games are unaffected.
+      playTutorialOnBip: config.playTutorialOnBip ? 'true' : 'false',
+      playIntroOnBip: config.playIntroOnBip ? 'true' : 'false',
     };
     // Name-pool draw needs audience + language server-side (cloud PHP / LAN
     // Rust read these from meta). language was previously meta-less.
@@ -647,23 +674,46 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     }> = teamRows;
     let finalNumberOfTeams =
       config.autoRegisterTeam || config.selfRegisterTeam ? 1 : config.numberOfTeams;
+    // Clash "Équipes prédéfinies": contiguous chip→clan blocks dealt here and
+    // applied after createLaunchedGame (clans/team_ids only exist post-launch).
+    let clashPredeterminedAssignments: Array<{ chipId: number; clanIndex: number }> = [];
     const isClashLaunch = game.gameTypeName?.toLowerCase() === 'clash';
     if (isClashLaunch) {
       try {
         const gd = (await scenarioStore.getGameData(game.uniqid)) as { game_data?: any } | any | null;
-        const gm = (gd?.game_data ?? gd)?.game_meta ?? (gd?.game_data ?? gd) ?? {};
+        const gdRoot = gd?.game_data ?? gd;
+        const gm = gdRoot?.game_meta ?? gdRoot ?? {};
         const territoriesMeta: any[] = Array.isArray(gm.territories) ? gm.territories : [];
         const clansMeta: any[] = Array.isArray(gm.clans) ? gm.clans : [];
 
-        // V2: each territory carries its physical balise station codes inline.
-        // The launch-time override grid (config.clashBalises) takes precedence per
+        // Balises are authored (studio + launch grid) as station NUMBERS (the
+        // si_balises.station_name label, e.g. "1"), but SI punches carry the
+        // station id (si_balises.id, e.g. 31) - the same convention as pattern
+        // assignments. Resolve numbers → ids here, ONCE, via the inventory map
+        // the studio ships inside the scenario game data; clash_config and the
+        // mother's punch matching then live entirely in id space. Numbers
+        // missing from the map pass through raw (older synced scenarios / ZIP
+        // imports without the map, or venues whose stations are programmed
+        // with the literal number).
+        const stationIdByNumber: Record<string, number> = {};
+        const rawStationMap = gdRoot?.station_ids_by_number;
+        if (rawStationMap && typeof rawStationMap === 'object') {
+          for (const [name, id] of Object.entries(rawStationMap as Record<string, unknown>)) {
+            const idNum = Number(id);
+            if (!Number.isNaN(idNum)) stationIdByNumber[name] = idNum;
+          }
+        }
+        const resolveStation = (n: number): number => stationIdByNumber[String(n)] ?? n;
+
+        // V2: each territory carries its balise station numbers inline. The
+        // launch-time override grid (config.clashBalises) takes precedence per
         // venue; fall back to the scenario's authored balises otherwise.
         const territories = territoriesMeta.map((t, ti) => {
           const override = config.clashBalises?.[ti];
           const scenarioBalises: number[] = Array.isArray(t.balises)
             ? t.balises.map((x: unknown) => Number(x)).filter((n: number) => !Number.isNaN(n))
             : [];
-          const balises = override && override.length ? override : scenarioBalises;
+          const balises = (override && override.length ? override : scenarioBalises).map(resolveStation);
           return {
             index: ti,
             points: parseInt(String(t.points ?? '0'), 10) || 0,
@@ -676,7 +726,10 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         // station collision here too (the modal hard-blocks it, but saved-config
         // paths could carry a stale station): a collision disables the purge
         // rather than corrupting validation.
-        const purgeStation = config.clashPurgeStation ?? 25;
+        // The purge station is authored as a station number too - resolve it
+        // through the same map so the collision check below and the mother's
+        // punch matching compare like with like (id space).
+        const purgeStation = resolveStation(config.clashPurgeStation ?? 25);
         const hasPurgeImage = typeof gm.purge_image === 'string' && gm.purge_image.length > 0;
         let purgeEnabled = !!config.clashPurgeEnabled && hasPurgeImage;
         if (purgeEnabled && territories.some((t) => t.balises.includes(purgeStation))) {
@@ -686,7 +739,12 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
 
         const clashConfig = {
           territories,
-          max_per_clan: config.clashMaxPerClan ?? 0,
+          // The cap only governs live self-registration (the launch modal hides
+          // it in 'bulk'). Sending a stale value there would make clash_register
+          // silently refuse chips past it - including ones the operator dealt or
+          // added by hand on step 2.
+          max_per_clan:
+            (config.clashRegistrationMode ?? 'self') === 'bulk' ? 0 : config.clashMaxPerClan ?? 0,
           purge_enabled: purgeEnabled,
           purge_station: purgeStation,
         };
@@ -711,6 +769,29 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           };
         });
         finalNumberOfTeams = numClans;
+
+        // Équipes prédéfinies (clashRegistrationMode==='bulk'): deal a uniform
+        // contiguous block of chips to each clan from the free card list, so the
+        // post-create clashRegister loop populates the clans - the same path the
+        // Excel chip→clan import uses. A manual import wins if the operator set one.
+        if ((config.clashRegistrationMode ?? 'self') === 'bulk' && (config.clashChipAssignments?.length ?? 0) === 0) {
+          try {
+            const [cards, used] = await Promise.all([cardsRepo.list(), collectUsedChipIds()]);
+            const free = cards.filter((c) => !used.has(c.id));
+            clashPredeterminedAssignments = buildClashContiguousAssignments(
+              free,
+              config.firstChipIndex,
+              // Same default the launch modal shows (10/clan) - a bulk config
+              // that never carried the field would otherwise deal nothing and
+              // launch with empty clans.
+              config.clashChipsPerClan ?? 10,
+              numClans,
+            );
+          } catch (err) {
+            console.error('[Clash] predetermined assignment build failed:', err);
+          }
+        }
+
         if (territories.every((t) => t.balises.length === 0)) {
           console.warn('[Clash] no territory balises found - validation will credit nothing until territories have station codes (author them in the scenario or set them in the launch grid).');
         }
@@ -750,23 +831,31 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
 
     // ── Station-based self-register: persist the device→teams registration
     // assignment (each assigned device becomes a hard-locked kiosk for its
-    // teams; unassigned devices keep the pick-any-team grid). The wizard passes
-    // the resolved map; the headless Quick Launch path passes none, so
-    // auto-assign here over the resolved devices (excluding the mother and
-    // reader-less devices, mirroring the wizard's default deal).
+    // teams; unassigned devices keep the pick-any-team grid). The wizard always
+    // passes a resolved map - EMPTY when its "Affecter des équipes aux
+    // appareils" toggle is off, which must stay empty. Only a MISSING map means
+    // nobody decided (the headless Quick Launch path), and only then do we
+    // auto-assign over every participating device, mirroring the wizard's
+    // default deal. Testing truthiness here instead of `undefined` silently
+    // auto-dealt with the toggle off, making it a no-op.
     // Design: project_selfregister_team_device_assignment.
     const regAssignQualifies =
       (isClashLaunch && (config.clashRegistrationMode ?? 'self') === 'self') ||
       (isTagQuestSelfReg && config.playMode === 'team');
     if (regAssignQualifies) {
       let regMap = deviceSelection.reg_assignments;
-      if (!regMap) {
+      if (regMap === undefined) {
         try {
           const rows = await listPairedDevicesForLaunch();
           const targets = new Set(deviceSelection.satellite_targets);
-          const eligibleIds = rows
-            .filter((r) => !r.is_self && targets.has(r.id) && r.has_reader)
-            .map((r) => r.id);
+          // Every participating device is dealt teams - the mother first when
+          // it takes part, then the selected satellites. Mirrors the wizard's
+          // deal (no reader filter: the flag is only meaningful while online).
+          const selfRow = rows.find((r) => r.is_self);
+          const eligibleIds = [
+            ...(deviceSelection.include_self && selfRow ? [selfRow.id] : []),
+            ...rows.filter((r) => !r.is_self && targets.has(r.id)).map((r) => r.id),
+          ];
           regMap = computeAutoRegAssignments(eligibleIds, finalNumberOfTeams);
         } catch (err) {
           console.error('[GameList] reg-assignment auto-deal failed:', err);
@@ -842,14 +931,19 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           console.error('[GameList] tracks per-team route persist failed:', err);
         }
       }
-      // Clash chip→clan import (deferred apply): clans only exist now that the
-      // game is created, so bind each imported chip to its clan via the
-      // server-authoritative clash_register. Resolve clanIndex (1..N) against
-      // the freshly-created clans' team_number. Residual failures (e.g. a
-      // clan hit its cap) are reported, non-fatally, via an alert.
+      // Clash chip→clan deferred apply: clans only exist now that the game is
+      // created, so bind each chip to its clan via the server-authoritative
+      // clash_register. Sources: an operator Excel import, else the "Équipes
+      // prédéfinies" contiguous blocks dealt above. Resolve clanIndex (1..N)
+      // against the freshly-created clans' team_number. Residual failures (e.g.
+      // a clan hit its cap) are reported, non-fatally, via an alert.
+      const clashAssignmentsToApply: Array<{ chipId: number; clanIndex: number }> =
+        (config.clashChipAssignments?.length ?? 0) > 0
+          ? config.clashChipAssignments!
+          : clashPredeterminedAssignments;
       if (
         isClashLaunch &&
-        (config.clashChipAssignments?.length ?? 0) > 0 &&
+        clashAssignmentsToApply.length > 0 &&
         launchedGameId !== null
       ) {
         try {
@@ -858,7 +952,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           for (const c of standings.clans) teamIdByNumber.set(c.team_number, c.team_id);
           let ok = 0;
           let failed = 0;
-          for (const a of config.clashChipAssignments!) {
+          for (const a of clashAssignmentsToApply) {
             const teamId = teamIdByNumber.get(a.clanIndex);
             if (teamId === undefined) { failed++; continue; }
             try {

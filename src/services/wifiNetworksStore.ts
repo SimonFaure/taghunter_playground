@@ -1,8 +1,9 @@
 // Remembered Wi-Fi networks the device may auto-join (see migration v19,
-// services/wifiAutoConnect.ts). Rows are written by Feature A (mother creds
-// piggybacked on the ping, in Rust, origin='paired') and - once the onboarding
-// feature lands - Feature B (studio relay, origin='studio'). This store is the
-// JS read/consent surface; it never invents creds.
+// services/wifiAutoConnect.ts). Rows are written by the mother-ping creds relay
+// (in Rust, origin='paired'), the studio sync mirror (origin='studio', see
+// syncOrchestrator's lan_networks work item) and the Join tab's manual add form
+// (origin='manual'). This store is the JS read/consent surface; it never
+// invents creds.
 
 import { getDb } from './db';
 
@@ -29,15 +30,56 @@ export async function list(): Promise<WifiNetworkRow[]> {
   );
 }
 
-/** How many studio-authored hotspot rows this device currently mirrors. Used by
- * the sync gate to re-pull when studio advertises networks but we hold none
- * (e.g. a prior empty pull advanced the version + tombstoned before the seed). */
-export async function countStudio(): Promise<number> {
+/**
+ * The networks a satellite may join to reach a mother: studio-relayed hotspots
+ * plus any the operator added by hand (origin='manual'). Excludes origin='paired'
+ * rows (learned passively from a mother ping) - those aren't shown as pickable
+ * "mother's Wi-Fi". Studio first, then manual, alphabetical within each.
+ */
+export async function listJoinable(): Promise<WifiNetworkRow[]> {
   const db = await getDb();
-  const rows = await db.select<{ n: number }[]>(
-    "SELECT COUNT(*) AS n FROM wifi_networks WHERE origin = 'studio'"
+  return db.select<WifiNetworkRow[]>(
+    `SELECT * FROM wifi_networks
+     WHERE origin IN ('studio', 'manual')
+     ORDER BY CASE origin WHEN 'studio' THEN 0 ELSE 1 END, ssid`
   );
-  return rows[0]?.n ?? 0;
+}
+
+/**
+ * Networks a satellite may CONNECT to by hand in the step-by-step flow. Unlike
+ * `listJoinable` (studio+manual only, the pickable "mother's Wi-Fi" list), this
+ * includes `origin='paired'` rows - the creds a child learned passively from a
+ * mother's ping relay (`read_mother_wifi`). Those are precisely the mother's own
+ * Wi-Fi, so a child that only ever learned its creds that way must still be able
+ * to connect. Ordered studio → manual → paired, then most-recently-connected.
+ * (Without this, such a child wrongly shows "no network configured" even though
+ * wifi_networks holds the right SSID/password.)
+ */
+export async function listConnectable(): Promise<WifiNetworkRow[]> {
+  const db = await getDb();
+  return db.select<WifiNetworkRow[]>(
+    `SELECT * FROM wifi_networks
+     ORDER BY CASE origin WHEN 'studio' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END,
+              last_connected_at IS NULL,
+              last_connected_at DESC,
+              ssid`
+  );
+}
+
+/**
+ * Manually add a network the operator typed in (Settings → Devices → Join, when
+ * studio hasn't synced any creds yet). Stored with origin='manual' so the sync
+ * tombstone never prunes it, and auto-consented so the auto-connect engine joins
+ * it silently. Idempotent upsert (re-adding updates the password).
+ */
+export async function addManual(ssid: string, password: string): Promise<void> {
+  await upsert({ ssid, password, source: 'hotspot', origin: 'manual', autoConnectOnInsert: true });
+}
+
+/** Delete a remembered network by SSID (used to remove a manual entry). */
+export async function remove(ssid: string): Promise<void> {
+  const db = await getDb();
+  await db.execute('DELETE FROM wifi_networks WHERE ssid = $1', [ssid]);
 }
 
 export async function get(ssid: string): Promise<WifiNetworkRow | null> {
@@ -112,15 +154,24 @@ export async function upsert(input: {
 }
 
 /**
- * Drop studio-origin rows whose SSID is no longer in the freshly-pulled set.
- * Studio is the sole author of these (plans/studio-authoritative-hotspot-creds.md):
- * when an admin renames the client's hotspot, the old SSID stops being relayed
- * and must disappear from this device's mirror so the picker / mother-raise don't
- * keep offering the stale network. Only origin='studio' rows are touched -
- * paired-mother rows (origin='paired') are never pruned here. Passing an empty
- * keep-set removes ALL studio rows (studio defines none for this client).
+ * Reconcile the local mirror to studio's authoritative set (called on every sync,
+ * version-independent). `keepSsids` = the SSIDs studio currently relays.
+ *
+ *  - When studio relays SOMETHING (non-empty keep set): studio is the source of
+ *    truth, so keep exactly that set PLUS any `origin='manual'` entries the
+ *    operator typed, and DROP stale HOTSPOT rows - stale studio rows (renamed
+ *    hotspot) AND stale `origin='paired'` hotspot rows (e.g. an old auto-generated
+ *    SSID learned via a past ping that nothing refreshes and that would otherwise
+ *    linger in the table and get auto-joined). A paired row whose SSID matches a
+ *    relayed one survives (it IS the current network).
+ *    `source='router'` rows are EXEMPT: studio never relays router creds (they
+ *    are learned on site via the mother ping), so pruning them here would
+ *    un-provision a router-mode venue on every office sync.
+ *  - When studio relays NOTHING (empty keep set): only drop stale studio rows;
+ *    leave paired/manual intact so a device that learned its creds via the mother
+ *    ping (studio not migrated / nothing seeded yet) keeps working.
  */
-export async function tombstoneMissingStudio(keepSsids: string[]): Promise<void> {
+export async function reconcileToStudioSet(keepSsids: string[]): Promise<void> {
   const db = await getDb();
   if (keepSsids.length === 0) {
     await db.execute("DELETE FROM wifi_networks WHERE origin = 'studio'");
@@ -128,7 +179,8 @@ export async function tombstoneMissingStudio(keepSsids: string[]): Promise<void>
   }
   const placeholders = keepSsids.map((_, i) => `$${i + 1}`).join(', ');
   await db.execute(
-    `DELETE FROM wifi_networks WHERE origin = 'studio' AND ssid NOT IN (${placeholders})`,
+    `DELETE FROM wifi_networks
+     WHERE origin != 'manual' AND source != 'router' AND ssid NOT IN (${placeholders})`,
     keepSsids
   );
 }

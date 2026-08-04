@@ -41,6 +41,7 @@
   "clashImportAppliedOk": "{{ok}} asignación(es) de chip aplicada(s) a los clanes.",
   "clashImportApplied": "{{ok}} asignación(es) aplicada(s), {{failed}} fallida(s) (clan lleno o no disponible).",
   "clashImportFailed": "No se pudieron aplicar las asignaciones de clan importadas.",
+  "joinFailed": "No se pudo unir a la partida: su configuración es ilegible. Comprueba la conexión con el dispositivo madre e inténtalo de nuevo.",
   "quickLaunchPrepareFailed": "No se pudo preparar un lanzamiento rápido - revisa y lanza.",
   "deleteSuccess": "«{{title}}» se ha eliminado. Se descargará de nuevo en la próxima sincronización.",
   "deleteError": "No se pudo eliminar «{{title}}». Inténtalo de nuevo.",

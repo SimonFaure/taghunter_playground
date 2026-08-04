@@ -41,6 +41,7 @@
   "clashImportAppliedOk": "{{ok}} chip assignment(s) applied to clans.",
   "clashImportApplied": "{{ok}} chip assignment(s) applied, {{failed}} failed (clan full or unavailable).",
   "clashImportFailed": "Could not apply the imported clan assignments.",
+  "joinFailed": "Could not join the game: its configuration was unreadable. Check the connection to the mother device and try again.",
   "quickLaunchPrepareFailed": "Could not prepare a quick launch - please review and launch.",
   "deleteSuccess": "\"{{title}}\" was deleted. It will be downloaded again on the next sync.",
   "deleteError": "Could not delete \"{{title}}\". Please try again.",

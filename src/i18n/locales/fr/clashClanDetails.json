@@ -17,12 +17,14 @@
   "alreadyOtherClan": "Cette puce appartient déjà à un autre clan",
   "alreadyInClan": "Cette puce est déjà dans ce clan",
   "couldNotAdd": "Impossible d'ajouter la puce",
-  "punchesHeading": "Poinçons ({{count}})",
+  "punchesHeading": "Pointages ({{count}})",
   "noCardReads": "Aucune lecture de carte pour ce clan pour l'instant.",
-  "punchCount_one": "{{count}} poinçon",
-  "punchCount_other": "{{count}} poinçons",
+  "chipHolder": "{{name}} - (n°{{number}} - id {{id}})",
+  "chipHolderNoNumber": "{{name}} - (id {{id}})",
+  "stationCount_one": "{{count}} balise",
+  "stationCount_other": "{{count}} balises",
   "end": "Fin",
-  "noStations": "Aucune station sur cette lecture.",
-  "stationCode": "Code de station",
-  "punchTime": "Heure de poinçon"
+  "noStations": "Aucune balise sur cette lecture.",
+  "stationCode": "Code de balise",
+  "punchTime": "Heure de pointage"
 }

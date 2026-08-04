@@ -10,6 +10,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './device';
 import { getAuthUser } from './authStore';
+import { saveHotspotCreds } from './lanCredentials';
 
 // The Rust side seeds a device's self row with this placeholder before the
 // operator's device name is known (ensure_self_pair replaces it with the real
@@ -55,15 +56,6 @@ export interface PairedDeviceRow {
   is_self: boolean;
 }
 
-export interface PendingPairRequest {
-  id: number;
-  peer_uuid: string;
-  peer_label: string;
-  peer_os: string | null;
-  peer_app_version: string | null;
-  created_at: string;
-}
-
 export interface PairedMotherRow {
   mother_uuid: string;
   mother_label: string | null;
@@ -95,10 +87,28 @@ export interface MotherServerInfo {
 
 // ─── mother-side commands ────────────────────────────────────────────────────
 
-export const startHotspot = (ssid: string, password: string) =>
-  invoke<HotspotInfo>('mother_start_hotspot', { ssid, password });
+export async function startHotspot(ssid: string, password: string): Promise<HotspotInfo> {
+  const info = await invoke<HotspotInfo>('mother_start_hotspot', { ssid, password });
+  // Keep schema_meta (hotspot_ssid/password) in lockstep with the AP now on the
+  // air. `read_mother_wifi` relays THOSE schema_meta creds to satellites over the
+  // ping (which Wi-Fi to join), so they must always match the broadcast SSID -
+  // otherwise a child learns a network that isn't being broadcast. Best-effort.
+  await saveHotspotCreds(ssid, password).catch(() => {});
+  return info;
+}
 
-export const stopHotspot = () => invoke<void>('mother_stop_hotspot');
+// The hotspot watchdog (lanMotherBoot.motherHotspotWatchdogTick) must not fight
+// a deliberate stop - record when this app last stopped the AP so the watchdog
+// holds off for a cooldown window instead of instantly re-raising it.
+let lastHotspotStopAt = 0;
+export function getLastHotspotStopAt(): number {
+  return lastHotspotStopAt;
+}
+
+export const stopHotspot = () => {
+  lastHotspotStopAt = Date.now();
+  return invoke<void>('mother_stop_hotspot');
+};
 
 export const hotspotStatus = () => invoke<HotspotStatus>('mother_hotspot_status');
 
@@ -110,14 +120,9 @@ export const getMotherServerInfo = () =>
 export const refreshMdns = (addresses: string[]) =>
   invoke<void>('mother_refresh_mdns', { addresses });
 
-export const listPendingPairRequests = () =>
-  invoke<PendingPairRequest[]>('mother_list_pending_pair_requests');
-
-export const approvePairRequest = (requestId: number) =>
-  invoke<number>('mother_approve_pair_request', { requestId });
-
-export const denyPairRequest = (requestId: number) =>
-  invoke<void>('mother_deny_pair_request', { requestId });
+// listPendingPairRequests / approvePairRequest / denyPairRequest were retired
+// with the manual-approval ceremony: same-client joins auto-approve, everything
+// else is flat-denied by the mother (see pair_request_handler in lan_server.rs).
 
 export const listPairedDevices = () =>
   invoke<PairedDeviceRow[]>('mother_list_paired_devices');
@@ -132,6 +137,30 @@ export const describeLocalRole = () =>
 
 export const discoverMothers = (timeoutMs = 3000) =>
   invoke<DiscoveredMother[]>('client_discover_mothers', { timeoutMs });
+
+// Result of a manual reachability probe (Step 3 of the hand-driven connect flow).
+// `ok` separates "discoverable" (mDNS answered) from "reachable" (the TCP connect
+// completed) - so a firewall block reads differently from a routing problem.
+export interface MotherProbe {
+  ok: boolean;
+  reached_addr: string | null;
+  mother_uuid: string | null;
+  client_id: number | null;
+  latency_ms: number | null;
+  /** Per-address technical failure detail (the REAL OS error); empty on success. */
+  errors: string[];
+  /** Coarse cause from the real OS error: 'refused' | 'timeout' | 'unreachable' |
+   *  'http' | 'other'. null on success. Drives the child's headline. */
+  category: string | null;
+}
+
+/**
+ * Unauthenticated reachability test against a discovered mother's addresses
+ * (GET /pair.php?action=hello). Confirms the TCP path is actually open - the
+ * half mDNS discovery can't prove - without pairing. Never mutates state.
+ */
+export const probeMother = (addresses: string[], port: number) =>
+  invoke<MotherProbe>('client_probe_mother', { addresses, port });
 
 /**
  * Discover mothers EXCLUDING this device. Every device runs its own mother

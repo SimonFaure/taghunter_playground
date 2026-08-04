@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { GameConfig } from './LaunchGameModal';
-import { sportidentService as usbReaderService, CardData, detectReaderPort } from '../services/sportidentService';
+import { sportidentService as usbReaderService, CardData, detectReaderPort, isReaderConnected } from '../services/sportidentService';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
@@ -427,7 +427,12 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     onGameEnded: () => { queue.clear(); setPhase('ended'); },
     onAllTeamsFinished: () => {},
     onNewBip: () => {},
-    enabled: phase === 'playing',
+    // A station left on the self-register inscription screen follows the device
+    // that pressed "Start game" into play. Enabled during register too (not just
+    // playing) so the poll is live to catch the mother's start flag flip;
+    // idempotent for the device that started the game itself.
+    onGameStarted: () => setPhase('playing'),
+    enabled: phase !== 'ended',
     disableAllFinishedEnd: true,
   });
 
@@ -492,7 +497,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
 
     // Registration phase: bind the chip to the station's selected clan.
     if (phaseRef.current === 'register') {
-      if (registrationMode !== 'self') return; // bulk mode assigns from the DB form
+      if (registrationMode !== 'self') return; // predetermined clans were dealt at launch
       const teamId = selectedTeamIdRef.current;
       if (teamId == null) return;
       try {
@@ -610,6 +615,28 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     };
   }, [launchedGameId]);
 
+  // ── Fast reader hotplug on the inscription screen ──────────────────────────
+  // The reader effect above (re)binds on the global 'reader:status' event, but
+  // that only fires off the footer's 10s poll - a dongle plugged in mid-
+  // registration then takes up to 10s to come alive, which reads as broken.
+  // While registering, actively probe every 2s and re-emit 'reader:status' as
+  // soon as a reader appears so the bind path fires within ~2s. Once bound,
+  // initializePort no-ops, so re-emitting is cheap. Scoped to the register
+  // phase so reader-less devices don't probe serial forever during play.
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'register') return;
+    if (!usbReaderService.isAvailable()) return;
+    let cancelled = false;
+    const id = setInterval(() => {
+      void isReaderConnected().then((ok) => {
+        if (ok && !cancelled) {
+          window.dispatchEvent(new CustomEvent('reader:status', { detail: { state: 'ok' } }));
+        }
+      });
+    }, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [launchedGameId, phase]);
+
   // Resume an already-started game (e.g. a station joining mid-match) → skip
   // registration and go straight to the live dashboard.
   useEffect(() => {
@@ -643,7 +670,6 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     const regVisualUrl = resolveMedia(meta?.game_visual || meta?.background_image || '');
     return (
       <ClashRegistrationScreen
-        launchedGameId={launchedGameId}
         standings={standings}
         clanByTeamId={clanByTeamId}
         mode={registrationMode}

@@ -4,7 +4,20 @@
 // fanout - no persistence, no ordering guarantees beyond "subscribers see
 // emits in the order they fire."
 
-type Listener = (launchedGameId: number) => void;
+/**
+ * The mother route resolved by the App-root listener from the push itself.
+ * Carried alongside the id because LaunchedGamesList's own mount-time
+ * `refreshLaunchedGamesRoute()` races this handoff and can restore the LOCAL
+ * route in between - the subscriber re-applies this one so the game's meta is
+ * always read from the mother that sent the push, never from our own server
+ * (whose colliding launched_game id yields a plausible but foreign config).
+ */
+export interface PendingJoinRoute {
+  baseUrl: string;
+  token: string;
+}
+
+type Listener = (launchedGameId: number, route?: PendingJoinRoute) => void;
 
 const listeners = new Set<Listener>();
 // One-slot buffer: a join_game can arrive while the satellite is on a page
@@ -13,15 +26,15 @@ const listeners = new Set<Listener>();
 // later - so we hold the last unhandled join and deliver it to the next
 // subscriber. This guarantees "enter the in-game page no matter which page we
 // were on" (e.g. settings, scenarios, rankings).
-let buffered: number | null = null;
+let buffered: { id: number; route?: PendingJoinRoute } | null = null;
 
 export function onPendingJoin(l: Listener): () => void {
   listeners.add(l);
   if (buffered !== null) {
-    const gid = buffered;
+    const held = buffered;
     buffered = null;
     try {
-      l(gid);
+      l(held.id, held.route);
     } catch (err) {
       console.error('[pendingJoinStore] listener threw:', err);
     }
@@ -31,14 +44,14 @@ export function onPendingJoin(l: Listener): () => void {
   };
 }
 
-export function emitPendingJoin(launchedGameId: number): void {
+export function emitPendingJoin(launchedGameId: number, route?: PendingJoinRoute): void {
   if (listeners.size === 0) {
-    buffered = launchedGameId;
+    buffered = { id: launchedGameId, route };
     return;
   }
   for (const l of listeners) {
     try {
-      l(launchedGameId);
+      l(launchedGameId, route);
     } catch (err) {
       console.error('[pendingJoinStore] listener threw:', err);
     }

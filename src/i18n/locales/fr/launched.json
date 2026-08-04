@@ -177,7 +177,7 @@
   "colTeams": "Équipes",
   "colPlayers": "Joueurs",
   "colSynced": "Synchronisée",
-  "trackRoute_default": "Par défaut (tous les points de contrôle)",
+  "trackRoute_default": "Tous les checkpoints",
   "trackRoute_first_half": "Première moitié",
   "trackRoute_last_half": "Seconde moitié",
   "trackRoute_odd": "Points de contrôle impairs",

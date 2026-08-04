@@ -1,7 +1,8 @@
 {
   "errors": {
     "requestFailed": "La solicitud ha fallado ({{status}})",
-    "generic": "Algo ha salido mal. Inténtalo de nuevo."
+    "generic": "Algo ha salido mal. Inténtalo de nuevo.",
+    "offlineFirstLogin": "Sin conexión a Internet con el servidor TagHunter. Este dispositivo debe configurarse en línea al menos una vez antes de llevarlo a un evento: conéctate a Internet e inicia sesión, y luego funcionará sin conexión en el lugar."
   },
   "provider": {
     "loading": "Cargando…"

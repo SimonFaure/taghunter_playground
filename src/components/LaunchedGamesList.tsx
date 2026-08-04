@@ -34,7 +34,8 @@ import { printReports } from '../services/reportPrint';
 import { GameDevicesModal } from './GameDevicesModal';
 import { GameVideoModal } from './GameVideoModal';
 import { RawDataModal } from './RawDataModal';
-import { onPendingJoin, onPendingLeave } from '../services/pendingJoinStore';
+import { onPendingJoin, onPendingLeave, type PendingJoinRoute } from '../services/pendingJoinStore';
+import { pointLaunchedGamesAtMother } from '../services/lanMotherBoot';
 import { isOperatorOnly } from '../services/operatorMode';
 import { refreshLaunchedGamesRoute, onLaunchedGamesRouteChange } from '../services/childControlLink';
 import { onMotherReachability } from '../services/motherFailover';
@@ -80,7 +81,7 @@ import type { SiPuce } from '../types/database';
 
 // Tracks route keys → operator-facing labels (Add Team per-team route override).
 const TRACKS_ROUTE_LABELS: Record<string, string> = {
-  default: 'Default (all checkpoints)',
+  default: 'All checkpoints',
   first_half: 'First half',
   last_half: 'Last half',
   odd: 'Odd checkpoints',
@@ -1204,13 +1205,25 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     // game must re-point at the mother first, or every read below 404s and the
     // button appears dead.
     if (gamesRouteRef.current) setLanOverride(gamesRouteRef.current);
+    // The whole in-game config is derived from this meta map, so an empty read
+    // is NOT "all options off" - getLaunchedGameMeta fails open to `{}` (unknown
+    // id / route not yet pointed at the mother). Entering with an empty map made
+    // a satellite miss e.g. tagquestSelfRegister and skip the registration
+    // screen, so retry briefly before giving up.
     let metaMap: Record<string, string> = {};
-    try {
-      metaMap = await getLaunchedGameMeta(game.id);
-    } catch (err) {
-      console.error('Error loading game meta:', err);
-      alert(t('launched:actionFailed'));
-      return;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        metaMap = await getLaunchedGameMeta(game.id);
+      } catch (err) {
+        console.error('Error loading game meta:', err);
+        alert(t('launched:actionFailed'));
+        return;
+      }
+      if (Object.keys(metaMap).length > 0) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (Object.keys(metaMap).length === 0) {
+      console.warn('[LaunchedGamesList] entering game with empty meta', game.id);
     }
     const config = gameConfigFromMeta(metaMap, { name: game.name, numberOfTeams: game.number_of_teams });
 
@@ -1220,7 +1233,21 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   // Drive into a launched game by id alone - used by the mother → satellite
   // join_game push. Looks the game up in the cached list (refetching if not
   // present), registers the satellite with the mother, then mounts GamePage.
-  const playGameById = async (launchedGameId: number) => {
+  const playGameById = async (launchedGameId: number, route?: PendingJoinRoute) => {
+    // Re-apply the route carried by the push BEFORE anything is read. This
+    // component's own mount-time refreshLaunchedGamesRoute() races the push and
+    // can restore the LOCAL route; reading the game from our own server then
+    // yields either nothing or - worse - a colliding local game id's config.
+    if (route) pointLaunchedGamesAtMother(route.baseUrl, route.token);
+    // The push navigates this device to the game - close any locally-opened
+    // full-screen rankings surface or modal. While playingGame is set they
+    // wouldn't render anyway, but left set they'd resurface the moment the
+    // operator backs out of the game.
+    setRankingPageGame(null);
+    setTimeRangePage(null);
+    setActiveGamesPage(null);
+    setShowRankingsModal(false);
+    setShowArchived(false);
     let game = games.find(g => g.id === launchedGameId);
     if (!game) {
       // The active list may be stale (e.g. mother created the game seconds ago).
@@ -1270,8 +1297,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   };
 
   useEffect(() => {
-    return onPendingJoin((launchedGameId) => {
-      void playGameById(launchedGameId);
+    return onPendingJoin((launchedGameId, route) => {
+      void playGameById(launchedGameId, route);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [games]);
@@ -1335,6 +1362,13 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   if (playingGame) {
     return (
       <GamePage
+        // Key on the game id: a join_game push can land while a GamePage for a
+        // PREVIOUS (ended) game is still mounted - e.g. the device was left on
+        // that game's leaderboard. Without the key React reuses the mounted
+        // instance (mount-time init never reruns, stale overlays stay up); with
+        // it the page remounts fresh on the game view. A same-game re-push
+        // keeps the key, so the Reconnect/rejoin channel is unaffected.
+        key={playingGame.launchedGameId}
         config={playingGame.config}
         gameUniqid={playingGame.uniqid}
         launchedGameId={playingGame.launchedGameId}

@@ -5,7 +5,7 @@
 // detection to the React rendering lifecycle:
 //
 //   - Initial detection on mount.
-//   - Re-detection on the 'reader:status' window event that Footer.tsx emits
+//   - Re-detection on the 'reader:status' window event that TopbarStatus.tsx emits
 //     when its 10s isReaderConnected poll flips state. That gives every
 //     consumer (game pages, ConfigurationPage, LaunchGameModal) a unified
 //     hotplug signal without needing each of them to run its own poll.

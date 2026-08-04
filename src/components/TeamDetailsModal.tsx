@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { X, Award, Zap, Target, Clock, List, ChevronDown, ChevronUp, BarChart2, Plus, Minus, Puzzle, RotateCcw, ImageOff, Pencil, Save, MapPin } from 'lucide-react';
 import * as scenarioStore from '../services/scenarioStore';
 import * as patternStore from '../services/patternStore';
+import * as cardsRepo from '../services/cardsRepo';
 import {
   checkpointsForRoute,
   orderedHitCheckpointIds,
@@ -51,6 +52,20 @@ interface CompletedQuest {
   points_awarded: number;
   teammate_chip_id: number | null;
   completed_at: string | null;
+}
+
+/** Chip number + carrier name for a chip id (see `chipInfo`). */
+interface ChipInfo {
+  number: number | null;
+  name: string | null;
+}
+
+/** The slice of meta.teamsConfig this modal needs to name a chip's carrier. */
+interface RosterEntry {
+  chipId?: number;
+  chipNumber?: number;
+  name?: string;
+  teammates?: Array<{ chipId?: number; chipNumber?: number; name?: string }>;
 }
 
 interface RawDataRecord {
@@ -432,6 +447,10 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const [tracksRoute, setTracksRoute] = useState('default');
   const [tracksScoreType, setTracksScoreType] = useState<TracksScoreType>('percentage');
   const [tracksPlayMode, setTracksPlayMode] = useState<'itinerary' | 'free'>('free');
+  // chip id → its number + the name of whoever carries it, so quest rows and
+  // punch records can be attributed to a person rather than a bare chip id.
+  // Filled from the card registry and (overriding it) the launch roster.
+  const [chipInfo, setChipInfo] = useState<Map<number, ChipInfo>>(new Map());
   const chipKey = (chipIds ?? []).join(',');
 
   // Auto late-malus for a run of `durationSec` - mirrors MysteryGamePage's rule.
@@ -560,6 +579,47 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     loadGameData();
   }, [gameUniqid]);
 
+  // Chip registry for this game: every card's number/name, then the launch
+  // roster on top. The roster wins because its names are what the operator
+  // typed for THIS game (team name for a leader chip, player name for a
+  // teammate); the card's key_name is the fallback and covers self-register
+  // games, whose members are bound at play time and never reach teamsConfig.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const map = new Map<number, ChipInfo>();
+      try {
+        for (const c of await cardsRepo.list()) {
+          map.set(c.id, { number: c.key_number, name: c.key_name || null });
+        }
+      } catch (err) {
+        console.error('[TeamDetailsModal] card registry load failed:', err);
+      }
+      try {
+        const meta = await getLaunchedGameMeta(launchedGameId);
+        const parsed: unknown = JSON.parse(meta.teamsConfig || '[]');
+        const roster: RosterEntry[] = Array.isArray(parsed) ? parsed : [];
+        for (const cfg of roster) {
+          for (const entry of [cfg, ...(cfg?.teammates ?? [])]) {
+            if (entry?.chipId == null) continue;
+            const id = Number(entry.chipId);
+            const prev = map.get(id);
+            map.set(id, {
+              number: entry.chipNumber ?? prev?.number ?? null,
+              name: entry.name || prev?.name || null,
+            });
+          }
+        }
+      } catch (err) {
+        console.error('[TeamDetailsModal] roster load failed:', err);
+      }
+      if (!cancelled) setChipInfo(map);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [launchedGameId]);
+
   // Mystery only: load the pattern's per-enigma good/wrong answer-station codes
   // (used to recompute each enigma's base status from the team's punches) and
   // this team's persisted status overrides. Both come from launched-game meta.
@@ -623,18 +683,25 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
       if (isInitial) setLoading(true);
 
       try {
-        const [questsRows, state] = await Promise.all([
+        const [questsRows, state, members] = await Promise.all([
           listCompletedQuests(launchedGameId, team.id),
           getLaunchedGameState(launchedGameId, 0),
+          getClashMembers(launchedGameId).catch(() => []),
         ]);
         setCompletedQuests(questsRows.map(toCompletedQuest));
         // Punches: in team mode each member punches with their OWN chip, so
         // filter the game's raw_data to every chip on this team (leader +
         // teammates) - the leader's key_id often never punches. state's
         // new_raw_data (since_raw_id 0) is the full set for the game.
+        // chipIds only covers the launch-meta teamsConfig roster; self-register
+        // games bind chips at play time via lg_clash_members instead, so union
+        // in those bindings or their punches would be filtered out entirely.
         const chipSet = new Set(
           (chipIds && chipIds.length ? chipIds : [team.key_id]).map(Number)
         );
+        members
+          .filter((m) => m.team_id === team.id)
+          .forEach((m) => chipSet.add(Number(m.chip_id)));
         const rawForTeam = (state.new_raw_data ?? []).filter((r) => {
           const cid = (r.raw_data as { id?: number } | null)?.id;
           return cid != null && chipSet.has(Number(cid));
@@ -672,7 +739,6 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
           if (isWeightingEnabled(meta)) {
             let roster: RosterTeam[] = [];
             try { roster = JSON.parse(meta.teamsConfig || '[]'); } catch { /* swallow */ }
-            const members = await getClashMembers(launchedGameId).catch(() => []);
             const headcounts = teamHeadcounts(state.teams, roster, memberCounts(members));
             setEffectifHeadcount(headcounts.get(team.id) ?? 1);
             setEffectifWeight(effectifWeights(headcounts).get(team.id) ?? 1);
@@ -693,6 +759,19 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     const interval = setInterval(() => load(false), 2000);
     return () => clearInterval(interval);
   }, [team.id, launchedGameId, team.key_id, chipKey]);
+
+  // "Alice - (n°12 - id 8012345)": who punched, plus the chip's number and id.
+  // A null chip id means the team's own (leader) chip. The leader is always
+  // labelled with the team name - in solo mode that IS the player's name.
+  const chipHolderLabel = (chipId: number | null | undefined): string => {
+    const id = Number(chipId ?? currentTeam.key_id);
+    if (!Number.isFinite(id) || id <= 0) return currentTeam.team_name;
+    const info = chipInfo.get(id);
+    const name = (id === currentTeam.key_id ? currentTeam.team_name : info?.name) || currentTeam.team_name;
+    return info?.number != null
+      ? t('teamDetails:chipHolder', { name, number: info.number, id })
+      : t('teamDetails:chipHolderNoNumber', { name, id });
+  };
 
   const quests = gameData?.quests ?? [];
   const comboConfig = gameData?.game_meta;
@@ -1533,10 +1612,10 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
                       <tr key={cq.id}>
                         <td className="text-[var(--pg-text-dim)]">{i + 1}</td>
                         <td className="text-[var(--pg-text)] font-medium">
-                          {getQuestName(cq.quest_number)}
-                          {cq.teammate_chip_id && cq.teammate_chip_id !== team.key_id && (
-                            <span className="ml-2 text-xs text-teal-400">{t('teamDetails:chipLabel', { id: cq.teammate_chip_id })}</span>
-                          )}
+                          <div>{getQuestName(cq.quest_number)}</div>
+                          <div className="text-[var(--pg-text-dim)] text-xs font-normal">
+                            {chipHolderLabel(cq.teammate_chip_id)}
+                          </div>
                         </td>
                         <td className="text-right">
                           <span className="text-[var(--pg-accent-bright)] font-semibold">+{cq.points_awarded}</span>
@@ -1621,16 +1700,16 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
                         className="w-full flex items-center justify-between px-4 py-3 hover:bg-[var(--pg-surface-3)] transition text-left"
                         onClick={() => setExpandedPunch(isExpanded ? null : rec.id)}
                       >
-                        <div className="flex items-center gap-3">
-                          <span className="text-[var(--pg-text-dim)] text-xs">#{i + 1}</span>
-                          <span className="text-[var(--pg-text)] text-sm font-medium">
-                            {t('teamDetails:punchCount', { count: punches.length })}
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[var(--pg-text-dim)] text-xs shrink-0">#{i + 1}</span>
+                          <span className="text-[var(--pg-text)] text-sm font-medium truncate">
+                            {chipHolderLabel(rec.raw_data?.id)}
                           </span>
-                          {rec.raw_data?.id != null && (
-                            <span className="text-[var(--pg-text-dim)] text-xs">{t('teamDetails:chipLabel', { id: rec.raw_data.id })}</span>
-                          )}
+                          <span className="text-[var(--pg-text-dim)] text-sm shrink-0">
+                            - {t('teamDetails:stationCount', { count: punches.length })}
+                          </span>
                           {rec.raw_data?.end != null && (
-                            <span className="px-1.5 py-0.5 bg-green-900/50 border border-green-700/50 rounded text-green-400 text-xs">
+                            <span className="px-1.5 py-0.5 bg-green-900/50 border border-green-700/50 rounded text-green-400 text-xs shrink-0">
                               {t('teamDetails:endStation')}
                             </span>
                           )}

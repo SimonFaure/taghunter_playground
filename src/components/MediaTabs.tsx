@@ -7,7 +7,7 @@ import * as gameTypesStore from '../services/gameTypesStore';
 import { resolveVideosByKind } from '../services/videoResolution';
 import { loadConfig, saveConfig } from '../utils/config';
 import { LANG_NAMES } from '../services/langFlags';
-import { scenarioAssetUrl, mediaRootAbs } from '../services/contentFs';
+import { scenarioAssetUrl, mediaRootAbs, ensureDir } from '../services/contentFs';
 import { gameTypeLabel } from '../utils/labels';
 import { GameTypeIcon } from './icons/GameTypeIcons';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
@@ -477,7 +477,10 @@ export function ImagesTab() {
   const openScenariosFolder = async () => {
     try {
       // Scenario media is now pooled by content hash under media/blobs; open
-      // the media root so the operator can still browse on disk.
+      // the media root so the operator can still browse on disk. On a fresh
+      // install (or before any scenario is downloaded) the folder doesn't
+      // exist yet and openPath would throw silently, so create it first.
+      await ensureDir('media');
       await openPath(await mediaRootAbs());
     } catch (err) {
       console.error('[media] open media folder failed:', err);

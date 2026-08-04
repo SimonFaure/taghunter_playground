@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2 } from 'lucide-react';
-import { loadConfig, saveConfig } from '../../utils/config';
+import { loadConfig, saveConfig, CONFIG_CHANGED_EVENT } from '../../utils/config';
 import {
   setDefaultMother,
   enqueuePendingOp,
@@ -27,11 +27,17 @@ export function DefaultRolesPanel() {
   const [beMother, setBeMother] = useState<boolean | null>(null);
 
   useEffect(() => {
-    void (async () => {
+    const refresh = async () => {
       setMotherOn(await getDefaultMotherLocal());
       const cfg = await loadConfig();
       setBeMother(Boolean(cfg.beMotherWhenAvailable));
-    })();
+    };
+    void refresh();
+    // Re-read when another flow changes the config (e.g. NotMotherPanel just
+    // below cleared beMotherWhenAvailable) so the toggle doesn't go stale.
+    const onChanged = () => void refresh();
+    window.addEventListener(CONFIG_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(CONFIG_CHANGED_EVENT, onChanged);
   }, []);
 
   async function toggleBeMother(next: boolean) {
@@ -57,14 +63,14 @@ export function DefaultRolesPanel() {
 
   if (motherOn === null) {
     return (
-      <div className="pg-panel p-4 flex items-center gap-2 text-[var(--pg-text-dim)] mb-6">
+      <div className="pg-panel p-4 flex items-center gap-2 text-[var(--pg-text-dim)]">
         <Loader2 className="w-4 h-4 animate-spin" /> …
       </div>
     );
   }
 
   return (
-    <div className="pg-panel mb-6 divide-y divide-[var(--pg-line)]">
+    <div className="pg-panel divide-y divide-[var(--pg-line)]">
       <RoleToggle
         label={t('mother.title')}
         description={t('mother.subtitle')}

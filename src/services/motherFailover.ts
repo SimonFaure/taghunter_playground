@@ -13,7 +13,12 @@
 // so the footer can tell the operator a promotion is needed.
 
 import { invoke } from '@tauri-apps/api/core';
-import { getLanOverride, setLanOverride, setLanRepointHandler } from './api';
+import {
+  getLanOverride,
+  setLanOverride,
+  setLanRepointHandler,
+  setLanContactHandler,
+} from './api';
 import { getAuthUser } from './authStore';
 import { getActiveLaunchedGameId } from './activeGameStore';
 import { getDb } from './db';
@@ -32,6 +37,15 @@ interface DiscoveredMother {
 type ReachListener = (unreachable: boolean) => void;
 const reachListeners = new Set<ReachListener>();
 let motherUnreachable = false;
+
+// Has this device actually REACHED a remote mother at least once this session?
+// The LAN override is persisted, so on a cold boot the very first launched_games
+// call can fail simply because we haven't (re)connected yet - which is NOT a
+// failover situation. The "become mother" banner is a *loss of contact* signal,
+// so we only raise it once contact was genuinely established. Set by api.ts via
+// the contact handler below; never cleared (the session-long fact is "we were
+// connected at some point", which is exactly what makes a later failure a loss).
+let hadMotherContact = false;
 
 /** Subscribe to the "mother unreachable" flag. Fires immediately with current. */
 export function onMotherReachability(l: ReachListener): () => void {
@@ -95,7 +109,10 @@ async function repointToNewMother(): Promise<boolean> {
     // can't help (it's our own process), and we'd risk hijacking our own route.
     if (!override || override.baseUrl.includes('127.0.0.1')) return false;
 
-    setMotherUnreachable(true);
+    // Only surface the banner if we LOST a mother we were actually talking to.
+    // A boot-time failure against a stale persisted override means "not yet
+    // connected", not "mother died" - re-point silently in that case.
+    if (hadMotherContact) setMotherUnreachable(true);
     try {
       const mothers = await invoke<DiscoveredMother[]>('client_discover_mothers', {
         timeoutMs: 4000,
@@ -195,4 +212,7 @@ export function installMotherFailover(): void {
   if (installed) return;
   installed = true;
   setLanRepointHandler(repointToNewMother);
+  setLanContactHandler(() => {
+    hadMotherContact = true;
+  });
 }

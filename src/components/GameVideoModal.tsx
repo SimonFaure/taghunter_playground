@@ -3,9 +3,16 @@
 // have joined this game. Extracted from the in-game Devices modal so the two
 // concerns (device roster vs. video control) live in separate modals.
 //
-// Targets are the "in this game" devices (excluding the operator's own). The
-// modal polls list_paired_with_status every 2s while open so the selectable
-// roster stays in sync as devices join / leave.
+// Targets are the "in this game" devices. The caller's OWN row is selectable
+// too, but it can't ride the pending_commands queue: `queue_command_inner`
+// rejects a self-targeted command (the mother never polls itself, so it would
+// sit unread forever). That one target is dispatched in-process through
+// `localVideoStore` instead - the same path the in-game VideoControlModal
+// uses - so the App-root <OperatorVideoOverlay> mounts the presentation right
+// here. Everything else still goes over the bulk queue.
+//
+// The modal polls list_paired_with_status every 2s while open so the
+// selectable roster stays in sync as devices join / leave.
 
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -17,7 +24,8 @@ import {
   getLaunchedGameState,
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
-import { resolveVideosByKind } from '../services/videoResolution';
+import { resolveVideosByKind, type VideoSource } from '../services/videoResolution';
+import { emitLocalPlayVideo, emitLocalStopVideo } from '../services/localVideoStore';
 import { HelpDot } from '../help';
 
 interface GameVideoModalProps {
@@ -52,6 +60,14 @@ export function GameVideoModal({
   const [errorFor, setErrorFor] = useState<Map<number, string>>(new Map());
   const [playMenuOpen, setPlayMenuOpen] = useState(false);
   const [avail, setAvail] = useState<VideoAvail | null>(null);
+  // The resolved sources behind `avail`, kept so a local (this-device) play can
+  // hand them straight to <OperatorVideoOverlay> without re-resolving.
+  const [videos, setVideos] = useState<VideoSource[]>([]);
+  // paired_devices.id of THIS device, server-resolved from our bearer secret.
+  // is_self can't answer "which row am I?" here: the roster comes from the
+  // mother's DB, so is_self marks the MOTHER's row even when this modal is
+  // open on a satellite. Null with an older mother build -> fall back to is_self.
+  const [callerId, setCallerId] = useState<number | null>(null);
 
   // Resolve which video kinds actually exist for this game, once. A missing
   // asset (no scenario intro video, or a game type whose tutorial video isn't
@@ -69,6 +85,7 @@ export function GameVideoModal({
           gameLanguage || 'fr',
         );
         if (cancelled) return;
+        setVideos(vids);
         setAvail({
           intro: vids.some((v) => v.kind === 'intro'),
           tutorial: vids.some((v) => v.kind === 'tutorial'),
@@ -76,7 +93,10 @@ export function GameVideoModal({
       } catch {
         // Couldn't resolve (game state fetch failed / scenario not downloaded)
         // - treat as nothing available rather than pretending both exist.
-        if (!cancelled) setAvail({ intro: false, tutorial: false });
+        if (!cancelled) {
+          setVideos([]);
+          setAvail({ intro: false, tutorial: false });
+        }
       }
     })();
     return () => {
@@ -97,6 +117,7 @@ export function GameVideoModal({
       const next = await listPairedWithStatus(launchedGameId).catch(() => null);
       if (cancelled || !next) return;
       setInGame(next.in_game);
+      setCallerId(next.caller_device_id ?? null);
       const ids = new Set(next.in_game.map((r) => r.id));
       setSelected((prev) => {
         if (prev.size === 0) return prev;
@@ -121,67 +142,142 @@ export function GameVideoModal({
     };
   }, [launchedGameId]);
 
-  const selectable = useMemo(() => inGame.filter((r) => !r.is_self), [inGame]);
+  // Selectable = every in-game device EXCEPT a foreign `is_self` row. That row
+  // is the mother's, seen from a satellite: the mother's server would reject a
+  // command targeting itself and we have no in-process channel to it, so it
+  // stays un-tickable. Our own row (id === callerId) is always selectable, even
+  // when it IS the is_self row (i.e. we're the mother) - it plays locally.
+  // callerId null = older mother build; fall back to the old is_self rule.
+  const isCaller = (row: PairedDeviceStatusRow) => callerId != null && row.id === callerId;
+  const selectable = useMemo(
+    () => inGame.filter((r) => (callerId != null && r.id === callerId) || !r.is_self),
+    [inGame, callerId],
+  );
+
+  // Dispatch on THIS device via localVideoStore. Returns false when the game
+  // has no source for the requested kinds (nothing to show).
+  function playHere(kinds: Array<'intro' | 'tutorial'>): boolean {
+    const sources = kinds
+      .map((k) => videos.find((v) => v.kind === k))
+      .filter((v): v is VideoSource => v != null);
+    if (sources.length === 0) return false;
+    emitLocalPlayVideo(sources);
+    return true;
+  }
+
+  // Split the selection into "me" (in-process) and the rest (bulk queue).
+  function splitTargets(): { localTarget: number | null; remote: number[] } {
+    const targets = Array.from(selected);
+    const localTarget = callerId != null && selected.has(callerId) ? callerId : null;
+    return { localTarget, remote: targets.filter((id) => id !== localTarget) };
+  }
+
+  function clearBusySoon(ids: number[]) {
+    // No per-target ack short of the satellite mounting the overlay (which we
+    // don't track on the mother). Clear the in-flight spinner after a beat.
+    window.setTimeout(() => {
+      setBusy((s) => {
+        if (s.size === 0) return s;
+        const n = new Set(s);
+        for (const id of ids) n.delete(id);
+        return n;
+      });
+    }, 1500);
+  }
 
   async function onPlayVideo(kinds: Array<'intro' | 'tutorial'>) {
     setPlayMenuOpen(false);
     const targets = Array.from(selected);
     if (targets.length === 0) return;
+    const { localTarget, remote } = splitTargets();
     setBusy((s) => {
       const n = new Set(s);
       for (const id of targets) n.add(id);
       return n;
     });
-    try {
-      await queuePlayVideoBulk(targets, launchedGameId, kinds, gameLanguage);
-    } catch (e) {
-      const msg = (e as Error).message;
-      setErrorFor((m) => {
-        const n = new Map(m);
-        for (const id of targets) n.set(id, msg);
-        return n;
-      });
-    } finally {
-      // No per-target ack short of the satellite mounting the overlay (which we
-      // don't track on the mother). Clear the in-flight spinner after a beat.
-      window.setTimeout(() => {
-        setBusy((s) => {
-          if (s.size === 0) return s;
-          const n = new Set(s);
-          for (const id of targets) n.delete(id);
+    let remoteFailed = false;
+    if (remote.length > 0) {
+      try {
+        const res = await queuePlayVideoBulk(remote, launchedGameId, kinds, gameLanguage);
+        // The bulk endpoint reports per-target failures (target_not_in_game,
+        // targeting self, ...) inside a 200 response - surface them, otherwise
+        // a rejected queue looks identical to a successful push.
+        setErrorFor((m) => {
+          const n = new Map(m);
+          for (const r of res.results) {
+            if (r.error) n.set(r.target_device_id, r.error);
+            else n.delete(r.target_device_id);
+          }
           return n;
         });
-      }, 1500);
+        remoteFailed = res.results.some((r) => r.error);
+      } catch (e) {
+        const msg = (e as Error).message;
+        setErrorFor((m) => {
+          const n = new Map(m);
+          for (const id of remote) n.set(id, msg);
+          return n;
+        });
+        remoteFailed = true;
+      }
     }
+    clearBusySoon(targets);
+    if (localTarget == null) return;
+    if (!playHere(kinds)) {
+      setErrorFor((m) => new Map(m).set(localTarget, t('devicesModal:videoNoneAvailable')));
+      return;
+    }
+    setErrorFor((m) => {
+      if (!m.has(localTarget)) return m;
+      const n = new Map(m);
+      n.delete(localTarget);
+      return n;
+    });
+    // The overlay takes over this screen, so get the modal out of the way -
+    // unless a satellite push failed, in which case keep it up so the operator
+    // still sees the error once playback ends.
+    if (!remoteFailed) onClose();
   }
 
   async function onStopVideo() {
     const targets = Array.from(selected);
     if (targets.length === 0) return;
+    const { localTarget, remote } = splitTargets();
     setBusy((s) => {
       const n = new Set(s);
       for (const id of targets) n.add(id);
       return n;
     });
-    try {
-      await queueStopVideoBulk(targets, launchedGameId);
-    } catch (e) {
-      const msg = (e as Error).message;
+    if (localTarget != null) {
+      emitLocalStopVideo();
       setErrorFor((m) => {
+        if (!m.has(localTarget)) return m;
         const n = new Map(m);
-        for (const id of targets) n.set(id, msg);
+        n.delete(localTarget);
         return n;
       });
-    } finally {
-      window.setTimeout(() => {
-        setBusy((s) => {
-          if (s.size === 0) return s;
-          const n = new Set(s);
-          for (const id of targets) n.delete(id);
+    }
+    if (remote.length > 0) {
+      try {
+        const res = await queueStopVideoBulk(remote, launchedGameId);
+        setErrorFor((m) => {
+          const n = new Map(m);
+          for (const r of res.results) {
+            if (r.error) n.set(r.target_device_id, r.error);
+            else n.delete(r.target_device_id);
+          }
           return n;
         });
-      }, 1500);
+      } catch (e) {
+        const msg = (e as Error).message;
+        setErrorFor((m) => {
+          const n = new Map(m);
+          for (const id of remote) n.set(id, msg);
+          return n;
+        });
+      }
     }
+    clearBusySoon(targets);
   }
 
   function toggleSelectAll() {
@@ -328,7 +424,8 @@ export function GameVideoModal({
                     row={row}
                     selected={selected.has(row.id)}
                     onToggle={() => toggleOne(row.id)}
-                    canSelect={!row.is_self}
+                    canSelect={isCaller(row) || !row.is_self}
+                    thisDevice={callerId != null ? row.id === callerId : row.is_self}
                     busy={busy.has(row.id)}
                     error={errorFor.get(row.id)}
                   />
@@ -370,6 +467,7 @@ function VideoDeviceRow({
   selected,
   onToggle,
   canSelect,
+  thisDevice,
   busy,
   error,
 }: {
@@ -377,6 +475,7 @@ function VideoDeviceRow({
   selected: boolean;
   onToggle: () => void;
   canSelect: boolean;
+  thisDevice: boolean;
   busy: boolean;
   error: string | undefined;
 }) {
@@ -394,7 +493,7 @@ function VideoDeviceRow({
       <div className="min-w-0">
         <div className="text-sm font-medium text-[var(--pg-text)] truncate">
           {row.device_label}
-          {row.is_self && (
+          {thisDevice && (
             <span className="ml-2 text-xs text-[var(--pg-text-dim)]">{t('devicesModal:thisDevice')}</span>
           )}
         </div>

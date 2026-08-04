@@ -32,7 +32,11 @@ let lanOverride: LanOverride | null = null;
 // A call to one of these before the override is installed must wait for it
 // rather than fall through to studio - studio has no mother-local launched
 // game, so it answers 404. See waitForLanOverride below.
-const LOCAL_ONLY_ENDPOINTS: ReadonlySet<string> = new Set(['launched_games']);
+// Exported as the single source of truth: every override installer
+// (lanMotherBoot, smoke tests) must route exactly this set, or a call would
+// pass the local-only gate here yet miss the override's endpoint match and
+// silently fall through to studio.
+export const LOCAL_ONLY_ENDPOINTS: ReadonlySet<string> = new Set(['launched_games']);
 const LAN_READY_TIMEOUT_MS = 4000;
 
 // A gate that resolves when the override is installed. The mother boot in
@@ -100,9 +104,20 @@ export function setLanReauthHandler(fn: (() => Promise<boolean>) | null): void {
   lanReauthHandler = fn;
 }
 
+// Fired whenever a mother-local call actually REACHES a remote mother (any HTTP
+// status - transport succeeded). motherFailover uses it to know we've had live
+// contact this session, which is what distinguishes "the mother we were talking
+// to just died" from "we booted with a stale override and never reached one".
+let lanContactHandler: (() => void) | null = null;
+export function setLanContactHandler(fn: (() => void) | null): void {
+  lanContactHandler = fn;
+}
+
 // Wait up to `timeoutMs` for the LAN override to be installed. Resolves
-// immediately if it's already set. On timeout it resolves anyway (the caller
-// then proceeds to studio) so a genuinely-absent mother never hangs forever.
+// immediately if it's already set. On timeout it resolves anyway so a
+// genuinely-absent mother never hangs forever - the caller then fails closed
+// with a synthetic 503 for LOCAL_ONLY_ENDPOINTS (it deliberately never falls
+// through to studio: launched games exist only in a mother's SQLite).
 function waitForLanOverride(timeoutMs: number): Promise<void> {
   if (lanOverride) return Promise.resolve();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -296,6 +311,18 @@ export async function apiCall<T = unknown>(
   } finally {
     if (timeoutHandle !== null) clearTimeout(timeoutHandle);
   }
+
+  // Transport succeeded against a REMOTE mother: record live contact.
+  if (
+    lanRoute &&
+    !forceLocalRoute &&
+    LOCAL_ONLY_ENDPOINTS.has(endpoint) &&
+    !lanRoute.baseUrl.includes('127.0.0.1') &&
+    lanContactHandler
+  ) {
+    lanContactHandler();
+  }
+
   let parsed: unknown;
   let parseFailed = false;
   try {

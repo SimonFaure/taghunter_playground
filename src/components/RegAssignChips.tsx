@@ -5,6 +5,8 @@
 // the launch wizard's step 3 and the in-game Devices modal.
 // Design: project_selfregister_team_device_assignment.
 
+import { Check } from 'lucide-react';
+
 export interface RegTeamDef {
   /** 1-based team_number - the value stored in the assignment map. */
   number: number;
@@ -38,12 +40,16 @@ export function RegAssignChips({ teams, value, onToggle, disabled, trailing }: R
               e.stopPropagation();
               onToggle(t.number);
             }}
-            className={`px-2 py-0.5 rounded-full border text-xs transition disabled:opacity-50 disabled:cursor-not-allowed ${
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-xs transition disabled:opacity-50 disabled:cursor-not-allowed ${
               selected
-                ? 'border-[var(--pg-accent-line)] bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)]'
-                : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)] hover:border-[var(--pg-line-strong)]'
+                // Assigned = solid, high-contrast, ticked. The old accent-tint
+                // treatment read as "slightly red text" and operators couldn't
+                // tell at a glance which station registers which team.
+                ? 'border-[var(--pg-accent)] bg-[var(--pg-accent)] text-white font-semibold shadow-sm'
+                : 'border-[var(--pg-line)] bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)] opacity-70 hover:opacity-100 hover:border-[var(--pg-line-strong)]'
             }`}
           >
+            {selected && <Check size={12} strokeWidth={3} />}
             {t.name}
           </button>
         );

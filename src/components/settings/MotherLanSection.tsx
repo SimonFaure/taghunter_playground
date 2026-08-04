@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Wifi, WifiOff, Copy, Check, Loader2, Trash2, Monitor, Smartphone, Tablet, Router, Crown,
+  Wifi, WifiOff, Copy, Check, Loader2, Router,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { listActiveLaunchedGames, queueBecomeMotherCommand } from '../../services/launchedGames';
 import {
   hotspotStatus, startHotspot, stopHotspot, refreshMdns,
-  listPendingPairRequests, approvePairRequest, denyPairRequest,
-  listPairedDevices, revokePairedDevice,
-  formatLanTime, isRecent, displayDeviceLabel,
-  type HotspotStatus, type PendingPairRequest, type PairedDeviceRow,
+  type HotspotStatus,
 } from '../../services/lanPairing';
 import {
   getNetworkSource, setNetworkSource, getRouterCreds, saveRouterCreds,
@@ -37,15 +33,6 @@ export function MotherLanSection() {
   const [hotspotErr, setHotspotErr] = useState<string | null>(null);
   const [copied, setCopied] = useState<'ssid' | 'password' | null>(null);
 
-  const [pending, setPending] = useState<PendingPairRequest[]>([]);
-  const [paired, setPaired] = useState<PairedDeviceRow[]>([]);
-  const [busyReqId, setBusyReqId] = useState<number | null>(null);
-  const [revokingId, setRevokingId] = useState<number | null>(null);
-  // Active launched game (for the per-device "Make mother" handover button) and
-  // which device a handover is being queued to.
-  const [activeGameId, setActiveGameId] = useState<number | null>(null);
-  const [makingMotherId, setMakingMotherId] = useState<number | null>(null);
-
   // Network source: create the LAN with this device's hotspot, or ride on an
   // external router. Only drives which host UI is shown - the pairing/discovery
   // stack works identically either way.
@@ -54,17 +41,7 @@ export function MotherLanSection() {
   const [routerPassword, setRouterPassword] = useState('');
 
   const refresh = useCallback(async () => {
-    const [st, pend, dev, games] = await Promise.all([
-      hotspotStatus().catch(() => null),
-      listPendingPairRequests().catch(() => [] as PendingPairRequest[]),
-      listPairedDevices().catch(() => [] as PairedDeviceRow[]),
-      listActiveLaunchedGames().catch(() => []),
-    ]);
-    setStatus(st);
-    setPending(pend);
-    setPaired(dev);
-    // Most-recent active game is the handover target's game.
-    setActiveGameId(games[0]?.id ?? null);
+    setStatus(await hotspotStatus().catch(() => null));
   }, []);
 
   useEffect(() => {
@@ -186,43 +163,6 @@ export function MotherLanSection() {
       setCopied(which);
       setTimeout(() => setCopied((c) => (c === which ? null : c)), 1500);
     } catch { /* clipboard may be unavailable */ }
-  }
-
-  async function approve(id: number) {
-    setBusyReqId(id);
-    try { await approvePairRequest(id); await refresh(); }
-    finally { setBusyReqId(null); }
-  }
-  async function deny(id: number) {
-    setBusyReqId(id);
-    try { await denyPairRequest(id); await refresh(); }
-    finally { setBusyReqId(null); }
-  }
-  async function revoke(d: PairedDeviceRow) {
-    if (!window.confirm(t('revokeConfirm'))) return;
-    setRevokingId(d.id);
-    try { await revokePairedDevice(d.id); await refresh(); }
-    finally { setRevokingId(null); }
-  }
-  // Planned handover: tell a paired device to take over as the mother for the
-  // active game. It adopts its cached snapshot and promotes; this device yields.
-  async function makeMother(d: PairedDeviceRow) {
-    if (activeGameId == null) return;
-    if (!window.confirm(t('makeMotherConfirm', {
-      defaultValue:
-        'Hand the game over to this device? It becomes the mother and the other devices reconnect to it.',
-    }))) return;
-    setMakingMotherId(d.id);
-    try {
-      await queueBecomeMotherCommand(d.id, activeGameId);
-    } catch (e) {
-      window.alert(t('makeMotherError', {
-        defaultValue: 'Could not hand over: {{message}}',
-        message: (e as Error).message,
-      }));
-    } finally {
-      setMakingMotherId(null);
-    }
   }
 
   return (
@@ -393,104 +333,15 @@ export function MotherLanSection() {
                        : running ? <WifiOff className="w-4 h-4" /> : <Wifi className="w-4 h-4" />}
           {running ? t('stopHotspot') : t('startHotspot')}
         </button>
-
-        <div className="mt-4 text-xs text-[var(--pg-text-dim)] space-y-1">
-          <p className="font-medium text-[var(--pg-text-muted)]">{t('joinHelpTitle')}</p>
-          <p>{t('joinHelpBody')}</p>
-          <p className="text-[var(--pg-text-dim)]">{t('joinHelpBand')}</p>
-        </div>
       </div>
       )}
 
-      {/* ── Pending requests ── */}
-      {pending.length > 0 && (
-        <div className="pg-panel border-[var(--pg-accent-line)]">
-          <h3 className="pg-panel-title mb-3">{t('pendingTitle')}</h3>
-          <div className="space-y-2">
-            {pending.map((r) => {
-              const Icon = osIcon(r.peer_os);
-              const busy = busyReqId === r.id;
-              return (
-                <div key={r.id} className="flex items-center gap-3 p-3 rounded-lg bg-[var(--pg-bg)] border border-[var(--pg-line)]">
-                  <Icon className="w-5 h-5 text-[var(--pg-text-muted)] shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[var(--pg-text)] font-medium truncate">{r.peer_label || t('unknownDevice')}</div>
-                    <div className="text-xs text-[var(--pg-text-dim)]">
-                      {[r.peer_os, r.peer_app_version && `app ${r.peer_app_version}`].filter(Boolean).join(' · ')}
-                      {` · ${t('requestedAt', { time: formatLanTime(r.created_at) })}`}
-                    </div>
-                  </div>
-                  <button onClick={() => approve(r.id)} disabled={busy}
-                    className="px-3 py-1.5 rounded-lg bg-green-600 text-white hover:bg-green-500 text-sm flex items-center gap-1 disabled:opacity-50">
-                    {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}{t('approve')}
-                  </button>
-                  <button onClick={() => deny(r.id)} disabled={busy}
-                    className="px-3 py-1.5 rounded-lg text-red-300 hover:bg-red-500/20 text-sm disabled:opacity-50">
-                    {t('deny')}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      {/* Pending-requests panel retired: same-client devices auto-pair with no
+          operator tap, and cross-client devices are flat-denied by the mother
+          (move them between clients in studio instead). */}
 
-      {/* ── Paired devices ── */}
-      <div>
-        <h3 className="pg-panel-title mb-3">{t('pairedTitle')}</h3>
-        {paired.length === 0 ? (
-          <div className="text-[var(--pg-text-dim)] text-sm py-4">{t('pairedEmpty')}</div>
-        ) : (
-          <div className="space-y-2">
-            {paired.map((d) => {
-              const Icon = osIcon(d.peer_os);
-              const online = d.is_self || isRecent(d.last_seen_at);
-              return (
-                <div key={d.id} className={`p-4 rounded-xl border flex items-center gap-4 ${
-                  d.is_self ? 'bg-[var(--pg-accent-tint)] border-[var(--pg-accent-line)]' : 'bg-[var(--pg-surface)] border-[var(--pg-line)]'}`}>
-                  <Icon className="w-6 h-6 text-[var(--pg-text-muted)] shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[var(--pg-text)] font-medium truncate">
-                        {displayDeviceLabel(d.peer_label) || (d.is_self ? t('thisDevice') : t('unknownDevice'))}
-                      </span>
-                      {d.is_self && (
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)] border border-[var(--pg-accent-line)]">
-                          {t('thisDevice')}
-                        </span>
-                      )}
-                      <span className={`text-xs px-2 py-0.5 rounded-full border ${
-                        online ? 'bg-green-500/20 text-green-300 border-green-500/40'
-                               : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
-                        {online ? t('online') : t('offline')}
-                      </span>
-                    </div>
-                    <div className="text-xs text-[var(--pg-text-dim)] mt-1">
-                      {d.peer_os}
-                      {d.last_seen_at && ` · ${t('lastSeen', { time: formatLanTime(d.last_seen_at) })}`}
-                    </div>
-                  </div>
-                  {!d.is_self && online && activeGameId != null && (
-                    <button onClick={() => makeMother(d)} disabled={makingMotherId === d.id}
-                      title={t('makeMother', { defaultValue: 'Make this device the mother' })}
-                      className="px-2.5 py-1.5 rounded-lg text-yellow-300 hover:bg-yellow-500/15 disabled:opacity-50 flex items-center gap-1.5 text-sm">
-                      {makingMotherId === d.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crown className="w-4 h-4" />}
-                      {t('makeMotherBtn', { defaultValue: 'Make mother' })}
-                    </button>
-                  )}
-                  {!d.is_self && (
-                    <button onClick={() => revoke(d)} disabled={revokingId === d.id}
-                      title={t('revoke')}
-                      className="p-2 rounded-lg text-red-300 hover:bg-red-500/20 disabled:opacity-50">
-                      {revokingId === d.id ? <Loader2 className="w-5 h-5 animate-spin" /> : <Trash2 className="w-5 h-5" />}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      {/* Paired-devices list moved to PairedDevicesPanel (top of the Network
+          tab); the firewall panel moved into the Advanced section below. */}
     </div>
   );
 }
@@ -520,16 +371,4 @@ function CredField({
       {copied && <div className="text-[10px] text-green-400 mt-0.5">{copiedLabel}</div>}
     </div>
   );
-}
-
-function osIcon(os: string | null) {
-  switch ((os ?? '').toLowerCase()) {
-    case 'ios':
-    case 'android':
-      return Smartphone;
-    case 'ipados':
-      return Tablet;
-    default:
-      return Monitor;
-  }
 }

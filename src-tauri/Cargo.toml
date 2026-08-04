@@ -13,8 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Compiles the WebView2 inspector (DevTools) into the binary AND auto-opens it
 # at boot (see the #[cfg(feature = "devtools")] block in lib.rs setup). OFF for
 # stable/production bundles - DevTools is stripped out. The Tester channel build
-# is produced with `tauri build --features devtools`, so QA devices can inspect
-# the running app. Re-exports tauri's own `devtools` feature.
+# is produced with `npm run tauri:build:test` (= VITE_QA_HARNESS=1 +
+# `tauri build --features devtools`): the env var keeps the window.__* QA
+# harnesses in the JS bundle (main.tsx gates them), the feature keeps DevTools
+# to invoke them from. Re-exports tauri's own `devtools` feature.
 devtools = ["tauri/devtools"]
 
 [build-dependencies]

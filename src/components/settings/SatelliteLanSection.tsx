@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Search, Loader2, Trash2, Radio, X, Wifi } from 'lucide-react';
+import { Search, Loader2, Trash2, Radio, X, Wifi, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   discoverOtherMothers, listPairedMothers, forgetPairedMother, joinMother,
@@ -8,9 +8,14 @@ import {
 } from '../../services/lanPairing';
 import { useMotherConnection } from '../../services/motherConnection';
 import { runAutoConnect, resolveConsent } from '../../services/wifiAutoConnect';
-import { getStudioHotspots, type HotspotCreds } from '../../services/lanCredentials';
+import { isStuckOnApipa } from '../../services/wifi';
+import {
+  listJoinable, addManual, remove as removeNetwork,
+  type WifiNetworkRow,
+} from '../../services/wifiNetworksStore';
 import { WifiAutoConnectPrompt } from '../WifiAutoConnectPrompt';
 import { WifiQr } from './WifiQr';
+import { StepByStepConnect } from './StepByStepConnect';
 import { HelpDot } from '../../help';
 
 type Msg = { kind: 'ok' | 'err'; text: string };
@@ -30,9 +35,19 @@ export function SatelliteLanSection() {
   // attempt the join. Reflected into `msg` on success/failure.
   const [consentSsid, setConsentSsid] = useState<string | null>(null);
   const [autoBusy, setAutoBusy] = useState(false);
-  // The studio-synced hotspot(s) this device should be ON to reach the mother.
-  // Shown read-only here so the operator can see/scan the network to join.
-  const [motherWifi, setMotherWifi] = useState<HotspotCreds[]>([]);
+  // The network(s) this device can join to reach the mother: studio-synced
+  // hotspots plus any the operator typed in by hand. Studio rows are read-only;
+  // manual rows can be deleted.
+  const [motherWifi, setMotherWifi] = useState<WifiNetworkRow[]>([]);
+  // "Add a network" form (shown so a device whose creds never synced can still
+  // be told which Wi-Fi to join).
+  const [addSsid, setAddSsid] = useState('');
+  const [addPassword, setAddPassword] = useState('');
+  const [addBusy, setAddBusy] = useState(false);
+
+  const refreshWifi = useCallback(async () => {
+    setMotherWifi(await listJoinable().catch(() => []));
+  }, []);
 
   const refreshPaired = useCallback(async () => {
     setPaired(await listPairedMothers().catch(() => []));
@@ -46,11 +61,37 @@ export function SatelliteLanSection() {
 
   useEffect(() => {
     void refreshPaired();
-    void getStudioHotspots().then(setMotherWifi).catch(() => setMotherWifi([]));
-    // Join-context auto-connect: allowed to surface the one-time consent prompt.
-    void runAutoConnect({ allowPrompt: true }).then(applyAutoResult).catch(() => {});
+    void refreshWifi();
+    // No auto-connect on open: the Step-by-step section drives connection by hand
+    // (the operator runs each step). applyAutoResult is still used by the manual
+    // "add a network" action below, which joins the network the operator just typed.
     return () => joinRef.current?.cancel();
-  }, [refreshPaired, applyAutoResult]);
+  }, [refreshPaired, refreshWifi]);
+
+  const addNetwork = useCallback(async () => {
+    const ssid = addSsid.trim();
+    const password = addPassword;
+    if (!ssid || password.length < 8) return;
+    setAddBusy(true);
+    setMsg(null);
+    try {
+      await addManual(ssid, password);
+      setAddSsid('');
+      setAddPassword('');
+      await refreshWifi();
+      // Try to join it right away so the operator doesn't have to hunt for it in
+      // the OS Wi-Fi list; the auto-connect engine picks up the freshly-added row.
+      const r = await runAutoConnect({ allowPrompt: true });
+      applyAutoResult(r);
+    } finally {
+      setAddBusy(false);
+    }
+  }, [addSsid, addPassword, refreshWifi, applyAutoResult]);
+
+  const deleteNetwork = useCallback(async (ssid: string) => {
+    await removeNetwork(ssid);
+    await refreshWifi();
+  }, [refreshWifi]);
 
   const answerConsent = useCallback(async (consent: boolean) => {
     if (!consentSsid) return;
@@ -113,9 +154,21 @@ export function SatelliteLanSection() {
       case 'timeout':
         setMsg({ kind: 'err', text: t('joinTimeout', { label }) });
         break;
-      case 'unreachable':
-        setMsg({ kind: 'err', text: t('joinError', { message: outcome.message }) });
+      case 'unreachable': {
+        // Discovery worked (we tapped a mother we could see) but the TCP connect
+        // was refused/timed out. Diagnose the usual cause instead of dumping the
+        // raw "error sending request" string: a child stuck on APIPA can't route
+        // to the mother's subnet; otherwise it's almost always the MOTHER's
+        // firewall blocking inbound connections.
+        const apipa = await isStuckOnApipa().catch(() => false);
+        setMsg({
+          kind: 'err',
+          text: apipa
+            ? t('joinUnreachableSubnet', { label })
+            : t('joinUnreachableFirewall', { label }),
+        });
         break;
+      }
     }
   }
 
@@ -140,6 +193,10 @@ export function SatelliteLanSection() {
 
   return (
     <div className="space-y-6">
+      {/* ── Step-by-step manual connection (connect → search → ping). The primary,
+          hand-driven path to reach a mother; nothing here fires automatically. ── */}
+      <StepByStepConnect />
+
       {/* ── Mother's Wi-Fi (the network this device must be ON to reach the
           mother). Studio-defined, synced to every device; read-only here so the
           operator can verify/scan it. ── */}
@@ -151,7 +208,7 @@ export function SatelliteLanSection() {
         <p className="text-sm text-[var(--pg-text-dim)] mb-4">{t('motherWifiHint')}</p>
         {motherWifi.length === 0 ? (
           <div className="text-xs text-[var(--pg-text-dim)] bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-lg p-3">
-            {t('noStudioHotspot')}
+            {t('noStudioHotspotAdd')}
           </div>
         ) : (
           <div className="space-y-4">
@@ -162,12 +219,56 @@ export function SatelliteLanSection() {
                   <div className="font-mono text-[var(--pg-text)] truncate">{h.ssid}</div>
                   <div className="text-xs text-[var(--pg-text-dim)] mt-2">{t('passwordLabel')}</div>
                   <div className="font-mono text-[var(--pg-text)] truncate">{h.password}</div>
+                  {h.origin === 'manual' && (
+                    <div className="text-[10px] uppercase tracking-wide text-[var(--pg-text-dim)] mt-1">
+                      {t('manualBadge')}
+                    </div>
+                  )}
                 </div>
-                <WifiQr ssid={h.ssid} password={h.password} />
+                <div className="flex items-center gap-2">
+                  <WifiQr ssid={h.ssid} password={h.password} />
+                  {h.origin === 'manual' && (
+                    <button onClick={() => void deleteNetwork(h.ssid)} title={t('removeNetwork')}
+                      className="p-2 rounded-lg text-red-300 hover:bg-red-500/20">
+                      <Trash2 className="w-5 h-5" />
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
         )}
+
+        {/* ── Add a network by hand (studio creds not synced, or a different
+            venue Wi-Fi). Saved locally, auto-consented so the device joins it. ── */}
+        <div className="mt-4 pt-4 border-t border-[var(--pg-line)]">
+          <div className="text-xs text-[var(--pg-text-dim)] mb-2">{t('addNetworkTitle')}</div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              value={addSsid}
+              onChange={(e) => setAddSsid(e.target.value)}
+              placeholder={t('ssidLabel')}
+              className="pg-input flex-1"
+            />
+            <input
+              type="text"
+              value={addPassword}
+              onChange={(e) => setAddPassword(e.target.value)}
+              placeholder={t('passwordLabel')}
+              className="pg-input flex-1"
+            />
+            <button
+              onClick={() => void addNetwork()}
+              disabled={addBusy || !addSsid.trim() || addPassword.length < 8}
+              className="pg-btn"
+            >
+              {addBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+              {t('addNetwork')}
+            </button>
+          </div>
+          <div className="text-[11px] text-[var(--pg-text-dim)] mt-1">{t('addNetworkHint')}</div>
+        </div>
       </div>
 
       {/* ── Currently paired mothers ── */}
@@ -276,6 +377,8 @@ export function SatelliteLanSection() {
           </div>
         )}
       </div>
+
+      {/* Firewall panel moved into the Advanced section (see LanDevicesPanel). */}
 
       {consentSsid && (
         <WifiAutoConnectPrompt ssid={consentSsid} busy={autoBusy} onAnswer={answerConsent} />

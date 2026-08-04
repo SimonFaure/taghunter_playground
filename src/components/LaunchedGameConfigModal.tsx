@@ -479,7 +479,8 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                   <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:malusPerMinuteHint')}</p>
                 </div>
                 {/* Clues page on team return - toggle + sub-options (mirrors the launch modal). */}
-                <div className="pt-3 border-t border-[var(--pg-line)]">
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:tracksCluesSectionTitle')}</h3>
                   <label className="flex items-start gap-2 text-sm">
                     <input
                       type="checkbox"

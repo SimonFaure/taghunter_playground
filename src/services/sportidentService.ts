@@ -388,7 +388,7 @@ export const sportidentService = new SportIdentService();
 
 // ─── isReaderConnected: fast "is a dongle plugged in?" probe ───────
 //
-// Footer.tsx polls this every 10 s for its green/red status dot. Lives
+// TopbarStatus.tsx polls this every 10 s for its green/red status dot. Lives
 // here rather than as a `SportIdentService` method because it
 // deliberately doesn't open the port - just enumerates and looks for the
 // SI BSF7/BSF8/BSM8 USB descriptor.

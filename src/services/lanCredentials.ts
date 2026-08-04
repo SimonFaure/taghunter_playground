@@ -1,6 +1,6 @@
-// Shared default credentials for the LAN Wi-Fi hotspot. Used by the operator
-// "Network / devices" UI and the DevTools hotspot harness so both generate
-// QR-safe SSIDs/passwords the same way.
+// Default-credential generators for the LAN Wi-Fi hotspot. Production creds
+// are studio-authored (see getPreferredHotspotCreds below); the generators
+// survive only for the DevTools hotspot harness (lanHotspotTest.ts).
 //
 // The alphabet deliberately excludes characters that need escaping in the
 // `WIFI:` QR format and the visually-ambiguous I/O/l/0/1, matching the
@@ -59,21 +59,15 @@ async function writeMeta(key: string, value: string): Promise<void> {
   );
 }
 
-/** Persist the operator's chosen hotspot credentials. */
+/**
+ * Persist the hotspot credentials this device is actually broadcasting.
+ * These schema_meta keys are the "currently on air" mirror read by the Rust
+ * ping relay (read_mother_wifi) so satellites learn the live SSID/password.
+ * The creds themselves are studio-authored (see getPreferredHotspotCreds) -
+ * the old generate-on-device path is gone.
+ */
 export async function saveHotspotCreds(ssid: string, password: string): Promise<void> {
   await Promise.all([writeMeta(SSID_KEY, ssid), writeMeta(PASSWORD_KEY, password)]);
-}
-
-/**
- * Return the persisted hotspot credentials, generating + saving a stable pair
- * on first use. Subsequent calls (and app restarts) return the same values.
- */
-export async function getOrCreateHotspotCreds(): Promise<HotspotCreds> {
-  const [ssid, password] = await Promise.all([readMeta(SSID_KEY), readMeta(PASSWORD_KEY)]);
-  if (ssid && password) return { ssid, password };
-  const creds = { ssid: ssid || defaultSsid(), password: password || defaultPassword() };
-  await saveHotspotCreds(creds.ssid, creds.password);
-  return creds;
 }
 
 // ─── network source (hotspot vs external router) ─────────────────────────────
@@ -147,17 +141,37 @@ export async function setPreferredHotspotSsid(ssid: string): Promise<void> {
 /**
  * Resolve the hotspot creds this device's mother should raise: the preferred one
  * if the operator picked it (and it's still synced), else the first studio
- * hotspot. Returns null when studio hasn't defined a hotspot for this client yet
- * (a brand-new client before its first sync) - the caller skips raising an AP.
- * Studio is the sole author; we never fall back to auto-generating creds.
+ * hotspot. Studio stays the author of record - but when NO studio hotspot has
+ * ever synced (fresh install provisioned offline, or studio's lan_networks
+ * fail-opened to version 0), fall back to an operator-typed manual network so
+ * the venue can still get an AP with zero studio contact. That mirrors the
+ * child side, which has had a manual "Add a network" escape hatch all along.
+ * Children learn whatever SSID the mother actually broadcasts via the ping
+ * relay, and when studio creds later sync they win again (the SSID-mismatch
+ * restart in raiseMotherHotspotIfConfigured migrates the fleet automatically).
+ * Returns null only when there is neither. We still never auto-generate creds.
  */
 export async function getPreferredHotspotCreds(): Promise<HotspotCreds | null> {
-  const hotspots = await getStudioHotspots();
-  if (hotspots.length === 0) return null;
   const preferred = await getPreferredHotspotSsid();
-  if (preferred) {
-    const match = hotspots.find((h) => h.ssid === preferred);
-    if (match) return match;
+  const hotspots = await getStudioHotspots();
+  if (hotspots.length > 0) {
+    if (preferred) {
+      const match = hotspots.find((h) => h.ssid === preferred);
+      if (match) return match;
+    }
+    return hotspots[0];
   }
-  return hotspots[0];
+  const manual = (await listWifiNetworks()).filter(
+    (r) =>
+      r.origin === 'manual' &&
+      r.source !== 'router' &&
+      // Pre-filter what the Rust validator would reject anyway (WPA2 bounds),
+      // so a typo'd row doesn't wedge the raise path in a fail-retry loop.
+      r.password.length >= 8 &&
+      r.password.length <= 63
+  );
+  if (manual.length === 0) return null;
+  const match = preferred ? manual.find((h) => h.ssid === preferred) : undefined;
+  const pick = match ?? manual[0];
+  return { ssid: pick.ssid, password: pick.password };
 }

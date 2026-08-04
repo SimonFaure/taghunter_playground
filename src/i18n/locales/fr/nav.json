@@ -9,6 +9,13 @@
   "exitAdmin": "Quitter admin",
   "logoScreen": "Écran logo",
   "lock": "Verrouiller",
+  "motherThisDevice": "Cet appareil est la mère",
+  "motherConnected": "Cet appareil est connecté à la mère",
+  "motherConnectedTo": "Cet appareil est connecté à la mère : {{label}}",
+  "motherNotConnected": "Cet appareil n'est pas connecté à la mère",
+  "readerOk": "Lecteur SI connecté",
+  "readerKo": "Lecteur SI non détecté",
+  "readerChecking": "Vérification du lecteur…",
   "testChannelBadge": "TEST",
   "testChannelHint": "Cet appareil est un testeur : il télécharge les mises à jour depuis le canal de test."
 }

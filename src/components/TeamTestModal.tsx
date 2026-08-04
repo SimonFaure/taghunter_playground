@@ -9,6 +9,7 @@ import {
   recordPunch,
   updateTeam,
 } from '../services/launchedGames';
+import { buildMediaMap } from '../utils/questMedia';
 
 interface TeamTestModalProps {
   gameId: number;
@@ -151,10 +152,10 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
         const gdjRaw = (await scenarioStore.getGameData(state.game_uniqid)) as any;
         const gdj = gdjRaw?.game_data ?? gdjRaw;
         if (gdj) {
-          const rawQuests: any[] = gdj?.quests || gdj?.game_quests || [];
+          const rawQuestsSrc = gdj?.quests || gdj?.game_quests || [];
+          const rawQuests: any[] = Array.isArray(rawQuestsSrc) ? rawQuestsSrc : Object.values(rawQuestsSrc);
           const stripMedia = (name: string) => name.replace(/^media[/\\]/i, '').replace(/^media[/\\]/i, '');
-          const mediaImages: Array<{ id: string; file_name: string }> = gdj?.game_media_images || [];
-          const mediaMap = new Map(mediaImages.map((m) => [String(m.id), stripMedia(m.file_name)]));
+          const mediaMap = buildMediaMap(gdj?.game_media_images, stripMedia);
 
           const parsedQuests: Quest[] = rawQuests.map((q: any, idx: number) => {
             const images: QuestImage[] = [];

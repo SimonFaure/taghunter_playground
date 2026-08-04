@@ -1,7 +1,8 @@
 {
   "errors": {
     "requestFailed": "Request failed ({{status}})",
-    "generic": "Something went wrong. Please try again."
+    "generic": "Something went wrong. Please try again.",
+    "offlineFirstLogin": "No internet connection to the TagHunter server. This device must be set up online at least once before you take it to a venue - connect to the internet and sign in, then it works offline on site."
   },
   "provider": {
     "loading": "Loading…"

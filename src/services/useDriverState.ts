@@ -1,7 +1,7 @@
 // React hook that exposes the auto-detected CP210x driver state.
 //
 // Mirrors useDetectedReaderPort: runs detection on mount, re-runs on the
-// 'reader:status' window event that Footer.tsx emits every 10s when its
+// 'reader:status' window event that TopbarStatus.tsx emits every 10s when its
 // isReaderConnected poll flips. This way the USB driver screen and the
 // Hardware tab both react to hotplug without each running its own poll.
 //

@@ -9,6 +9,8 @@ import { listen } from '@tauri-apps/api/event';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { resolveVideosByKind, type VideoSource } from '../services/videoResolution';
 import { getLaunchedGameState } from '../services/launchedGames';
+import { pointLaunchedGamesAtMother } from '../services/lanMotherBoot';
+import { getPairedMother } from '../services/lanPairing';
 import { onLocalVideoCommand } from '../services/localVideoStore';
 import { pushOverlay, popOverlay } from '../services/screenState';
 import { waitForPresentationIdle } from '../services/presentationGate';
@@ -21,6 +23,8 @@ interface LanCommand {
     kinds?: Array<'intro' | 'tutorial'>;
     language?: string;
   };
+  mother_uuid?: string;
+  mother_addr?: string;
 }
 
 export function OperatorVideoOverlay() {
@@ -74,6 +78,20 @@ export function OperatorVideoOverlay() {
           const kinds = cmd.payload.kinds ?? [];
           const language = cmd.payload.language ?? 'fr';
           if (!gid || kinds.length === 0) return;
+          // The pushed game lives in the PUSHING mother's SQLite. Repoint our
+          // launched_games traffic there before the state fetch (same as App's
+          // join_game handler): the ambient route may have been restored to
+          // this device's own local server, where `gid` either doesn't exist
+          // (fetch throws -> silent abort) or collides with a DIFFERENT local
+          // game whose scenario resolves no videos.
+          if (cmd.mother_uuid && cmd.mother_addr) {
+            try {
+              const m = await getPairedMother(cmd.mother_uuid);
+              if (m) pointLaunchedGamesAtMother(`http://${cmd.mother_addr}`, m.peer_secret);
+            } catch (err) {
+              console.warn('[OperatorVideoOverlay] mother repoint failed:', err);
+            }
+          }
           // Look up game_uniqid + game_type from the launched_game so we know
           // which scenario to resolve videos against. One-shot fetch - the
           // game's identity doesn't change after creation.
