@@ -200,17 +200,17 @@ export function StepByStepConnect() {
 
   const stepIcon = (phase: Phase) => {
     if (phase === 'busy') return <Loader2 className="w-5 h-5 animate-spin text-[var(--pg-accent-bright)]" />;
-    if (phase === 'ok') return <CheckCircle2 className="w-5 h-5 text-green-400" />;
-    if (phase === 'warn') return <AlertTriangle className="w-5 h-5 text-amber-400" />;
-    if (phase === 'err') return <AlertTriangle className="w-5 h-5 text-red-400" />;
+    if (phase === 'ok') return <CheckCircle2 className="w-5 h-5 text-[var(--pg-ok-icon)]" />;
+    if (phase === 'warn') return <AlertTriangle className="w-5 h-5 text-[var(--pg-warn-icon)]" />;
+    if (phase === 'err') return <AlertTriangle className="w-5 h-5 text-[var(--pg-danger-icon)]" />;
     return <Circle className="w-5 h-5 text-[var(--pg-text-dim)]" />;
   };
 
   const noteBox = (phase: 'ok' | 'warn' | 'err', node: React.ReactNode) => {
     const cls =
-      phase === 'ok' ? 'bg-green-500/15 border-green-500/40 text-green-200'
-      : phase === 'warn' ? 'bg-amber-500/15 border-amber-500/40 text-amber-200'
-      : 'bg-red-500/15 border-red-500/40 text-red-300';
+      phase === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+      : phase === 'warn' ? 'bg-[var(--pg-warn-bg)] border-[var(--pg-warn-line)] text-[var(--pg-warn-text)]'
+      : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]';
     return <div className={`mt-3 text-sm rounded-lg p-2 border ${cls}`}>{node}</div>;
   };
 
@@ -225,7 +225,7 @@ export function StepByStepConnect() {
       <p className="text-sm text-[var(--pg-text-dim)] mb-4">{t('stepIntro')}</p>
 
       {role?.isHotspot && (
-        <div className="mb-4 text-sm rounded-lg p-3 border bg-amber-500/15 border-amber-500/40 text-amber-200 flex items-start gap-2">
+        <div className="mb-4 text-sm rounded-lg p-3 border bg-[var(--pg-warn-bg)] border-[var(--pg-warn-line)] text-[var(--pg-warn-text)] flex items-start gap-2">
           <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
           <span>{t('stepSelfHotspotWarn')}</span>
         </div>
@@ -273,7 +273,7 @@ export function StepByStepConnect() {
                       {target.password}
                       <button onClick={() => void copyPw()} title={t('copy')}
                         className="p-1 rounded text-[var(--pg-text-dim)] hover:bg-[var(--pg-surface-3)]">
-                        {copied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+                        {copied ? <Check className="w-3.5 h-3.5 text-[var(--pg-ok-icon)]" /> : <Copy className="w-3.5 h-3.5" />}
                       </button>
                     </span>
                   </div>
@@ -289,7 +289,7 @@ export function StepByStepConnect() {
                   {staticBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Pin className="w-4 h-4" />}
                   {t('stepForceIpBtn')}
                 </button>
-                {step1.detail && <div className="text-red-300">{step1.detail}</div>}
+                {step1.detail && <div className="text-[var(--pg-danger-text)]">{step1.detail}</div>}
               </div>
             ))}
             {step1.phase === 'err' && noteBox('err', step1.detail)}
@@ -368,10 +368,10 @@ export function StepByStepConnect() {
                       </div>
 
                       {pr?.phase === 'ok' && (
-                        <div className="mt-2 text-sm rounded-lg p-2 border bg-green-500/15 border-green-500/40 text-green-200 space-y-2">
+                        <div className="mt-2 text-sm rounded-lg p-2 border bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)] space-y-2">
                           <div>{t('stepPingOk', { addr: pr.probe?.reached_addr ?? '', ms: pr.probe?.latency_ms ?? '?' })}</div>
                           {joining ? (
-                            <span className="text-xs text-green-200/80 flex items-center gap-1">
+                            <span className="text-xs text-[var(--pg-ok-text)] flex items-center gap-1">
                               <Loader2 className="w-4 h-4 animate-spin" /> {t('waitingApproval', { label: labelOf(m) })}
                             </span>
                           ) : (
@@ -383,7 +383,7 @@ export function StepByStepConnect() {
                         </div>
                       )}
                       {pr?.phase === 'err' && (
-                        <div className="mt-2 text-sm rounded-lg p-2 border bg-red-500/15 border-red-500/40 text-red-300 space-y-1">
+                        <div className="mt-2 text-sm rounded-lg p-2 border bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)] space-y-1">
                           <div>{t(
                             pr.probe?.category === 'refused' ? 'stepPingFailRefused'
                             : pr.probe?.category === 'unreachable' ? 'stepPingFailUnreachable'
@@ -405,8 +405,8 @@ export function StepByStepConnect() {
 
             {joinMsg && (
               <div className={`mt-3 text-sm rounded-lg p-2 border ${
-                joinMsg.kind === 'ok' ? 'bg-green-500/15 border-green-500/40 text-green-300'
-                                      : 'bg-red-500/15 border-red-500/40 text-red-300'}`}>
+                joinMsg.kind === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+                                      : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'}`}>
                 {joinMsg.text}
               </div>
             )}

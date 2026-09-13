@@ -44,6 +44,7 @@
   "tracksCluesShowText": "Mostrar las descripciones de los puntos de control en la página de pistas",
   "tracksCluesShowImage": "Mostrar las imágenes de los puntos de control en la página de pistas",
   "routeDefault": "Todos los checkpoints",
+  "routeReverse": "Recorrido invertido",
   "routeFirstHalf": "Primera mitad",
   "routeLastHalf": "Última mitad",
   "routeOdd": "Puntos de control impares",

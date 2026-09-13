@@ -1,7 +1,7 @@
 {
-  "becomeMotherPromptTitle": "¿Hacer de este dispositivo la madre?",
-  "becomeMotherPromptBody": "No hay ningún dispositivo madre accesible en la red, así que este dispositivo se convertirá en la madre y alojará la partida. Los demás dispositivos podrán unirse a él.",
-  "becomeMotherPromptConfirm": "Ser la madre y lanzar",
+  "becomeMotherPromptTitle": "¿Alojar una nueva partida en este dispositivo?",
+  "becomeMotherPromptBody": "No hay ningún dispositivo madre accesible en la red, así que este dispositivo se convertirá en la madre y alojará una NUEVA partida. Los demás dispositivos podrán unirse a él. Para retomar una partida en curso cuya madre se apagó, use la banda roja «Retomar la partida».",
+  "becomeMotherPromptConfirm": "Alojar y lanzar una nueva partida",
   "save": "Guardar",
   "cancel": "Cancelar",
   "close": "Cerrar",

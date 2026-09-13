@@ -12,7 +12,8 @@ import {
 } from 'lucide-react';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
 import { GameTypeIcon } from './icons/GameTypeIcons';
-import { gameTypeLabel, audienceLabelKey, titleCaseSlug } from '../utils/labels';
+import { gameTypeLabel } from '../utils/labels';
+import { bandLabel, resolveBands, type AudienceBand } from '../utils/audienceBands';
 import * as scenarioStore from '../services/scenarioStore';
 
 interface GameType {
@@ -48,6 +49,7 @@ interface ParsedMeta {
   description: string;
   scenarioVersion: string | null;
   audience: string | null;
+  audienceBands: AudienceBand[];
   questCount: number | null;
   enigmaCount: number | null;
   pointsUnit: string | null;
@@ -156,6 +158,7 @@ function parseGameData(gd: unknown, fallbackDescription: string, lang: string): 
     description,
     scenarioVersion: typeof meta.scenario_version === 'string' ? meta.scenario_version : null,
     audience: typeof meta.game_public === 'string' ? meta.game_public : null,
+    audienceBands: resolveBands(meta.audience_bands, typeof meta.game_public === 'string' ? meta.game_public : null),
     questCount: questsArr ? questsArr.length : null,
     enigmaCount: toNumber(meta.number_of_enigmas) ?? (enigmasArr ? enigmasArr.length : null),
     pointsUnit: typeof meta.points_units === 'string' ? meta.points_units : null,
@@ -237,12 +240,11 @@ export function ScenarioDetailsModal({ scenario, thumbnailUrl, onClose, onDelete
         : row.remote_version
       : null;
 
-  // Human label for the scenario's audience (game_meta.game_public) - show the
-  // name, never the raw slug.
+  // Age ranges the scenario targets (game_meta.audience_bands) - the same six
+  // bands the studio catalog shows, not the coarse name-pool tier.
   const audienceLabel = (() => {
-    if (!meta?.audience) return null;
-    const key = audienceLabelKey(meta.audience);
-    return key ? t(`home:${key}`) : titleCaseSlug(meta.audience);
+    const bands = meta?.audienceBands ?? [];
+    return bands.length > 0 ? bands.map((b) => bandLabel(b, t)).join(' · ') : null;
   })();
 
   // Metadata tiles - only render the ones we actually have a value for.

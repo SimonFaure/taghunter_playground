@@ -30,6 +30,7 @@ import { getSyncedLayout } from './reportLayoutsStore';
 import { checkpointsForRoute, orderedHitCheckpointIds, type TracksCheckpoint } from './tracksScoring';
 import { getClashState, getClashMembers } from './clash';
 import {
+  MALUS_QUEST_NUMBER,
   comboBonusPoints,
   effectifWeights,
   isWeightingEnabled,
@@ -362,9 +363,17 @@ async function computeStatsByTeam(
     const pts6 = toInt(gd.gameMeta.combo_6_quests);
     const pts4 = toInt(gd.gameMeta.combo_4_quests);
     const pts2 = toInt(gd.gameMeta.combo_2_quests);
-    const byTeam = new Map<number, { score: number; count: number; counts: Record<string, number> }>();
+    const byTeam = new Map<number, { score: number; count: number; counts: Record<string, number>; malus: number }>();
     for (const r of questRows) {
-      const e = byTeam.get(r.team_id) ?? { score: 0, count: 0, counts: {} };
+      const e = byTeam.get(r.team_id) ?? { score: 0, count: 0, counts: {}, malus: 0 };
+      // Malus-station hits ride in the same table (see MALUS_QUEST_NUMBER) but
+      // are penalties: they are not quests, never feed combos, and come off the
+      // total unweighted.
+      if (r.quest_number === MALUS_QUEST_NUMBER) {
+        e.malus += Math.abs(r.points_awarded ?? 0);
+        byTeam.set(r.team_id, e);
+        continue;
+      }
       e.score += r.points_awarded ?? 0;
       e.count += 1;
       e.counts[r.quest_number] = (e.counts[r.quest_number] ?? 0) + 1;
@@ -377,9 +386,9 @@ async function computeStatsByTeam(
     const headcounts = teamHeadcounts(teams, cfg, memberCounts(members));
     const weights = isWeightingEnabled(meta) ? effectifWeights(headcounts) : null;
     for (const team of teams) {
-      const e = byTeam.get(team.id) ?? { score: 0, count: 0, counts: {} };
+      const e = byTeam.get(team.id) ?? { score: 0, count: 0, counts: {}, malus: 0 };
       const combos = comboBonusPoints(e.counts, pts6, pts4, pts2);
-      const total = weightedScore(e.score + combos, weights?.get(team.id) ?? 1);
+      const total = weightedScore(e.score + combos, weights?.get(team.id) ?? 1, e.malus);
       out.set(team.id, {
         score: total,
         stats: {

@@ -12,7 +12,14 @@
 
 import { Check, Play, Users } from 'lucide-react';
 import { type ClashStandings } from '../services/clash';
+import { tIngame } from '../i18n/ingame';
 import type { ClashClanVisual } from './ClashGameRenderer';
+
+/** Split marker for the two sentences that style part of themselves (the clan
+ *  name, the Start-game label). Interpolating a sentinel then splitting on it
+ *  keeps the translator's word order while letting us wrap that fragment in
+ *  its own <span>. NUL can never occur in a catalog string. */
+const SLOT = String.fromCharCode(0);
 
 interface ClashRegistrationScreenProps {
   standings: ClashStandings | null;
@@ -33,6 +40,9 @@ interface ClashRegistrationScreenProps {
    *  team_numbers - only they render, no switching off them. null ⇒ the
    *  legacy pick-any-clan grid. Design: project_selfregister_team_device_assignment. */
   assignedTeamNumbers?: number[] | null;
+  /** Language chosen at launch - every string on this screen resolves against
+   *  it, not against the operator's chrome language. */
+  lang: string;
 }
 
 function clanIsFull(memberCount: number, maxPerClan: number): boolean {
@@ -51,7 +61,10 @@ export function ClashRegistrationScreen({
   visualUrl,
   resolveMedia,
   assignedTeamNumbers = null,
+  lang,
 }: ClashRegistrationScreenProps) {
+  const tc = (key: string, vars?: Record<string, string | number>) =>
+    tIngame('ingame_clash', key, lang, vars);
   // Station assignment (self mode): a locked station renders only its clan(s).
   const restricted = mode === 'self' && assignedTeamNumbers != null;
   const clans = restricted
@@ -70,6 +83,12 @@ export function ClashRegistrationScreen({
         .map(resolveMedia);
 
   const lastJoinClan = lastJoin ? clanByTeamId[lastJoin.teamId] : undefined;
+
+  const startLabel = tc('start_game');
+  // Sentences that style one fragment: interpolate the sentinel, then split.
+  const [bipBefore, bipAfter = ''] =
+    selectedTeamId != null ? tc('bip_to_join', { clan: SLOT }).split(SLOT) : [''];
+  const [bulkBefore, bulkAfter = ''] = tc('bulk_footer', { start: SLOT }).split(SLOT);
 
   return (
     <div className="fixed inset-0 z-[100] flex flex-col bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white overflow-auto">
@@ -94,24 +113,23 @@ export function ClashRegistrationScreen({
 
       <div className="relative flex-1 max-w-5xl w-full mx-auto p-8 space-y-6">
         <div className="flex items-center justify-between">
-          <h1 className="text-3xl font-bold">Clan registration</h1>
-          <button onClick={onBack} className="text-sm text-white/60 hover:text-white">Back</button>
+          <h1 className="text-3xl font-bold">{tc('title')}</h1>
+          <button onClick={onBack} className="text-sm text-white/60 hover:text-white">{tc('back')}</button>
         </div>
 
         <p className="text-white/70">
           {restricted
             ? clans.length === 1
-              ? 'This station registers one clan only - players bip their chip here to join it.'
-              : 'This station registers the clans below only - pick one, then players bip their chip to join it.'
+              ? tc('intro_locked_one')
+              : tc('intro_locked_many')
             : mode === 'self'
-              ? 'Select a clan on this station, then players bip their chip to join it. Leave a station on one clan to use it as a dedicated join reader.'
-              : 'Clans were formed at launch (predetermined teams). Review the counts below, then start the game.'}
+              ? tc('intro_self')
+              : tc('intro_bulk')}
         </p>
 
         {restricted && clans.length === 0 && (
           <div className="rounded-xl border-2 border-amber-400 bg-amber-500/15 p-4 text-amber-200">
-            No clan matches this station's assignment - ask the operator to update it from the
-            Devices panel.
+            {tc('no_assigned_clan')}
           </div>
         )}
 
@@ -149,7 +167,7 @@ export function ClashRegistrationScreen({
                 )}
                 {full && (
                   <span className="absolute top-3 right-3 text-[10px] font-bold uppercase tracking-wider text-amber-300 border border-amber-300/60 rounded px-1.5 py-0.5">
-                    Full
+                    {tc('full')}
                   </span>
                 )}
                 {v?.logo ? (
@@ -165,7 +183,7 @@ export function ClashRegistrationScreen({
                   />
                 )}
                 <div className="text-2xl font-bold leading-tight break-words mb-4">
-                  {v?.name ?? `Clan ${c.team_number}`}
+                  {v?.name ?? tc('clan_fallback', { n: c.team_number })}
                 </div>
                 <div className="flex items-baseline justify-center gap-2 text-white">
                   <Users size={22} className="self-center opacity-60" />
@@ -196,9 +214,9 @@ export function ClashRegistrationScreen({
 
         {stationComplete && (
           <div className="rounded-xl border-2 border-green-400 bg-green-500/15 p-5 text-center">
-            <p className="text-2xl font-bold text-green-300">Registration complete on this station</p>
+            <p className="text-2xl font-bold text-green-300">{tc('station_complete')}</p>
             <p className="text-white/70 mt-1">
-              {clans.length === 1 ? 'The assigned clan is full.' : 'All assigned clans are full.'}
+              {clans.length === 1 ? tc('station_complete_one') : tc('station_complete_many')}
             </p>
           </div>
         )}
@@ -207,20 +225,21 @@ export function ClashRegistrationScreen({
           <div className="rounded-xl bg-slate-800/50 p-4 text-center">
             {selectedTeamId != null ? (
               <p className="text-lg">
-                Bip a chip to join{' '}
+                {bipBefore}
                 <span className="font-bold" style={{ color: clanByTeamId[selectedTeamId]?.color }}>
                   {clanByTeamId[selectedTeamId]?.name}
                 </span>
+                {bipAfter}
               </p>
             ) : (
-              <p className="text-white/60">Select a clan above to start enrolling players.</p>
+              <p className="text-white/60">{tc('select_clan_hint')}</p>
             )}
             {lastJoin && (
               <p className="mt-2 text-sm text-white/70">
-                {lastJoin.status === 'ok' && `Joined ${lastJoinClan?.name ?? ''} ✓`}
-                {lastJoin.status === 'clan_full' && 'Clan full - pick another clan'}
-                {lastJoin.status === 'already_in_clan' && 'Already in this clan'}
-                {lastJoin.status === 'already_in_other_clan' && 'Chip already belongs to another clan'}
+                {lastJoin.status === 'ok' && tc('join_ok', { clan: lastJoinClan?.name ?? '' })}
+                {lastJoin.status === 'clan_full' && tc('join_clan_full')}
+                {lastJoin.status === 'already_in_clan' && tc('join_already_in_clan')}
+                {lastJoin.status === 'already_in_other_clan' && tc('join_already_other_clan')}
               </p>
             )}
           </div>
@@ -229,8 +248,9 @@ export function ClashRegistrationScreen({
         {mode === 'bulk' && (
           <div className="rounded-xl bg-slate-800/50 p-4 text-center">
             <p className="text-lg">
-              Predetermined clans — chips were dealt at launch. The counts above are
-              final; press <span className="font-semibold">Start game</span> when ready.
+              {bulkBefore}
+              <span className="font-semibold">{startLabel}</span>
+              {bulkAfter}
             </p>
           </div>
         )}
@@ -241,7 +261,7 @@ export function ClashRegistrationScreen({
           onClick={onStart}
           className="inline-flex items-center gap-2 px-8 py-3 bg-green-600 hover:bg-green-700 rounded-xl text-lg font-semibold"
         >
-          <Play size={22} /> Start game
+          <Play size={22} /> {startLabel}
         </button>
       </div>
     </div>

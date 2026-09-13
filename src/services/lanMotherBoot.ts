@@ -148,9 +148,30 @@ export async function becomeMother(
   // over the hotspot's Public profile (one-time UAC). Fire-and-forget so the
   // promotion isn't blocked on the prompt.
   void ensureFirewallRuleOnce();
+  // A promoted device becomes a WILLING mother. Two things gate on this flag and
+  // both matter now: the boot path (so a restart mid-game re-hosts instead of
+  // going satellite) and - critically - motherHotspotWatchdogTick, which bails
+  // on `!beMotherWhenAvailable`. Without this, a promoted device whose AP failed
+  // to come up, or whose AP Windows later idles off, has NOTHING that re-raises
+  // it. GameList's "become mother and launch" path already does the same.
+  await loadConfig()
+    .then((cfg) => (cfg.beMotherWhenAvailable ? null : saveConfig({ ...cfg, beMotherWhenAvailable: true })))
+    .catch(() => null);
+  // Rust raises the AP once, inline. That single attempt is fragile precisely
+  // here: the Wi-Fi adapter is still reassociating to the SSID that just
+  // vanished, and Windows answers OperationInProgress / NetworkLimitedConnectivity.
+  // Retry through the idempotent raise routine, which also re-syncs the creds and
+  // re-announces mDNS on the AP subnet (start_mdns is INERT until an AP address
+  // exists, so without this the new mother stays undiscoverable).
+  let effective = info;
+  if (!info.hotspot_started && (await getNetworkSource().catch(() => 'hotspot')) === 'hotspot') {
+    await raiseMotherHotspotIfConfigured();
+    const st = await hotspotStatus().catch(() => null);
+    if (st?.running) effective = { ...info, hotspot_started: true, hotspot_error: null };
+  }
   // We're the mother now - clear the "unreachable" banner.
   notifyPromotedToMother();
-  return info;
+  return effective;
 }
 
 export interface TakeoverTarget {
@@ -177,9 +198,10 @@ export async function takeoverMother(target: TakeoverTarget): Promise<BecomeMoth
     port: target.port,
   });
   if (!ok) {
-    throw new Error(
-      'Could not fetch the current game state from the active mother - it may have just gone offline. Try again.'
-    );
+    // Thrown as an i18n KEY, not prose: this surfaces in the startup "Take back
+    // control?" prompt, which the operator reads in their own language.
+    // Retours Ludiom #75. See `failoverErrorText` for the render side.
+    throw new Error('failover:errSnapshotFetch');
   }
   return becomeMother(target.launched_game_id);
 }
@@ -198,6 +220,17 @@ export async function yieldToMother(target: TakeoverTarget): Promise<void> {
   // and two same-SSID APs is exactly what we want to avoid.
   await invoke('mother_stop_hotspot').catch(() => {});
 
+  // Forget that we were hosting, the way demoteFromMother does. Our server is
+  // stopped, so a remembered local route is a route to a dead port - and
+  // childControlLink's `restoreLocalLaunchedGames()` would happily reinstall it
+  // every 15s, dragging the games list back onto our own stale rows. That was
+  // half of "the game still showed as running on the old mother" (Ludiom #76).
+  // NOT touched: `beMotherWhenAvailable`. Being superseded is a temporary
+  // supersession, not the operator declaring this device a satellite.
+  bootPromise = null;
+  localInfo = null;
+  setLocalLaunchedGamesRoute(null);
+
   const secret = await invoke<string | null>('get_self_peer_secret').catch(() => null);
   if (secret) {
     pointLaunchedGamesAtMother(`http://${target.addr}:${target.port}`, secret);
@@ -208,6 +241,48 @@ export async function yieldToMother(target: TakeoverTarget): Promise<void> {
     }).catch(() => {});
     await invoke('client_refresh_mother_endpoints', { timeoutMs: 2500 }).catch(() => {});
   }
+
+  // The other half of #76: our local rows still describe the game as WE last
+  // knew it. Pull the winner's current state and mirror it, so this device's
+  // own list, archive and statistics tell the truth - including "ended" once
+  // the operator closes the game over there. Best-effort: if the fetch fails,
+  // the periodic reconcile retries.
+  try {
+    await invoke('fetch_snapshot_from_mother', {
+      launchedGameId: target.launched_game_id,
+      addr: target.addr,
+      port: target.port,
+    });
+    const outcome = await applyMotherSnapshot(target.launched_game_id);
+    console.log('[yieldToMother] mirrored game state →', outcome.reason);
+  } catch (e) {
+    console.warn('[yieldToMother] could not mirror the new mother state:', e);
+  }
+}
+
+/** Outcome of the Rust `apply_mother_snapshot` mirror - see its doc comment. */
+export interface ApplyOutcome {
+  applied: boolean;
+  reason:
+    | 'applied'
+    | 'no_cached_snapshot'
+    | 'no_local_row'
+    | 'stale_snapshot'
+    | 'serving_locally'
+    | 'corrupt_snapshot';
+  ended: boolean;
+  mother_epoch: number;
+  state_version: number;
+}
+
+/**
+ * Mirror this device's cached snapshot of `launchedGameId` onto its own local
+ * rows without taking ownership: the fix for a superseded mother that keeps
+ * showing a game someone else already finished (Ludiom #76). Refusals come back
+ * as an outcome, not a throw - the callers run on timers.
+ */
+export async function applyMotherSnapshot(launchedGameId: number): Promise<ApplyOutcome> {
+  return invoke<ApplyOutcome>('apply_mother_snapshot', { launchedGameId });
 }
 
 export type ForceMotherOutcome = 'takeover' | 'adopted' | 'restarted';
@@ -249,6 +324,8 @@ export async function forceBecomeMother(clientId: number): Promise<ForceMotherOu
       // guard / real failure should surface to the operator.
       const msg = String((e as { message?: string })?.message ?? e);
       console.warn('[forceBecomeMother] becomeMother(', gid, ') failed:', msg);
+      // A genuine failure keeps its raw message - it is the diagnostic. Only
+      // the "nothing cached here" case falls through to step 3.
       if (!msg.includes('No cached snapshot')) throw e;
     }
   }
@@ -258,18 +335,13 @@ export async function forceBecomeMother(clientId: number): Promise<ForceMotherOu
   const hasLocalGame = await deviceHasLocalActiveGame();
   console.log('[forceBecomeMother] hasLocalActiveGame=', hasLocalGame);
   if (!hasLocalGame) {
-    throw new Error(
-      'This device was not part of any active game (no saved state, and no other host is reachable). ' +
-        'Join the game on this device first, or take control from a device that was in it.'
-    );
+    throw new Error('failover:errNotInGame');
   }
   console.log('[forceBecomeMother] falling back to ensureMotherServer');
   const info = await ensureMotherServer(clientId);
   console.log('[forceBecomeMother] ensureMotherServer →', info ? `port ${info.port}` : 'null');
   if (!info) {
-    throw new Error(
-      'Could not take control: another device may already be the current mother. Try again in a few seconds.'
-    );
+    throw new Error('failover:errTakeControl');
   }
   return 'restarted';
 }

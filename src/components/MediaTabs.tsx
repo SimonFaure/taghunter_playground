@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Film, Image as ImageIcon, Play, RefreshCw, FolderOpen, X, Subtitles } from 'lucide-react';
+import { Film, Image as ImageIcon, Play, RefreshCw, FolderOpen, X, Subtitles, Upload, Trash2, AlertCircle } from 'lucide-react';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import * as scenarioStore from '../services/scenarioStore';
 import * as gameTypesStore from '../services/gameTypesStore';
 import { resolveVideosByKind } from '../services/videoResolution';
 import { loadConfig, saveConfig } from '../utils/config';
+import { formatBytes } from '../services/syncLog';
 import { LANG_NAMES } from '../services/langFlags';
 import { scenarioAssetUrl, mediaRootAbs, ensureDir } from '../services/contentFs';
 import { gameTypeLabel } from '../utils/labels';
@@ -84,13 +85,30 @@ interface VideoItem {
   key: string;
   title: string;
   gameType: string;
+  // Empty string = this game type has no playable tutorial video yet; the card
+  // renders an empty slot instead of a play button (the operator can still
+  // import one from the actions strip below it).
   videoUrl: string;
   posterUrl: string | null;
   // All available subtitle tracks, keyed by language code → local webview URL.
   subtitles: Record<string, string>;
 }
 
-function VideoCard({ item, appLang, useSubsDefault }: { item: VideoItem; appLang: string; useSubsDefault: boolean }) {
+function VideoCard({
+  item,
+  appLang,
+  useSubsDefault,
+  badge,
+  actions,
+}: {
+  item: VideoItem;
+  appLang: string;
+  useSubsDefault: boolean;
+  // Optional source pill rendered next to the title (game-type cards only).
+  badge?: React.ReactNode;
+  // Optional strip under the title row (import / replace / remove controls).
+  actions?: React.ReactNode;
+}) {
   const { t } = useTranslation('cards');
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -119,9 +137,15 @@ function VideoCard({ item, appLang, useSubsDefault }: { item: VideoItem; appLang
   return (
     <div className="rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] bg-[var(--pg-surface-2)] overflow-hidden">
       <div className="relative w-full aspect-video bg-black">
-        {playing ? (
+        {!item.videoUrl ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[var(--pg-surface-2)] text-[var(--pg-text-dim)]">
+            <Film className="w-8 h-8 opacity-50" />
+            <span className="text-sm">{t('noVideoForGameType')}</span>
+          </div>
+        ) : playing ? (
           // preload only happens now (on click), and autoPlay starts it.
           <video
+            key={item.videoUrl}
             ref={videoRef}
             controls
             autoPlay
@@ -156,37 +180,162 @@ function VideoCard({ item, appLang, useSubsDefault }: { item: VideoItem; appLang
           </button>
         )}
       </div>
-      <div className="flex items-center gap-2 p-3 min-w-0">
-        <GameTypeIcon type={item.gameType} className="w-4 h-4 text-[var(--pg-text-dim)] shrink-0" />
-        <span className="font-medium truncate">{item.title}</span>
-        {playing && subtitleLangs.length > 0 && (
-          <div className="ml-auto flex items-center gap-1.5 shrink-0">
-            <Subtitles className="w-4 h-4 text-[var(--pg-text-dim)]" />
-            <select
-              value={selectedLang ?? 'off'}
-              onChange={(e) => setSelectedLang(e.target.value === 'off' ? null : e.target.value)}
-              aria-label={t('subtitles')}
-              className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded px-1.5 py-0.5 text-sm"
-            >
-              <option value="off">{t('subtitlesOff')}</option>
-              {subtitleLangs.map((lang) => (
-                <option key={lang} value={lang}>{LANG_NAMES[lang] || lang}</option>
-              ))}
-            </select>
-          </div>
-        )}
+      <div className="p-3 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <GameTypeIcon type={item.gameType} className="w-4 h-4 text-[var(--pg-text-dim)] shrink-0" />
+          <span className="font-medium truncate">{item.title}</span>
+          {badge}
+          {playing && subtitleLangs.length > 0 && (
+            <div className="ml-auto flex items-center gap-1.5 shrink-0">
+              <Subtitles className="w-4 h-4 text-[var(--pg-text-dim)]" />
+              <select
+                value={selectedLang ?? 'off'}
+                onChange={(e) => setSelectedLang(e.target.value === 'off' ? null : e.target.value)}
+                aria-label={t('subtitles')}
+                className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded px-1.5 py-0.5 text-sm"
+              >
+                <option value="off">{t('subtitlesOff')}</option>
+                {subtitleLangs.map((lang) => (
+                  <option key={lang} value={lang}>{LANG_NAMES[lang] || lang}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+        {actions}
       </div>
     </div>
   );
+}
+
+const VIDEO_ACCEPT = 'video/mp4,video/webm,video/ogg,video/quicktime,.mp4,.webm,.ogg,.mov';
+
+// Wraps VideoCard with the source pill and the local-import controls. The
+// imported file stays on THIS device: it is never pushed to studio and never
+// reaches satellites, which the hint text under the panel title spells out.
+function GameTypeVideoCard({
+  entry,
+  appLang,
+  useSubsDefault,
+  uploadedBytes,
+  onImport,
+  onRemove,
+}: {
+  entry: GameTypeVideoItem;
+  appLang: string;
+  useSubsDefault: boolean;
+  // Bytes written so far, or undefined when no import is running for this row.
+  uploadedBytes?: number;
+  onImport: (file: File) => void;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation('cards');
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const busy = uploadedBytes !== undefined;
+  const isLocal = entry.variant === 'local';
+
+  const badgeLabel =
+    entry.variant === 'local'
+      ? t('videoSourceLocal')
+      : entry.variant === 'override'
+        ? t('videoSourceClient')
+        : entry.variant === 'admin'
+          ? t('videoSourceDefault')
+          : null;
+
+  return (
+    <VideoCard
+      item={entry.item}
+      appLang={appLang}
+      useSubsDefault={useSubsDefault}
+      badge={
+        badgeLabel ? (
+          <span
+            className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-xs ${
+              isLocal
+                ? 'bg-[var(--pg-accent)] text-white'
+                : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border border-[var(--pg-line)]'
+            }`}
+          >
+            {badgeLabel}
+          </span>
+        ) : null
+      }
+      actions={
+        <div className="mt-3 pt-3 border-t border-[var(--pg-line)] flex flex-wrap items-center gap-2">
+          <input
+            ref={inputRef}
+            type="file"
+            accept={VIDEO_ACCEPT}
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onImport(f);
+              // Clear so re-picking the SAME file fires change again.
+              if (e.target) e.target.value = '';
+            }}
+          />
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => inputRef.current?.click()}
+            className="pg-btn pg-btn--primary"
+          >
+            <Upload className="w-4 h-4" />
+            {isLocal ? t('replaceLocalVideo') : t('importLocalVideo')}
+          </button>
+          {isLocal && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onRemove}
+              className="pg-btn pg-btn--danger"
+              title={t('removeLocalVideo')}
+            >
+              <Trash2 className="w-4 h-4" />
+              {t('removeLocalVideo')}
+            </button>
+          )}
+          {busy ? (
+            <span className="text-xs text-[var(--pg-text-dim)] ml-auto">
+              {t('importingVideo', { bytes: formatBytes(uploadedBytes) })}
+            </span>
+          ) : (
+            isLocal &&
+            entry.localSizeBytes !== null && (
+              <span className="text-xs text-[var(--pg-text-dim)] ml-auto">
+                {formatBytes(entry.localSizeBytes)}
+              </span>
+            )
+          )}
+        </div>
+      }
+    />
+  );
+}
+
+// A game-type row on this page: the resolved tutorial video (possibly none) plus
+// where it came from, so the card can label its source and offer the right
+// import / replace / remove action.
+interface GameTypeVideoItem {
+  item: VideoItem;
+  variant: 'local' | 'override' | 'admin' | null;
+  localSizeBytes: number | null;
 }
 
 export function VideosTab() {
   const { t, i18n } = useTranslation('cards');
   const lang = i18n.language || 'fr';
   const [loading, setLoading] = useState(true);
-  const [gameTypeVideos, setGameTypeVideos] = useState<VideoItem[]>([]);
+  const [gameTypeVideos, setGameTypeVideos] = useState<GameTypeVideoItem[]>([]);
   const [scenarioVideos, setScenarioVideos] = useState<VideoItem[]>([]);
   const [useSubsDefault, setUseSubsDefault] = useState(true);
+  // Bumped after every import/removal: re-runs the resolver AND cache-busts the
+  // asset URL, so replacing a file that kept its name still shows the new video.
+  const [reloadKey, setReloadKey] = useState(0);
+  // code -> bytes written so far, while an import is streaming to disk.
+  const [uploading, setUploading] = useState<Record<string, number>>({});
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   useEffect(() => {
     loadConfig()
@@ -209,22 +358,34 @@ export function VideosTab() {
     (async () => {
       setLoading(true);
       try {
-        // Default game-type tutorial videos (admin default or client override).
+        // One row per game type that supports a tutorial video - including the
+        // ones that have none yet, so the operator has somewhere to import one.
+        // The resolver picks local import > client override > Tag Hunter default.
         // No cover art for these - VideoCard falls back to the game-type icon.
         const gts = await gameTypesStore.listGameTypes();
-        const gtOut: VideoItem[] = [];
+        const gtOut: GameTypeVideoItem[] = [];
         for (const gt of gts) {
+          if (!gt.supports_tutorial_video) continue;
           const resolved = await gameTypesStore.resolveTutorialVideoUrl(gt.code).catch(() => null);
-          if (resolved) {
-            gtOut.push({
+          const local = await gameTypesStore.getLocalVideo(gt.code).catch(() => null);
+          gtOut.push({
+            item: {
               key: gt.code,
               title: gameTypeLabel(gt.name || gt.code),
               gameType: gt.code,
-              videoUrl: resolved.videoUrl,
+              // Local files keep their path across a replace, so hang the reload
+              // counter off the URL to defeat the webview's media cache.
+              videoUrl: resolved
+                ? resolved.variant === 'local'
+                  ? `${resolved.videoUrl}?r=${reloadKey}`
+                  : resolved.videoUrl
+                : '',
               posterUrl: null,
-              subtitles: resolved.subtitleUrls,
-            });
-          }
+              subtitles: resolved?.subtitleUrls ?? {},
+            },
+            variant: resolved?.variant ?? null,
+            localSizeBytes: local?.size_bytes ?? null,
+          });
         }
 
         // Scenario intro videos (downloaded scenarios only), with the scenario
@@ -256,7 +417,42 @@ export function VideosTab() {
     return () => {
       cancelled = true;
     };
-  }, [lang]);
+  }, [lang, reloadKey]);
+
+  // Copy the picked file into this device's local store for `code`. Nothing is
+  // uploaded to studio and nothing reaches other devices - see
+  // gameTypesStore.saveLocalVideo.
+  const importLocalVideo = async (code: string, file: File) => {
+    setUploadError(null);
+    setUploading((u) => ({ ...u, [code]: 0 }));
+    try {
+      await gameTypesStore.saveLocalVideo(code, file, (written) =>
+        setUploading((u) => ({ ...u, [code]: written }))
+      );
+      setReloadKey((k) => k + 1);
+    } catch (e) {
+      console.error('[media] local tutorial video import failed:', e);
+      setUploadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading((u) => {
+        const next = { ...u };
+        delete next[code];
+        return next;
+      });
+    }
+  };
+
+  const removeLocalVideo = async (code: string, title: string) => {
+    if (!confirm(t('removeLocalVideoConfirm', { name: title }))) return;
+    setUploadError(null);
+    try {
+      await gameTypesStore.removeLocalVideo(code);
+      setReloadKey((k) => k + 1);
+    } catch (e) {
+      console.error('[media] local tutorial video removal failed:', e);
+      setUploadError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   if (loading) return <Loading text={t('loadingVideos')} />;
 
@@ -276,13 +472,36 @@ export function VideosTab() {
         </label>
       </div>
 
+      {uploadError && (
+        <div className="pg-panel p-4 mb-6 flex items-center gap-3 border border-[var(--pg-danger-line)] bg-[var(--pg-danger-bg)] text-[var(--pg-danger-text)]">
+          <AlertCircle className="w-5 h-5 text-[var(--pg-danger-icon)] shrink-0" />
+          <span className="text-sm">{t('localVideoError', { error: uploadError })}</span>
+          <button
+            type="button"
+            onClick={() => setUploadError(null)}
+            className="ml-auto text-sm underline shrink-0"
+          >
+            {t('dismiss')}
+          </button>
+        </div>
+      )}
+
       <Panel icon={<Film className="text-[var(--pg-accent-bright)]" size={24} />} title={t('gameTypeVideos')}>
+        <p className="text-sm text-[var(--pg-text-dim)] mb-4">{t('gameTypeVideosImportHint')}</p>
         {gameTypeVideos.length === 0 ? (
           <p className="text-[var(--pg-text-dim)] italic text-sm">{t('noVideosAvailable')}</p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {gameTypeVideos.map((v) => (
-              <VideoCard key={v.key} item={v} appLang={lang} useSubsDefault={useSubsDefault} />
+              <GameTypeVideoCard
+                key={v.item.key}
+                entry={v}
+                appLang={lang}
+                useSubsDefault={useSubsDefault}
+                uploadedBytes={uploading[v.item.gameType]}
+                onImport={(file) => importLocalVideo(v.item.gameType, file)}
+                onRemove={() => removeLocalVideo(v.item.gameType, v.item.title)}
+              />
             ))}
           </div>
         )}

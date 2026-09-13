@@ -1,8 +1,20 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
-import { Trophy, ArrowLeft, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, ArrowRight, Minus, MonitorUp, MonitorOff } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Trophy, ArrowLeft, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, ArrowRight, Minus, MonitorUp, MonitorOff, X } from 'lucide-react';
 import { getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
 import { pushOverlay, popOverlay } from '../services/screenState';
 import { GameConfig, Team as ConfigTeam } from './LaunchGameModal';
+import { getClashState, type ClashStandings } from '../services/clash';
+import * as scenarioStore from '../services/scenarioStore';
+import { scenarioAssetUrl } from '../services/contentFs';
+import { tIngame } from '../i18n/ingame';
+import {
+  eventKey,
+  eventRuns,
+  pickLocalized,
+  relativeAge,
+  type ClashEventTexts,
+} from './clashEventFeed';
 import {
   openProjector,
   closeProjector,
@@ -45,6 +57,19 @@ interface TeamResult {
 interface RankedTeam extends TeamResult {
   rank: number;
   rankDelta: number | null;
+}
+
+/** Fallback clan colours, mirroring ClashGamePage's FALLBACK_COLORS. */
+const CLASH_FALLBACK_COLORS = ['#c0392b', '#2980b9', '#27ae60', '#8e44ad'];
+
+/**
+ * The slice of a Clash scenario's `game_meta` this board needs: clan identity
+ * (colour + emblem), territory names, and the author's event sentences.
+ */
+interface ClashBoardMeta {
+  clans: Array<{ name?: Record<string, string> | string; color?: string; logo?: string }>;
+  territories: Array<{ name?: Record<string, string> | string }>;
+  eventTexts: ClashEventTexts;
 }
 
 function formatDuration(seconds: number): string {
@@ -92,7 +117,37 @@ function sortTeams(teams: TeamResult[], victoryType: string): TeamResult[] {
 }
 
 export function LeaderboardPage({ launchedGameId, config, gameName, onBack, projectorMode = false, autoScroll = true }: LeaderboardPageProps) {
+  // `tr`, not `t`: this file already uses `t` as the loop variable for a team.
+  const { t: tr } = useTranslation('rankings');
   const [teams, setTeams] = useState<RankedTeam[]>([]);
+  // Retours Ludiom #70: once the operator has closed the game, a team that never
+  // punched its finish is NOT "in progress" - the game is over and it simply did
+  // not finish. Without the game's own `ended` flag the board can't tell the two
+  // apart, so it kept every team on "In progress" after closure.
+  const [gameEnded, setGameEnded] = useState(false);
+  // --- Clash mode ----------------------------------------------------------
+  // A Clash launch has no per-team run: clans never receive a `start_time` or
+  // an `end_time`, so this board read "Did not start" under every clan for the
+  // whole match, and the score column showed a dash (retours #97). When the
+  // launch carries a `clash_config` the board switches data source to the live
+  // standings - weighted score, domination rate, headcount, activity - and
+  // gains the match's own event feed (retours #95).
+  const [isClash, setIsClash] = useState(false);
+  const isClashRef = useRef(false);
+  useEffect(() => { isClashRef.current = isClash; }, [isClash]);
+  const [gameUniqid, setGameUniqid] = useState('');
+  const [clashStandings, setClashStandings] = useState<ClashStandings | null>(null);
+  const clashStandingsRef = useRef<ClashStandings | null>(null);
+  const [clashMeta, setClashMeta] = useState<ClashBoardMeta | null>(null);
+  // Clash words the players read (clan/territory names, event sentences) come
+  // from the LAUNCH language, like everywhere else in the game; the board's own
+  // chrome stays on the operator's language.
+  const clashLang = config.language || 'fr';
+  const tc = useCallback(
+    (key: string, vars?: Record<string, string | number>) => tIngame('ingame_clash', key, clashLang, vars),
+    [clashLang],
+  );
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [teamsConfig, setTeamsConfig] = useState<ConfigTeam[]>(config.teams || []);
   const [playMode, setPlayMode] = useState<'solo' | 'team'>(config.playMode || 'solo');
   const [loading, setLoading] = useState(true);
@@ -178,6 +233,8 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
     let data: Array<{ id: number; team_number: number; team_name: string; score: number; start_time: number | null; end_time: number | null; key_id: number }> = [];
     try {
       const state = await getLaunchedGameState(launchedGameId, 0);
+      setGameEnded(!!state.ended);
+      if (state.game_uniqid) setGameUniqid((cur) => (cur === state.game_uniqid ? cur : state.game_uniqid));
       data = state.teams.map((t) => ({
         id: t.id,
         team_number: t.team_number,
@@ -190,6 +247,23 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
     } catch (err) {
       console.error('[LeaderboardPage] fetchTeams failed:', err);
       return;
+    }
+
+    // Clash: the persisted `lg_teams.score` only advances on a validation, while
+    // domination pays out continuously - so take the score (and the ordering it
+    // drives) from the live standings instead. Fetched in step with the team
+    // poll so a clan's row and its rank never disagree.
+    if (isClashRef.current) {
+      try {
+        const st = await getClashState(launchedGameId);
+        clashStandingsRef.current = st;
+        setClashStandings(st);
+        setNowMs(Date.now());
+        const byId = new Map(st.clans.map((c) => [c.team_id, c]));
+        data = data.map((t) => (byId.has(t.id) ? { ...t, score: byId.get(t.id)!.points } : t));
+      } catch (err) {
+        console.error('[LeaderboardPage] clash state failed:', err);
+      }
     }
 
     const ranked = processTeams(data);
@@ -275,6 +349,14 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
         if (map.teamsConfig) {
           try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
+        // `clash_config` is written by the launch for Clash games only - the
+        // one marker available here without plumbing the game type down from
+        // GamePage (and it reaches the projector window too, which only carries
+        // the launched-game id).
+        if (map.clash_config) {
+          setIsClash(true);
+          isClashRef.current = true;
+        }
       } catch (err) {
         console.error('[LeaderboardPage] meta load failed:', err);
       }
@@ -290,6 +372,44 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
       if (animationTimerRef.current) clearTimeout(animationTimerRef.current);
     };
   }, [launchedGameId, fetchTeams]);
+
+  // Clash: pull the clan identity (colour + emblem), the territory names and the
+  // author's event sentences out of the scenario once. Everything else on this
+  // board comes from the live standings.
+  useEffect(() => {
+    if (!isClash || !gameUniqid) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const gd = await scenarioStore.getGameData(gameUniqid);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const raw = ((gd as any)?.game_data ?? gd) as any;
+        const gm = (raw?.game_meta ?? raw) ?? {};
+        if (cancelled) return;
+        setClashMeta({
+          clans: Array.isArray(gm.clans) ? gm.clans : [],
+          territories: Array.isArray(gm.territories) ? gm.territories : [],
+          eventTexts: {
+            conquest: pickLocalized(gm.event_text_conquest, clashLang),
+            attack: pickLocalized(gm.event_text_attack, clashLang),
+            neutralized: pickLocalized(gm.event_text_neutralized, clashLang),
+            purge: pickLocalized(gm.event_text_purge, clashLang),
+            rankingTitle: pickLocalized(gm.ranking_title, clashLang),
+          },
+        });
+      } catch (err) {
+        console.error('[LeaderboardPage] clash scenario meta failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isClash, gameUniqid, clashLang]);
+
+  // Clash event ages ("il y a 4 min") need to tick between polls.
+  useEffect(() => {
+    if (!isClash) return;
+    const id = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [isClash]);
 
   // Reveal the top bar only when the cursor approaches the top edge of the page.
   useEffect(() => {
@@ -459,6 +579,27 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
     }
   }, [projectorBusy, projectorOpen, launchedGameId, gameName, config]);
 
+  // --- Clash derived lookups (no-ops for every other game type) -------------
+  const clashByTeamId = new Map((clashStandings?.clans ?? []).map((c) => [c.team_id, c]));
+  /** Validations this clan has landed, summed over every territory - the only
+   *  activity signal a clan has (no start/finish punches). */
+  const clashValidations = (teamId: number): number =>
+    (clashStandings?.territories ?? []).reduce(
+      (n, t) => n + (t.counts[String(teamId)] ?? 0),
+      0,
+    );
+  const clashVisual = (teamNumber: number) => {
+    const c = clashMeta?.clans?.[teamNumber - 1];
+    return {
+      color: c?.color || CLASH_FALLBACK_COLORS[(teamNumber - 1) % CLASH_FALLBACK_COLORS.length],
+      logo: c?.logo ? scenarioAssetUrl(gameUniqid, String(c.logo).replace(/^media\//, '')) : '',
+    };
+  };
+  const clashTerritoryName = (index: number): string =>
+    pickLocalized(clashMeta?.territories?.[index]?.name, clashLang) ||
+    tc('territory_fallback', { n: index + 1 });
+  const clashEvents = clashStandings?.events ?? [];
+
   return (
     <div
       ref={scrollRef}
@@ -488,7 +629,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
                 className="flex items-center gap-2 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition-colors text-sm font-medium"
               >
                 <ArrowLeft size={18} />
-                Back
+                {tr('back')}
               </button>
             )}
             {!projectorMode && launchedGameId !== null && (
@@ -500,10 +641,10 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
                     ? 'border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20'
                     : 'border-[var(--pg-line-strong)] bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)] hover:text-[var(--pg-text)]'
                 } ${projectorBusy ? 'opacity-50 cursor-wait' : ''}`}
-                title={projectorOpen ? 'Close the projector window' : 'Open this leaderboard on a second screen'}
+                title={projectorOpen ? tr('closeProjectorTitle') : tr('openSecondScreenTitle')}
               >
                 {projectorOpen ? <MonitorOff size={14} /> : <MonitorUp size={14} />}
-                {projectorOpen ? 'Close projector' : 'Open on second screen'}
+                {projectorOpen ? tr('closeProjector') : tr('openSecondScreen')}
               </button>
             )}
           </div>
@@ -512,22 +653,22 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
             {playMode === 'team' && (
               <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-teal-500/15 border border-teal-500/30 text-teal-400 text-xs font-semibold uppercase tracking-wide">
                 <Users size={12} />
-                Team mode
+                {tr('teamMode')}
               </span>
             )}
             <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs font-medium">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block" />
-              Live
+              {tr('live')}
             </span>
             {victoryType === 'speed' ? (
               <>
                 <Zap size={15} className="text-orange-400" />
-                <span className="text-orange-400 font-semibold uppercase tracking-wide text-xs">Speed</span>
+                <span className="text-orange-400 font-semibold uppercase tracking-wide text-xs">{tr('speed')}</span>
               </>
             ) : (
               <>
                 <Star size={15} className="text-[var(--pg-accent-bright)]" />
-                <span className="text-[var(--pg-accent-bright)] font-semibold uppercase tracking-wide text-xs">Score</span>
+                <span className="text-[var(--pg-accent-bright)] font-semibold uppercase tracking-wide text-xs">{tr('score')}</span>
               </>
             )}
           </div>
@@ -538,16 +679,16 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
             <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-yellow-400/10 border-2 border-yellow-400/40 mb-5">
               <Trophy size={36} className="text-yellow-400" />
             </div>
-            <h1 className="text-4xl font-bold text-[var(--pg-text)] tracking-tight mb-1">Rankings</h1>
+            <h1 className="text-4xl font-bold text-[var(--pg-text)] tracking-tight mb-1">{tr('title')}</h1>
             {gameName && (
               <p className="text-[var(--pg-text-dim)] text-base mt-1">{gameName}</p>
             )}
           </div>
 
           {loading ? (
-            <div className="text-[var(--pg-text-dim)] text-center py-16">Loading rankings...</div>
+            <div className="text-[var(--pg-text-dim)] text-center py-16">{tr('loading')}</div>
           ) : teams.length === 0 ? (
-            <div className="text-[var(--pg-text-dim)] text-center py-16">No team data found.</div>
+            <div className="text-[var(--pg-text-dim)] text-center py-16">{tr('noTeams')}</div>
           ) : (
             <div className="w-full space-y-3">
               {teams.map((team) => {
@@ -616,36 +757,86 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
 
                       <div className="flex-1 min-w-0">
                         <div
-                          className={`font-bold leading-tight ${movingUp ? 'text-emerald-300' : getRankColor(index)}`}
+                          className={`font-bold leading-tight flex items-center gap-2 ${movingUp ? 'text-emerald-300' : getRankColor(index)}`}
                           style={{
                             fontSize: movingUp ? '1.2rem' : '1.125rem',
                             transition: 'font-size 0.3s ease, color 0.3s ease',
+                            ...(isClash && !movingUp ? { color: clashVisual(team.team_number).color } : {}),
                           }}
                         >
-                          {team.team_name}
+                          {isClash && (
+                            clashVisual(team.team_number).logo ? (
+                              <img
+                                src={clashVisual(team.team_number).logo}
+                                alt=""
+                                className="w-6 h-6 shrink-0 object-contain"
+                              />
+                            ) : (
+                              <span
+                                className="w-3 h-3 shrink-0 rounded-full"
+                                style={{ backgroundColor: clashVisual(team.team_number).color }}
+                              />
+                            )
+                          )}
+                          <span className="truncate">{team.team_name}</span>
                         </div>
                         <div className="text-[var(--pg-text-dim)] text-xs mt-0.5 flex items-center gap-1">
-                          {team.end_time ? (
+                          {isClash ? (
+                            // Clans have no run: report headcount + whether they
+                            // are actually playing (retours #97).
+                            (() => {
+                              const st = clashByTeamId.get(team.id);
+                              const validations = clashValidations(team.id);
+                              const status = gameEnded
+                                ? tr('statusFinished')
+                                : validations > 0
+                                  ? tr('statusInProgress')
+                                  : tr('clashNoValidation');
+                              return (
+                                <>
+                                  <Users size={11} />
+                                  {tr('clashMembers', { count: st?.member_count ?? 0 })}
+                                  <span className="opacity-50">·</span>
+                                  {status}
+                                </>
+                              );
+                            })()
+                          ) : team.end_time ? (
                             <>
                               <Clock size={11} />
-                              Finished
+                              {tr('statusFinished')}
                             </>
                           ) : team.start_time ? (
-                            'In progress'
+                            gameEnded ? tr('statusNotFinished') : tr('statusInProgress')
                           ) : (
-                            'Did not start'
+                            tr('statusNotStarted')
                           )}
                         </div>
                       </div>
 
                       <div className="text-right shrink-0">
-                        {victoryType === 'score' ? (
+                        {isClash ? (
+                          <>
+                            <div
+                              className={`font-bold transition-all duration-300 ${movingUp ? 'text-emerald-400' : 'text-[var(--pg-text)]'}`}
+                              style={{ fontSize: movingUp ? '1.4rem' : '1.25rem' }}
+                            >
+                              {team.score}
+                              <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">{tr('pts')}</span>
+                            </div>
+                            {!gameEnded && (clashByTeamId.get(team.id)?.rate ?? 0) > 0 && (
+                              <div className="text-emerald-400 text-xs mt-0.5">
+                                {tr('clashRate', { n: clashByTeamId.get(team.id)?.rate ?? 0 })}
+                              </div>
+                            )}
+                          </>
+                        ) : victoryType === 'score' ? (
                           <div
                             className={`font-bold transition-all duration-300 ${movingUp ? 'text-emerald-400' : 'text-[var(--pg-text)]'}`}
                             style={{ fontSize: movingUp ? '1.4rem' : '1.25rem' }}
                           >
                             {team.score}
-                            <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">pts</span>
+                            <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">{tr('pts')}</span>
                           </div>
                         ) : duration !== null ? (
                           <div
@@ -660,7 +851,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
 
                         {victoryType === 'speed' && team.score > 0 && (
                           <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">
-                            {team.score} pts
+                            {team.score} {tr('pts')}
                           </div>
                         )}
                       </div>
@@ -682,8 +873,88 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
               })}
             </div>
           )}
+
+          {/* Clash live event feed (retours #95): players watching the board can
+              see what is happening right now - a conquest, an attack, a purge -
+              instead of a bare table of numbers. Same sentences as the in-game
+              dashboard (shared `clashEventFeed` helpers), so a scenario that
+              authored its own wording reads identically on both surfaces, in the
+              LAUNCH language. */}
+          {isClash && (
+            <div className="w-full mt-10">
+              <h2 className="text-[var(--pg-text-muted)] text-sm font-semibold uppercase tracking-wide mb-3">
+                {tr('clashEvents')}
+              </h2>
+              {clashEvents.length === 0 ? (
+                <div className="text-[var(--pg-text-dim)] text-sm py-6 text-center border border-[var(--pg-line)] rounded-xl bg-[var(--pg-surface-2)]">
+                  {tr('clashNoEvents')}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {clashEvents.map((ev) => {
+                    const visual = (() => {
+                      const st = ev.team_id != null ? clashByTeamId.get(ev.team_id) : undefined;
+                      if (!st) return { name: '?', color: '#888', logo: '' };
+                      const v = clashVisual(st.team_number);
+                      return {
+                        name:
+                          st.team_name ||
+                          pickLocalized(clashMeta?.clans?.[st.team_number - 1]?.name, clashLang) ||
+                          tc('clan_fallback', { n: st.team_number }),
+                        color: v.color,
+                        logo: v.logo,
+                      };
+                    })();
+                    const terr = clashTerritoryName(ev.territory_index);
+                    const runs = eventRuns(ev, visual.name, terr, clashMeta?.eventTexts, tc);
+                    return (
+                      <div
+                        key={eventKey(ev)}
+                        className="flex items-center gap-3 rounded-xl border border-[var(--pg-line)] bg-[var(--pg-surface-2)] px-4 py-2.5"
+                        style={{ borderLeft: `3px solid ${visual.color}` }}
+                      >
+                        <div className="w-7 h-7 shrink-0 flex items-center justify-center overflow-hidden">
+                          {visual.logo ? (
+                            <img src={visual.logo} alt="" className="w-full h-full object-contain" />
+                          ) : (
+                            <span className="w-3 h-3 rounded-full" style={{ backgroundColor: visual.color }} />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0 text-[var(--pg-text)] text-sm leading-tight">
+                          {runs.map((run, ri) => (
+                            <span key={ri} style={run.clan ? { color: visual.color, fontWeight: 700 } : undefined}>
+                              {run.text}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="shrink-0 text-[var(--pg-text-dim)] text-xs">
+                          {relativeAge(ev.at, nowMs, tc)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Retours Ludiom #71: the projector window could only be closed with Esc,
+          which no operator discovers. A dimmed close control sits in the corner
+          at all times (so it IS discoverable) and lights up on hover, staying
+          out of the way of the projected board. */}
+      {projectorMode && (
+        <button
+          onClick={() => void closeSelfProjectorWindow()}
+          className="fixed top-3 right-3 z-40 flex items-center gap-1.5 px-3 py-2 rounded-full border border-[var(--pg-line-strong)] bg-[var(--pg-surface-2)]/80 text-[var(--pg-text-muted)] opacity-30 hover:opacity-100 hover:text-[var(--pg-text)] focus:opacity-100 transition-opacity duration-200 text-sm font-medium backdrop-blur"
+          title={tr('closeWindowTitle')}
+          aria-label={tr('closeWindowTitle')}
+        >
+          <X size={16} />
+          {tr('closeWindow')}
+        </button>
+      )}
 
       {/* Climber badge - pinned to the right edge, vertically centered, OUTSIDE
           the transformed content wrapper so `position: fixed` resolves to the
@@ -703,7 +974,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
           >
             <div className="flex items-center gap-1.5 text-emerald-300 text-xs font-bold uppercase tracking-wide mb-1.5">
               <ArrowUp size={14} />
-              Moving up
+              {tr('movingUp')}
             </div>
             <div className="text-[var(--pg-text)] font-bold text-lg leading-tight truncate max-w-[240px]">
               {currentClimber.c.teamName}

@@ -109,6 +109,8 @@
   "timeSlotCheck": "Contrôle",
   "timeSlotFinish": "Arrivée",
   "punchesHeading": "Poinçons",
+  "cardFull": "Puce pleine",
+  "clockSkewHint": "Écart entre l'horloge de chaque poste et celle de ce PC. Aucune incidence sur les scores : sert à repérer un poste à remettre à l'heure.",
   "navGroupAccount": "Compte",
   "navAccount": "Compte",
   "navSync": "Synchronisation",

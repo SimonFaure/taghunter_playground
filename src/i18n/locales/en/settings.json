@@ -109,6 +109,8 @@
   "timeSlotCheck": "Check",
   "timeSlotFinish": "Finish",
   "punchesHeading": "Punches",
+  "cardFull": "Card full",
+  "clockSkewHint": "Gap between each station's clock and this PC's. Does not affect scoring - it is here to spot a station that needs re-timing.",
   "navGroupAccount": "Account",
   "navAccount": "Account",
   "navSync": "Sync",

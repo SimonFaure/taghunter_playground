@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { GameConfig } from './LaunchGameModal';
 import { MysteryGamePage } from './MysteryGamePage';
 import { TagQuestGamePage } from './TagQuestGamePage';
@@ -50,6 +51,9 @@ interface Team {
 }
 
 export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, onBack }: GamePageProps) {
+  // Operator chrome (controls panel, confirmations, PIN prompts) speaks the
+  // app language of whoever runs the device - not the players' launch language.
+  const { t } = useTranslation('operatorControls');
   // Live config: starts from the launch snapshot but is re-derived from the DB
   // meta whenever the in-game config modal saves, so edits apply to the running
   // page (the renderers read these fields on every render).
@@ -137,7 +141,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
           let title: string | undefined;
           if (gd.game && gd.game.type) {
             type = gd.game.type;
-            title = gd.game.title || 'Unknown Game';
+            title = gd.game.title || t('gamePanel.unknownGame');
           } else if (gd.scenario) {
             type = gd.scenario.scenario_type;
             title = gd.scenario.title || gd.scenario.name;
@@ -151,17 +155,17 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
         if (row) {
           setGameMetadata({ type: row.game_type, title: row.title });
         } else {
-          setGameMetadata({ type: 'unknown', title: 'Unknown Game' });
+          setGameMetadata({ type: 'unknown', title: t('gamePanel.unknownGame') });
         }
       } catch {
-        setGameMetadata({ type: 'unknown', title: 'Unknown Game' });
+        setGameMetadata({ type: 'unknown', title: t('gamePanel.unknownGame') });
       } finally {
         setLoading(false);
       }
     };
 
     loadGameMetadata();
-  }, [gameUniqid]);
+  }, [gameUniqid, t]);
 
   // Publish this device's screen state as "in this game" while a game page is
   // mounted, so the mother's Devices modal can show what each peer is showing.
@@ -208,8 +212,8 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   // Passed to every game renderer + the leaderboard in place of the raw
   // onBack, so their visible Back buttons prompt for the PIN first.
   const guardedBack = useCallback(
-    () => runGuarded(onBack, 'Enter the device PIN to leave the game.'),
-    [runGuarded, onBack]
+    () => runGuarded(onBack, t('gamePanel.pinToLeave')),
+    [runGuarded, onBack, t]
   );
 
   const handleCornerTap = useCallback(() => {
@@ -222,12 +226,12 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
       // Operator devices get the controls panel; player devices get an exit
       // back to the launched-games list. Both stay behind the PIN when set.
       if (operatorOnly) {
-        runGuarded(() => setShowPanel(true), 'Enter the device PIN to open game controls.');
+        runGuarded(() => setShowPanel(true), t('gamePanel.pinToOpenControls'));
       } else {
-        runGuarded(onBack, 'Enter the device PIN to leave the game.');
+        runGuarded(onBack, t('gamePanel.pinToLeave'));
       }
     }
-  }, [runGuarded, operatorOnly, onBack]);
+  }, [runGuarded, operatorOnly, onBack, t]);
 
   const loadRankings = async () => {
     if (!launchedGameId) return;
@@ -253,10 +257,10 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   const handleEndGame = () => {
     setConfirmDialog({
       isOpen: true,
-      title: 'End Game',
-      message: 'Are you sure you want to end this game? This will mark it as completed.',
+      title: t('gamePanel.endGameTitle'),
+      message: t('gamePanel.endGameMessage'),
       variant: 'warning',
-      confirmText: 'End Game',
+      confirmText: t('gamePanel.endGame'),
       onConfirm: async () => {
         if (!launchedGameId) return;
         try {
@@ -274,10 +278,10 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   const handleDeleteGame = () => {
     setConfirmDialog({
       isOpen: true,
-      title: 'Delete Game',
-      message: 'Are you sure you want to delete this game? This will permanently remove all data. This action cannot be undone.',
+      title: t('gamePanel.deleteTitle'),
+      message: t('gamePanel.deleteMessage'),
       variant: 'danger',
-      confirmText: 'Delete Game',
+      confirmText: t('gamePanel.deleteTitle'),
       onConfirm: async () => {
         if (!launchedGameId) return;
         try {
@@ -294,7 +298,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   };
 
   const formatTime = (ts: number | null) => {
-    if (!ts) return 'Not started';
+    if (!ts) return t('gamePanel.notStarted');
     // Team start_time / end_time are stored in unix SECONDS; the Date ctor wants
     // milliseconds, so scale by 1000 to avoid a 1970 timestamp.
     return new Date(ts * 1000).toLocaleTimeString();
@@ -307,7 +311,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   if (loading) {
     return (
       <div className="fixed inset-0 z-[100] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
-        <div className="text-white text-xl">Loading...</div>
+        <div className="text-white text-xl">{t('gamePanel.loading')}</div>
       </div>
     );
   }
@@ -337,7 +341,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
     }
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-white text-xl">Game type "{gameMetadata?.type}" not yet supported</div>
+        <div className="text-white text-xl">{t('gamePanel.unsupportedType', { type: gameMetadata?.type ?? '' })}</div>
       </div>
     );
   };
@@ -376,35 +380,35 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <Settings size={16} />
-                    Configure
+                    {t('gamePanel.configure')}
                   </button>
                   <button
                     onClick={() => { setShowPanel(false); setShowTestModal(true); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <FlaskConical size={16} />
-                    Test
+                    {t('gamePanel.test')}
                   </button>
                   <button
                     onClick={() => { setShowPanel(false); loadRankings(); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <Trophy size={16} />
-                    Rankings
+                    {t('gamePanel.rankings')}
                   </button>
                   <button
                     onClick={() => { setShowPanel(false); loadDevices(); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-slate-600 hover:bg-slate-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <Monitor size={16} />
-                    Devices
+                    {t('gamePanel.devices')}
                   </button>
                   <button
                     onClick={() => { setShowPanel(false); setShowVideoControl(true); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <Film size={16} />
-                    Play Video
+                    {t('gamePanel.playVideo')}
                   </button>
                   {gameMetadata?.type === 'clash' && (
                     <button
@@ -415,7 +419,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
                       className="flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition"
                     >
                       <Clock size={16} />
-                      +5 min
+                      {t('gamePanel.addFiveMin')}
                     </button>
                   )}
                   <button
@@ -423,14 +427,14 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <StopCircle size={16} />
-                    End Game
+                    {t('gamePanel.endGame')}
                   </button>
                   <button
                     onClick={() => { setShowPanel(false); handleDeleteGame(); }}
                     className="flex items-center justify-center gap-2 px-4 py-3 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition"
                   >
                     <Trash2 size={16} />
-                    Delete
+                    {t('gamePanel.delete')}
                   </button>
                 </>
               )}
@@ -440,7 +444,7 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
               onClick={() => { setShowPanel(false); onBack(); }}
               className="mt-4 w-full px-4 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm font-medium transition"
             >
-              Back to Launched Games
+              {t('gamePanel.backToLaunched')}
             </button>
           </div>
         </div>
@@ -476,14 +480,14 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-2xl font-bold text-white flex items-center gap-2">
                 <Trophy size={24} className="text-yellow-500" />
-                Rankings
+                {t('gamePanel.rankings')}
               </h3>
               <button onClick={() => setShowRankings(false)} className="text-slate-400 hover:text-white transition">
                 <X size={20} />
               </button>
             </div>
             {rankings.length === 0 ? (
-              <p className="text-slate-400 text-center py-8">No teams yet.</p>
+              <p className="text-slate-400 text-center py-8">{t('gamePanel.noTeams')}</p>
             ) : (
               <div className="space-y-3">
                 {rankings.map((team, index) => (
@@ -506,20 +510,20 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
                             {team.end_time ? <CheckCircle size={16} className="text-green-500" /> :
                              team.start_time ? <Play size={16} className="text-blue-500" /> :
                              <Clock size={16} className="text-slate-500" />}
-                            <span className="text-white font-semibold">Team {team.team_number}: {team.team_name}</span>
+                            <span className="text-white font-semibold">{t('gamePanel.teamLabel', { number: team.team_number, name: team.team_name })}</span>
                           </div>
-                          <p className="text-sm text-slate-400">Chip #{team.key_id}</p>
+                          <p className="text-sm text-slate-400">{t('gamePanel.chipLabel', { id: team.key_id })}</p>
                         </div>
                       </div>
                       <div className="text-right">
                         <div className="text-2xl font-bold text-white">{team.score}</div>
-                        <div className="text-xs text-slate-400">points</div>
+                        <div className="text-xs text-slate-400">{t('gamePanel.points')}</div>
                       </div>
                     </div>
                     {(team.start_time || team.end_time) && (
                       <div className="mt-3 pt-3 border-t border-slate-700 text-sm text-slate-400 flex gap-4">
-                        {team.start_time && <div>Start: <span className="text-white">{formatTime(team.start_time)}</span></div>}
-                        {team.end_time && <div>End: <span className="text-white">{formatTime(team.end_time)}</span></div>}
+                        {team.start_time && <div>{t('gamePanel.startLabel')} <span className="text-white">{formatTime(team.start_time)}</span></div>}
+                        {team.end_time && <div>{t('gamePanel.endLabel')} <span className="text-white">{formatTime(team.end_time)}</span></div>}
                       </div>
                     )}
                   </div>

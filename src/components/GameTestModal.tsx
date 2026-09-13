@@ -12,6 +12,7 @@ import {
 import { checkpointsForRoute, computeScore, type TracksScoreType } from '../services/tracksScoring';
 import { processTagQuestPunch } from '../services/tagquestPunchLogic';
 import { buildMediaMap } from '../utils/questMedia';
+import { wrongAnswerPoints } from '../services/mysteryScoring';
 
 interface GameTestModalProps {
   gameId: number;
@@ -27,6 +28,12 @@ interface TestConfig {
   badAnswerPercent: number;
   noAnswerPercent: number;
   selectedDeviceId: string;
+  /**
+   * TagQuest: how many stale punches to put on the card BEFORE the ones being
+   * simulated, as if the player never wiped it. Exercises the `tqbase:`
+   * baseline - they must be ignored while the fresh punches still score.
+   */
+  tqStalePunches: number;
 }
 
 interface TestResult {
@@ -74,6 +81,7 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
     badAnswerPercent: 20,
     noAnswerPercent: 20,
     selectedDeviceId: '',
+    tqStalePunches: 0,
   });
   const [devices, setDevices] = useState<Device[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(true);
@@ -259,11 +267,25 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
     }
   };
 
+  // Real SI punch times are local "HH:MM:SS" time-of-day strings (see the Rust
+  // `Punch::time_hms`), NOT epoch seconds. The mock used to emit epochs, which
+  // made the simulated card structurally unlike a real one: `punchSecondsOfDay`
+  // rejected every time, so the scorer's ordering and its double-bip collapse
+  // both silently degraded and the whole class of bugs behind client report
+  // #101 was unreproducible without hardware. Keep this in the real shape.
+  const hms = (epochSec: number): string => {
+    const d = new Date(epochSec * 1000);
+    return [d.getHours(), d.getMinutes(), d.getSeconds()]
+      .map((n) => String(n).padStart(2, '0'))
+      .join(':');
+  };
+
   const buildTagQuestMockCard = (
     teamKeyId: string,
     selectedImageKeys: Set<string>,
     patternItems: PatternItem[],
-    withEnd: boolean
+    withEnd: boolean,
+    stalePunches = 0,
   ): any => {
     const now = Math.floor(Date.now() / 1000);
 
@@ -272,7 +294,7 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
       itemMap[`${p.item_index}:${p.assignment_type}`] = p.station_key_number;
     });
 
-    const punches: Array<{ code: string; time: number }> = [];
+    const punches: Array<{ code: number; time: string }> = [];
     for (const quest of quests) {
       for (const img of quest.images) {
         if (!selectedImageKeys.has(img.key)) continue;
@@ -283,19 +305,33 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         const assignmentType = `image_${imgIndex}`;
         const stationKey = itemMap[`${quest.index}:${assignmentType}`];
         if (stationKey !== undefined) {
-          punches.push({ code: String(stationKey), time: now });
+          punches.push({ code: stationKey, time: hms(now) });
         }
       }
     }
 
+    // "Player forgot to wipe": stale marks on the SAME stations, an hour back,
+    // prepended in card order (SI cards are append-only, oldest first). They
+    // must be caught by the baseline snapshot, not by any clock comparison.
+    const stale: Array<{ code: number; time: string }> = [];
+    const stationPool = [...new Set(patternItems.map((p) => p.station_key_number))];
+    for (let i = 0; i < stalePunches && stationPool.length > 0; i++) {
+      stale.push({
+        code: stationPool[i % stationPool.length],
+        time: hms(now - 3600 - i * 60),
+      });
+    }
+    const allPunches = [...stale, ...punches];
+
     return {
       id: teamKeyId,
-      series: 0,
-      nbPunch: punches.length,
-      start: { code: '255', time: now - 600 },
+      series: 4,
+      cardType: 'SI11',
+      nbPunch: allPunches.length,
+      start: { code: 255, time: hms(now - 600) },
       check: null,
-      end: withEnd ? { code: '254', time: now } : null,
-      punches,
+      end: withEnd ? { code: 254, time: hms(now) } : null,
+      punches: allPunches,
     };
   };
 
@@ -343,6 +379,10 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
         // Each simulated team gets a fresh consumed-punch pool, mirroring how the
         // live TagQuestGamePage owns one set per game instance.
         const tqConsumed = new Map<number, Set<string>>();
+        // ...and a baseline map, mirroring the `tqbase:` meta the live page
+        // snapshots when a chip is first seen. Without this the simulator can't
+        // exercise the only remaining stale-card defence.
+        const tqBaselines = new Map<number, Set<string>>();
         const tqPlayMode = (meta.playMode === 'team' ? 'team' : 'solo') as 'solo' | 'team';
         const results: TestResult[] = [];
         for (const team of teamsToTest) {
@@ -356,9 +396,26 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
           const startTime = Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 1200 + 300);
           await updateTeam(team.id, { start_time: startTime });
 
-          const mockCard = buildTagQuestMockCard(team.key_id, selectedImages, tqPatternItems, endChip);
+          const mockCard = buildTagQuestMockCard(
+            team.key_id,
+            selectedImages,
+            tqPatternItems,
+            endChip,
+            testConfig.tqStalePunches,
+          );
           appendLog(`Punch: ${JSON.stringify(mockCard)}`);
           await recordPunch(gameId, mockCard);
+
+          // The stale punches are prepended, so they are exactly the first N -
+          // i.e. what would have been on the card at its baseline moment. The
+          // fresh ones came after and must still score.
+          const staleIds: string[] = mockCard.punches
+            .slice(0, testConfig.tqStalePunches)
+            .map((p: { code: number; time: string }) => `${p.code}@${p.time}`);
+          if (staleIds.length > 0) {
+            tqBaselines.set(mockCard.id, new Set(staleIds));
+            appendLog(`  card not wiped: ${staleIds.length} pre-existing punch(es) baselined`);
+          }
 
           // Score the punch here. The live game page now only processes punches
           // its own reader read (so a bip animates on just that device), and no
@@ -372,8 +429,14 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
             [],
             () => '',
             tqConsumed,
+            new Map(),
+            tqBaselines,
           );
           appendLog(`  ${punchResult.status} - score ${punchResult.new_total_score}`);
+          for (const d of punchResult.dropped_punches ?? []) {
+            appendLog(`  ignored station ${d.code} @ ${d.time} (${d.reason})`);
+          }
+          if (punchResult.card_full) appendLog('  CARD FULL - stations can write no more to it');
           results.push({
             teamName: team.team_name,
             score: punchResult.new_total_score,
@@ -524,11 +587,12 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
           for (const enigma of patternEnigmas) {
             const ge = enigmasForScoring.find((e: any) => e.number === enigma.enigma_id);
             const goodPts = parseInt(ge?.good_answer_points || '0');
-            const wrongPts = parseInt(ge?.wrong_answer_points || '0');
+            // Signed (a legacy positive magnitude folds to its negative).
+            const wrongPts = wrongAnswerPoints(ge?.wrong_answer_points);
             const hasGood = enigma.good_answers.some((a: string) => cardCodes.includes(a));
             const hasBad = enigma.wrong_answers.some((a: string) => cardCodes.includes(a));
             if (hasGood && !hasBad) totalScore += goodPts;
-            else if (hasBad && !hasGood) totalScore -= wrongPts;
+            else if (hasBad && !hasGood) totalScore += wrongPts;
           }
         } else if (patternEnigmas.length === 0) {
           totalScore = mockCard.punches.length * 10;
@@ -656,6 +720,25 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
 
             {gameType?.toLowerCase() === 'tagquest' ? (
               <div>
+                <div className="mb-3">
+                  <label className="pg-label" htmlFor="tqStalePunches">
+                    Stale punches on the card (not wiped)
+                  </label>
+                  <input
+                    id="tqStalePunches"
+                    type="number"
+                    min={0}
+                    max={20}
+                    value={testConfig.tqStalePunches}
+                    onChange={(e) => handleChange('tqStalePunches', parseInt(e.target.value, 10) || 0)}
+                    className="pg-input"
+                  />
+                  <div className="text-xs text-[var(--pg-text-dim)] mt-1">
+                    Prepends this many hour-old punches from a &ldquo;previous game&rdquo;. They must be
+                    ignored by the baseline while the fresh ones below still score.
+                  </div>
+                </div>
+
                 <div className="flex items-center mb-3">
                   <label className="pg-label flex items-center gap-2">
                     <ImageIcon size={15} className="text-[var(--pg-accent-bright)]" />

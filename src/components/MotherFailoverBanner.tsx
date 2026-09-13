@@ -10,14 +10,20 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Crown, X } from 'lucide-react';
+import { AlertTriangle, Crown, Link2, X } from 'lucide-react';
 import { onMotherReachability, getPromotableGameId } from '../services/motherFailover';
+import { rejoinCurrentMother } from '../services/childControlLink';
 import { BecomeMotherModal } from './BecomeMotherModal';
 
 export function MotherFailoverBanner() {
   const { t } = useTranslation();
   const [unreachable, setUnreachable] = useState(false);
   const [promoteGameId, setPromoteGameId] = useState<number | null>(null);
+  // "Rejoin" is offered BEFORE "become mother": after a failover the mother the
+  // device needs usually exists already, and rejoining it keeps one mother for
+  // the game. Promotion is the heavier answer, for when there is none.
+  const [rejoining, setRejoining] = useState(false);
+  const [rejoinFailed, setRejoinFailed] = useState(false);
   // Set when the operator clicks "Become mother" but this device never cached a
   // game (nothing to adopt). Shows a brief inline note instead of silently doing
   // nothing.
@@ -54,10 +60,34 @@ export function MotherFailoverBanner() {
                   defaultValue:
                     'This device has no saved game to take over - promote a device that was in the game.',
                 })
-              : t('failover:bannerText', {
-                  defaultValue: 'Lost contact with the mother device.',
-                })}
+              : rejoinFailed
+                ? t('failover:rejoinNotFound', {
+                    defaultValue: 'No mother found for this game on the network.',
+                  })
+                : t('failover:bannerText', {
+                    defaultValue: 'Lost contact with the mother device.',
+                  })}
           </span>
+          <button
+            type="button"
+            disabled={rejoining}
+            onClick={async () => {
+              setRejoining(true);
+              setRejoinFailed(false);
+              try {
+                const outcome = await rejoinCurrentMother();
+                if (outcome === 'not_found') setRejoinFailed(true);
+              } finally {
+                setRejoining(false);
+              }
+            }}
+            className="ml-2 inline-flex items-center gap-1.5 rounded-md bg-white/15 hover:bg-white/25 disabled:opacity-60 px-3 py-1 text-sm font-semibold transition-colors"
+          >
+            <Link2 size={15} />
+            {rejoining
+              ? t('failover:rejoinWorking', { defaultValue: 'Reconnecting…' })
+              : t('failover:rejoinBtn', { defaultValue: 'Rejoin the mother' })}
+          </button>
           {!noGame && (
             <button
               type="button"

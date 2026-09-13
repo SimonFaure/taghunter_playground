@@ -229,7 +229,7 @@ export function SatelliteLanSection() {
                   <WifiQr ssid={h.ssid} password={h.password} />
                   {h.origin === 'manual' && (
                     <button onClick={() => void deleteNetwork(h.ssid)} title={t('removeNetwork')}
-                      className="p-2 rounded-lg text-red-300 hover:bg-red-500/20">
+                      className="p-2 rounded-lg text-[var(--pg-danger-text)] hover:bg-red-500/20">
                       <Trash2 className="w-5 h-5" />
                     </button>
                   )}
@@ -278,14 +278,14 @@ export function SatelliteLanSection() {
           <div className="space-y-2">
             {paired.map((m) => (
               <div key={m.mother_uuid} className="p-4 rounded-xl border bg-[var(--pg-surface)] border-[var(--pg-line)] flex items-center gap-4">
-                <Radio className={`w-6 h-6 shrink-0 ${connOk ? 'text-green-400' : 'text-[var(--pg-text-dim)]'}`} />
+                <Radio className={`w-6 h-6 shrink-0 ${connOk ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-text-dim)]'}`} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-[var(--pg-text)] font-medium truncate">
                       {m.mother_label || m.mother_uuid.slice(0, 8)}
                     </span>
                     <span className={`text-xs px-2 py-0.5 rounded-full border ${
-                      connOk ? 'bg-green-500/20 text-green-300 border-green-500/40'
+                      connOk ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
                              : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
                       {connText}
                     </span>
@@ -298,7 +298,7 @@ export function SatelliteLanSection() {
                 </div>
                 <button onClick={() => forget(m)} disabled={forgettingUuid === m.mother_uuid}
                   title={t('forget')}
-                  className="p-2 rounded-lg text-red-300 hover:bg-red-500/20 disabled:opacity-50">
+                  className="p-2 rounded-lg text-[var(--pg-danger-text)] hover:bg-red-500/20 disabled:opacity-50">
                   {forgettingUuid === m.mother_uuid ? <Loader2 className="w-5 h-5 animate-spin" /> : <Trash2 className="w-5 h-5" />}
                 </button>
               </div>
@@ -317,8 +317,8 @@ export function SatelliteLanSection() {
 
         {msg && (
           <div className={`mb-3 text-sm rounded-lg p-2 border ${
-            msg.kind === 'ok' ? 'bg-green-500/15 border-green-500/40 text-green-300'
-                              : 'bg-red-500/15 border-red-500/40 text-red-300'}`}>
+            msg.kind === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+                              : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'}`}>
             {msg.text}
           </div>
         )}

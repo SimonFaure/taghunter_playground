@@ -3,13 +3,17 @@
 // so matching logic (launch resolve, icon lookup, filters) keeps working.
 
 /**
- * Display label for a game type. The canonical slug for the route-based game
- * type is `tracks`, but the user-facing name is singular - "Track". Everything
- * else passes through unchanged. Accepts a slug or a display name.
+ * Display label for a game type. The canonical slugs stay as they are; only the
+ * user-facing names are normalised - `tracks` reads "Track" (singular), and
+ * `tagquest` reads "Quest" (the mode's actual name - there is no "Tag" in front
+ * of it). Everything else passes through unchanged. Accepts a slug or a
+ * display name.
  */
 export function gameTypeLabel(name: string | null | undefined): string {
   const v = (name || '').trim();
-  if (v.toLowerCase() === 'tracks' || v.toLowerCase() === 'track') return 'Track';
+  const k = v.toLowerCase();
+  if (k === 'tracks' || k === 'track') return 'Track';
+  if (k === 'tagquest' || k === 'tag quest' || k === 'quest') return 'Quest';
   return v;
 }
 

@@ -6,6 +6,8 @@
 //         assignment-type keys + station-number rows.
 //   XLSX: a "meta" sheet (key/value) + a "pattern" sheet (the grid).
 
+import { tError } from '../i18n/errors';
+
 export interface ParsedPattern {
   pattern_uniqid: string;
   name: string;
@@ -95,12 +97,12 @@ export async function parsePatternFile(file: File): Promise<ParsedPattern> {
 
   const game_type = (meta.game_type || '').toLowerCase().trim();
   if (!game_type) {
-    throw new Error('This file has no game type. Use a pattern exported from the studio.');
+    throw new Error(tError('patternNoGameType'));
   }
 
   const pattern_data = gridRows(gridMatrix);
   if (pattern_data.length === 0) {
-    throw new Error('No pattern rows found in the file.');
+    throw new Error(tError('patternNoRows'));
   }
 
   const versionNum = parseFloat(meta.version || '');

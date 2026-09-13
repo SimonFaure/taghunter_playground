@@ -1,0 +1,15 @@
+{
+  "authPersistFailed": "No se ha podido guardar la cuenta conectada en este dispositivo.",
+  "authPersistFailedEviction": "No se ha podido guardar la cuenta conectada en este dispositivo tras liberar una plaza.",
+  "noCachedAccount": "No hay ninguna cuenta guardada en este dispositivo: el PIN no se puede restablecer.",
+  "deviceCapReached": "Límite de dispositivos alcanzado: cierra la sesión desde Ajustes y vuelve a iniciarla.",
+  "patternNoGameType": "Este archivo no indica ningún tipo de juego. Usa un modelo exportado desde el estudio.",
+  "patternNoRows": "No se ha encontrado ninguna fila de modelo en el archivo.",
+  "scenarioNotDownloaded": "Este escenario todavía no está descargado: abre la pantalla de lanzamiento completa para sincronizarlo.",
+  "noPatternAvailable": "No hay ningún modelo disponible para este escenario.",
+  "noMonitors": "No se ha detectado ninguna pantalla.",
+  "noUpdateToDownload": "No hay ninguna actualización para descargar.",
+  "noUpdateToInstall": "No hay ninguna actualización descargada lista para instalar.",
+  "motherUnreachable": "No hay ninguna madre accesible: este dispositivo no aloja la partida ni está conectado todavía a una madre.",
+  "pinFourDigits": "El PIN debe tener exactamente 4 dígitos."
+}

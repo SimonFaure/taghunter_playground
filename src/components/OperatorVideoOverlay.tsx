@@ -22,6 +22,13 @@ interface LanCommand {
     launched_game_id?: number;
     kinds?: Array<'intro' | 'tutorial'>;
     language?: string;
+    // Present only on a command this device's OWN mother server dispatched
+    // in-process (a satellite operator targeting the mother's screen). The
+    // server resolved the scenario identity for us - see queue_command_inner -
+    // because we can't fetch it over HTTP: we ARE the mother, and our
+    // launched_games route may be pointed at a different one.
+    game_uniqid?: string;
+    game_type?: string;
   };
   mother_uuid?: string;
   mother_addr?: string;
@@ -78,6 +85,23 @@ export function OperatorVideoOverlay() {
           const kinds = cmd.payload.kinds ?? [];
           const language = cmd.payload.language ?? 'fr';
           if (!gid || kinds.length === 0) return;
+          // Locally dispatched by our own mother server: the scenario identity
+          // rode along in the payload, so there is nothing to repoint or fetch.
+          if (cmd.payload.game_uniqid && cmd.payload.game_type) {
+            const local = await resolveVideosByKind(
+              kinds,
+              cmd.payload.game_uniqid,
+              cmd.payload.game_type,
+              language,
+            );
+            if (cancelled) return;
+            if (local.length === 0) {
+              console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
+              return;
+            }
+            void startVideosDeferred(local);
+            return;
+          }
           // The pushed game lives in the PUSHING mother's SQLite. Repoint our
           // launched_games traffic there before the state fetch (same as App's
           // join_game handler): the ambient route may have been restored to

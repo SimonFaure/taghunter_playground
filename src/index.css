@@ -36,6 +36,28 @@
   --pg-radius-sm: 7px;
   --pg-radius-md: 9px;
   --pg-radius-lg: 12px;
+
+  /* ---------- Status tokens (ok / warn / danger) ----------
+     Retours Ludiom #79: the network panels painted their status frames with raw
+     Tailwind shades chosen for the dark themes (`text-green-200` on
+     `bg-green-500/15`, and the amber twin). On a LIGHT theme that translucent
+     wash sits on white, so a 200-shade text lands green-on-green /
+     yellow-on-yellow - illegible at exactly the moment an operator needs to
+     reconnect a device. Status colour now comes from these tokens, which each
+     theme block re-defines, so the text keeps its contrast either way.
+     Use as: `bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]`. */
+  --pg-ok-text: #86efac;
+  --pg-ok-icon: #4ade80;
+  --pg-ok-bg: rgba(34, 197, 94, 0.15);
+  --pg-ok-line: rgba(34, 197, 94, 0.4);
+  --pg-warn-text: #fcd34d;
+  --pg-warn-icon: #fbbf24;
+  --pg-warn-bg: rgba(245, 158, 11, 0.15);
+  --pg-warn-line: rgba(245, 158, 11, 0.4);
+  --pg-danger-text: #fca5a5;
+  --pg-danger-icon: #f87171;
+  --pg-danger-bg: rgba(239, 68, 68, 0.15);
+  --pg-danger-line: rgba(239, 68, 68, 0.4);
 }
 
 [data-theme='blue'] {
@@ -75,6 +97,20 @@
   --pg-text-dim: #6b6b73;
   --pg-meter-off: #cfcfd5;
   --pg-scroll-thumb: rgba(0, 0, 0, 0.22);
+  /* Status text goes DARK on the light themes - the pale dark-theme shades were
+     invisible on the tinted-white washes below. Retours Ludiom #79. */
+  --pg-ok-text: #14532d;
+  --pg-ok-icon: #15803d;
+  --pg-ok-bg: rgba(34, 197, 94, 0.16);
+  --pg-ok-line: rgba(21, 128, 61, 0.4);
+  --pg-warn-text: #713f12;
+  --pg-warn-icon: #b45309;
+  --pg-warn-bg: rgba(245, 158, 11, 0.2);
+  --pg-warn-line: rgba(180, 83, 9, 0.4);
+  --pg-danger-text: #7f1d1d;
+  --pg-danger-icon: #b91c1c;
+  --pg-danger-bg: rgba(239, 68, 68, 0.14);
+  --pg-danger-line: rgba(185, 28, 28, 0.4);
 }
 
 [data-theme='red-light'] {
@@ -958,6 +994,10 @@ body::-webkit-scrollbar-corner {
 }
 .pg-stat-value--muted {
   color: var(--pg-text-dim);
+}
+/* Penalties (malus). */
+.pg-stat-value--danger {
+  color: #f87171;
 }
 
 /* ---------- Badges + segmented pills ---------- */

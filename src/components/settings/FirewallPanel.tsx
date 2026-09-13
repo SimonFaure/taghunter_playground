@@ -43,8 +43,8 @@ export function FirewallPanel({ hintKey }: { hintKey: 'firewallHint' | 'firewall
       </button>
       {result && (
         <div className={`mt-3 text-sm rounded-lg p-2 border ${
-          result === 'ok' ? 'bg-green-500/15 border-green-500/40 text-green-300'
-                          : 'bg-red-500/15 border-red-500/40 text-red-300'}`}>
+          result === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+                          : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'}`}>
           {result === 'ok' ? t('firewallOk') : t('firewallErr')}
         </div>
       )}

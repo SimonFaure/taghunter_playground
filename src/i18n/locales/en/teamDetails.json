@@ -8,6 +8,7 @@
   "summaryQuests": "Quests",
   "summaryQuestPts": "Quest pts",
   "summaryComboBonus": "Combo bonus",
+  "summaryStationMalus": "Station malus",
   "summaryTotalScore": "Total score",
   "comboBreakdown": "Combo breakdown",
   "comboPill6": "{{count}}× combo-6 = +{{points}} pts",
@@ -59,5 +60,7 @@
   "editSave": "Save",
   "editSaving": "Saving...",
   "editSaveChanges": "Save changes",
-  "editSaveFailed": "Failed to update the team."
+  "editSaveFailed": "Failed to update the team.",
+  "summaryLateMalus": "Late malus",
+  "lateMalusRevert": "Revert to the auto-computed late malus ({{value}})"
 }

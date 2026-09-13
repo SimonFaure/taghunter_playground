@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { ArrowLeft, Trophy } from 'lucide-react';
 import { LeaderboardPanel } from './LeaderboardPanel';
 import type { ActiveGameOption } from './RankingsModal';
@@ -15,6 +16,10 @@ function getGridClass(count: number): string {
 }
 
 export function MultiGameLeaderboard({ games, onBack }: MultiGameLeaderboardProps) {
+  // `tr`, not `t`: matches the sibling boards, which use `t` for a team.
+  // This whole header was hard-coded English on a screen players stand in
+  // front of (retours #97).
+  const { t: tr } = useTranslation('rankings');
   const count = Math.min(games.length, 4);
   const visibleGames = games.slice(0, count);
   const compact = count > 2;
@@ -27,16 +32,16 @@ export function MultiGameLeaderboard({ games, onBack }: MultiGameLeaderboardProp
           className="flex items-center gap-2 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition-colors text-sm font-medium"
         >
           <ArrowLeft size={18} />
-          Back
+          {tr('back')}
         </button>
 
         <div className="flex items-center gap-2.5">
           <div className="w-7 h-7 rounded-lg bg-yellow-400/15 flex items-center justify-center">
             <Trophy size={14} className="text-yellow-400" />
           </div>
-          <span className="text-[var(--pg-text)] font-bold text-sm">Live Rankings</span>
+          <span className="text-[var(--pg-text)] font-bold text-sm">{tr('liveRankings')}</span>
           <span className="px-2 py-0.5 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs font-medium">
-            {count} {count === 1 ? 'game' : 'games'}
+            {tr('gameCount', { count })}
           </span>
         </div>
       </header>

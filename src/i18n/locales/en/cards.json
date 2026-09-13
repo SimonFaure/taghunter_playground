@@ -50,5 +50,17 @@
   "assignmentLabel": "{{label}}:",
   "station": "station {{number}}",
   "stationNumber": "Station {{number}}",
-  "stationId": "ID {{id}}"
+  "stationId": "ID {{id}}",
+  "noVideoForGameType": "No tutorial video",
+  "gameTypeVideosImportHint": "You can import your own tutorial video for each game type. It stays on THIS device: it is not sent to the studio and is not pushed to the other devices.",
+  "videoSourceLocal": "Local",
+  "videoSourceClient": "Your studio",
+  "videoSourceDefault": "Tag Hunter",
+  "importLocalVideo": "Import a video",
+  "replaceLocalVideo": "Replace",
+  "removeLocalVideo": "Remove",
+  "removeLocalVideoConfirm": "Remove the imported tutorial video for {{name}}? The device will fall back to the studio video.",
+  "importingVideo": "Importing… {{bytes}}",
+  "localVideoError": "Import failed: {{error}}",
+  "dismiss": "Dismiss"
 }

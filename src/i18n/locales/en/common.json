@@ -1,7 +1,7 @@
 {
-  "becomeMotherPromptTitle": "Make this device the mother?",
-  "becomeMotherPromptBody": "No mother device is reachable on the network, so this device will become the mother and host the game. Other devices can then join it.",
-  "becomeMotherPromptConfirm": "Become mother & launch",
+  "becomeMotherPromptTitle": "Host a new game on this device?",
+  "becomeMotherPromptBody": "No mother device is reachable on the network, so this device will become the mother and host a NEW game. Other devices can then join it. To resume a game in progress whose mother went down, use the red \"Take over the game\" banner instead.",
+  "becomeMotherPromptConfirm": "Host & launch a new game",
   "save": "Save",
   "cancel": "Cancel",
   "close": "Close",

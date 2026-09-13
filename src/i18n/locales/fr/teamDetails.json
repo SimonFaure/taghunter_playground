@@ -8,6 +8,7 @@
   "summaryQuests": "Quêtes",
   "summaryQuestPts": "Pts de quête",
   "summaryComboBonus": "Bonus combo",
+  "summaryStationMalus": "Malus station",
   "summaryTotalScore": "Score total",
   "comboBreakdown": "Détail des combos",
   "comboPill6": "{{count}}× combo-6 = +{{points}} pts",
@@ -59,5 +60,7 @@
   "editSave": "Enregistrer",
   "editSaving": "Enregistrement...",
   "editSaveChanges": "Enregistrer les modifications",
-  "editSaveFailed": "Échec de la mise à jour de l'équipe."
+  "editSaveFailed": "Échec de la mise à jour de l'équipe.",
+  "summaryLateMalus": "Malus de retard",
+  "lateMalusRevert": "Revenir au malus de retard calculé automatiquement ({{value}})"
 }

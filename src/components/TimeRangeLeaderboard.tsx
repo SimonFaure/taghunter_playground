@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Trophy, ArrowLeft, Clock, Medal, Calendar, Zap, Star, Users } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Trophy, ArrowLeft, Clock, Medal, Calendar, Zap, Star, Users, X } from 'lucide-react';
 import {
   listLaunchedGames,
   getLaunchedGameMeta,
@@ -63,17 +64,14 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
-function timeRangeLabel(range: TimeRange): string {
-  const map: Record<TimeRange, string> = {
-    day: 'Today',
-    week: 'This Week',
-    month: 'This Month',
-    trimester: 'This Quarter',
-    year: 'This Year',
-    all: 'All Time',
-  };
-  return map[range];
-}
+const TIME_RANGE_KEY: Record<TimeRange, string> = {
+  day: 'rangeDay',
+  week: 'rangeWeek',
+  month: 'rangeMonth',
+  trimester: 'rangeTrimester',
+  year: 'rangeYear',
+  all: 'rangeAll',
+};
 
 function getRankBg(index: number): string {
   if (index === 0) return 'bg-yellow-400/10 border-yellow-400/30';
@@ -97,6 +95,8 @@ function RankIcon({ index }: { index: number }) {
 }
 
 export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMode = false }: TimeRangeLeaderboardProps) {
+  const { t } = useTranslation('rankings');
+  const rangeLabel = t(TIME_RANGE_KEY[timeRange]);
   const [teams, setTeams] = useState<TeamEntry[]>([]);
   const [victoryType, setVictoryType] = useState<'speed' | 'score'>('score');
   const [playMode, setPlayMode] = useState<'solo' | 'team'>('solo');
@@ -226,37 +226,47 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
       >
         <header className="flex items-center justify-between px-6 py-5 border-b border-[var(--pg-line)]">
           {projectorMode ? (
-            <span />
+            /* Retours Ludiom #71: a visible way out of the projector window,
+               not just the undiscoverable Esc key. */
+            <button
+              onClick={() => void closeSelfProjectorWindow()}
+              className="flex items-center gap-2 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition-colors text-sm font-medium"
+              title={t('closeWindowTitle')}
+              aria-label={t('closeWindowTitle')}
+            >
+              <X size={18} />
+              {t('closeWindow')}
+            </button>
           ) : (
             <button
               onClick={onBack}
               className="flex items-center gap-2 text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] transition-colors text-sm font-medium"
             >
               <ArrowLeft size={18} />
-              Back
+              {t('back')}
             </button>
           )}
 
           <div className="flex items-center gap-3">
             <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs font-medium">
               <Calendar size={12} />
-              {timeRangeLabel(timeRange)}
+              {rangeLabel}
             </span>
             {playMode === 'team' && (
               <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-teal-500/15 border border-teal-500/30 text-teal-400 text-xs font-semibold uppercase tracking-wide">
                 <Users size={12} />
-                Team mode
+                {t('teamMode')}
               </span>
             )}
             {victoryType === 'speed' ? (
               <span className="flex items-center gap-1.5 text-orange-400 text-xs font-semibold uppercase tracking-wide">
                 <Zap size={13} />
-                Speed
+                {t('speed')}
               </span>
             ) : (
               <span className="flex items-center gap-1.5 text-[var(--pg-accent-bright)] text-xs font-semibold uppercase tracking-wide">
                 <Star size={13} />
-                Score
+                {t('score')}
               </span>
             )}
           </div>
@@ -267,9 +277,9 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
             <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-yellow-400/10 border-2 border-yellow-400/40 mb-5">
               <Trophy size={36} className="text-yellow-400" />
             </div>
-            <h1 className="text-4xl font-bold text-[var(--pg-text)] tracking-tight mb-1">Rankings</h1>
+            <h1 className="text-4xl font-bold text-[var(--pg-text)] tracking-tight mb-1">{t('title')}</h1>
             <p className="text-[var(--pg-accent-bright)] font-medium text-base mt-1">{scenario.title}</p>
-            <p className="text-[var(--pg-text-dim)] text-sm mt-1">{timeRangeLabel(timeRange)}</p>
+            <p className="text-[var(--pg-text-dim)] text-sm mt-1">{rangeLabel}</p>
           </div>
 
           {loading ? (
@@ -281,7 +291,7 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
           ) : teams.length === 0 ? (
             <div className="text-center py-16">
               <Trophy size={36} className="text-[var(--pg-text-dim)] mx-auto mb-3" />
-              <p className="text-[var(--pg-text-dim)]">No results found for this time range.</p>
+              <p className="text-[var(--pg-text-dim)]">{t('noResults')}</p>
             </div>
           ) : (
             <div className="w-full space-y-3">
@@ -326,16 +336,16 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
                           </div>
                           <div className="text-[var(--pg-text-dim)] text-xs mt-0.5 flex items-center justify-end gap-1">
                             <Clock size={10} />
-                            time
+                            {t('timeLabel')}
                           </div>
                         </>
                       ) : victoryType === 'score' ? (
                         <>
                           <div className={`text-xl font-bold ${index === 0 ? 'text-yellow-400' : 'text-[var(--pg-text)]'}`}>
                             {team.score}
-                            <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">pts</span>
+                            <span className="text-[var(--pg-text-dim)] text-sm font-normal ml-1">{t('pts')}</span>
                           </div>
-                          <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">score</div>
+                          <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">{t('scoreLabel')}</div>
                         </>
                       ) : (
                         <div className="text-[var(--pg-text-dim)] text-sm">&mdash;</div>

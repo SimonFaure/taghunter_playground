@@ -50,5 +50,6 @@
   "delete": "Delete",
   "cancel": "Cancel",
   "enterPinTitle": "Enter your PIN",
-  "enterPinDeleteSubtitle": "Enter the device PIN to delete \"{{title}}\"."
+  "enterPinDeleteSubtitle": "Enter the device PIN to delete \"{{title}}\".",
+  "bandAdults": "Adults"
 }

@@ -10,6 +10,7 @@ import {
   updateTeam,
 } from '../services/launchedGames';
 import { buildMediaMap } from '../utils/questMedia';
+import { wrongAnswerPoints } from '../services/mysteryScoring';
 
 interface TeamTestModalProps {
   gameId: number;
@@ -421,11 +422,12 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
         for (const enigma of patternEnigmas) {
           const ge = enigmasForScoring.find((e: any) => e.number === enigma.enigma_id);
           const goodPts = parseInt(ge?.good_answer_points || '0');
-          const wrongPts = parseInt(ge?.wrong_answer_points || '0');
+          // Signed (a legacy positive magnitude folds to its negative).
+          const wrongPts = wrongAnswerPoints(ge?.wrong_answer_points);
           const hasGood = enigma.good_answers.some((a: string) => cardCodes.includes(a));
           const hasBad = enigma.wrong_answers.some((a: string) => cardCodes.includes(a));
           if (hasGood && !hasBad) totalScore += goodPts;
-          else if (hasBad && !hasGood) totalScore -= wrongPts;
+          else if (hasBad && !hasGood) totalScore += wrongPts;
         }
       } else if (patternEnigmas.length === 0) {
         totalScore = mockCard.punches.length * 10;

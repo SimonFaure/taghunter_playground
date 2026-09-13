@@ -19,6 +19,7 @@ import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { getAuthUser } from './authStore';
+import { tError } from '../i18n/errors';
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -186,7 +187,7 @@ export async function downloadUpdate(
   // channel hook is a request header the server also reads.
   const channel = await resolveUpdateChannel();
   const update = await check({ headers: { 'X-Update-Channel': channel } });
-  if (!update) throw new Error('No update available to download');
+  if (!update) throw new Error(tError('noUpdateToDownload'));
   pendingUpdate = update;
 
   let downloaded = 0;
@@ -218,7 +219,7 @@ export function hasPendingUpdate(): boolean {
  * On Windows the installer (passive mode) takes over and the process exits.
  */
 export async function installAndRelaunch(): Promise<void> {
-  if (!pendingUpdate) throw new Error('No downloaded update to install');
+  if (!pendingUpdate) throw new Error(tError('noUpdateToInstall'));
   await pendingUpdate.install();
   await relaunch();
 }

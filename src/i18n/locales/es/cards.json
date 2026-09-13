@@ -50,5 +50,17 @@
   "assignmentLabel": "{{label}}:",
   "station": "estación {{number}}",
   "stationNumber": "Estación {{number}}",
-  "stationId": "ID {{id}}"
+  "stationId": "ID {{id}}",
+  "noVideoForGameType": "Sin vídeo tutorial",
+  "gameTypeVideosImportHint": "Puede importar su propio vídeo tutorial para cada tipo de juego. Se queda en ESTE dispositivo: no se envía al estudio ni se transmite a los demás dispositivos.",
+  "videoSourceLocal": "Local",
+  "videoSourceClient": "Su estudio",
+  "videoSourceDefault": "Tag Hunter",
+  "importLocalVideo": "Importar un vídeo",
+  "replaceLocalVideo": "Reemplazar",
+  "removeLocalVideo": "Quitar",
+  "removeLocalVideoConfirm": "¿Quitar el vídeo tutorial importado para {{name}}? El dispositivo volverá al vídeo del estudio.",
+  "importingVideo": "Importando… {{bytes}}",
+  "localVideoError": "Error de importación: {{error}}",
+  "dismiss": "Descartar"
 }

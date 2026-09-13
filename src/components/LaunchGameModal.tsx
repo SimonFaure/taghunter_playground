@@ -30,6 +30,7 @@ import {
   type RosterImportMode,
 } from '../services/rosterImport';
 import { isOperatorOnly } from '../services/operatorMode';
+import { DEFAULT_CLASH_PURGE_STATION } from '../services/clash';
 import {
   listActiveLaunchedGames,
   getLaunchedGameState,
@@ -127,6 +128,7 @@ function extractDefaultLanguage(rawGameData: unknown): string | null {
 // to display copy at the call sites via `t()`.
 export const TRACKS_ROUTE_LABELS: Record<string, string> = {
   default: 'launchModal:routeDefault',
+  reverse: 'launchModal:routeReverse',
   first_half: 'launchModal:routeFirstHalf',
   last_half: 'launchModal:routeLastHalf',
   odd: 'launchModal:routeOdd',
@@ -557,6 +559,13 @@ export function LaunchGameModal({
   // Clash "The Purge": the feature is only offered when the scenario ships a
   // purge image (game_meta.purge_image) - no built-in fallback marker exists.
   const [clashHasPurgeImage, setClashHasPurgeImage] = useState(false);
+  // Clash "The Purge": the scenario-authored purge station (game_meta
+  // .purge_station). Since retours #50 the author picks it in Studio - where
+  // the territory picker reserves it - and this launch field just prefills
+  // from it. Falls back to the historic 25 for pre-#50 scenarios.
+  const [clashPurgeStationSeed, setClashPurgeStationSeed] = useState<number>(
+    DEFAULT_CLASH_PURGE_STATION,
+  );
   // Scenario's audience (game_meta.game_public) - default for the name-pool draw.
   const [scenarioPublic, setScenarioPublic] = useState<NamePoolAudience>('kids');
   // Scenario-authored timing defaults (game_meta) that prefill the launch fields:
@@ -713,6 +722,15 @@ export function LaunchGameModal({
         typeof (gmClash as { purge_image?: unknown }).purge_image === 'string' &&
           ((gmClash as { purge_image: string }).purge_image).length > 0,
       );
+      const authoredPurgeStation = parseInt(
+        String((gmClash as { purge_station?: unknown }).purge_station ?? ''),
+        10,
+      );
+      setClashPurgeStationSeed(
+        Number.isFinite(authoredPurgeStation) && authoredPurgeStation > 0
+          ? authoredPurgeStation
+          : DEFAULT_CLASH_PURGE_STATION,
+      );
 
       // Audience for name-pool draws: scenario's game_meta.game_public, folded
       // onto the canonical trio (legacy 'adults'/'teens' -> 'ado_adultes').
@@ -831,7 +849,7 @@ export function LaunchGameModal({
         clashBalises: clashBalisesSeed,
         // The Purge - ON by default when the scenario has a purge image.
         clashPurgeEnabled: clashHasPurgeImage,
-        clashPurgeStation: 25,
+        clashPurgeStation: clashPurgeStationSeed,
         // TagQuest teams are predetermined by default (operator builds the
         // roster on step 2). Self-register is an opt-in that mirrors Clash.
         tagquestSelfRegister: false,
@@ -882,7 +900,7 @@ export function LaunchGameModal({
       setOverwriteConfirm(null);
       setSavedFlash(null);
     }
-  }, [isOpen, defaultPattern, patternFolders, scenarioDefaultLang, scenarioPublic, scenarioMessageDisplayTime, scenarioEnigmaDuration, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, clashBalisesSeed, clashHasPurgeImage, prefillConfig, prefillConfigName]);
+  }, [isOpen, defaultPattern, patternFolders, scenarioDefaultLang, scenarioPublic, scenarioMessageDisplayTime, scenarioEnigmaDuration, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, clashBalisesSeed, clashHasPurgeImage, clashPurgeStationSeed, prefillConfig, prefillConfigName]);
 
   // Tracks: warn when the selected pattern's row count doesn't match the
   // course's checkpoint count. The checkpoint↔station binding is positional
@@ -929,7 +947,7 @@ export function LaunchGameModal({
   // physical punch can't both validate and purge. This is a HARD launch gate.
   const clashPurgeCollision = useMemo(() => {
     if (!isClash || !config.clashPurgeEnabled) return null;
-    const station = config.clashPurgeStation ?? 25;
+    const station = config.clashPurgeStation ?? clashPurgeStationSeed;
     for (const terr of clashTerritories) {
       const override = config.clashBalises?.[terr.index];
       const effective =
@@ -939,7 +957,7 @@ export function LaunchGameModal({
       }
     }
     return null;
-  }, [isClash, config.clashPurgeEnabled, config.clashPurgeStation, config.clashBalises, clashTerritories, clashBalisesSeed]);
+  }, [isClash, config.clashPurgeEnabled, config.clashPurgeStation, clashPurgeStationSeed, config.clashBalises, clashTerritories, clashBalisesSeed]);
   // Tracks multi-route launch: 2+ routes selected ⇒ teams get a per-team route
   // (assigned in order on the team-config step) and auto-register is disabled.
   const multipleRoutes = isTracks && (config.routes?.length ?? 0) > 1;
@@ -2776,11 +2794,14 @@ export function LaunchGameModal({
                                 type="number"
                                 id="clashPurgeStation"
                                 min="1"
-                                value={config.clashPurgeStation ?? 25}
+                                value={config.clashPurgeStation ?? clashPurgeStationSeed}
                                 onChange={(e) =>
                                   setConfig({
                                     ...config,
-                                    clashPurgeStation: Math.max(1, parseInt(e.target.value) || 25),
+                                    clashPurgeStation: Math.max(
+                                      1,
+                                      parseInt(e.target.value) || clashPurgeStationSeed,
+                                    ),
                                   })
                                 }
                                 className="pg-input w-28"

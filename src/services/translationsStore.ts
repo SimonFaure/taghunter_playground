@@ -1,10 +1,16 @@
 import { getDb } from './db';
 
 /**
- * The set of admin-managed translation rows we expect to receive from the
- * studio manifest. Used by `tombstoneMissing` to safely delete cached rows
- * for keys no longer present (admin deleted) without affecting unrelated
- * tables.
+ * The set of admin-managed config rows we expect to receive from the studio
+ * manifest. Used by `tombstoneMissing` to safely delete cached rows for keys no
+ * longer present (admin deleted) without affecting unrelated tables - so a key
+ * missing from this list is DELETED on every sync, not just ignored.
+ *
+ * The table is named after translations because that is all it used to hold; it
+ * is really a generic `key -> value_json` cache of studio `default_config` rows,
+ * and the Quest default layout/typography blobs ride it too rather than adding a
+ * second table (editing an already-applied tauri-plugin-sql migration is the
+ * thing we do not do - see the layouts-table note in lib.rs migration 2).
  */
 export const KNOWN_TRANSLATION_KEYS = [
   // Legacy key for the tagquest HUD labels - the playground absorbs it into the
@@ -14,6 +20,11 @@ export const KNOWN_TRANSLATION_KEYS = [
   'ingame_common',
   'ingame_mystery',
   'ingame_tracks',
+  'ingame_clash',
+  // Studio-wide Quest HUD defaults, authored on the studio admin "Default
+  // layouts" page: element geometry overrides and per-role text size/colour.
+  'default_layout_tagquest',
+  'default_typography_tagquest',
 ] as const;
 export type TranslationKey = (typeof KNOWN_TRANSLATION_KEYS)[number];
 

@@ -33,6 +33,7 @@ import { enable as enableAutostart, disable as disableAutostart } from '@tauri-a
 import { useTranslation } from 'react-i18next';
 import {
   sportidentService,
+  SI_CARD_CAPACITY,
   type CardData,
   type StationData,
 } from '../services/sportidentService';
@@ -1156,9 +1157,35 @@ function CardReaderTestSection() {
   );
 }
 
+// Past this many minutes of station-vs-PC clock difference, a punch's skew is
+// flagged. Generous on purpose: this is a "go re-time that box" hint, not a
+// scoring rule - nothing in the punch logic reads a station clock any more.
+const CLOCK_SKEW_ALERT_MIN = 10;
+
+/**
+ * How far a punch's station clock sits from this PC's, in whole minutes
+ * (positive = the station is ahead). SI punch times are local "HH:MM:SS"
+ * time-of-day; anything else (a synthetic card from the test simulator) gives
+ * `null`. Midnight wrap is folded to the nearest direction so a punch just
+ * after midnight against a PC just before it doesn't read as -1439 min.
+ */
+function clockSkewMinutes(time: string): number | null {
+  const m = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec(String(time).trim());
+  if (!m) return null;
+  const punchSec = +m[1] * 3600 + +m[2] * 60 + +m[3];
+  const now = new Date();
+  const nowSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  let delta = punchSec - nowSec;
+  if (delta > 12 * 3600) delta -= 24 * 3600;
+  if (delta < -12 * 3600) delta += 24 * 3600;
+  return Math.round(delta / 60);
+}
+
 function CardRow({ entry }: { entry: CardWithReceivedAt }) {
   const { t } = useTranslation();
   const { card, receivedAt } = entry;
+  const cardCapacity: number | undefined = SI_CARD_CAPACITY[card.cardType];
+  const cardIsFull = cardCapacity != null && card.punches.length >= cardCapacity;
   const [registered, setRegistered] = useState<cardsRepo.CardRow | null>(null);
   const [showRegister, setShowRegister] = useState(false);
   const [keyNumberStr, setKeyNumberStr] = useState('');
@@ -1234,7 +1261,16 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
           <span className="font-mono text-2xl text-[var(--pg-accent-bright)]">#{card.id}</span>
           <span className="text-sm text-[var(--pg-text-dim)]">
             {card.cardType} · {t('settings:punchCount', { count: card.nbPunch })}
+            {cardCapacity != null && ` (${card.punches.length}/${cardCapacity})`}
           </span>
+          {/* A full card stops accepting punches with nothing but a beep, so the
+              player keeps "punching" stations that never land. Chaining several
+              scenarios on one chip is what fills it (client report #101). */}
+          {cardIsFull && (
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-red-500/20 text-red-300 text-xs font-medium border border-red-500/30">
+              {t('settings:cardFull')}
+            </span>
+          )}
           {registered ? (
             <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-green-500/20 text-green-300 text-xs font-medium border border-green-500/30">
               <Check size={12} />
@@ -1330,16 +1366,31 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
             {t('settings:punchesHeading')}
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-1">
-            {card.punches.map((p, i) => (
-              <div
-                key={i}
-                className="flex justify-between items-center font-mono text-xs bg-[var(--pg-surface-3)] rounded px-2 py-1"
-              >
-                <span className="text-[var(--pg-accent-bright)]">#{p.code}</span>
-                <span className="text-[var(--pg-text-dim)]">{p.time}</span>
-              </div>
-            ))}
+            {card.punches.map((p, i) => {
+              const skew = clockSkewMinutes(p.time);
+              return (
+                <div
+                  key={i}
+                  className="flex justify-between items-center gap-2 font-mono text-xs bg-[var(--pg-surface-3)] rounded px-2 py-1"
+                >
+                  <span className="text-[var(--pg-accent-bright)]">#{p.code}</span>
+                  <span className="text-[var(--pg-text-dim)]">{p.time}</span>
+                  {skew != null && (
+                    <span className={skew >= CLOCK_SKEW_ALERT_MIN || skew <= -CLOCK_SKEW_ALERT_MIN
+                      ? 'text-red-300'
+                      : 'text-[var(--pg-text-dim)] opacity-60'}>
+                      {skew > 0 ? '+' : ''}{skew}′
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
+          {/* Nothing scores on these any more - the punch logic never compares a
+              station clock to the PC's. This is a fleet-health readout: a lone
+              station sitting minutes (or a whole 12h AM/PM half) away from the
+              others is the box to go re-time. */}
+          <div className="text-xs text-[var(--pg-text-dim)] mt-2">{t('settings:clockSkewHint')}</div>
         </div>
       )}
     </div>

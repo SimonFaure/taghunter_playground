@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { X, Award, Zap, Target, Clock, List, ChevronDown, ChevronUp, BarChart2, Plus, Minus, Puzzle, RotateCcw, ImageOff, Pencil, Save, MapPin } from 'lucide-react';
+import { X, Award, Zap, Target, Clock, List, ChevronDown, ChevronUp, BarChart2, Plus, Minus, Puzzle, RotateCcw, ImageOff, Pencil, Save, MapPin, AlertTriangle } from 'lucide-react';
 import * as scenarioStore from '../services/scenarioStore';
 import * as patternStore from '../services/patternStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -24,12 +24,14 @@ import {
   updateTeam,
 } from '../services/launchedGames';
 import { getClashMembers } from '../services/clash';
+import { wrongAnswerPoints } from '../services/mysteryScoring';
 import {
   computeCombos,
   effectifWeights,
   formatWeight,
   isWeightingEnabled,
   memberCounts,
+  partitionMalusRows,
   teamHeadcounts,
   weightedScore,
   type RosterTeam,
@@ -112,9 +114,11 @@ const ENIGMA_STATUS_META: Record<EnigmaStatus, { label: string; activeClass: str
 const ENIGMA_STATUS_ORDER: EnigmaStatus[] = ['found', 'wrong', 'not_found', 'both'];
 
 // Points a single enigma contributes for a given (effective) status - the same
-// rule MysteryGamePage applies: good answer adds its points, wrong answer
-// subtracts its penalty, both = the both-answers malus, no-answer = the
-// no-answer malus (both signed; default 0).
+// rule MysteryGamePage applies: good answer adds its points, wrong answer adds
+// its (negative) points, both = the both-answers malus, no-answer = the
+// no-answer malus. Every one of them is signed; default 0.
+//
+// `wrongPts` must already be signed - pass it through wrongAnswerPoints().
 function enigmaPoints(
   status: EnigmaStatus,
   goodPts: number,
@@ -123,7 +127,7 @@ function enigmaPoints(
   noAnswerMalus: number,
 ): number {
   if (status === 'found') return goodPts;
-  if (status === 'wrong') return -wrongPts;
+  if (status === 'wrong') return wrongPts;
   if (status === 'both') return bothMalus;
   return noAnswerMalus; // 'not_found'
 }
@@ -410,7 +414,12 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const isMystery = (gameType ?? '').toLowerCase() === 'mystery';
   const isTracks = (gameType ?? '').toLowerCase() === 'tracks';
   const isTagQuest = (gameType ?? '').toLowerCase() === 'tagquest';
+  // Real quest completions only - malus-station hits share the same table (see
+  // MALUS_QUEST_NUMBER) and are split into `stationMalus` below so they never
+  // show up as quests or feed the combo math.
   const [completedQuests, setCompletedQuests] = useState<CompletedQuest[]>([]);
+  /** TagQuest: points this team lost to punches on the scenario's malus station. */
+  const [stationMalus, setStationMalus] = useState(0);
   // TagQuest effectif weighting (when the launch option is on): this team's live
   // headcount + weight, refreshed on the same poll as the quest rows so the
   // modal's totals match lg_teams.score. null ⇒ weighting off / not tagquest.
@@ -688,7 +697,9 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
           getLaunchedGameState(launchedGameId, 0),
           getClashMembers(launchedGameId).catch(() => []),
         ]);
-        setCompletedQuests(questsRows.map(toCompletedQuest));
+        const split = partitionMalusRows(questsRows);
+        setCompletedQuests(split.questRows.map(toCompletedQuest));
+        setStationMalus(split.stationMalus);
         // Punches: in team mode each member punches with their OWN chip, so
         // filter the game's raw_data to every chip on this team (leader +
         // teammates) - the leader's key_id often never punches. state's
@@ -798,7 +809,8 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const comboTotal = combos.combos6 * pts6 + combos.combos4 * pts4 + combos.combos2 * pts2;
   // Effectif weighting (when active) scales the earned points - the tile then
   // matches the persisted score. Quest-pts / combo tiles stay raw on purpose.
-  const totalScore = weightedScore(totalQuestPoints + comboTotal, effectifWeight ?? 1);
+  // The station malus is a penalty, so it comes off unweighted.
+  const totalScore = weightedScore(totalQuestPoints + comboTotal, effectifWeight ?? 1, stationMalus);
   const currentLevel = computeLevel(totalScore, gameLevels);
 
   const allQuestNumbers = quests.length > 0
@@ -831,13 +843,15 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   // combo bonus, matching how the list/modal display it) and persist it, so the
   // rankings / in-game HUD stay consistent after a manual adjustment. Applies
   // the effectif weight when active - otherwise a ± adjustment would overwrite
-  // the punch logic's weighted score with a raw one.
-  const recomputeScore = (rows: CompletedQuest[]): number => {
+  // the punch logic's weighted score with a raw one - and re-subtracts the
+  // station malus, which would otherwise be wiped by the same overwrite.
+  // `rows` must be quest rows only (malus already split out).
+  const recomputeScore = (rows: CompletedQuest[], malus: number): number => {
     const qp = rows.reduce((s, q) => s + (q.points_awarded ?? 0), 0);
     const countMap = new Map<string, number>();
     for (const q of rows) countMap.set(q.quest_number, (countMap.get(q.quest_number) ?? 0) + 1);
     const c = computeCombos(countMap);
-    return weightedScore(qp + c.combos6 * pts6 + c.combos4 * pts4 + c.combos2 * pts2, effectifWeight ?? 1);
+    return weightedScore(qp + c.combos6 * pts6 + c.combos4 * pts4 + c.combos2 * pts2, effectifWeight ?? 1, malus);
   };
 
   const adjustQuest = async (questNumber: string, delta: 1 | -1) => {
@@ -859,9 +873,11 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
           quest_number: questNumber,
         });
       }
-      const fresh = (await listCompletedQuests(launchedGameId, team.id)).map(toCompletedQuest);
+      const split = partitionMalusRows(await listCompletedQuests(launchedGameId, team.id));
+      const fresh = split.questRows.map(toCompletedQuest);
       setCompletedQuests(fresh);
-      await updateTeam(team.id, { score: recomputeScore(fresh) });
+      setStationMalus(split.stationMalus);
+      await updateTeam(team.id, { score: recomputeScore(fresh, split.stationMalus) });
     } catch (err) {
       console.error('[TeamDetailsModal] adjustQuest failed:', err);
     } finally {
@@ -906,7 +922,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const enigmaRows = patternEnigmas.map((pe) => {
     const ge = findGameEnigma(pe.enigma_id);
     const goodPts = toPoints(ge?.good_answer_points);
-    const wrongPts = toPoints(ge?.wrong_answer_points);
+    const wrongPts = wrongAnswerPoints(ge?.wrong_answer_points);
     const base = detectBaseStatus(pe);
     const override = enigmaOverrides[pe.enigma_id];
     const effective: EnigmaStatus = override ?? base;
@@ -931,7 +947,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     patternEnigmas.reduce((sum, pe) => {
       const ge = findGameEnigma(pe.enigma_id);
       const eff = overrides[pe.enigma_id] ?? detectBaseStatus(pe);
-      return sum + enigmaPoints(eff, toPoints(ge?.good_answer_points), toPoints(ge?.wrong_answer_points), bothMalus, noAnswerMalus);
+      return sum + enigmaPoints(eff, toPoints(ge?.good_answer_points), wrongAnswerPoints(ge?.wrong_answer_points), bothMalus, noAnswerMalus);
     }, 0);
 
   // Full recompute of the team's score: enigma points − effective late malus,
@@ -1323,6 +1339,14 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
                   <div className="pg-stat-value pg-stat-value--warn">{comboTotal}</div>
                 </div>
               )}
+              {stationMalus > 0 && (
+                <div className="pg-stat">
+                  <div className="pg-stat-label">
+                    <AlertTriangle size={11} /> {t('teamDetails:summaryStationMalus')}
+                  </div>
+                  <div className="pg-stat-value pg-stat-value--danger">-{stationMalus}</div>
+                </div>
+              )}
               <div className="pg-stat">
                 <div className="pg-stat-label">
                   <Clock size={11} /> {t('teamDetails:summaryTotalScore')}
@@ -1467,7 +1491,9 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
                       </div>
                       <div className="text-[var(--pg-text-dim)] text-xs">
                         +{row.goodPts}
-                        {row.wrongPts > 0 && <span className="opacity-70"> / −{row.wrongPts}</span>}
+                        {row.wrongPts !== 0 && (
+                          <span className="opacity-70"> / {row.wrongPts}</span>
+                        )}
                         <span className="opacity-70"> {t('teamDetails:pts')}</span>
                       </div>
                     </div>

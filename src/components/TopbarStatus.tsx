@@ -229,8 +229,8 @@ export function TopbarStatus() {
         <div
           className={`fixed top-16 right-4 z-50 max-w-xs text-sm rounded-lg px-3 py-2 border shadow-lg ${
             toast.kind === 'ok'
-              ? 'bg-green-500/15 border-green-500/40 text-green-200'
-              : 'bg-red-500/15 border-red-500/40 text-red-200'
+              ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+              : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'
           }`}
           role="status"
         >

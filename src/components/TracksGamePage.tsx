@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { GameConfig } from './LaunchGameModal';
 import { sportidentService as siReader, CardData, StationData, detectReaderPort } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
@@ -7,6 +8,7 @@ import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
 import { localizedStatus, type GameMessageType } from '../services/gameMessages';
+import { tIngame } from '../i18n/ingame';
 import {
   getLaunchedGameState,
   recordPunch,
@@ -60,16 +62,19 @@ interface HudFrameBox {
   y: number;
   width: number;
   height: number;
+  /** Author-set value font size, in % of the box height. Undefined = the
+   *  renderer's default (45 with a caption, 55 without). Retours point 45. */
+  textScale?: number;
 }
 
 /** HUD frame element ids written to `scenarios.scenario_layout.elements[]` by
  *  the studio LayoutEditor. Mirrors `TRACKS_HUD_ITEMS` in the studio's
- *  `creator-ported/utils/layoutGroups.ts`. */
+ *  `creator-ported/utils/layoutGroups.ts` - three frames; the legacy
+ *  `time_background_image` slot was never drawn and is ignored here. */
 const HUD_FRAME_IDS = [
   'team_name_background_image',
   'timer_background_image',
   'score_background_image',
-  'time_background_image',
 ] as const;
 
 interface TracksGameData {
@@ -117,9 +122,24 @@ const TRACKS_TEXT_KEYS = [
 ] as const;
 
 /**
+ * Every spelling of the team-name placeholder an author may type. `%team%` is
+ * the one the studio editor advertises ("Astuce : écrivez %team% ..."), and it
+ * is written `%TEAM%` as often as `%team%` - hence the case-insensitive flag.
+ * The `{team}`/`{name}`/`%s` forms are legacy spellings kept working.
+ *
+ * Matching only the brace forms left a literal `%TEAM%` on the Track start
+ * screen (retours #86; the same class of bug as GO/Spot's #62).
+ */
+const TEAM_TOKEN_RE = /%team%|%name%|\{team\}|\{name\}|%s/gi;
+const COUNT_TOKEN_RE = /%count%|\{count\}|%d/gi;
+
+/**
  * Resolve one text_* string for the given language, substituting the team name
- * ({team}/{name}/%s) and an optional count ({count}/%d). Returns '' when the
- * author left the field blank - callers then fall back to the built-in message.
+ * and an optional count. Returns '' when the author left the field blank -
+ * callers then fall back to the built-in message.
+ *
+ * Team tokens are ALWAYS consumed, even with no team name to put in their
+ * place: a stray `%TEAM%` reaching the screen is worse than a missing word.
  */
 function resolveTracksText(
   texts: Record<string, unknown> | undefined,
@@ -132,10 +152,9 @@ function resolveTracksText(
     lang,
   ).trim();
   if (!raw) return '';
-  let out = raw;
-  if (vars?.team) out = out.replace(/\{team\}|\{name\}|%s/gi, vars.team);
-  if (vars?.count != null) out = out.replace(/\{count\}|%d/gi, String(vars.count));
-  return out;
+  let out = raw.replace(TEAM_TOKEN_RE, (vars?.team ?? '').trim());
+  if (vars?.count != null) out = out.replace(COUNT_TOKEN_RE, String(vars.count));
+  return out.trim();
 }
 
 const SOUND_SLOTS = [
@@ -153,7 +172,6 @@ const IMAGE_SLOTS = [
   'team_name_background_image',
   'timer_background_image',
   'score_background_image',
-  'time_background_image',
   'wrong_order_image',
   'missing_checkpoint_image',
   'checkpoints_unique_image_id',
@@ -249,8 +267,15 @@ function normalizeTracksGameData(raw: any): TracksGameData {
       typeof (el as Record<string, unknown>).width === 'number' &&
       typeof (el as Record<string, unknown>).height === 'number'
     ) {
-      const e = el as { id: (typeof HUD_FRAME_IDS)[number]; x: number; y: number; width: number; height: number };
-      hudLayout[e.id] = { x: e.x, y: e.y, width: e.width, height: e.height };
+      const e = el as {
+        id: (typeof HUD_FRAME_IDS)[number];
+        x: number; y: number; width: number; height: number;
+        textScale?: unknown;
+      };
+      hudLayout[e.id] = {
+        x: e.x, y: e.y, width: e.width, height: e.height,
+        ...(typeof e.textScale === 'number' && e.textScale > 0 ? { textScale: e.textScale } : {}),
+      };
     }
   }
 
@@ -284,7 +309,34 @@ function normalizeTracksGameData(raw: any): TracksGameData {
 const AUTO_RESET_SECONDS = 5;
 const REVEAL_STEP_MS = 700;
 
+/** Parse an SI clock time "HH:MM:SS" to seconds-of-day. */
+function secondsOfDay(t: string): number {
+  const [h, m, s] = (t ?? '').split(':').map(Number);
+  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+}
+
+/** Punches the SI card actually recorded (a 00:00:00 slot is an empty one). */
+function timedPunches(card: CardData): Array<{ code: number; time: string }> {
+  return (card.punches ?? []).filter((p) => p.time && p.time !== '00:00:00');
+}
+
+/**
+ * Unix seconds for a seconds-of-day reading on the LOCAL day, used to rebuild a
+ * start/end timestamp for a run recovered from the card itself (the SI clock is
+ * all we have - the team never bipped a start). Clamped to "now" so a station
+ * clock running fast can never produce a future timestamp (which would make the
+ * run duration negative).
+ */
+function epochForSecondsOfDay(sod: number): number {
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  const guess = Math.floor(midnight.getTime() / 1000) + sod;
+  return Math.min(guess, Math.floor(Date.now() / 1000));
+}
+
 export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onGameEnd }: TracksGamePageProps) {
+  // Operator-facing diagnostic strip - chrome language, not the team language.
+  const { t: tr } = useTranslation('rankings');
   const [data, setData] = useState<TracksGameData | null>(null);
   const dataRef = useRef<TracksGameData | null>(null);
   // Punches read by THIS device's USB reader are processed immediately in
@@ -293,6 +345,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // own-reader bip runs twice (now + ~1s later), which would start AND reveal a
   // team on its very first bip.
   const processedRawIdsRef = useRef<Set<number>>(new Set());
+  // Cards that arrived at the start reader with punches still on them. The run
+  // is NOT started on that first bip (retours #90: the "wipe your card" prompt
+  // must not be bypassable); the next bip of the same card either starts the
+  // run (they wiped it) or RECOVERS the run already recorded on it (retours
+  // #91: kids who left without punching their start used to lose everything,
+  // because the first bip declared their whole course "pre-existing").
+  const dirtyCardHoldRef = useRef<Set<number>>(new Set());
   const [audioElements, setAudioElements] = useState<Record<string, HTMLAudioElement>>({});
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
   const [showCardAlert, setShowCardAlert] = useState(false);
@@ -453,6 +512,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         // True when *this* bip created the team - drives the self-register abort
         // cleanup (delete a just-created team, never a rostered one).
         let createdNow = false;
+        // True when this bip opened a FRESH run on a card that already finished
+        // one in this game (reuse-after-cooldown). Anything still on such a card
+        // belongs to that closed run, so the not-empty-card recovery below must
+        // not fire for it.
+        let reusedAfterFinish = false;
 
         if (!team) {
           const finished = teamsForCard.length > 0;
@@ -485,6 +549,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 return;
               }
               createdNow = true;
+              reusedAfterFinish = true;
             } else {
               // reuse off OR within cooldown → existing clues-review behavior:
               // show the map with every checkpoint revealed, then reset.
@@ -587,8 +652,65 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           console.error('[TracksGamePage] route resolve error:', err);
         }
 
+        // The run start reads the card's own timestamps when it is recovered
+        // rather than started (see the dirty-card gate below); `null` until one
+        // of the two paths sets it.
+        let runStartSec: number | null = team.start_time ?? null;
+        // Set only on the recovery path: the run ended at the card's LAST punch,
+        // not when it reached the desk (which could be an hour later, and would
+        // otherwise be charged as time-limit malus).
+        let recoveredEndSec: number | null = null;
+
+        // --- Not-empty card at the start reader ------------------------------
+        // The card still carries punches, so we cannot tell a forgotten wipe
+        // from a team that ran the whole course without punching their start.
+        // Refuse to start on this bip and let the NEXT bip of the same card
+        // decide: wiped → normal start; still full → recover the run recorded
+        // on it. Retours #90 (the wipe prompt was bypassable by simply bipping
+        // twice) + #91 (that second bip used to throw the whole course away).
+        // ...EXCEPT on the card-reuse path: there the punches on the card are
+        // provably the previous run's (that run was already scored and closed),
+        // so they get baselined away at the start as before - re-scoring them
+        // would post the same course twice.
+        if (!team.start_time && !reusedAfterFinish) {
+          const onCard = timedPunches(card);
+          if (onCard.length > 0 && !dirtyCardHoldRef.current.has(card.id)) {
+            dirtyCardHoldRef.current.add(card.id);
+            // Deliberately NOT the authored `text_team_starts_card_not_empty`:
+            // that string starts with "C'est parti !" (it is the START message
+            // for a dirty card, which is still what it says on the reuse path),
+            // and the run has precisely NOT started here. The hold text is a
+            // bucket-2 string, editable in the studio Translations admin.
+            const holdLang = team.language || language;
+            showMessage(
+              tIngame('ingame_tracks', 'card_not_empty_hold', holdLang),
+              'warning',
+              teamName,
+            );
+            return;
+          }
+          if (onCard.length > 0) {
+            // Second bip, card still not empty → recover. Backdate the run to
+            // the card's own first/last punch and fall through to the scoring
+            // path below, which reads `runStartSec` / `recoveredEndSec`.
+            dirtyCardHoldRef.current.delete(card.id);
+            const times = onCard.map((p) => secondsOfDay(p.time));
+            runStartSec = epochForSecondsOfDay(Math.min(...times));
+            recoveredEndSec = epochForSecondsOfDay(Math.max(...times));
+            await updateTeam(team.id, { start_time: runStartSec });
+            showMessage(
+              tIngame('ingame_tracks', 'card_recovered', team.language || language),
+              'info',
+              teamName,
+            );
+          } else {
+            // Card is clean - drop any hold from a previous bip and start.
+            dirtyCardHoldRef.current.delete(card.id);
+          }
+        }
+
         // First bip → (self-register name) → (videos) → start the team's clock.
-        if (!team.start_time) {
+        if (runStartSec == null) {
           // The start sequence, parameterised by the effective team name: persist
           // a self-registered rename, then gate the clock on any first-bip videos.
           const proceedAfterName = async (effectiveName: string, teamLanguage?: string) => {
@@ -609,13 +731,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             const finalizeStart = async () => {
               const startSec = Math.floor(Date.now() / 1000);
               await updateTeam(team.id, { start_time: startSec });
-              // Snapshot the punches already on the card so a forgotten wipe or a
-              // card reuse does not re-score stale punches. Persisted to meta
-              // (durable across reload - tracks runs are long). Matched on
-              // code+time so a legit re-punch (new time) still counts at scoring.
+              // The dirty-card gate above means the card is empty here on the
+              // normal path; the only way to reach this with punches on it is
+              // reuse-after-cooldown, where they belong to the run already
+              // scored. Baseline them (matched on code+time, so a station
+              // legitimately re-punched during the new run still counts) so they
+              // are not credited twice. Persisted to meta - tracks runs are long
+              // and outlive a reload.
               let staleCount = 0;
               try {
-                const stale = (card.punches ?? []).filter((p) => p.time && p.time !== '00:00:00');
+                const stale = timedPunches(card);
                 staleCount = stale.length;
                 if (stale.length > 0) {
                   await mergeLaunchedGameMeta(launchedGameId, {
@@ -642,11 +767,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               );
               const warn =
                 staleCount > 0
-                  ? ` - ${cardNotEmptyMsg || `⚠️ Votre puce n'est pas vide, effacez votre puce`}`
+                  ? ` - ${cardNotEmptyMsg || tIngame('ingame_tracks', 'card_not_empty_warn', effLang)}`
                   : '';
               const startMsg =
                 resolveTracksText(gd.texts, 'text_player_starts', effLang, { team: effectiveName }) ||
-                `C'est parti ! ${effectiveName}`;
+                tIngame('ingame_tracks', 'player_starts', effLang, { team: effectiveName });
               showMessage(`${startMsg}${warn}`, staleCount > 0 ? 'warning' : 'success', effectiveName);
               setScreen('background');
               setBigReveal(null);
@@ -697,8 +822,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           return;
         }
 
-        // Second bip → score the run from the card's punch codes.
-        const endTime = Math.floor(Date.now() / 1000);
+        // Second bip → score the run from the card's punch codes. On the
+        // recovery path the run closed at its last punch, not at this bip.
+        const endTime = recoveredEndSec ?? Math.floor(Date.now() / 1000);
         const allCps = gd.checkpoints;
         const routeCps = checkpointsForRoute(allCps, teamRoute);
         const stations = await patternStore.getTracksCheckpointStations(config.pattern);
@@ -728,19 +854,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         }
 
         const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
-        // Parse an SI clock time "HH:MM:SS" to seconds-of-day for ordering.
-        const secondsOfDay = (t: string) => {
-          const [h, m, s] = (t ?? '').split(':').map(Number);
-          return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
-        };
         // Earliest live-punch time at which each route checkpoint was reached
         // (undefined = never reached).
         const hitTimeByCp = new Map<string, number | undefined>();
+        let unboundCheckpoints = 0;
         for (const cp of routeCps) {
           const cpStations = stations.get(numberOf(cp)) ?? [];
-          if (import.meta.env.DEV && cpStations.length === 0) {
+          if (cpStations.length === 0) {
+            unboundCheckpoints++;
             console.warn(
-              `[TracksGamePage] checkpoint #${numberOf(cp)} resolves to NO pattern stations - it can never be scored as hit. Check the pattern row count matches the checkpoint count.`,
+              `[TracksGamePage] checkpoint #${numberOf(cp)} resolves to NO pattern station - it can never be scored as hit. Check that the pattern has one row per checkpoint.`,
             );
           }
           let earliest: number | undefined;
@@ -751,6 +874,32 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             }
           }
           hitTimeByCp.set(cp.id, earliest);
+        }
+
+        // Punch-vs-course diagnostic. A run that scores nothing looks exactly
+        // like "the software reports punch errors" (retours #87/#89), so make
+        // the two causes distinguishable: a wrong/absent pattern binding leaves
+        // EVERY checkpoint unreached while the card is full of punches.
+        const matchedAnyStation = routeCps.some((cp) => hitTimeByCp.get(cp.id) !== undefined);
+        console.info(
+          '[TracksGamePage] scoring',
+          {
+            card: card.id,
+            pattern: config.pattern,
+            playMode: trackPlayMode,
+            route: teamRoute,
+            checkpoints: routeCps.length,
+            unboundCheckpoints,
+            punchCodes: livePunches.map((p) => `${p.code}@${p.time}`),
+            expectedStations: routeCps.map((cp) => `#${numberOf(cp)}→${(stations.get(numberOf(cp)) ?? []).join('/') || '—'}`),
+          },
+        );
+        if (livePunches.length > 0 && !matchedAnyStation) {
+          showMessage(
+            tIngame('ingame_tracks', 'no_station_match', team.language || language),
+            'error',
+            teamName,
+          );
         }
 
         // Itinerary = strict in-order prefix; free = any reached checkpoint.
@@ -764,7 +913,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           }
         }
 
-        const elapsedMin = (endTime - team.start_time) / 60;
+        const elapsedMin = Math.max(0, endTime - runStartSec) / 60;
         const finalScore = computeScore({
           routeCheckpoints: routeCps,
           hitCheckpointIds: hitIds,
@@ -788,9 +937,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         // Wrapped as ONE serial presentation slot so a second team bipping during
         // this reveal waits its turn (shown in the bottom line) instead of racing
         // this one's setScreen / focus state. Scoring above already committed.
-        // Captured before the slot closure (where team.start_time is narrowed
-        // non-null) - TS loses the narrowing across the nested async fn.
-        const frozenSec = endTime - team.start_time;
+        // Captured before the slot closure - TS loses the `runStartSec`
+        // narrowing across the nested async fn.
+        const frozenSec = Math.max(0, endTime - runStartSec);
         await queue.enqueue(teamName, async () => {
         setFocusTeamName(teamName);
         setFocusLanguage(team.language ?? '');
@@ -1064,7 +1213,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     onGameEnded: () => onGameEnd?.(),
     onAllTeamsFinished: () => onGameEnd?.(),
     onNewBip: handleNewBip,
-    disableAllFinishedEnd: !!(config.autoRegisterTeam || config.reuseCards || config.selfRegisterTeam),
+    // Tracks NEVER auto-ends on "all teams finished". A track session is a
+    // rolling one: teams leave and come back one at a time over hours, cards
+    // get reused, and new teams register mid-session. Ending the game the
+    // moment the first (or last-so-far) team returned swapped the play screen
+    // for the final ranking board while the session was still running -
+    // retours #88. The operator's "End game" is the only end.
+    disableAllFinishedEnd: true,
   });
 
   if (!data) {
@@ -1077,6 +1232,19 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
   const fontFamily = resolveFontFamily(data.font) || undefined;
   const routeCheckpoints = checkpointsForRoute(data.checkpoints, focusRoute);
+
+  // HUD chrome in the focused team's language (idle → the launch language).
+  // These were hard-coded English ("Time" / "Score" / "N checkpoints") on every
+  // Track screen - retours #99.
+  const hudLangCode = focusLanguage || language;
+  const hudLang = {
+    time: tIngame('ingame_tracks', 'hud_time', hudLangCode),
+    score: tIngame('ingame_tracks', 'hud_score', hudLangCode),
+    summary: tIngame('ingame_tracks', 'summary_checkpoints', hudLangCode, {
+      hit: focusHitCount,
+      total: routeCheckpoints.length,
+    }),
+  };
 
   // Focused team's clock: the frozen final run duration during the reveal,
   // blank otherwise (no HUD over the background during the run).
@@ -1128,16 +1296,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         fontFamily={fontFamily}
       />
 
-      <PendingTeamsBar labels={queue.pending} fontFamily={fontFamily} />
+      <PendingTeamsBar labels={queue.pending} lang={config.language ?? ''} fontFamily={fontFamily} />
 
       {/* No top nav on the in-game (kiosk) display. Exit is via Esc (operator
           keyboard) - see the keydown handler. The reader-not-connected banner is
           kept as a thin diagnostic strip since it explains missing punches. */}
       {siReader.isAvailable() && !detectedReader.isPresent && (
-        <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-center gap-3 px-4 py-1.5 bg-orange-500/20">
-          <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
-          <span className="text-orange-200 text-xs">
-            Reader not connected - punches start landing as soon as you plug in the dongle.
+        <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-center gap-3 px-4 py-2 bg-orange-600 border-b-2 border-orange-300 shadow-lg">
+          <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
+          <span className="font-sans normal-case tracking-normal text-white font-semibold text-sm">
+            {tr('readerNotConnected')}
           </span>
         </div>
       )}
@@ -1158,13 +1326,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           teamNameFrame: getImageUrl(data.images.team_name_background_image),
           timerFrame: getImageUrl(data.images.timer_background_image),
           scoreFrame: getImageUrl(data.images.score_background_image),
-          timeFrame: getImageUrl(data.images.time_background_image),
         }}
         teamName={focusTeamName || config.name}
         timerText={timerDisplay}
         scoreText={focusScoreText || (scoreType === 'percentage' ? '0%' : '0 pts')}
         showScore={data.showScore}
-        hitCount={focusHitCount}
+        timeLabel={hudLang.time}
+        scoreLabel={hudLang.score}
+        checkpointsSummary={hudLang.summary}
         language={focusLanguage || language}
         clues={clues}
         topRevealUrl={topRevealUrl}

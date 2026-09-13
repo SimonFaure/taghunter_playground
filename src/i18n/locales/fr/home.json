@@ -50,5 +50,6 @@
   "delete": "Supprimer",
   "cancel": "Annuler",
   "enterPinTitle": "Saisissez votre code PIN",
-  "enterPinDeleteSubtitle": "Saisissez le code PIN de l'appareil pour supprimer « {{title}} »."
+  "enterPinDeleteSubtitle": "Saisissez le code PIN de l'appareil pour supprimer « {{title}} ».",
+  "bandAdults": "Adultes"
 }

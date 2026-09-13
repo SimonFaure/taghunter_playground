@@ -3,18 +3,21 @@
 // have joined this game. Extracted from the in-game Devices modal so the two
 // concerns (device roster vs. video control) live in separate modals.
 //
-// Targets are the "in this game" devices. The caller's OWN row is selectable
-// too, but it can't ride the pending_commands queue: `queue_command_inner`
-// rejects a self-targeted command (the mother never polls itself, so it would
-// sit unread forever). That one target is dispatched in-process through
-// `localVideoStore` instead - the same path the in-game VideoControlModal
-// uses - so the App-root <OperatorVideoOverlay> mounts the presentation right
-// here. Everything else still goes over the bulk queue.
+// Targets are ALL the "in this game" devices - the operator's own screen
+// included, whichever device this modal is open on. Two channels get us there:
+//  - our OWN row can't ride the pending_commands queue (a device never polls
+//    its own queue), so it's dispatched in-process through `localVideoStore`,
+//    the same path the in-game VideoControlModal uses;
+//  - every other row goes over the bulk queue, INCLUDING the mother's row when
+//    a satellite operator drives the room's main screen: `queue_command_inner`
+//    detects a self-targeted play_video/stop_video and emits it straight to the
+//    mother's renderer instead of enqueueing it.
+// Either way the App-root <OperatorVideoOverlay> is what mounts the playback.
 //
 // The modal polls list_paired_with_status every 2s while open so the
 // selectable roster stays in sync as devices join / leave.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Video, X, Play, StopCircle, Loader2, Usb, AlertTriangle } from 'lucide-react';
 import {
@@ -142,17 +145,12 @@ export function GameVideoModal({
     };
   }, [launchedGameId]);
 
-  // Selectable = every in-game device EXCEPT a foreign `is_self` row. That row
-  // is the mother's, seen from a satellite: the mother's server would reject a
-  // command targeting itself and we have no in-process channel to it, so it
-  // stays un-tickable. Our own row (id === callerId) is always selectable, even
-  // when it IS the is_self row (i.e. we're the mother) - it plays locally.
-  // callerId null = older mother build; fall back to the old is_self rule.
-  const isCaller = (row: PairedDeviceStatusRow) => callerId != null && row.id === callerId;
-  const selectable = useMemo(
-    () => inGame.filter((r) => (callerId != null && r.id === callerId) || !r.is_self),
-    [inGame, callerId],
-  );
+  // Every in-game device is a valid target, including this one. Two channels
+  // get us there: our OWN row (id === callerId) plays through localVideoStore
+  // in this renderer, everything else rides the bulk queue - and the mother's
+  // row is fine there too, since `queue_command_inner` now executes a
+  // self-targeted play_video/stop_video in-process rather than enqueueing it.
+  const selectable = inGame;
 
   // Dispatch on THIS device via localVideoStore. Returns false when the game
   // has no source for the requested kinds (nothing to show).
@@ -424,7 +422,6 @@ export function GameVideoModal({
                     row={row}
                     selected={selected.has(row.id)}
                     onToggle={() => toggleOne(row.id)}
-                    canSelect={isCaller(row) || !row.is_self}
                     thisDevice={callerId != null ? row.id === callerId : row.is_self}
                     busy={busy.has(row.id)}
                     error={errorFor.get(row.id)}
@@ -466,7 +463,6 @@ function VideoDeviceRow({
   row,
   selected,
   onToggle,
-  canSelect,
   thisDevice,
   busy,
   error,
@@ -474,7 +470,6 @@ function VideoDeviceRow({
   row: PairedDeviceStatusRow;
   selected: boolean;
   onToggle: () => void;
-  canSelect: boolean;
   thisDevice: boolean;
   busy: boolean;
   error: string | undefined;
@@ -482,14 +477,12 @@ function VideoDeviceRow({
   const { t } = useTranslation();
   return (
     <div className="flex items-center gap-3 p-3 bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)]">
-      {canSelect && (
-        <input
-          type="checkbox"
-          className="w-4 h-4 accent-[var(--pg-accent)]"
-          checked={selected}
-          onChange={onToggle}
-        />
-      )}
+      <input
+        type="checkbox"
+        className="w-4 h-4 accent-[var(--pg-accent)]"
+        checked={selected}
+        onChange={onToggle}
+      />
       <div className="min-w-0">
         <div className="text-sm font-medium text-[var(--pg-text)] truncate">
           {row.device_label}

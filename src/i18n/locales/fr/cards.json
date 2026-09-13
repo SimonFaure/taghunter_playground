@@ -50,5 +50,17 @@
   "assignmentLabel": "{{label}} :",
   "station": "station {{number}}",
   "stationNumber": "Station {{number}}",
-  "stationId": "ID {{id}}"
+  "stationId": "ID {{id}}",
+  "noVideoForGameType": "Aucune vidéo tutorielle",
+  "gameTypeVideosImportHint": "Vous pouvez importer votre propre vidéo tutorielle pour chaque type de jeu. Elle reste sur CET appareil : elle n'est pas envoyée au studio et n'est pas transmise aux autres appareils.",
+  "videoSourceLocal": "Locale",
+  "videoSourceClient": "Votre studio",
+  "videoSourceDefault": "Tag Hunter",
+  "importLocalVideo": "Importer une vidéo",
+  "replaceLocalVideo": "Remplacer",
+  "removeLocalVideo": "Retirer",
+  "removeLocalVideoConfirm": "Retirer la vidéo tutorielle importée pour {{name}} ? L'appareil reviendra à la vidéo du studio.",
+  "importingVideo": "Importation… {{bytes}}",
+  "localVideoError": "Échec de l'importation : {{error}}",
+  "dismiss": "Ignorer"
 }

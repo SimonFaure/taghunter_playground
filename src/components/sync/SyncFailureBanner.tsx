@@ -71,8 +71,8 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
   };
 
   return (
-    <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 py-2 flex items-center justify-between text-sm">
-      <div className="flex items-center gap-2 text-amber-300">
+    <div className="bg-[var(--pg-warn-bg)] border-b border-[var(--pg-warn-line)] px-4 py-2 flex items-center justify-between text-sm">
+      <div className="flex items-center gap-2 text-[var(--pg-warn-text)]">
         <AlertTriangle className="w-4 h-4" />
         <span>
           {state.kind === 'partial'
@@ -84,7 +84,7 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
         {onViewDetails && (
           <button
             onClick={onViewDetails}
-            className="text-amber-200 hover:text-white inline-flex items-center gap-1 underline"
+            className="text-[var(--pg-warn-text)] hover:text-[var(--pg-text)] inline-flex items-center gap-1 underline"
           >
             {t('sync:viewDetails')}
             <ExternalLink className="w-3 h-3" />
@@ -93,11 +93,11 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
         <button
           onClick={handleRetry}
           disabled={retrying}
-          className="text-amber-200 hover:text-white underline disabled:opacity-50"
+          className="text-[var(--pg-warn-text)] hover:text-[var(--pg-text)] underline disabled:opacity-50"
         >
           {retrying ? t('sync:retrying') : t('sync:retry')}
         </button>
-        <button onClick={() => setState({ kind: 'hidden' })} aria-label={t('sync:dismiss')} className="text-amber-300/70 hover:text-white">
+        <button onClick={() => setState({ kind: 'hidden' })} aria-label={t('sync:dismiss')} className="text-[var(--pg-warn-text)] opacity-70 hover:opacity-100 hover:text-[var(--pg-text)]">
           <X className="w-4 h-4" />
         </button>
       </div>

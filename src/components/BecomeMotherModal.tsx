@@ -9,10 +9,23 @@
 
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Crown, X, AlertTriangle, Loader2, CheckCircle } from 'lucide-react';
-import { becomeMother, type BecomeMotherInfo } from '../services/lanMotherBoot';
+import { Crown, X, AlertTriangle, Loader2, CheckCircle, Wifi } from 'lucide-react';
+import {
+  becomeMother,
+  raiseMotherHotspotIfConfigured,
+  type BecomeMotherInfo,
+} from '../services/lanMotherBoot';
+import { hotspotStatus } from '../services/lanPairing';
+import { getNetworkSource } from '../services/lanCredentials';
+import { failoverErrorText } from '../services/failoverErrors';
 
-type Phase = 'confirm' | 'promoting' | 'success' | 'error';
+// 'partial' = the game was adopted and we ARE serving it, but the Wi-Fi access
+// point is not up. That is NOT a success to the operator: with no AP there is no
+// LAN, so no satellite can reach us and the game cannot actually continue. It
+// used to render as the plain green success panel (the yellow note required a
+// non-null hotspot_error, which the missing-creds path never set), which is
+// exactly why an operator saw "success" and nothing happened.
+type Phase = 'confirm' | 'promoting' | 'success' | 'partial' | 'error';
 
 export function BecomeMotherModal({
   launchedGameId,
@@ -25,17 +38,45 @@ export function BecomeMotherModal({
   const [phase, setPhase] = useState<Phase>('confirm');
   const [error, setError] = useState<string>('');
   const [info, setInfo] = useState<BecomeMotherInfo | null>(null);
+  const [retryingAp, setRetryingAp] = useState(false);
+
+  // Promotion "succeeded" only if the other devices can actually reach us. In
+  // hotspot mode that means the AP is up: without it there is no LAN at all.
+  const settle = async (result: BecomeMotherInfo) => {
+    setInfo(result);
+    if (result.hotspot_started) {
+      setPhase('success');
+      return;
+    }
+    const source = await getNetworkSource().catch(() => 'hotspot');
+    setPhase(source === 'hotspot' ? 'partial' : 'success');
+  };
 
   const promote = async () => {
     setPhase('promoting');
     setError('');
     try {
-      const result = await becomeMother(launchedGameId);
-      setInfo(result);
-      setPhase('success');
+      await settle(await becomeMother(launchedGameId));
     } catch (e) {
-      setError(String((e as { message?: string })?.message ?? e));
+      setError(failoverErrorText(e, t));
       setPhase('error');
+    }
+  };
+
+  // Retry ONLY the access point - the game is already adopted and served, so we
+  // must never re-run becomeMother here (it would bump the epoch and re-adopt a
+  // now-staler snapshot).
+  const retryHotspot = async () => {
+    setRetryingAp(true);
+    try {
+      await raiseMotherHotspotIfConfigured();
+      const st = await hotspotStatus().catch(() => null);
+      if (st?.running) {
+        setInfo((prev) => (prev ? { ...prev, hotspot_started: true, hotspot_error: null } : prev));
+        setPhase('success');
+      }
+    } finally {
+      setRetryingAp(false);
     }
   };
 
@@ -117,18 +158,57 @@ export function BecomeMotherModal({
                       'This device is now the mother. The other devices will reconnect to it within a few seconds.',
                   })}
                 </p>
-                {info && !info.hotspot_started && info.hotspot_error && (
-                  <p className="text-xs text-yellow-400">
-                    {t('failover:hotspotWarn', {
-                      defaultValue:
-                        'Note: the Wi-Fi hotspot could not be started automatically - start it from Settings → Network if devices cannot reconnect.',
-                    })}
-                  </p>
-                )}
+                <p className="text-xs text-[var(--pg-text-dim)]">
+                  {t('failover:stickyMotherNote', {
+                    defaultValue:
+                      'This device will keep hosting on the next start. To undo: Settings → Network → "I am not a mother".',
+                  })}
+                </p>
               </div>
               <button onClick={onClose} className="pg-btn pg-btn--primary w-full justify-center">
                 {t('failover:done', { defaultValue: 'Done' })}
               </button>
+            </div>
+          )}
+
+          {/* Adopted and serving, but no Wi-Fi: deliberately NOT a green success.
+              With no access point there is no LAN, so no other device can reach
+              this one and the game cannot actually continue. */}
+          {phase === 'partial' && (
+            <div className="space-y-5">
+              <div className="flex items-start gap-2.5">
+                <Wifi size={18} className="text-yellow-400 shrink-0 mt-0.5" />
+                <div className="space-y-2">
+                  <p className="text-sm text-[var(--pg-text)]">
+                    {t('failover:apDownBody', {
+                      defaultValue:
+                        'This device has taken over the game, but its Wi-Fi hotspot is not up - the other devices cannot find it yet.',
+                    })}
+                  </p>
+                  {info?.hotspot_error && (
+                    <p className="text-xs text-yellow-400 break-words">{info.hotspot_error}</p>
+                  )}
+                  <p className="text-xs text-[var(--pg-text-dim)]">
+                    {t('failover:apDownHint', {
+                      defaultValue:
+                        'Retry below, or start the hotspot from Settings → Network. The game itself is safe on this device.',
+                    })}
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2.5">
+                <button onClick={onClose} className="pg-btn flex-1 justify-center">
+                  {t('failover:close', { defaultValue: 'Close' })}
+                </button>
+                <button
+                  onClick={retryHotspot}
+                  disabled={retryingAp}
+                  className="pg-btn pg-btn--primary flex-1 justify-center"
+                >
+                  {retryingAp ? <Loader2 size={16} className="animate-spin" /> : <Wifi size={16} />}
+                  {t('failover:retryHotspot', { defaultValue: 'Retry hotspot' })}
+                </button>
+              </div>
             </div>
           )}
 

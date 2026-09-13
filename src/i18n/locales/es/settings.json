@@ -109,6 +109,8 @@
   "timeSlotCheck": "Control",
   "timeSlotFinish": "Llegada",
   "punchesHeading": "Fichajes",
+  "cardFull": "Tarjeta llena",
+  "clockSkewHint": "Diferencia entre el reloj de cada estación y el de este PC. No afecta a la puntuación: sirve para detectar una estación que hay que poner en hora.",
   "navGroupAccount": "Cuenta",
   "navAccount": "Cuenta",
   "navSync": "Sincronización",

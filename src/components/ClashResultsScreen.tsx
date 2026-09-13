@@ -5,6 +5,7 @@
 // Design: project_clash_game_type_design.
 
 import type { ClashStandings } from '../services/clash';
+import { tIngame } from '../i18n/ingame';
 import type { ClashClanVisual } from './ClashGameRenderer';
 
 interface ClashResultsScreenProps {
@@ -13,6 +14,9 @@ interface ClashResultsScreenProps {
   territoryNames: Record<number, string>;
   resolveMedia: (filename: string) => string;
   fontFamily?: string;
+  /** Language chosen at launch - this screen's chrome resolves against it, not
+   *  against the operator's chrome language. */
+  lang: string;
   onBack: () => void;
 }
 
@@ -22,8 +26,11 @@ export function ClashResultsScreen({
   territoryNames,
   resolveMedia,
   fontFamily,
+  lang,
   onBack,
 }: ClashResultsScreenProps) {
+  const tc = (key: string, vars?: Record<string, string | number>) =>
+    tIngame('ingame_clash', key, lang, vars);
   // Tiebreak on the exact (unrounded) weighted score; a true tie ⇒ Draw.
   const clans = (standings?.clans ?? [])
     .map((c) => ({ standing: c, visual: clanByTeamId[c.team_id] }))
@@ -58,7 +65,7 @@ export function ClashResultsScreen({
                 )}
               </div>
               <h1 className="text-4xl font-bold" style={{ color: winner.visual!.color }}>
-                {winner.visual!.name} wins!
+                {tc('results_winner', { clan: winner.visual!.name })}
               </h1>
             </>
           ) : (
@@ -77,7 +84,7 @@ export function ClashResultsScreen({
                 ))}
               </div>
               <h1 className="text-4xl font-bold text-white/90">
-                {topExact > 0 ? 'Draw!' : 'No territory taken'}
+                {topExact > 0 ? tc('results_draw') : tc('results_no_territory')}
               </h1>
             </>
           )}
@@ -93,14 +100,16 @@ export function ClashResultsScreen({
               <span className="w-6 text-center text-white/50 font-bold">{i + 1}</span>
               <span className="w-4 h-4 rounded-full" style={{ backgroundColor: c.visual!.color }} />
               <span className="flex-1 font-semibold">{c.visual!.name}</span>
-              <span className="tabular-nums text-lg font-bold">{c.standing.points} pts</span>
+              <span className="tabular-nums text-lg font-bold">
+                {c.standing.points} {tc('pts')}
+              </span>
             </div>
           ))}
         </div>
 
         {/* Final territory ownership */}
         <div className="w-full">
-          <h2 className="text-sm font-bold uppercase tracking-wide text-white/50 mb-2">Territories</h2>
+          <h2 className="text-sm font-bold uppercase tracking-wide text-white/50 mb-2">{tc('territories')}</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {(standings?.territories ?? []).map((t, i) => {
               const owner = t.owner_team_id != null ? clanByTeamId[t.owner_team_id] : undefined;
@@ -114,13 +123,15 @@ export function ClashResultsScreen({
                     {owner?.logo ? (
                       <img src={resolveMedia(owner.logo)} alt="" className="w-full h-full object-contain" />
                     ) : (
-                      <span className="text-xs text-white/40">Neutre</span>
+                      <span className="text-xs text-white/40">{tc('neutral')}</span>
                     )}
                   </div>
                   <span className="text-xs text-center truncate w-full">
-                    {territoryNames[t.index] || `Territory ${i + 1}`}
+                    {territoryNames[t.index] || tc('territory_fallback', { n: i + 1 })}
                   </span>
-                  <span className="text-[10px] text-white/50">{t.points} pts/min</span>
+                  <span className="text-[10px] text-white/50">
+                    {t.points} {tc('pts_per_min')}
+                  </span>
                 </div>
               );
             })}
@@ -133,7 +144,7 @@ export function ClashResultsScreen({
           onClick={onBack}
           className="px-8 py-3 bg-slate-700 hover:bg-slate-600 rounded-xl text-lg font-semibold"
         >
-          Back to games
+          {tc('back_to_games')}
         </button>
       </div>
     </div>

@@ -23,9 +23,15 @@ import {
   MysteryFixedFrames,
   MysteryIdleBox,
   MysteryLayoutBox,
+  MysteryStatusPlate,
   resolveIdleLayout,
   resolveIngameLayout,
+  resolveMysteryBonusBox,
+  resolveMysteryGaugeGeometry,
+  resolveMysteryStatusFrame,
+  resolveMysteryUnderlayScale,
   type IdleLayout,
+  type IngameFrames,
   type IngameLayout,
   type IngameRoleKey,
 } from './mysteryIngameLayout';
@@ -44,6 +50,8 @@ export interface MysteryRendererGameMeta {
   team_name_background_image?: string;
   time_background_image?: string;
   score_background_image?: string;
+  /** The "empty bonus" plate: on screen for the whole run, replaced by each
+   *  overscore tier's image as the team unlocks it. */
   steps_container_image?: string;
   enigmas_header_image?: string;
   levels_gauge_image?: string;
@@ -64,8 +72,23 @@ export interface MysteryRendererGameMeta {
   levels?: Record<string, { points?: string; name?: Localized | string; description?: Localized | string }>;
   /** Author-placed positions for the 4 in-game text roles. Absent → defaults. */
   ingame_layout?: IngameLayout;
+  /** Author-placed rectangles for the timer/score/team-name frame images.
+   *  Absent → the historical fixed positions. */
+  ingame_frames?: IngameFrames;
   /** Author-placed styled title/subtitle for the idle (between-teams) screen. */
   idle_layout?: IdleLayout;
+  /** Author-tunable gauge fill geometry (see resolveMysteryGaugeGeometry). */
+  gauge_fill_inset_left?: string;
+  gauge_fill_inset_right?: string;
+  gauge_fill_inset_y?: string;
+  gauge_fill_radius?: string;
+  /** Author-tunable result sub-frame - the green/red/amber/grey plate behind
+   *  (and, faintly, over) each enigma image. See resolveMysteryStatusFrame. */
+  status_frame_scale?: string;
+  status_frame_radius?: string;
+  status_frame_over_image?: string;
+  /** Size of the main-image underlay (see resolveMysteryUnderlayScale). */
+  enigma_underlay_scale?: string;
 }
 
 export interface MysteryRendererEnigma {
@@ -143,6 +166,10 @@ export interface MysteryGameRendererProps {
   /** Whether to render the author-placed idle layout (title/subtitle) between
    *  teams. When false, the idle screen shows the background only. Defaults to true. */
   showIdleLayout?: boolean;
+  /** Fades the idle title/subtitle out while a full-screen game message is on
+   *  screen. Both are big bold centred text, so "C'est parti !" landing on top
+   *  of the scenario title left the two unreadable (retour #82). */
+  idleTextHidden?: boolean;
   /** Per-launch subtitle - text of the idle screen's subtitle element. */
   idleSubtitle?: string;
   /** Bonus ("overscore") tiers authored for this scenario, names already
@@ -328,6 +355,7 @@ export function MysteryGameRenderer({
   fontFamily,
   scenarioTitle,
   showIdleLayout = true,
+  idleTextHidden,
   idleSubtitle,
   bonuses,
 }: MysteryGameRendererProps) {
@@ -368,17 +396,35 @@ export function MysteryGameRenderer({
 
   // Gauge geometry mirrors MysteryPreviewRenderer so icons + player icon line
   // up with the gradient bar.
-  const gaugeBarHeight = stage.height * 0.08;
-  const gaugeIconHeight = gaugeBarHeight - 14;
-  const gaugeInset = gaugeIconHeight / 2 + 8;
-  const gaugeInsetPx = `${gaugeInset}px`;
-  const gaugeDoubleInsetPx = `${gaugeInset * 2}px`;
+  const gauge = resolveMysteryGaugeGeometry(gameMeta, stage.height);
 
-  // Bonus tiers unlocked by the score currently on the board. Empty for every
-  // run that stays at or under `score_full_game`, so the left column keeps its
-  // old spacer behaviour; during the reveal each tier appears at the exact
-  // moment the running tally crosses its threshold.
+  // Bonus tiers unlocked by the score currently on the board. Only the HIGHEST
+  // one is drawn: tiers replace each other on a single plate rather than piling
+  // up side by side, which is what the legacy renderer did (every
+  // `.team_bonus_container` was absolutely positioned on the same spot, the
+  // later one covering the earlier). Under them the "empty bonus" plate is
+  // visible for the whole run. Retour #35.
+  // Result sub-frame geometry (retours #83 + #85): how big the verdict plate is
+  // inside each enigma tile, how round it is, and how much of it is repeated
+  // over the artwork so an opaque image can't swallow the colour.
+  const statusFrame = resolveMysteryStatusFrame(gameMeta);
+
+  // Size of the square underlay each enigma's main image sits on, authored in
+  // the studio (`enigma_underlay_scale`). The board honours the SIZE but never
+  // paints the neutral, verdict-less layer: a white slab behind the artwork is
+  // not wanted in-game, so `MYSTERY_STATUS_NEUTRAL` is no longer used here.
+  const underlayScale = resolveMysteryUnderlayScale(gameMeta);
+
   const reachedBonuses = reachedMysteryBonuses(bonuses ?? [], score);
+  const activeBonus = reachedBonuses.length > 0 ? reachedBonuses[reachedBonuses.length - 1] : null;
+  const emptyBonusUrl = gameMeta.steps_container_image
+    ? resolveMediaUrl(gameMeta.steps_container_image)
+    : '';
+  // Where the bonus plate sits. Author-placed like the other image blocks; the
+  // default box is the board grid's left cell, i.e. exactly where it used to be
+  // pinned. The board keeps that cell as an empty spacer so the enigma and the
+  // recap column don't move when the plate is dragged elsewhere.
+  const bonusBox = resolveMysteryBonusBox(gameMeta.ingame_frames);
 
   return (
     <div
@@ -432,35 +478,51 @@ export function MysteryGameRenderer({
               When the scenario didn't author any idle element (the in-game layout editor
               leaves both disabled by default), "Show idle layout when idle" falls back to
               the default positions so the operator still sees the title/subtitle. */}
-          {screen === 'ingame' && boardHidden && showIdleLayout && (() => {
-            const idle = resolveIdleLayout(gameMeta.idle_layout);
-            const authored = idle.title.enabled || idle.subtitle.enabled;
-            const fallbackFont = fontFamily || 'Arial Black, Arial, sans-serif';
-            const fallbackColor = gameMeta.font_color || '#ffffff';
-            const textByRole: Record<string, string> = {
-              title: scenarioTitle ?? '',
-              subtitle: idleSubtitle ?? '',
-            };
-            return IDLE_ROLES.map((role) => {
-              const el = idle[role.key];
-              // Respect the author's per-element enable flags when they configured an
-              // idle layout; otherwise (nothing authored) render every role with text.
-              if (authored && !el.enabled) return null;
-              const text = textByRole[role.key];
-              if (!text) return null;
-              return (
-                <MysteryIdleBox
-                  key={role.key}
-                  element={el}
-                  stageHeight={stage.height}
-                  text={text}
-                  fallbackFontFamily={fallbackFont}
-                  fallbackColor={fallbackColor}
-                  resolveFont={resolveFontFamily}
-                />
-              );
-            });
-          })()}
+          {screen === 'ingame' && boardHidden && showIdleLayout && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                // Faded out while a full-screen message is up: the idle title and
+                // "C'est parti !" are both big bold centred text and were landing
+                // on top of each other (retour #82).
+                opacity: idleTextHidden ? 0 : 1,
+                transition: 'opacity 0.2s ease',
+                pointerEvents: 'none',
+              }}
+            >
+              {(() => {
+                const idle = resolveIdleLayout(gameMeta.idle_layout);
+                const authored = idle.title.enabled || idle.subtitle.enabled;
+                const fallbackFont = fontFamily || 'Arial Black, Arial, sans-serif';
+                const fallbackColor = gameMeta.font_color || '#ffffff';
+                const textByRole: Record<string, string> = {
+                  title: scenarioTitle ?? '',
+                  subtitle: idleSubtitle ?? '',
+                };
+                return IDLE_ROLES.map((role) => {
+                  const el = idle[role.key];
+                  // Respect the author's per-element enable flags when they configured
+                  // an idle layout; otherwise (nothing authored) render every role
+                  // with text.
+                  if (authored && !el.enabled) return null;
+                  const text = textByRole[role.key];
+                  if (!text) return null;
+                  return (
+                    <MysteryIdleBox
+                      key={role.key}
+                      element={el}
+                      stageHeight={stage.height}
+                      text={text}
+                      fallbackFontFamily={fallbackFont}
+                      fallbackColor={fallbackColor}
+                      resolveFont={resolveFontFamily}
+                    />
+                  );
+                });
+              })()}
+            </div>
+          )}
           {screen === 'ingame' && !boardHidden && summary?.note && (
             <div
               style={{
@@ -499,88 +561,12 @@ export function MysteryGameRenderer({
                   minHeight: 0,
                 }}
               >
-                {/* Left column: the bonus ("overscore") badges a team unlocks
-                    by scoring ABOVE score_full_game. Stays an empty 1fr spacer
-                    for every run that doesn't beat the maximum, so the centre
-                    enigma image + right recap keep their fixed positions.
-                    Timer + score are author-placed overlays (see below). */}
-                <div
-                  style={{
-                    display: 'grid',
-                    // One column up to 2 badges, then 2, then 3 - a perfect run
-                    // on a 9-tier scenario still fits without scrolling.
-                    gridTemplateColumns: `repeat(${
-                      reachedBonuses.length <= 2 ? 1 : reachedBonuses.length <= 6 ? 2 : 3
-                    }, minmax(0, 1fr))`,
-                    gap: `${stage.height * 0.015}px`,
-                    alignContent: 'center',
-                    justifyItems: 'center',
-                    minHeight: 0,
-                    overflow: 'hidden',
-                  }}
-                >
-                  {reachedBonuses.map((bonus) => {
-                    const imgUrl = bonus.image ? resolveMediaUrl(bonus.image) : '';
-                    return (
-                      <div
-                        // Keyed by tier index so each badge mounts exactly once,
-                        // when it is unlocked - that's what makes the pop-in
-                        // animation fire per tier instead of on every re-render.
-                        key={`bonus-${bonus.index}`}
-                        className="mystery-game-bonus"
-                        style={{
-                          display: 'flex',
-                          flexDirection: 'column',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          gap: `${stage.height * 0.006}px`,
-                          minWidth: 0,
-                          maxWidth: '100%',
-                        }}
-                      >
-                        {imgUrl && (
-                          <img
-                            src={imgUrl}
-                            alt=""
-                            style={{
-                              maxWidth: '100%',
-                              maxHeight: `${stage.height * (reachedBonuses.length <= 2 ? 0.24 : 0.16)}px`,
-                              width: 'auto',
-                              height: 'auto',
-                              objectFit: 'contain',
-                            }}
-                          />
-                        )}
-                        {bonus.name && (
-                          <div
-                            style={{
-                              fontSize: `${stage.height * 0.018}px`,
-                              textAlign: 'center',
-                              lineHeight: 1.15,
-                              // Authored names run long ("Champion de la lutte
-                              // contre les Zombies") and the column is narrow.
-                              overflowWrap: 'anywhere',
-                              textShadow: '0 1px 4px rgba(0,0,0,0.8)',
-                              color: gameMeta.level_font_color || '#ffffff',
-                              // Name-only tiers (no authored image) still read as
-                              // a badge rather than floating text.
-                              ...(imgUrl
-                                ? {}
-                                : {
-                                    padding: `${stage.height * 0.008}px ${stage.width * 0.008}px`,
-                                    border: '2px solid rgba(255,255,255,0.65)',
-                                    borderRadius: 8,
-                                    background: 'rgba(0,0,0,0.35)',
-                                  }),
-                            }}
-                          >
-                            {bonus.name}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+                {/* Left column: an empty spacer. The bonus plate that used to
+                    live here is now an author-placed overlay (drawn after the
+                    board, below) - the cell stays so the centre enigma image and
+                    the right recap keep their fixed positions.
+                    Timer + score are author-placed overlays too. */}
+                <div />
 
                 {/* Centre column: ONE big enigma - text on top, image below.
                     Once a run's reveal has finished, the end-of-run summary
@@ -755,17 +741,36 @@ export function MysteryGameRenderer({
                           <div
                             style={{
                               position: 'relative',
-                              height: '100%',
+                              height: `${underlayScale}%`,
                               aspectRatio: '1 / 1',
-                              maxWidth: '100%',
-                              background: featuredOverlay || 'rgba(255,255,255,0.06)',
-                              borderRadius: 12,
+                              maxWidth: `${underlayScale}%`,
                               overflow: 'hidden',
-                              transition: 'background 0.3s ease',
                             }}
                           >
+                            {/* Underlay: drawn ONLY once the enigma has a
+                                verdict. The old neutral fallback painted a white
+                                plate behind every un-answered image - a white
+                                slab under the artwork is never wanted in-game. */}
+                            {featuredOverlay && (
+                              <MysteryStatusPlate
+                                color={featuredOverlay}
+                                frame={statusFrame}
+                                legacyRadius={12}
+                              />
+                            )}
                             {imgSrc && (
                               <CenterEnigmaImage src={imgSrc} blurred={!revealed} alt={text} />
+                            )}
+                            {/* Same tint repeated over the artwork so a picture
+                                exported on an opaque background still shows its
+                                verdict colour (retour #83). */}
+                            {featuredOverlay && (
+                              <MysteryStatusPlate
+                                color={featuredOverlay}
+                                frame={statusFrame}
+                                legacyRadius={12}
+                                over
+                              />
                             )}
                             {colorblind && featuredKind && (
                               <StatusMark kind={featuredKind} size={stage.height * 0.075} />
@@ -813,18 +818,35 @@ export function MysteryGameRenderer({
                             width: '100%',
                             aspectRatio: '1 / 1',
                             position: 'relative',
-                            background: overlay || 'rgba(255,255,255,0.06)',
-                            borderRadius: 4,
                             overflow: 'hidden',
-                            transition: 'background 0.3s ease',
                           }}
                         >
+                          {overlay && (
+                            <MysteryStatusPlate
+                              color={overlay}
+                              frame={statusFrame}
+                              legacyRadius={4}
+                            />
+                          )}
                           {imgSrc && (
                             <img
                               src={imgSrc}
                               alt=""
                               className={revealed ? '' : 'mystery-game-blur'}
-                              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                              style={{
+                                position: 'relative',
+                                width: '100%',
+                                height: '100%',
+                                objectFit: 'cover',
+                              }}
+                            />
+                          )}
+                          {overlay && (
+                            <MysteryStatusPlate
+                              color={overlay}
+                              frame={statusFrame}
+                              legacyRadius={4}
+                              over
                             />
                           )}
                           {colorblind && overlayKind && (
@@ -836,6 +858,108 @@ export function MysteryGameRenderer({
                   </div>
                 </div>
               </div>
+
+              {/* The bonus ("overscore") plate, placed by the author
+                  (ingame_frames.bonus, default = the board's left cell). The
+                  "empty bonus" image is on screen for the whole run; the highest
+                  tier a team has unlocked by scoring ABOVE score_full_game is
+                  drawn on top of it, REPLACING whatever tier was showing before
+                  (retour #35). Absolutely positioned over the stage, so moving
+                  or resizing it never disturbs the board columns. */}
+              {(emptyBonusUrl || activeBonus) && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: `${bonusBox.left}%`,
+                    top: `${bonusBox.top}%`,
+                    width: `${bonusBox.width}%`,
+                    height: `${bonusBox.height}%`,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {emptyBonusUrl && (
+                    <img
+                      src={emptyBonusUrl}
+                      alt=""
+                      style={{
+                        position: 'absolute',
+                        inset: 0,
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'contain',
+                      }}
+                    />
+                  )}
+                  {activeBonus && (
+                    <div
+                      // Keyed by tier index so the plate remounts - and the
+                      // pop-in animation fires - exactly when a new tier
+                      // takes over, not on every re-render.
+                      key={`bonus-${activeBonus.index}`}
+                      className="mystery-game-bonus"
+                      style={{
+                        position: 'absolute',
+                        inset: 0,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: `${stage.height * 0.006}px`,
+                        minWidth: 0,
+                      }}
+                    >
+                      {activeBonus.image && (
+                        <img
+                          src={resolveMediaUrl(activeBonus.image)}
+                          alt=""
+                          style={{
+                            maxWidth: '100%',
+                            // 37 % of the plate, which is what the old fixed
+                            // 24 %-of-stage cap came to inside the old fixed
+                            // 65 %-tall cell: the tier art keeps its size on an
+                            // untouched scenario and now scales WITH the plate
+                            // instead of ignoring it.
+                            maxHeight: '37%',
+                            width: 'auto',
+                            height: 'auto',
+                            objectFit: 'contain',
+                          }}
+                        />
+                      )}
+                      {activeBonus.name && (
+                        <div
+                          style={{
+                            fontSize: `${stage.height * 0.018}px`,
+                            textAlign: 'center',
+                            lineHeight: 1.15,
+                            // Authored names run long ("Champion de la lutte
+                            // contre les Zombies") and the plate is narrow.
+                            overflowWrap: 'anywhere',
+                            maxWidth: '100%',
+                            textShadow: '0 1px 4px rgba(0,0,0,0.8)',
+                            color: gameMeta.level_font_color || '#ffffff',
+                            // Name-only tiers (no authored image) still read
+                            // as a badge rather than floating text.
+                            ...(activeBonus.image
+                              ? {}
+                              : {
+                                  padding: `${stage.height * 0.008}px ${stage.width * 0.008}px`,
+                                  border: '2px solid rgba(255,255,255,0.65)',
+                                  borderRadius: 8,
+                                  background: 'rgba(0,0,0,0.35)',
+                                }),
+                          }}
+                        >
+                          {activeBonus.name}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Bottom: level gauge. Outer wrapper is taller than the gauge
                   bar so level icons + labels that overflow the bar stay
@@ -850,7 +974,7 @@ export function MysteryGameRenderer({
                   flexShrink: 0,
                 }}
               >
-                <div style={{ position: 'relative', width: '100%', height: `${stage.height * 0.08}px` }}>
+                <div style={{ position: 'relative', width: '100%', height: `${gauge.barHeight}px` }}>
                   {gameMeta.levels_gauge_image && (
                     <img
                       src={resolveMediaUrl(gameMeta.levels_gauge_image)}
@@ -867,13 +991,13 @@ export function MysteryGameRenderer({
                   <div
                     style={{
                       position: 'absolute',
-                      left: gaugeInsetPx,
-                      top: 7,
-                      bottom: 7,
-                      width: `calc((100% - ${gaugeDoubleInsetPx}) * ${Math.max(0, Math.min(100, gaugePercent)) / 100})`,
+                      left: gauge.insetLeft,
+                      top: gauge.insetY,
+                      height: gauge.trackHeight,
+                      width: gauge.trackWidth(Math.max(0, Math.min(100, gaugePercent)) / 100),
                       background: gameMeta.gauge_filling || 'linear-gradient(90deg, #ffc700 0%, #fee300 100%)',
                       opacity: 0.85,
-                      borderRadius: 6,
+                      borderRadius: gauge.radius,
                     }}
                   />
                   {gameMeta.levels_gauge_image_with_content && (
@@ -897,7 +1021,7 @@ export function MysteryGameRenderer({
                     const iconUrl = gameMeta.levels_gauge_level_icon_image
                       ? resolveMediaUrl(gameMeta.levels_gauge_level_icon_image)
                       : '';
-                    const iconHeight = gaugeIconHeight;
+                    const iconHeight = gauge.iconHeight;
                     const fontSize = stage.height * 0.018;
                     const barHeight = stage.height * 0.012;
                     const labelOffset = iconHeight / 2 + barHeight;
@@ -916,7 +1040,7 @@ export function MysteryGameRenderer({
                       const name = level?.name
                         ? (typeof level.name === 'string' ? level.name : Object.values(level.name)[0] ?? '')
                         : '';
-                      const leftCalc = `calc(${gaugeInsetPx} + (100% - ${gaugeDoubleInsetPx}) * ${fraction})`;
+                      const leftCalc = gauge.trackLeft(fraction);
 
                       if (iconUrl) {
                         nodes.push(
@@ -1012,9 +1136,9 @@ export function MysteryGameRenderer({
                         alt=""
                         style={{
                           position: 'absolute',
-                          left: `calc(${gaugeInsetPx} + (100% - ${gaugeDoubleInsetPx}) * ${fraction})`,
-                          top: 7,
-                          height: 'calc(100% - 14px)',
+                          left: gauge.trackLeft(fraction),
+                          top: gauge.insetY,
+                          height: gauge.trackHeight,
                           width: 'auto',
                           transform: 'translateX(-50%)',
                           pointerEvents: 'none',
@@ -1026,15 +1150,15 @@ export function MysteryGameRenderer({
                 </div>
               </div>
 
-              {/* Fixed element frame images (non-movable), drawn behind the
-                  author-placed text. */}
+              {/* Element frame images, drawn behind the author-placed text at
+                  the rectangles stored in `ingame_frames`. */}
               {(() => {
                 const frameUrls: Partial<Record<IngameRoleKey, string>> = {};
                 for (const role of INGAME_ROLES) {
                   const file = role.frameImageKey ? gameMeta[role.frameImageKey] : undefined;
                   if (file) frameUrls[role.key] = resolveMediaUrl(file);
                 }
-                return <MysteryFixedFrames frameUrls={frameUrls} />;
+                return <MysteryFixedFrames frameUrls={frameUrls} frames={gameMeta.ingame_frames} />;
               })()}
 
               {/* Author-placed text overlays - the 4 in-game roles positioned
@@ -1044,9 +1168,14 @@ export function MysteryGameRenderer({
                 const overlayFont = fontFamily || 'Arial Black, Arial, sans-serif';
                 const overlayColor = gameMeta.font_color || '#ffffff';
                 const featured = enigmas[selectedEnigmaIndex];
-                const enigmaName = featured
-                  ? featured.text || `Enigma ${featured.number ?? selectedEnigmaIndex + 1}`
-                  : '';
+                // The end-of-run summary has taken the centre column, so the
+                // last-walked enigma's title no longer names anything on screen
+                // and used to sit there over the final score (retour #98).
+                const enigmaName = summary
+                  ? ''
+                  : featured
+                    ? featured.text || `Enigma ${featured.number ?? selectedEnigmaIndex + 1}`
+                    : '';
                 const scoreText = `${score}${pointsUnits === 'percentage' ? '%' : ''}`;
                 const textByRole: Record<string, string> = {
                   enigma_name: enigmaName,

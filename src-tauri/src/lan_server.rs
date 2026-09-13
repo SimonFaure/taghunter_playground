@@ -59,7 +59,18 @@ pub struct MotherServerState {
 #[derive(Default)]
 pub struct MotherEndpointCache {
     inner: Mutex<HashMap<String, SocketAddr>>,
+    // Consecutive TRANSPORT failures per mother uuid. A dead mother's address
+    // used to stay warm for the whole session (only a uuid mismatch evicted
+    // it), so `client_resolve_mother_link` kept handing back the corpse and the
+    // 15s route tick kept re-pointing at it - the satellite could never
+    // converge on the promoted mother (Ludiom #74). See `note_ping_failure`.
+    fails: Mutex<HashMap<String, u32>>,
 }
+
+// Evict a mother's cached endpoint after this many consecutive transport
+// failures. Two, not one: the in-game ping runs every 4s, so a genuinely dead
+// mother is dropped in ~8s while a single blip costs nothing.
+const ENDPOINT_EVICT_AFTER_FAILS: u32 = 2;
 
 /// Client-side: the satellite's current SportIdent reader-attached state.
 /// Updated by JS (`Footer.tsx`'s 10s polling tick → `client_set_reader_presence`)
@@ -495,6 +506,7 @@ pub async fn mother_start_local_server(
         mother_uuid: self_pair.mother_device_uuid.clone(),
         self_peer_id: self_pair.peer_id,
         last_bump: Arc::new(Mutex::new(HashMap::new())),
+        app: app.clone(),
     };
 
     let app_router = build_router(app_state);
@@ -588,6 +600,9 @@ struct GameRow {
     started: bool,
     ended: bool,
     created_at: String,
+    // Optional so a snapshot written by an older build (which didn't carry it)
+    // still parses; it simply mirrors as NULL, exactly as before.
+    ended_at: Option<i64>,
 }
 struct MetaRow { meta_name: String, meta_value: Option<String> }
 struct DevRow {
@@ -653,74 +668,30 @@ fn req_str(v: &Value, k: &str) -> Result<String, String> {
     vstr(v, k).ok_or_else(|| format!("snapshot row missing string field '{k}'"))
 }
 
-/// Promote THIS device (a satellite holding a cached snapshot) into the new
-/// mother for `launched_game_id`. Adopts the snapshot's game state + pairing
-/// table, bumps the epoch, starts the local server + mDNS, and best-effort
-/// raises the same-named hotspot. See plans/mother-failover-promote-any-device.md.
-///
-/// Identity reconciliation (the careful bit): the snapshot's `paired_devices`
-/// has the OLD mother as `is_self=1`. This device is one of the *non-self* rows,
-/// keyed by its `client_device_uuid` (the uuid it paired to the old mother
-/// with). On adopt we rebuild the pairing table preserving every `id` (so the
-/// game's `device_id` references stay valid), then mark OUR row `is_self=1` and
-/// everyone else `is_self=0`. The advertised mother uuid becomes our
-/// `client_device_uuid`, keeping the "self row peer_uuid == mother uuid"
-/// convention `ensure_self_pair` relies on.
-#[tauri::command]
-pub async fn become_mother(
-    app: AppHandle,
-    state: tauri::State<'_, MotherServerState>,
-    launched_game_id: i64,
-    port: u16,
-    mdns_label: Option<String>,
-) -> Result<BecomeMotherInfo, String> {
-    // Every device runs its OWN idle local server from boot (ensureMotherServer),
-    // so "already running" is the normal case, not an error - stop it before we
-    // adopt the game and start the replacement. Take it out under the lock, then
-    // shut it down without holding the lock (the join await would otherwise
-    // block other server-state callers).
-    let existing = { state.inner.lock().await.take() };
-    if let Some(running) = existing {
-        if let Some(m) = running.mdns {
-            let _ = m.daemon.unregister(&m.full_name);
-            let _ = m.daemon.shutdown();
-        }
-        let _ = running.shutdown.send(());
-        let _ = running.join.await;
-    }
+/// Everything a snapshot says about one launched game, parsed and validated
+/// BEFORE any DB work so shape problems surface as clear errors instead of
+/// half-applied writes.
+struct SnapshotRows {
+    game: GameRow,
+    mother_epoch: i64,
+    state_version: i64,
+    paired_devices: Vec<PdRow>,
+    meta: Vec<MetaRow>,
+    devices: Vec<DevRow>,
+    raw_data: Vec<RawRow>,
+    teams: Vec<TeamRow>,
+    cqs: Vec<CqRow>,
+    clash_members: Vec<ClashMemberRow>,
+    clash_validations: Vec<ClashValidationRow>,
+    clash_consumed: Vec<ClashConsumedRow>,
+    clash_effectif: Vec<ClashEffectifRow>,
+    clash_purges: Vec<ClashPurgeRow>,
+}
 
-    let db_path = resolve_db_path(&app)?;
-    let conn = DbConnection::open(db_path.clone())
-        .await
-        .map_err(|e| format!("open sqlite ({}): {e}", db_path.display()))?;
-    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-        c.pragma_update(None, "foreign_keys", "ON")?;
-        let _: String = c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-        c.pragma_update(None, "busy_timeout", 5000)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("pragma setup: {e}"))?;
-
-    // 1. Load the cached snapshot for this game.
-    let snap_json: Option<String> = conn
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
-            Ok(c.query_row(
-                "SELECT snapshot_json FROM mother_snapshots WHERE launched_game_id = ?",
-                params![launched_game_id],
-                |r| r.get(0),
-            )
-            .optional()?)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    let Some(snap_json) = snap_json else {
-        return Err("No cached snapshot for this game on this device - it can't be promoted. Pick a device that was in the game.".into());
-    };
-    let snap: Value = serde_json::from_str(&snap_json)
-        .map_err(|e| format!("cached snapshot is corrupt: {e}"))?;
-
-    // 2. Parse + validate everything up front.
+/// Parse a cached snapshot into typed rows. Shared by `become_mother` (which
+/// takes ownership of the game) and `apply_mother_snapshot` (which only mirrors
+/// it), so the two can never disagree about the wire shape.
+fn parse_snapshot_rows(snap: &Value) -> Result<SnapshotRows, String> {
     let game_v = snap.get("game").ok_or("snapshot missing 'game'")?;
     let game = GameRow {
         id: req_i64(game_v, "id")?,
@@ -735,14 +706,13 @@ pub async fn become_mother(
         started: vbool(game_v, "started"),
         ended: vbool(game_v, "ended"),
         created_at: vstr(game_v, "created_at").unwrap_or_default(),
+        ended_at: vi64(game_v, "ended_at"),
     };
-    let old_epoch = vi64(&snap, "mother_epoch").unwrap_or(1);
-    let new_epoch = old_epoch + 1;
 
     let arr = |k: &str| snap.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let mut pds = Vec::new();
+    let mut paired_devices = Vec::new();
     for v in arr("paired_devices") {
-        pds.push(PdRow {
+        paired_devices.push(PdRow {
             id: req_i64(&v, "id")?,
             peer_uuid: req_str(&v, "peer_uuid")?,
             peer_label: vstr(&v, "peer_label").unwrap_or_else(|| "device".into()),
@@ -849,8 +819,245 @@ pub async fn become_mother(
         });
     }
 
+    Ok(SnapshotRows {
+        game,
+        mother_epoch: vi64(snap, "mother_epoch").unwrap_or(1),
+        state_version: vi64(snap, "state_version").unwrap_or(0),
+        paired_devices,
+        meta,
+        devices,
+        raw_data,
+        teams,
+        cqs,
+        clash_members,
+        clash_validations,
+        clash_consumed,
+        clash_effectif,
+        clash_purges,
+    })
+}
+
+/// Replace one launched game's rows with the snapshot's, inside the caller's
+/// transaction. The DELETE cascades the children, so this is a wholesale
+/// replacement, not a merge: the mother is the truth.
+///
+/// LEGALITY: the game's `device_id` references (`lg_launched_game_devices`,
+/// `lg_launched_game_raw_data`) point into `paired_devices` by convention -
+/// there is no FK - so applying game rows WITHOUT rebuilding the pairing table
+/// is only sound because `become_mother` preserves `paired_devices.id` when it
+/// adopts. Do not "optimise" that id preservation away; this function depends
+/// on it.
+///
+/// `preserve_launched_by_self` guards a per-DEVICE fact that must never travel
+/// with the mother's copy: it drives the `mine=1` filter behind the "This
+/// device" list. A mirroring device (Ludiom #76) keeps its own value, or the
+/// very act of correcting the game's status would delete it from that list.
+/// A promoting device passes false, matching the pre-refactor behaviour: it
+/// surfaces the game through its participant row instead.
+fn apply_game_rows(
+    tx: &rusqlite::Transaction,
+    rows: &SnapshotRows,
+    mother_epoch: i64,
+    preserve_launched_by_self: bool,
+) -> rusqlite::Result<()> {
+    let game = &rows.game;
+    let game_id = game.id;
+    let launched_by_self: i64 = if preserve_launched_by_self {
+        tx.query_row(
+            "SELECT launched_by_self FROM lg_launched_games WHERE id = ?",
+            params![game_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+    } else {
+        0
+    };
+
+    tx.execute("DELETE FROM lg_launched_games WHERE id = ?", params![game_id])?;
+    tx.execute(
+        "INSERT INTO lg_launched_games
+           (id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
+            game_type, duration, start_time, started, ended, mother_epoch, created_at,
+            ended_at, launched_by_self)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
+                 COALESCE(NULLIF(?13,''), CURRENT_TIMESTAMP), ?14, ?15)",
+        params![
+            game.id, game.summary_uuid, game.client_id, game.game_uniqid, game.name,
+            game.number_of_teams, game.game_type, game.duration, game.start_time,
+            game.started as i64, game.ended as i64, mother_epoch, game.created_at,
+            game.ended_at, launched_by_self
+        ],
+    )?;
+    for m in &rows.meta {
+        tx.execute(
+            "INSERT INTO lg_launched_game_meta (launched_game_id, meta_name, meta_value)
+             VALUES (?1, ?2, ?3)",
+            params![game_id, m.meta_name, m.meta_value],
+        )?;
+    }
+    for d in &rows.devices {
+        tx.execute(
+            "INSERT INTO lg_launched_game_devices
+               (launched_game_id, device_id, device_label, os, os_version, connected)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![game_id, d.device_id, d.device_label, d.os, d.os_version, d.connected as i64],
+        )?;
+    }
+    for r in &rows.raw_data {
+        tx.execute(
+            "INSERT INTO lg_launched_game_raw_data
+               (id, launched_game_id, device_id, raw_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
+            params![r.id, game_id, r.device_id, r.raw_data, r.created_at],
+        )?;
+    }
+    for t in &rows.teams {
+        tx.execute(
+            "INSERT INTO lg_teams
+               (id, launched_game_id, team_number, team_name, pattern, score,
+                key_id, start_time, end_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![t.id, game_id, t.team_number, t.team_name, t.pattern, t.score, t.key_id, t.start_time, t.end_time],
+        )?;
+    }
+    for q in &rows.cqs {
+        tx.execute(
+            "INSERT INTO lg_team_completed_quests
+               (id, launched_game_id, team_id, teammate_chip_id, quest_id,
+                quest_number, points_awarded, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(NULLIF(?8,''), CURRENT_TIMESTAMP))",
+            params![q.id, game_id, q.team_id, q.teammate_chip_id, q.quest_id, q.quest_number, q.points_awarded, q.created_at],
+        )?;
+    }
+    // Clash V2 state (empty for non-clash games / older snapshots). Ordered
+    // after lg_teams - these rows FK onto it.
+    for m in &rows.clash_members {
+        tx.execute(
+            "INSERT INTO lg_clash_members (id, launched_game_id, team_id, chip_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
+            params![m.id, game_id, m.team_id, m.chip_id, m.created_at],
+        )?;
+    }
+    for vr in &rows.clash_validations {
+        tx.execute(
+            "INSERT INTO lg_clash_validations
+               (id, launched_game_id, team_id, chip_id, combo_index, territory_index, seq, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(NULLIF(?8,''), CURRENT_TIMESTAMP))",
+            params![vr.id, game_id, vr.team_id, vr.chip_id, vr.combo_index, vr.territory_index, vr.seq, vr.created_at],
+        )?;
+    }
+    for cr in &rows.clash_consumed {
+        tx.execute(
+            "INSERT INTO lg_clash_consumed (id, launched_game_id, chip_id, punch_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
+            params![cr.id, game_id, cr.chip_id, cr.punch_key, cr.created_at],
+        )?;
+    }
+    for e in &rows.clash_effectif {
+        tx.execute(
+            "INSERT INTO lg_clash_effectif (launched_game_id, team_id, size)
+             VALUES (?1, ?2, ?3)",
+            params![game_id, e.team_id, e.size],
+        )?;
+    }
+    for p in &rows.clash_purges {
+        tx.execute(
+            "INSERT INTO lg_clash_purges
+               (id, launched_game_id, team_id, chip_id, territory_index, seq, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(NULLIF(?7,''), CURRENT_TIMESTAMP))",
+            params![p.id, game_id, p.team_id, p.chip_id, p.territory_index, p.seq, p.created_at],
+        )?;
+    }
+    // Keep the language column on teams in sync (separate UPDATE so the INSERT
+    // column list stays aligned with the base schema).
+    for t in &rows.teams {
+        if let Some(lang) = &t.language {
+            tx.execute("UPDATE lg_teams SET language = ?1 WHERE id = ?2", params![lang, t.id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Promote THIS device (a satellite holding a cached snapshot) into the new
+/// mother for `launched_game_id`. Adopts the snapshot's game state + pairing
+/// table, bumps the epoch, starts the local server + mDNS, and best-effort
+/// raises the same-named hotspot. See plans/mother-failover-promote-any-device.md.
+///
+/// Identity reconciliation (the careful bit): the snapshot's `paired_devices`
+/// has the OLD mother as `is_self=1`. This device is one of the *non-self* rows,
+/// keyed by its `client_device_uuid` (the uuid it paired to the old mother
+/// with). On adopt we rebuild the pairing table preserving every `id` (so the
+/// game's `device_id` references stay valid), then mark OUR row `is_self=1` and
+/// everyone else `is_self=0`. The advertised mother uuid becomes our
+/// `client_device_uuid`, keeping the "self row peer_uuid == mother uuid"
+/// convention `ensure_self_pair` relies on.
+#[tauri::command]
+pub async fn become_mother(
+    app: AppHandle,
+    state: tauri::State<'_, MotherServerState>,
+    cache: tauri::State<'_, MotherEndpointCache>,
+    launched_game_id: i64,
+    port: u16,
+    mdns_label: Option<String>,
+) -> Result<BecomeMotherInfo, String> {
+    // Every device runs its OWN idle local server from boot (ensureMotherServer),
+    // so "already running" is the normal case, not an error - stop it before we
+    // adopt the game and start the replacement. Take it out under the lock, then
+    // shut it down without holding the lock (the join await would otherwise
+    // block other server-state callers).
+    let existing = { state.inner.lock().await.take() };
+    if let Some(running) = existing {
+        if let Some(m) = running.mdns {
+            let _ = m.daemon.unregister(&m.full_name);
+            let _ = m.daemon.shutdown();
+        }
+        let _ = running.shutdown.send(());
+        let _ = running.join.await;
+    }
+
+    let db_path = resolve_db_path(&app)?;
+    let conn = DbConnection::open(db_path.clone())
+        .await
+        .map_err(|e| format!("open sqlite ({}): {e}", db_path.display()))?;
+    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+        c.pragma_update(None, "foreign_keys", "ON")?;
+        let _: String = c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        c.pragma_update(None, "busy_timeout", 5000)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("pragma setup: {e}"))?;
+
+    // 1. Load the cached snapshot for this game.
+    let snap_json: Option<String> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+            Ok(c.query_row(
+                "SELECT snapshot_json FROM mother_snapshots WHERE launched_game_id = ?",
+                params![launched_game_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(snap_json) = snap_json else {
+        return Err("No cached snapshot for this game on this device - it can't be promoted. Pick a device that was in the game.".into());
+    };
+    let snap: Value = serde_json::from_str(&snap_json)
+        .map_err(|e| format!("cached snapshot is corrupt: {e}"))?;
+
+    // 2. Parse + validate everything up front. `rows` is moved into the adopt
+    // transaction below, so anything needed after it is copied out here.
+    let rows = parse_snapshot_rows(&snap)?;
+    let game_uniqid = rows.game.game_uniqid.clone();
+    let game_client_id = rows.game.client_id;
+    let old_epoch = rows.mother_epoch;
+    let new_epoch = old_epoch + 1;
+    let snap_state_version = rows.state_version;
+
     // 3. Content guard - refuse if this device hasn't synced the scenario.
-    let game_uniqid_for_guard = game.game_uniqid.clone();
+    let game_uniqid_for_guard = game_uniqid.clone();
     let has_content: bool = conn
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
             Ok(c.query_row(
@@ -866,7 +1073,7 @@ pub async fn become_mother(
     if !has_content {
         return Err(format!(
             "This device hasn't downloaded the scenario \"{}\" - sync it before promoting this device to mother.",
-            game.game_uniqid
+            game_uniqid
         ));
     }
 
@@ -899,7 +1106,6 @@ pub async fn become_mother(
     let mother_uuid = client_device_uuid.clone();
     let self_uuid = client_device_uuid.clone();
     let new_self_secret = random_token(32);
-    let game_id = game.id;
     let adopt_label = mdns_label.clone();
     // Network creds from the snapshot, to be mirrored into schema_meta inside
     // the adoption transaction. The JS boot raise path does this via
@@ -921,7 +1127,7 @@ pub async fn become_mother(
             // 5a. Rebuild the pairing table from the snapshot, preserving ids.
             tx.execute("DELETE FROM paired_devices", [])?;
             let mut self_found: Option<(i64, String)> = None;
-            for pd in &pds {
+            for pd in &rows.paired_devices {
                 let is_self = if pd.peer_uuid == self_uuid { 1 } else { 0 };
                 tx.execute(
                     "INSERT INTO paired_devices
@@ -951,100 +1157,10 @@ pub async fn become_mother(
                 }
             };
 
-            // 5b. Replace this game's rows (cascade clears any stale children first).
-            tx.execute("DELETE FROM lg_launched_games WHERE id = ?", params![game_id])?;
-            tx.execute(
-                "INSERT INTO lg_launched_games
-                   (id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
-                    game_type, duration, start_time, started, ended, mother_epoch, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                         COALESCE(NULLIF(?13,''), CURRENT_TIMESTAMP))",
-                params![
-                    game.id, game.summary_uuid, game.client_id, game.game_uniqid, game.name,
-                    game.number_of_teams, game.game_type, game.duration, game.start_time,
-                    game.started as i64, game.ended as i64, new_epoch, game.created_at
-                ],
-            )?;
-            for m in &meta {
-                tx.execute(
-                    "INSERT INTO lg_launched_game_meta (launched_game_id, meta_name, meta_value)
-                     VALUES (?1, ?2, ?3)",
-                    params![game_id, m.meta_name, m.meta_value],
-                )?;
-            }
-            for d in &devices {
-                tx.execute(
-                    "INSERT INTO lg_launched_game_devices
-                       (launched_game_id, device_id, device_label, os, os_version, connected)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![game_id, d.device_id, d.device_label, d.os, d.os_version, d.connected as i64],
-                )?;
-            }
-            for r in &raw_data {
-                tx.execute(
-                    "INSERT INTO lg_launched_game_raw_data
-                       (id, launched_game_id, device_id, raw_data, created_at)
-                     VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
-                    params![r.id, game_id, r.device_id, r.raw_data, r.created_at],
-                )?;
-            }
-            for t in &teams {
-                tx.execute(
-                    "INSERT INTO lg_teams
-                       (id, launched_game_id, team_number, team_name, pattern, score,
-                        key_id, start_time, end_time)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![t.id, game_id, t.team_number, t.team_name, t.pattern, t.score, t.key_id, t.start_time, t.end_time],
-                )?;
-            }
-            for q in &cqs {
-                tx.execute(
-                    "INSERT INTO lg_team_completed_quests
-                       (id, launched_game_id, team_id, teammate_chip_id, quest_id,
-                        quest_number, points_awarded, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(NULLIF(?8,''), CURRENT_TIMESTAMP))",
-                    params![q.id, game_id, q.team_id, q.teammate_chip_id, q.quest_id, q.quest_number, q.points_awarded, q.created_at],
-                )?;
-            }
-            // 5b-bis. Clash V2 state (empty for non-clash games / older
-            // snapshots). Ordered after lg_teams - these rows FK onto it.
-            for m in &clash_members {
-                tx.execute(
-                    "INSERT INTO lg_clash_members (id, launched_game_id, team_id, chip_id, created_at)
-                     VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
-                    params![m.id, game_id, m.team_id, m.chip_id, m.created_at],
-                )?;
-            }
-            for vr in &clash_validations {
-                tx.execute(
-                    "INSERT INTO lg_clash_validations
-                       (id, launched_game_id, team_id, chip_id, combo_index, territory_index, seq, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(NULLIF(?8,''), CURRENT_TIMESTAMP))",
-                    params![vr.id, game_id, vr.team_id, vr.chip_id, vr.combo_index, vr.territory_index, vr.seq, vr.created_at],
-                )?;
-            }
-            for cr in &clash_consumed {
-                tx.execute(
-                    "INSERT INTO lg_clash_consumed (id, launched_game_id, chip_id, punch_key, created_at)
-                     VALUES (?1, ?2, ?3, ?4, COALESCE(NULLIF(?5,''), CURRENT_TIMESTAMP))",
-                    params![cr.id, game_id, cr.chip_id, cr.punch_key, cr.created_at],
-                )?;
-            }
-            for e in &clash_effectif {
-                tx.execute(
-                    "INSERT INTO lg_clash_effectif (launched_game_id, team_id, size)
-                     VALUES (?1, ?2, ?3)",
-                    params![game_id, e.team_id, e.size],
-                )?;
-            }
-            for p in &clash_purges {
-                tx.execute(
-                    "INSERT INTO lg_clash_purges
-                       (id, launched_game_id, team_id, chip_id, territory_index, seq, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(NULLIF(?7,''), CURRENT_TIMESTAMP))",
-                    params![p.id, game_id, p.team_id, p.chip_id, p.territory_index, p.seq, p.created_at],
-                )?;
-            }
+            // 5b. Replace this game's rows at our NEW epoch. `preserve` is false:
+            // taking ownership doesn't make us the device that launched the game,
+            // and our participant row is what surfaces it in "This device".
+            apply_game_rows(&tx, &rows, new_epoch, false)?;
 
             // 5c. Our mother identity == our client_device_uuid (keeps the
             // self-row peer_uuid == mother_uuid convention).
@@ -1079,13 +1195,20 @@ pub async fn become_mother(
             // OUR previous identity and drop self-referential mother links
             // (see heal_self_identity).
             heal_self_identity(&tx, self_id)?;
-            // Keep the language column on teams in sync (separate UPDATE so the
-            // INSERT column list stays aligned with the base schema).
-            for t in &teams {
-                if let Some(lang) = &t.language {
-                    tx.execute("UPDATE lg_teams SET language = ?1 WHERE id = ?2", params![lang, t.id])?;
-                }
-            }
+            // We ARE the mother now: no outbound link to any other mother may
+            // survive. heal_self_identity only drops SELF-links, so the row for
+            // the mother we just replaced used to persist - and childControlLink's
+            // 15s refreshLaunchedGamesRoute tick would resolve it (its endpoint is
+            // still warm in MotherEndpointCache) and drag our OWN launched_games
+            // traffic off 127.0.0.1 onto the dead machine, re-raising "lost
+            // contact with the mother" on the device that just got promoted.
+            // If we later stand down, yieldToMother re-creates the row via
+            // client_save_paired_mother, so nothing is lost.
+            tx.execute("DELETE FROM paired_mothers", [])?;
+            // Take over the state-version counter too, or every snapshot WE ship
+            // as the new mother looks stale to the satellites (see
+            // `seed_state_version`).
+            seed_state_version(&tx, snap_state_version)?;
 
             tx.commit()?;
             Ok((self_id, self_secret))
@@ -1093,14 +1216,22 @@ pub async fn become_mother(
         .await
         .map_err(|e| format!("adopt snapshot: {e}"))?;
 
+    // 5-bis. The in-memory endpoint cache is process-global and still holds the
+    // dead mother's SocketAddr. `client_resolve_mother_link` reads ONLY that
+    // cache, so leaving it warm would resurrect the link we just deleted above
+    // for the rest of the session.
+    cache.inner.lock().await.clear();
+    cache.fails.lock().await.clear();
+
     // 6. Build state + serve + mDNS (epoch bumped so fencing prefers us).
     let app_state = AppState {
         db: Arc::new(conn),
         media_root: resolve_media_root(&app)?,
-        client_id: game.client_id,
+        client_id: game_client_id,
         mother_uuid: mother_uuid.clone(),
         self_peer_id,
         last_bump: Arc::new(Mutex::new(HashMap::new())),
+        app: app.clone(),
     };
     let app_router = build_router(app_state);
     let listener = bind_mother_listener(port)
@@ -1124,7 +1255,7 @@ pub async fn become_mother(
         .get("wifi")
         .and_then(|w| vstr(w, "source"))
         .unwrap_or_else(|| "hotspot".to_string());
-    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game.client_id, new_epoch, &[], &boot_source) {
+    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game_client_id, new_epoch, &[], &boot_source) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("[lan_server] become_mother mDNS start failed: {e} (continuing)");
@@ -1140,7 +1271,7 @@ pub async fn become_mother(
             mdns,
             mother_uuid: mother_uuid.clone(),
             mdns_label,
-            client_id: game.client_id,
+            client_id: game_client_id,
             epoch: new_epoch,
         });
     }
@@ -1149,13 +1280,41 @@ pub async fn become_mother(
     // then re-announce mDNS on the AP subnet so satellites can resolve us.
     let mut hotspot_started = false;
     let mut hotspot_error: Option<String> = None;
-    let wifi = snap.get("wifi");
-    let ssid = wifi.and_then(|w| vstr(w, "ssid"));
-    let password = wifi.and_then(|w| vstr(w, "password"));
-    let source = wifi.and_then(|w| vstr(w, "source")).unwrap_or_default();
+    // The mode to host in: the dead mother's, else THIS device's configured one
+    // (`read_lan_network_source` defaults to "hotspot", the mode the fleet ships
+    // in). Deriving it from `snap.wifi.source` ALONE was the bug: read_mother_wifi
+    // returns null whenever the mother's hotspot_ssid/password were empty, so
+    // `source` fell back to "" and the whole AP branch was skipped - promotion
+    // returned Ok with hotspot_started=false AND hotspot_error=None, which the
+    // modal rendered as an unqualified success while the venue had no Wi-Fi.
+    let source = match snap.get("wifi").and_then(|w| vstr(w, "source")) {
+        Some(s) if !s.is_empty() => s,
+        _ => read_lan_network_source(&app).await,
+    };
     if source == "hotspot" {
-        if let (Some(ssid), Some(password)) = (ssid, password) {
-            match crate::hotspot::mother_start_hotspot(ssid, password).await {
+        // Creds from the snapshot when the dead mother published them, else our
+        // own schema_meta (studio sync writes there, and step 5c-bis just
+        // mirrored the snapshot's).
+        let creds = match snap.get("wifi").and_then(|w| {
+            match (vstr(w, "ssid"), vstr(w, "password")) {
+                (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => Some((s, p)),
+                _ => None,
+            }
+        }) {
+            Some(c) => Some(c),
+            None => read_local_hotspot_creds(&app).await,
+        };
+        match creds {
+            // No AP means no LAN: satellites can never reach us. Report it - the
+            // operator has to bring the devices onto another network by hand.
+            None => {
+                hotspot_error = Some(
+                    "no Wi-Fi credentials on this device, so the access point could not be raised. \
+                     Set them in Settings > Network, then retry."
+                        .into(),
+                );
+            }
+            Some((ssid, password)) => match crate::hotspot::mother_start_hotspot(ssid, password).await {
                 Ok(info) => {
                     hotspot_started = true;
                     // Re-register mDNS with the AP IPv4s so clients resolve us.
@@ -1187,7 +1346,7 @@ pub async fn become_mother(
                 Err(e) => {
                     hotspot_error = Some(e);
                 }
-            }
+            },
         }
     }
 
@@ -1200,6 +1359,129 @@ pub async fn become_mother(
         epoch: new_epoch,
         hotspot_started,
         hotspot_error,
+    })
+}
+
+/// Outcome of `apply_mother_snapshot`. Never an error for the ordinary "nothing
+/// to do" cases - the caller runs this on a timer and a refusal is information,
+/// not a failure.
+#[derive(Serialize)]
+pub struct ApplyOutcome {
+    pub applied: bool,
+    /// `applied`, `no_cached_snapshot`, `no_local_row`, `stale_snapshot`,
+    /// `serving_locally`, or `corrupt_snapshot`.
+    pub reason: String,
+    pub ended: bool,
+    pub mother_epoch: i64,
+    pub state_version: i64,
+}
+
+/// Mirror the cached snapshot of ONE game onto this device's local rows, WITHOUT
+/// taking ownership of the game (Ludiom #76).
+///
+/// The case: this device was the mother, another device was promoted, and the
+/// operator ended the game there. `become_mother` is entirely local to the
+/// promoted device - nothing ever writes back here - so this device kept
+/// `ended = 0` and went on showing a game that finished elsewhere, in its games
+/// list, its "This device" history and its statistics. Worse, that stale row
+/// feeds `deviceHasLocalActiveGame`, the epoch advertised at boot and
+/// `get_takeover_target`, so it also distorts the next failover.
+///
+/// This is `become_mother`'s row application and nothing else. It deliberately
+/// does NOT: bump the epoch, rebuild `paired_devices` (we keep our own secrets),
+/// touch `paired_mothers`, write identity or wifi keys, heal identities, or
+/// start any server/mDNS/hotspot. It adopts the epoch it mirrors, so a later
+/// snapshot from the same owner is not seen as stale.
+///
+/// Four guards make it safe to run on a timer: a local row must already exist
+/// (we never materialise a stranger's game - `mother_snapshots` is never
+/// pruned), the snapshot's epoch must be at least the local one, this device
+/// must not be serving that game itself at an epoch that would make it the
+/// rightful owner, and the caller short-circuits when it is a running mother.
+#[tauri::command]
+pub async fn apply_mother_snapshot(
+    app: AppHandle,
+    state: tauri::State<'_, MotherServerState>,
+    launched_game_id: i64,
+) -> Result<ApplyOutcome, String> {
+    let refused = |reason: &str| ApplyOutcome {
+        applied: false,
+        reason: reason.to_string(),
+        ended: false,
+        mother_epoch: 0,
+        state_version: 0,
+    };
+
+    let conn = open_db_for_command(&app).await?;
+    let snap_json: Option<String> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+            Ok(c.query_row(
+                "SELECT snapshot_json FROM mother_snapshots WHERE launched_game_id = ?",
+                params![launched_game_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(snap_json) = snap_json else {
+        return Ok(refused("no_cached_snapshot"));
+    };
+    let Ok(snap) = serde_json::from_str::<Value>(&snap_json) else {
+        return Ok(refused("corrupt_snapshot"));
+    };
+    let Ok(rows) = parse_snapshot_rows(&snap) else {
+        return Ok(refused("corrupt_snapshot"));
+    };
+    let snap_epoch = rows.mother_epoch;
+    let snap_version = rows.state_version;
+    let ended = rows.game.ended;
+
+    // Are we serving right now, at an epoch that says the game is still ours?
+    // Then the snapshot is a peer's opinion, not the truth, and mirroring would
+    // destroy live state. (The TS caller already skips running mothers; this is
+    // the same rule enforced where it can't be bypassed.)
+    if let Some(running) = state.inner.lock().await.as_ref() {
+        if running.epoch >= snap_epoch {
+            return Ok(refused("serving_locally"));
+        }
+    }
+
+    let outcome = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<&'static str>> {
+            let tx = c.transaction()?;
+            let local: Option<i64> = tx
+                .query_row(
+                    "SELECT mother_epoch FROM lg_launched_games WHERE id = ?",
+                    params![launched_game_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(local_epoch) = local else {
+                return Ok(Some("no_local_row"));
+            };
+            if snap_epoch < local_epoch {
+                return Ok(Some("stale_snapshot"));
+            }
+            apply_game_rows(&tx, &rows, snap_epoch, /* preserve_launched_by_self */ true)?;
+            // The mirrored state came with the owner's counter; adopting it keeps
+            // our own snapshots (should we ever host again) from looking stale.
+            seed_state_version(&tx, snap_version)?;
+            tx.commit()?;
+            Ok(None)
+        })
+        .await
+        .map_err(|e| format!("apply snapshot: {e}"))?;
+
+    if let Some(reason) = outcome {
+        return Ok(refused(reason));
+    }
+    Ok(ApplyOutcome {
+        applied: true,
+        reason: "applied".into(),
+        ended,
+        mother_epoch: snap_epoch,
+        state_version: snap_version,
     })
 }
 
@@ -1356,6 +1638,43 @@ pub async fn get_self_peer_secret(app: AppHandle) -> Result<Option<String>, Stri
     .map_err(|e| e.to_string())
 }
 
+/// One authenticated snapshot request against a mother at `addr_port`
+/// ("ip:port"), asking for `launched_game_id` with `known_version: -1` so the
+/// mother always answers with a full snapshot rather than "you're up to date".
+///
+/// `Ok(None)` is a MEANINGFUL answer, not a failure: the mother replied and
+/// authenticated us, but has no such game (`build_snapshot` returns None → the
+/// ping body carries `snapshot: null`). That is precisely what makes this call
+/// a candidate test - it proves reachable + honours our token + actually serves
+/// THIS game, in one round trip. `Err` is reserved for transport failures and
+/// non-2xx replies.
+async fn pull_snapshot_over_http(
+    addr_port: &str,
+    secret: &str,
+    launched_game_id: i64,
+) -> Result<Option<Value>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(1500))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(format!("http://{addr_port}/ping.php"))
+        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .json(&json!({ "launched_game_id": launched_game_id, "known_version": -1 }))
+        .send()
+        .await
+        .map_err(|e| format!("contacting current mother: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("current mother returned HTTP {}", resp.status().as_u16()));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body
+        .get("snapshot")
+        .filter(|v| v.is_object())
+        .cloned())
+}
+
 /// Pull the CURRENT snapshot of `launched_game_id` from the live mother at
 /// `addr:port` and cache it locally (so a subsequent `become_mother` adopts the
 /// up-to-date state, not this device's stale copy). Authenticates with THIS
@@ -1373,30 +1692,41 @@ pub async fn fetch_snapshot_from_mother(
         return Err("this device has no credentials to authenticate with the current mother".into());
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_millis(1500))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .post(format!("http://{addr}:{port}/ping.php"))
-        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-        .json(&json!({ "launched_game_id": launched_game_id, "known_version": -1 }))
-        .send()
-        .await
-        .map_err(|e| format!("contacting current mother: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("current mother returned HTTP {}", resp.status().as_u16()));
-    }
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let Some(snap) = body.get("snapshot").filter(|v| v.is_object()) else {
+    let Some(snap) = pull_snapshot_over_http(&format!("{addr}:{port}"), &secret, launched_game_id).await?
+    else {
         return Ok(false);
     };
     let gid = snap.get("game").and_then(|g| g.get("id")).and_then(|v| v.as_i64());
     let ver = snap.get("state_version").and_then(|v| v.as_i64());
     let epoch = snap.get("mother_epoch").and_then(|v| v.as_i64()).unwrap_or(1);
     let (Some(gid), Some(ver)) = (gid, ver) else { return Ok(false) };
-    let snap_json = snap.to_string();
+    upsert_cached_snapshot(&conn, gid, ver, epoch, snap.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Cache a received snapshot in `mother_snapshots`, the single writer for that
+/// table on a satellite. Both callers (this file's `fetch_snapshot_from_mother`
+/// and the `/ping.php` piggyback in `client_ping_mother`) MUST go through here:
+/// they used to carry hand-copied SQL, and the strict-advance guard is exactly
+/// the kind of thing that drifts when duplicated.
+///
+/// The guard is EPOCH-DOMINANT. `state_version` is a per-DEVICE counter
+/// (`schema_meta.lg_state_version`), so a newly promoted mother's counter is not
+/// comparable to the dead mother's - it typically restarts far below it. Keying
+/// staleness on the version alone therefore made a satellite reject every
+/// snapshot the new mother shipped, for ever: its cached epoch/uuid froze at the
+/// dead mother's values and re-point could never see a "genuine promotion"
+/// (Ludiom #74). A higher epoch always wins; the version only breaks ties
+/// within one epoch, where it IS the same counter.
+async fn upsert_cached_snapshot(
+    conn: &DbConnection,
+    launched_game_id: i64,
+    state_version: i64,
+    mother_epoch: i64,
+    snapshot_json: String,
+) -> Result<(), tokio_rusqlite::Error> {
     conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
         c.execute(
             "INSERT INTO mother_snapshots
@@ -1407,14 +1737,14 @@ pub async fn fetch_snapshot_from_mother(
                mother_epoch  = excluded.mother_epoch,
                snapshot_json = excluded.snapshot_json,
                updated_at    = excluded.updated_at
-             WHERE excluded.state_version > mother_snapshots.state_version",
-            params![gid, ver, epoch, snap_json],
+             WHERE excluded.mother_epoch > mother_snapshots.mother_epoch
+                OR (excluded.mother_epoch = mother_snapshots.mother_epoch
+                    AND excluded.state_version > mother_snapshots.state_version)",
+            params![launched_game_id, state_version, mother_epoch, snapshot_json],
         )?;
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?;
-    Ok(true)
 }
 
 /// Re-announce the mother over mDNS, advertising `addresses` explicitly (plus
@@ -1823,6 +2153,10 @@ struct AppState {
     /// authorization check on queue_command (only self may push commands) is
     /// a single integer comparison instead of a SQL roundtrip per call.
     self_peer_id: i64,
+    /// Handle on the hosting app, so a command a satellite targets at the
+    /// MOTHER's own screen can be executed in-process (emitted straight to
+    /// this device's renderer) instead of queued - see `queue_command_inner`.
+    app: AppHandle,
     /// Debounce map for `bump_presence` - peer_id → last write Instant. The
     /// 5s window keeps the row from churning under the satellite's 1s state
     /// polling, while the 25s online window in `list_paired_with_status`
@@ -2039,6 +2373,35 @@ fn action_mutates_game_state(method: &str, action: &str) -> bool {
         )
 }
 
+/// Adopt a snapshot's `state_version` into THIS device's counter, taking the
+/// max of the two and stepping past it.
+///
+/// `lg_state_version` is per-DEVICE, and every device runs its own idle server
+/// from boot, so a promoted mother's counter is unrelated to (and usually far
+/// below) the counter of the mother it replaces. Satellites cache snapshots
+/// under a staleness guard, so without this the new mother's snapshots looked
+/// permanently stale and were dropped for ever - freezing every satellite's
+/// cached epoch at the dead mother's value and breaking re-point (Ludiom #74).
+/// Runs inside the caller's transaction so adoption stays atomic.
+fn seed_state_version(tx: &rusqlite::Transaction, snap_version: i64) -> rusqlite::Result<()> {
+    let local: i64 = tx
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'lg_state_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let next = local.max(snap_version) + 1;
+    tx.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('lg_state_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![next.to_string()],
+    )?;
+    Ok(())
+}
+
 /// Current value of the monotonic `lg_state_version` counter (0 if unset).
 async fn read_state_version(state: &AppState) -> i64 {
     state
@@ -2074,8 +2437,18 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<Value>> {
             let game: Option<Value> = c
                 .query_row(
+                    // `ended_at` travels with the snapshot: Clash scoring integrates
+                    // up to min(now, start+duration, ended_at), so a device that
+                    // adopts or mirrors this game without it computes WRONG final
+                    // standings for a manually-ended game.
+                    //
+                    // `launched_by_self` deliberately does NOT travel: it is a
+                    // per-device fact ("I launched this"), and it drives the
+                    // `mine=1` filter behind the "This device" list. Shipping the
+                    // mother's value would rewrite every other device's history.
                     "SELECT id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
-                            game_type, duration, start_time, started, ended, mother_epoch, created_at
+                            game_type, duration, start_time, started, ended, mother_epoch, created_at,
+                            ended_at
                      FROM lg_launched_games WHERE id = ?",
                     params![game_id],
                     |r| {
@@ -2093,6 +2466,7 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
                             "ended": r.get::<_, i64>(10)? != 0,
                             "mother_epoch": r.get::<_, i64>(11)?,
                             "created_at": r.get::<_, String>(12)?,
+                            "ended_at": r.get::<_, Option<i64>>(13)?,
                         }))
                     },
                 )
@@ -2341,6 +2715,7 @@ async fn dispatch_launched_games(
         ("GET", "list_active") => list_active(&state).await,
         ("GET", "get_meta") => get_meta(&state, &q.rest).await,
         ("POST", "update_meta") => update_meta(&state, body).await,
+        ("POST", "merge_meta") => merge_meta(&state, body).await,
         ("GET", "state") => state_action(&state, &q.rest).await,
         ("GET", "raw_data_for_chip") => raw_data_for_chip(&state, &q.rest).await,
         ("POST", "record_punch") => record_punch(&state, peer_id, body).await,
@@ -3074,6 +3449,61 @@ async fn update_meta(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     Ok(json!({ "success": true }))
 }
 
+/// Upsert ONLY the given meta keys, leaving every other key untouched. Unlike
+/// `update_meta` (which replaces the whole map) this is safe to call from
+/// several devices at once - the classic case being self-register, where each
+/// registration station writes its own per-chip keys concurrently. A read-
+/// merge-write on the client cannot do this: two devices that read the same
+/// base both write it back and one device's key is silently lost.
+///
+/// A null value deletes the key.
+async fn merge_meta(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let id = json_i64(&body, "id")?;
+    require_game_owned(state, id).await?;
+    let meta_pairs: Vec<(String, Option<String>)> = body
+        .get("meta")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        Value::Null => None,
+                        Value::String(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    };
+                    (k.clone(), s)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+            let tx = c.transaction()?;
+            for (k, v) in &meta_pairs {
+                // No UNIQUE(launched_game_id, meta_name) on this table, so
+                // delete-then-insert rather than ON CONFLICT. Both statements
+                // are scoped to the single key, inside one transaction.
+                tx.execute(
+                    "DELETE FROM lg_launched_game_meta
+                     WHERE launched_game_id = ? AND meta_name = ?",
+                    params![id, k],
+                )?;
+                if let Some(val) = v {
+                    tx.execute(
+                        "INSERT INTO lg_launched_game_meta
+                           (launched_game_id, meta_name, meta_value) VALUES (?, ?, ?)",
+                        params![id, k, val],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(json!({ "success": true }))
+}
+
 async fn state_action(
     state: &AppState,
     rest: &HashMap<String, String>,
@@ -3538,9 +3968,9 @@ async fn start_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
 async fn end_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let id = json_i64(&body, "id")?;
     require_game_owned(state, id).await?;
-    state
+    let teams_closed = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
             // Stamp the freeze moment (first end wins) so clash's per-minute
             // scoring stops accruing at an early manual-end, not at the scheduled
             // timer expiry. Harmless for other game types.
@@ -3548,13 +3978,45 @@ async fn end_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
                 "UPDATE lg_launched_games
                  SET ended = 1,
                      ended_at = COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER))
-                 WHERE id = ?",
+                 WHERE id = ?1",
                 params![id],
             )?;
-            Ok(())
+
+            // Closing the game closes every run still open, for EVERY game type:
+            // a team the operator (or the timer) stopped mid-run is finished, not
+            // eternally "in progress". Same semantics as the per-team "end team"
+            // button - end_time = the freeze moment, and a team that never
+            // started gets start_time backfilled so its recorded duration is 0
+            // rather than a bogus negative. Their live score in lg_teams is
+            // already final, so nothing else needs recomputing, and summaries
+            // (which need start_time + end_time + score <> 0) now count them.
+            // Clash clans have no per-team run at all; the boards read their
+            // status from the standings, so this is inert for them.
+            let ended_at: Option<i64> = c
+                .query_row(
+                    "SELECT ended_at FROM lg_launched_games WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let stamp = match ended_at {
+                Some(v) => v,
+                // No row / never stamped (a legacy game ended before ended_at
+                // existed): nothing reliable to stamp the teams with.
+                None => return Ok(0),
+            };
+            let closed = c.execute(
+                "UPDATE lg_teams
+                    SET end_time = ?2,
+                        start_time = COALESCE(start_time, ?2)
+                  WHERE launched_game_id = ?1 AND end_time IS NULL",
+                params![id, stamp],
+            )?;
+            Ok(closed as i64)
         })
         .await?;
-    Ok(json!({ "success": true }))
+    Ok(json!({ "success": true, "teams_closed": teams_closed }))
 }
 
 // Extend a running game by N minutes (operator "add time"). Single-column bump
@@ -4209,7 +4671,13 @@ async fn queue_command_inner(
     kind: &str,
     payload: Value,
 ) -> Result<i64, ApiErr> {
-    if target_device_id == state.self_peer_id {
+    // Nothing polls the mother's own `pending_commands` (only satellites drain
+    // it via /ping.php), so a row targeting the mother would sit unread
+    // forever. Video commands are still meaningful on the mother's screen - a
+    // satellite operator driving the room's main display - so those are
+    // executed IN-PROCESS further down instead of being enqueued. Every other
+    // kind stays rejected: `join_game` & co. only make sense for a satellite.
+    if target_device_id == state.self_peer_id && !matches!(kind, "play_video" | "stop_video") {
         return Err(ApiErr::bad("Cannot queue a command targeting self"));
     }
     let launched_game_id = payload
@@ -4332,6 +4800,58 @@ async fn queue_command_inner(
             require_game_owned(state, gid).await?;
         }
         _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
+    }
+
+    // Self-targeted video command (a satellite operator driving the mother's
+    // own screen). Emit the very same `taghunter://lan-command` event the
+    // satellite path emits on /ping.php pickup - <OperatorVideoOverlay> at the
+    // App root already handles it - instead of inserting an unreadable queue
+    // row. The overlay's usual "repoint at the pushing mother, then fetch the
+    // game state over HTTP" would be wrong here: WE are that mother, the game
+    // lives in our own db, and our `launched_games` route may legitimately be
+    // pointed at a different mother right now. So resolve the scenario
+    // identity server-side and ship it in the payload; the overlay uses those
+    // fields verbatim when present and skips the fetch entirely.
+    if target_device_id == state.self_peer_id {
+        let mut enriched = payload.clone();
+        if kind == "play_video" {
+            let gid = launched_game_id
+                .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
+            let ident: Option<(String, String)> = state
+                .db
+                .call(
+                    move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<(String, String)>> {
+                        Ok(c.query_row(
+                            "SELECT game_uniqid, game_type FROM lg_launched_games WHERE id = ?",
+                            params![gid],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?)
+                    },
+                )
+                .await?;
+            let (uniqid, game_type) =
+                ident.ok_or_else(|| ApiErr::not_found("Launched game not found"))?;
+            if let Some(obj) = enriched.as_object_mut() {
+                obj.insert("game_uniqid".into(), Value::String(uniqid));
+                obj.insert("game_type".into(), Value::String(game_type));
+            }
+        }
+        use tauri::Emitter;
+        state
+            .app
+            .emit(
+                "taghunter://lan-command",
+                json!({ "id": 0, "kind": kind, "payload": enriched }),
+            )
+            .map_err(|e| {
+                ApiErr::status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("local dispatch failed: {e}"),
+                )
+            })?;
+        // Handled in-process: no queue row exists, so there is nothing to ack.
+        return Ok(0);
     }
 
     let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
@@ -4607,6 +5127,23 @@ struct ClashTerr {
     points: i64,
     /// Physical balise station codes composing this territory (no shared balises).
     balises: Vec<i64>,
+    /// The HUMAN-facing station numbers (`si_balises.station_name`) the author
+    /// typed, positionally paired with `balises` (which hold the ids the SI
+    /// punches actually carry). Persisted by the launch so a station can name
+    /// the balises a player is still missing in the numbers printed on them -
+    /// retours #96. Empty on pre-2026-09 launches ⇒ fall back to the ids.
+    balise_numbers: Vec<i64>,
+}
+
+impl ClashTerr {
+    /// Label for the k-th balise of this territory: the authored number when the
+    /// launch carried one, else the raw station id.
+    fn balise_label(&self, k: usize) -> i64 {
+        self.balise_numbers
+            .get(k)
+            .copied()
+            .unwrap_or_else(|| self.balises.get(k).copied().unwrap_or_default())
+    }
 }
 
 struct ClashConfig {
@@ -4649,10 +5186,16 @@ fn load_clash_config(c: &rusqlite::Connection, lgid: i64) -> rusqlite::Result<Op
                 .and_then(|x| x.as_array())
                 .map(|a| a.iter().filter_map(|s| s.as_i64()).collect())
                 .unwrap_or_default();
+            let balise_numbers: Vec<i64> = t
+                .get("balise_numbers")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_i64()).collect())
+                .unwrap_or_default();
             territories.push(ClashTerr {
                 index,
                 points,
                 balises,
+                balise_numbers,
             });
         }
     }
@@ -5391,6 +5934,53 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                 }
             }
 
+            // Nothing credited: name the territory the read got CLOSEST to, so
+            // the station can say "<name> incomplet" instead of a generic
+            // "keep going". Best partial = most balises present (ties → higher
+            // points → lowest index). No territory with a single fresh punch ⇒
+            // no partial (every punch on the card was already consumed, or the
+            // fresh ones belong to no territory) - the station falls back to
+            // the generic line, which is itself the diagnostic.
+            let mut partial_json: Option<Value> = None;
+            if credited.is_empty() {
+                let scored = cfg
+                    .territories
+                    .iter()
+                    .filter(|t| !t.balises.is_empty())
+                    .map(|t| {
+                        let have = t
+                            .balises
+                            .iter()
+                            .filter(|s| by_station.get(s).is_some_and(|v| !v.is_empty()))
+                            .count() as i64;
+                        (t, have)
+                    })
+                    .filter(|(_, have)| *have > 0)
+                    .max_by(|(a, ha), (b, hb)| {
+                        ha.cmp(hb)
+                            .then(a.points.cmp(&b.points))
+                            .then(b.index.cmp(&a.index))
+                    });
+                if let Some((t, have)) = scored {
+                    // Name the balises still missing, in the numbers printed on
+                    // them: "incomplete" alone told a team nothing about what to
+                    // go and punch (retours #96).
+                    let missing: Vec<i64> = t
+                        .balises
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| by_station.get(s).map_or(true, |v| v.is_empty()))
+                        .map(|(k, _)| t.balise_label(k))
+                        .collect();
+                    partial_json = Some(json!({
+                        "territory_index": t.index,
+                        "have": have,
+                        "need": t.balises.len() as i64,
+                        "missing": missing,
+                    }));
+                }
+            }
+
             let standings = compute_clash_standings(&tx, launched_game_id, &cfg, true)?;
             tx.commit()?;
 
@@ -5400,6 +5990,11 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                 "credited": credited,
                 "standings": standings,
             });
+            if let Some(p) = partial_json {
+                resp.as_object_mut()
+                    .expect("resp is an object")
+                    .insert("partial".into(), p);
+            }
             if let Some(p) = purge_json {
                 resp.as_object_mut()
                     .expect("resp is an object")
@@ -5854,23 +6449,39 @@ pub enum JoinOutcome {
     Unreachable { message: String },
 }
 
+/// Do these two IPv4 addresses sit on the same /24? The one test that decides
+/// "can I actually reach this host": a mother straddling the venue AP and an
+/// office LAN advertises an address on each, and only the one sharing a subnet
+/// with us is routable. Shared by `select_address` (endpoint cache) and
+/// `order_pair_candidates` (probe/pair) so the two can never disagree about
+/// which address is the good one.
+fn shares_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    let (ao, bo) = (a.octets(), b.octets());
+    ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2]
+}
+
 // Order a mother's advertised addresses best-first for a reachable connection:
-// routable private IPv4 first, link-local (169.254) last, IPv6 skipped (fe80::
-// needs a zone id we don't have). Mirrors the JS heuristic but runs in Rust.
+// same-/24-as-us first, then other routable private IPv4, link-local (169.254)
+// last, IPv6 skipped (fe80:: needs a zone id we don't have). Mirrors the JS
+// heuristic but runs in Rust.
 fn order_pair_candidates(addresses: &[String]) -> Vec<String> {
-    let is_ipv4 = |a: &str| {
-        let parts: Vec<&str> = a.split('.').collect();
-        parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+    let v4 = |a: &String| a.parse::<Ipv4Addr>().ok();
+    let locals = local_ipv4s();
+    let near = |a: &String| match v4(a) {
+        Some(ip) => locals.iter().any(|l| shares_24(*l, ip)),
+        None => false,
     };
-    let mut out: Vec<String> = addresses
-        .iter()
-        .filter(|a| is_ipv4(a) && !a.starts_with("127.") && !a.starts_with("169.254."))
-        .cloned()
-        .collect();
+    let routable = |a: &String| {
+        v4(a).is_some() && !a.starts_with("127.") && !a.starts_with("169.254.")
+    };
+    // Three passes rather than a sort_by_key: the relative order WITHIN each
+    // bucket is the mother's own advertisement order, which we keep.
+    let mut out: Vec<String> = addresses.iter().filter(|a| routable(a) && near(a)).cloned().collect();
+    out.extend(addresses.iter().filter(|a| routable(a) && !near(a)).cloned());
     out.extend(
         addresses
             .iter()
-            .filter(|a| is_ipv4(a) && a.starts_with("169.254."))
+            .filter(|a| v4(a).is_some() && a.starts_with("169.254."))
             .cloned(),
     );
     out
@@ -6448,6 +7059,120 @@ pub async fn client_probe_mother(
     })
 }
 
+/// Verdict on one candidate mother, for the satellite's failover re-point.
+#[derive(Serialize)]
+pub struct CandidateCheck {
+    /// The hello answered on one of the advertised addresses.
+    pub ok: bool,
+    /// `http://ip:port` built from the address that ANSWERED - install this
+    /// verbatim as the LAN override; never rebuild it from the mDNS record.
+    pub base_url: Option<String>,
+    pub mother_uuid: Option<String>,
+    pub client_id: Option<i64>,
+    /// The candidate serves the requested game AND honoured our token. False
+    /// when the ping was refused, unauthorized, or answered `snapshot: null`.
+    pub serves_game: bool,
+    /// Epoch/version of the snapshot it answered with, when `serves_game`.
+    pub mother_epoch: Option<i64>,
+    pub state_version: Option<i64>,
+    /// Why the game check failed, for the console trail: "no_game_id",
+    /// "no_secret", "not_served", or the transport/HTTP error text.
+    pub detail: Option<String>,
+}
+
+/// Positive validation of a candidate mother before re-pointing at it
+/// (Ludiom #74).
+///
+/// The old rule was "advertises a strictly higher epoch than the snapshot we
+/// cached". That is inference, and it broke in the field: a satellite whose
+/// cached snapshot came from an unrelated older game carried an epoch the
+/// promoted mother could never beat, so the only correct candidate was rejected
+/// for ever, silently. This asks the candidate directly instead - hello probe
+/// (which also yields the address that actually answered), then ONE
+/// authenticated snapshot request for our game. Reachable, honours our token,
+/// and serves this very game: three facts, one round trip, no guessing.
+///
+/// Also warms `mother_snapshots` on success, so the re-point leaves the device
+/// with a current snapshot instead of the dead mother's.
+#[tauri::command]
+pub async fn client_verify_mother_candidate(
+    app: AppHandle,
+    addresses: Vec<String>,
+    port: u16,
+    launched_game_id: Option<i64>,
+    token: Option<String>,
+) -> Result<CandidateCheck, String> {
+    let probe = client_probe_mother(addresses, port).await?;
+    let (Some(reached), true) = (probe.reached_addr.clone(), probe.ok) else {
+        return Ok(CandidateCheck {
+            ok: false,
+            base_url: None,
+            mother_uuid: probe.mother_uuid,
+            client_id: probe.client_id,
+            serves_game: false,
+            mother_epoch: None,
+            state_version: None,
+            detail: Some(probe.errors.join(" | ")),
+        });
+    };
+    let mut out = CandidateCheck {
+        ok: true,
+        base_url: Some(format!("http://{reached}")),
+        mother_uuid: probe.mother_uuid,
+        client_id: probe.client_id,
+        serves_game: false,
+        mother_epoch: None,
+        state_version: None,
+        detail: None,
+    };
+
+    let Some(gid) = launched_game_id else {
+        out.detail = Some("no_game_id".into());
+        return Ok(out);
+    };
+    let conn = open_db_for_command(&app).await?;
+    // The caller's bearer first (the override token a satellite already holds -
+    // the promoted mother adopted the row it belongs to), then whatever this
+    // device would use outbound. A former mother has only the latter.
+    let mut secrets: Vec<String> = Vec::new();
+    if let Some(t) = token.filter(|t| !t.is_empty()) {
+        secrets.push(t);
+    }
+    if let Some(s) = best_outbound_secret(&conn).await {
+        if !secrets.contains(&s) {
+            secrets.push(s);
+        }
+    }
+    if secrets.is_empty() {
+        out.detail = Some("no_secret".into());
+        return Ok(out);
+    }
+
+    for secret in secrets {
+        match pull_snapshot_over_http(&reached, &secret, gid).await {
+            Ok(Some(snap)) => {
+                let ver = snap.get("state_version").and_then(|v| v.as_i64());
+                let epoch = snap.get("mother_epoch").and_then(|v| v.as_i64());
+                out.serves_game = true;
+                out.state_version = ver;
+                out.mother_epoch = epoch;
+                if let (Some(v), Some(e)) = (ver, epoch) {
+                    let _ = upsert_cached_snapshot(&conn, gid, v, e, snap.to_string()).await;
+                }
+                return Ok(out);
+            }
+            // Answered and authenticated, but doesn't host this game: a
+            // definitive NO, so don't burn the second secret on it.
+            Ok(None) => {
+                out.detail = Some("not_served".into());
+                return Ok(out);
+            }
+            Err(e) => out.detail = Some(e),
+        }
+    }
+    Ok(out)
+}
+
 /// Force a fresh DHCP lease. When a child connects to the mother's hotspot before
 /// the mother's ICS DHCP server is ready (or a DISCOVER is lost), Windows falls
 /// back to an APIPA address (169.254.*) that can't reach the mother's 192.168.137.1
@@ -6754,6 +7479,34 @@ async fn read_lan_network_source(app: &AppHandle) -> String {
     .unwrap_or_else(|_| "hotspot".to_string())
 }
 
+/// Read THIS device's own hotspot credentials from schema_meta. Used by
+/// `become_mother` as the fallback when the adopted snapshot carries no `wifi`
+/// block (a mother whose `hotspot_ssid`/`hotspot_password` were never written -
+/// `read_mother_wifi` returns null then, and the promoted device would otherwise
+/// never even ATTEMPT to raise an AP, leaving the venue with no Wi-Fi while the
+/// promotion reported success). Studio-synced creds land in these same keys via
+/// `saveHotspotCreds`, so a satellite that never hosted usually still has them.
+/// Returns None when either key is missing or empty.
+async fn read_local_hotspot_creds(app: &AppHandle) -> Option<(String, String)> {
+    let db_path = resolve_db_path(app).ok()?;
+    let conn = DbConnection::open(db_path).await.ok()?;
+    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<(String, String)>> {
+        let get = |key: &str| -> Option<String> {
+            c.query_row(
+                "SELECT value FROM schema_meta WHERE key = ?",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .filter(|v| !v.is_empty())
+        };
+        Ok(get("hotspot_ssid").zip(get("hotspot_password")))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Choose which advertised mother address to talk to. A mother that hosts a
 /// hotspot advertises BOTH its upstream/office LAN IP and its hotspot IP
 /// (192.168.137.1); a satellite on the hotspot subnet can only route to the
@@ -6767,13 +7520,7 @@ fn select_address(addresses: &[String]) -> Option<String> {
         .filter_map(|a| a.parse::<Ipv4Addr>().ok())
         .collect();
     let locals = local_ipv4s();
-    if let Some(same_subnet) = v4.iter().find(|m| {
-        let mo = m.octets();
-        locals.iter().any(|l| {
-            let lo = l.octets();
-            lo[0] == mo[0] && lo[1] == mo[1] && lo[2] == mo[2]
-        })
-    }) {
+    if let Some(same_subnet) = v4.iter().find(|m| locals.iter().any(|l| shares_24(*l, **m))) {
         return Some(same_subnet.to_string());
     }
     v4.first()
@@ -6824,9 +7571,42 @@ pub async fn client_refresh_mother_endpoints(
             Err(_) => continue,
         };
         guard.insert(m.mother_uuid.clone(), socket);
+        // A freshly resolved address deserves a clean slate, or a mother that
+        // just came back would be evicted again on its first failure.
+        cache.fails.lock().await.remove(&m.mother_uuid);
         refreshed.push(m.mother_uuid);
     }
     Ok(refreshed)
+}
+
+/// Record a transport failure against a mother's cached endpoint, and evict the
+/// entry once `ENDPOINT_EVICT_AFTER_FAILS` consecutive ones have piled up.
+///
+/// Why eviction matters (Ludiom #74): `client_resolve_mother_link` reads ONLY
+/// this cache, and the 15s `refreshLaunchedGamesRoute` tick installs whatever it
+/// returns. While a dead mother's address stayed cached, that tick kept dragging
+/// the satellite's `launched_games` traffic back onto the corpse - overwriting a
+/// correct re-point - and the route resolver's "no link" branch, which is what
+/// triggers re-discovery of the PROMOTED mother, could never run. Dropping the
+/// entry is what lets the device converge; a mother that was only blipping is
+/// re-cached by the next `client_refresh_mother_endpoints` browse.
+/// Lock order is `inner` then `fails`, matching
+/// `client_refresh_mother_endpoints` (which holds `inner` across its loop).
+/// Taking them the other way round here would be a deadlock.
+async fn note_ping_failure(cache: &MotherEndpointCache, mother_uuid: &str) {
+    let mut endpoints = cache.inner.lock().await;
+    let mut fails = cache.fails.lock().await;
+    let n = fails.entry(mother_uuid.to_string()).or_insert(0);
+    *n += 1;
+    if *n >= ENDPOINT_EVICT_AFTER_FAILS {
+        fails.remove(mother_uuid);
+        endpoints.remove(mother_uuid);
+    }
+}
+
+/// Clear the consecutive-failure count: the address answered.
+async fn note_ping_success(cache: &MotherEndpointCache, mother_uuid: &str) {
+    cache.fails.lock().await.remove(mother_uuid);
 }
 
 /// A control link to a reachable paired mother: the base URL (the same
@@ -6999,7 +7779,7 @@ pub async fn client_ping_mother(
         .build()
         .map_err(|e| PingErr::Network { message: e.to_string() })?;
 
-    let resp = client
+    let resp = match client
         .post(&url)
         .header(header::AUTHORIZATION, format!("Bearer {secret}"))
         .json(&serde_json::json!({
@@ -7010,8 +7790,19 @@ pub async fn client_ping_mother(
         }))
         .send()
         .await
-        .map_err(|e| PingErr::Network { message: e.to_string() })?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Transport failure - nothing answered at that address. Count it,
+            // and evict once we're sure (see ENDPOINT_EVICT_AFTER_FAILS).
+            note_ping_failure(&cache, &mother_uuid).await;
+            return Err(PingErr::Network { message: e.to_string() });
+        }
+    };
 
+    // Something answered on that address, whatever it thinks of us: the
+    // endpoint itself is good, so an auth or HTTP error must NOT evict it.
+    note_ping_success(&cache, &mother_uuid).await;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(PingErr::Unauth);
@@ -7033,8 +7824,8 @@ pub async fn client_ping_mother(
     if got != mother_uuid {
         // Cached endpoint is pointing at the wrong machine - drop it so the
         // next refresh picks up the correct address (if any).
-        let mut guard = cache.inner.lock().await;
-        guard.remove(&mother_uuid);
+        cache.inner.lock().await.remove(&mother_uuid);
+        cache.fails.lock().await.remove(&mother_uuid);
         return Err(PingErr::WrongUuid { got });
     }
 
@@ -7067,8 +7858,8 @@ pub async fn client_ping_mother(
     // Mother-failover slice 2: cache the latest snapshot to our own
     // playground.db (one "latest" row per game) so THIS device can be promoted
     // into the new mother (slice 4) if the current one dies. We store the whole
-    // snapshot verbatim and key it by the game id; the strict-advance guard
-    // keeps an out-of-order/stale ping from clobbering a newer cached copy.
+    // snapshot verbatim and key it by the game id; `upsert_cached_snapshot`
+    // holds the staleness guard (epoch-dominant - see its doc comment).
     if let Some(snap) = body.get("snapshot").filter(|v| v.is_object()) {
         let gid = snap
             .get("game")
@@ -7077,25 +7868,8 @@ pub async fn client_ping_mother(
         let ver = snap.get("state_version").and_then(|v| v.as_i64());
         let epoch = snap.get("mother_epoch").and_then(|v| v.as_i64()).unwrap_or(1);
         if let (Some(gid), Some(ver)) = (gid, ver) {
-            let snap_json = snap.to_string();
             if let Ok(conn) = open_db_for_command(&app).await {
-                let _ = conn
-                    .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-                        c.execute(
-                            "INSERT INTO mother_snapshots
-                               (launched_game_id, state_version, mother_epoch, snapshot_json, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
-                             ON CONFLICT(launched_game_id) DO UPDATE SET
-                               state_version = excluded.state_version,
-                               mother_epoch  = excluded.mother_epoch,
-                               snapshot_json = excluded.snapshot_json,
-                               updated_at    = excluded.updated_at
-                             WHERE excluded.state_version > mother_snapshots.state_version",
-                            params![gid, ver, epoch, snap_json],
-                        )?;
-                        Ok(())
-                    })
-                    .await;
+                let _ = upsert_cached_snapshot(&conn, gid, ver, epoch, snap.to_string()).await;
             }
         }
     }

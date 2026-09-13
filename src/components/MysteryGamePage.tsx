@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { GameConfig } from './LaunchGameModal';
 import { sportidentService as siReader, CardData, StationData, detectReaderPort } from '../services/sportidentService';
 import { useDetectedReaderPort } from '../services/useDetectedReaderPort';
@@ -6,7 +7,8 @@ import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
-import { applyTeamName } from '../services/gameMessages';
+import { applyTeamName, localizedStatus } from '../services/gameMessages';
+import { tIngame } from '../i18n/ingame';
 import type { GameMessageType } from '../services/gameMessages';
 import {
   getLaunchedGameState,
@@ -27,7 +29,9 @@ import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { SelfRegisterOverlay } from './SelfRegisterOverlay';
 import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
 import { MysteryGameRenderer, type MysteryScreen, type EnigmaStatusKind } from './MysteryGameRenderer';
+import { MYSTERY_STATUS_COLORS } from './mysteryIngameLayout';
 import { resolveMysteryBonuses } from '../services/mysteryBonuses';
+import { wrongAnswerPoints } from '../services/mysteryScoring';
 import '../mystery.css';
 
 interface MysteryGamePageProps {
@@ -125,6 +129,10 @@ interface GameData {
   }>;
 }
 
+/** How long a refused empty finishing bip stays "confirmable" in Départ groupé
+ *  (retour #84): re-biping the same card inside this window closes the team. */
+const EMPTY_FINISH_CONFIRM_MS = 30_000;
+
 /** Read a Localized<string> map (or plain string) at the given language. Returns
  *  '' when absent so callers can `.trim()` and fall back. */
 function pickLocalized(v: unknown, lang: string): string {
@@ -138,6 +146,10 @@ function pickLocalized(v: unknown, lang: string): string {
 }
 
 export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd }: MysteryGamePageProps) {
+  // Operator-facing banners (test mode, reader unplugged) speak the app's
+  // chrome language, not the players' launch language - they are addressed to
+  // whoever is running the base station.
+  const { t: tr } = useTranslation('rankings');
   const [gameData, setGameData] = useState<GameData | null>(null);
   const gameDataRef = useRef<GameData | null>(null);
   // Legacy single-player "endgame" screen - never entered in the per-team
@@ -182,6 +194,12 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // only: a base-station display stays open across a team's two bips, so this
   // doesn't need to survive an app reload.
   const preExistingPunchesRef = useRef<Map<number, Set<string>>>(new Map());
+  // Cards whose empty finishing bip was refused in "Départ groupé" (retour #84),
+  // keyed by card id → when the refusal happened (ms). Biping the same card again
+  // within EMPTY_FINISH_CONFIRM_MS confirms and closes the team, so an operator
+  // can still finish a team that genuinely came back with nothing; two stray bips
+  // minutes apart each get refused instead of confirming one another.
+  const emptyFinishConfirmRef = useRef<Map<number, number>>(new Map());
   // Punches read by THIS device's USB reader are processed immediately in
   // saveCardData; the 1s state poll then echoes those same raw_data rows back
   // (the server returns every row since the cursor, with no own-device filter).
@@ -408,7 +426,9 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     const enigmaResults = patternEnigmas.map((enigma) => {
       const gameEnigma = data.game_enigmas.find((ge) => ge.number === enigma.enigma_id);
       const goodPoints = parseInt(gameEnigma?.good_answer_points || '0');
-      const wrongPoints = parseInt(gameEnigma?.wrong_answer_points || '0');
+      // Signed, like the maluses above (a legacy positive magnitude folds to its
+      // negative) - so this is ADDED, never subtracted.
+      const wrongPoints = wrongAnswerPoints(gameEnigma?.wrong_answer_points);
       const hasGoodAnswer = enigma.good_answers.some((a) => cardPunchCodes.includes(a));
       const hasWrongAnswer = enigma.wrong_answers.some((a) => cardPunchCodes.includes(a));
       let result: EnigmaStatusKind;
@@ -423,8 +443,8 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         totalScore += goodPoints;
       } else if (hasWrongAnswer) {
         result = 'incorrect';
-        points = -wrongPoints;
-        totalScore -= wrongPoints;
+        points = wrongPoints;
+        totalScore += wrongPoints;
       } else {
         result = 'no_answer';
         points = noAnswerMalus;
@@ -469,15 +489,9 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     }
   };
 
-  // Reveal-overlay colour for a semantic enigma result.
-  const enigmaResultColor = (result: EnigmaStatusKind): string =>
-    result === 'correct'
-      ? 'rgba(0, 255, 0, 0.3)'
-      : result === 'incorrect'
-        ? 'rgba(255, 0, 0, 0.3)'
-        : result === 'no_answer'
-          ? 'rgba(128, 128, 128, 0.3)'
-          : 'rgba(255, 165, 0, 0.3)';
+  // Reveal-overlay colour for a semantic enigma result. Shared with the studio
+  // preview so an author tuning the result sub-frame sees the board's colours.
+  const enigmaResultColor = (result: EnigmaStatusKind): string => MYSTERY_STATUS_COLORS[result];
 
   // Late-malus points for a run of `durationSec`: `malusPerMinute` × each started
   // minute past the launch time limit (`config.duration`, minutes). 0 when no
@@ -749,7 +763,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           }
           team = await ensureTeamForCard(launchedGameId, card.id, state, !!config.useNamePool);
           if (!team) {
-            showMessage('Puce non enregistrée', 'warning');
+            showMessage(localizedStatus('card_not_registered', config.language || ''), 'warning');
             return;
           }
           createdNow = true;
@@ -849,9 +863,11 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               if (cardNotEmpty) {
                 startMessage = cardNotEmptyTxt
                   ? cardNotEmptyTxt
-                  : `C'est parti ! ${effectiveName} - ⚠️ Votre puce n'est pas vide, effacez votre puce`;
+                  : tIngame('ingame_mystery', 'player_starts_card_not_empty', startLang, { team: effectiveName });
               } else {
-                startMessage = playerStartsTxt ? playerStartsTxt : `C'est parti ! ${effectiveName}`;
+                startMessage = playerStartsTxt
+                  ? playerStartsTxt
+                  : tIngame('ingame_mystery', 'player_starts', startLang, { team: effectiveName });
               }
               showMessage(startMessage, cardNotEmpty ? 'warning' : 'success', 'game_start', effectiveName);
             } catch (err) {
@@ -919,6 +935,31 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         // (mirrors the baseline subtraction scoreCardEnigmas applies).
         const baseline = preExistingPunchesRef.current.get(card.id) ?? new Set<string>();
         const livePunchCount = card.punches.filter(p => !baseline.has(`${p.code}@${p.time}`)).length;
+
+        // Retour #84 - "Départ groupé": every team is started at launch, so a card
+        // bipped by accident on the base station BEFORE the group leaves lands
+        // straight in this finishing branch. It scored an empty card, closed the
+        // run and burnt the reveal - the player's real return bip then only got
+        // the "team ended" message, the animation having been consumed. An empty
+        // card therefore doesn't close a mass-start run: the operator gets a
+        // warning instead. A team that genuinely found nothing is still closable -
+        // biping the same card a second time confirms and goes through.
+        if (config.massStart && livePunchCount === 0) {
+          const refusedAt = emptyFinishConfirmRef.current.get(card.id) ?? 0;
+          if (Date.now() - refusedAt > EMPTY_FINISH_CONFIRM_MS) {
+            emptyFinishConfirmRef.current.set(card.id, Date.now());
+            const authored = resolveMetaText('text_card_empty', finishLang, teamName);
+            const base = authored || `${teamName} : puce vide, aucune balise n'a été bipée.`;
+            showMessage(
+              `${base} Bipez à nouveau pour terminer quand même.`,
+              'warning',
+              undefined,
+              teamName,
+            );
+            return;
+          }
+        }
+        emptyFinishConfirmRef.current.delete(card.id);
 
         let updateOk = true;
         try {
@@ -1329,17 +1370,17 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       {(config.testMode || (siReader.isAvailable() && !detectedReader.isPresent)) && (
         <div className="fixed top-0 left-0 right-0 z-50 pointer-events-none flex flex-col">
           {config.testMode && (
-            <div className="flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/20 backdrop-blur-sm border-b border-amber-500/30">
-              <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode - Max 5 Teams</span>
-              <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            <div className="flex items-center justify-center gap-3 px-4 py-2 bg-amber-400 border-b-2 border-amber-200 shadow-lg">
+              <div className="w-2 h-2 rounded-full bg-black/70 animate-pulse" />
+              <span className="font-sans tracking-wide uppercase text-black font-bold text-sm">{tr('testMode')}</span>
+              <div className="w-2 h-2 rounded-full bg-black/70 animate-pulse" />
             </div>
           )}
           {siReader.isAvailable() && !detectedReader.isPresent && (
-            <div className="flex items-center justify-center gap-3 px-4 py-2 bg-orange-500/20 backdrop-blur-sm border-b border-orange-500/40">
-              <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
-              <span className="text-orange-300 text-sm">
-                Reader not connected - waiting for SportIdent dongle. Punches will start landing as soon as you plug it in.
+            <div className="flex items-center justify-center gap-3 px-4 py-2 bg-orange-600 border-b-2 border-orange-300 shadow-lg">
+              <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              <span className="font-sans normal-case tracking-normal text-white font-semibold text-sm">
+                {tr('readerNotConnected')}
               </span>
             </div>
           )}
@@ -1370,6 +1411,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         fontFamily={scenarioFontFamily || undefined}
         scenarioTitle={gameData.game.title}
         showIdleLayout={config.showIdleLayout}
+        idleTextHidden={!!gameMessage}
         idleSubtitle={config.idleSubtitle}
         bonuses={bonusTiers}
       />
@@ -1385,6 +1427,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           message clears. */}
       <PendingTeamsBar
         labels={queue.pending}
+        lang={config.language ?? ''}
         hidden={!!gameMessage}
         fontFamily={scenarioFontFamily || undefined}
       />

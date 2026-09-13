@@ -35,5 +35,32 @@
     "id": "ID : {{id}}",
     "punches_one": "Poinçon : {{count}}",
     "punches_other": "Poinçons : {{count}}"
+  },
+  "gamePanel": {
+    "loading": "Chargement…",
+    "unsupportedType": "Le type de jeu « {{type}} » n'est pas encore pris en charge",
+    "unknownGame": "Partie inconnue",
+    "pinToLeave": "Saisissez le code PIN de l'appareil pour quitter la partie.",
+    "pinToOpenControls": "Saisissez le code PIN de l'appareil pour ouvrir les commandes de la partie.",
+    "configure": "Configurer",
+    "test": "Test",
+    "rankings": "Classement",
+    "devices": "Appareils",
+    "playVideo": "Lancer une vidéo",
+    "addFiveMin": "+5 min",
+    "endGame": "Terminer la partie",
+    "delete": "Supprimer",
+    "backToLaunched": "Retour aux parties lancées",
+    "endGameTitle": "Terminer la partie",
+    "endGameMessage": "Voulez-vous vraiment terminer cette partie ? Elle sera marquée comme terminée.",
+    "deleteTitle": "Supprimer la partie",
+    "deleteMessage": "Voulez-vous vraiment supprimer cette partie ? Toutes les données seront définitivement effacées. Cette action est irréversible.",
+    "noTeams": "Aucune équipe pour l'instant.",
+    "teamLabel": "Équipe {{number}} : {{name}}",
+    "chipLabel": "Puce n° {{id}}",
+    "points": "points",
+    "startLabel": "Départ :",
+    "endLabel": "Arrivée :",
+    "notStarted": "Non démarrée"
   }
 }

@@ -15,7 +15,7 @@
 // rows show a spinner that clears when the device crosses into bucket A on a
 // subsequent poll. A 30s timeout reverts the spinner with a retry hint.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Monitor, X, Play, StopCircle, Loader2, Usb, Trophy, Gamepad2, Moon, RefreshCw, LogOut } from 'lucide-react';
 import {
@@ -435,7 +435,11 @@ export function GameDevicesModal({
 
   function toggleSelectAll() {
     setSelectedForVideo((prev) => {
-      const eligible = buckets.in_game.filter((r) => !r.is_self).map((r) => r.id);
+      // Every in-game device is a valid video target, the `is_self` row (the
+      // mother's) included: the server dispatches a self-targeted play/stop
+      // command to its own renderer rather than enqueueing it, so a satellite
+      // operator can drive the room's main screen. See queue_command_inner.
+      const eligible = buckets.in_game.map((r) => r.id);
       const allSelected = eligible.every((id) => prev.has(id)) && eligible.length > 0;
       if (allSelected) return new Set();
       return new Set(eligible);
@@ -451,10 +455,7 @@ export function GameDevicesModal({
     });
   }
 
-  const inGameSelectableCount = useMemo(
-    () => buckets.in_game.filter((r) => !r.is_self).length,
-    [buckets.in_game]
-  );
+  const inGameSelectableCount = buckets.in_game.length;
 
   return (
     <>
@@ -494,9 +495,7 @@ export function GameDevicesModal({
                     className="w-4 h-4 accent-[var(--pg-accent)]"
                     checked={
                       selectedForVideo.size > 0 &&
-                      buckets.in_game
-                        .filter((r) => !r.is_self)
-                        .every((r) => selectedForVideo.has(r.id))
+                      buckets.in_game.every((r) => selectedForVideo.has(r.id))
                     }
                     onChange={toggleSelectAll}
                   />
@@ -577,7 +576,7 @@ export function GameDevicesModal({
                     thisGameId={launchedGameId}
                     selected={selectedForVideo.has(row.id)}
                     onToggle={() => toggleOne(row.id)}
-                    canSelect={isMother && showVideoControls && !row.is_self}
+                    canSelect={isMother && showVideoControls}
                     canReconnect={isMother && !row.is_self}
                     reconnecting={reconnecting.has(row.id)}
                     onReconnect={() => onReconnect(row.id)}

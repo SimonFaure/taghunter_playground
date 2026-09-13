@@ -7,7 +7,10 @@ import {
   gameTypeAdminVersionDirRel,
   gameTypeClientVersionDirAbs,
   gameTypeClientVersionDirRel,
+  localGameTypeDirAbs,
+  localGameTypeDirRel,
   removeRecursive,
+  streamBinary,
 } from './contentFs';
 
 // Two related tables drive a single resolved "play this video on first bip"
@@ -20,6 +23,12 @@ import {
 // admin row if the override is missing or unsynced. Both are versioned
 // independently - sync downloads each freshly when its own
 // `remote_version != local_version`.
+//
+// A third, purely LOCAL source sits on top of those two:
+//   - local_game_type_videos: a file the operator imported on THIS device from
+//     Settings > Videos. It never leaves the device (no upload to studio, no
+//     propagation to satellites) and is unversioned, so it wins over both
+//     synced variants until the operator removes it.
 
 export interface GameTypeRow {
   code: string;
@@ -40,6 +49,14 @@ export interface GameTypeOverrideRow {
   local_version: number | null;
   tutorial_subtitles: Record<string, string>;
   failed_attempts: number;
+}
+
+// Operator-imported tutorial video, local to this device.
+export interface LocalGameTypeVideoRow {
+  game_type_code: string;
+  filename: string;
+  size_bytes: number;
+  created_at: string;
 }
 
 export interface GameTypeManifestRow {
@@ -239,6 +256,8 @@ export async function markOverrideDownloaded(code: string, version: number): Pro
 // video roots. Rows stay (manifest metadata preserved). Used by the
 // Operator-only toggle (services/operatorMode.ts): ON skips these on the next
 // cycle (so they stay gone), OFF re-downloads them. Returns rows reset.
+// Operator-imported local videos are deliberately NOT touched: there is no
+// remote copy to pull them back from, so clearing them would destroy the file.
 export async function resetVideosForRedownload(): Promise<number> {
   const db = await getDb();
   const codes = await db.select<Array<{ code: string }>>('SELECT code FROM game_types');
@@ -290,12 +309,116 @@ export async function listPendingOverrideDownloads(): Promise<GameTypeOverrideRo
   return rows.map(overrideRowOut);
 }
 
-// Resolved tutorial video at runtime - override wins if present and downloaded.
-// Returns null if neither admin nor override has a downloaded video.
+// ─────────────────────────── operator-imported (local) tutorial videos ──
+//
+// The file is copied into media/local_game_types/<code>/<filename> and the row
+// below records which name to look for. One video per game type - importing a
+// second one replaces the first.
+
+function localRowOut(row: {
+  game_type_code: string;
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+}): LocalGameTypeVideoRow {
+  return {
+    game_type_code: row.game_type_code,
+    filename: row.filename,
+    size_bytes: row.size_bytes,
+    created_at: row.created_at,
+  };
+}
+
+export async function listLocalVideos(): Promise<LocalGameTypeVideoRow[]> {
+  const db = await getDb();
+  const rows = await db.select<Parameters<typeof localRowOut>[0][]>(
+    'SELECT * FROM local_game_type_videos ORDER BY game_type_code'
+  );
+  return rows.map(localRowOut);
+}
+
+export async function getLocalVideo(code: string): Promise<LocalGameTypeVideoRow | null> {
+  const db = await getDb();
+  const rows = await db.select<Parameters<typeof localRowOut>[0][]>(
+    'SELECT * FROM local_game_type_videos WHERE game_type_code = $1',
+    [code.toLowerCase()]
+  );
+  return rows.length ? localRowOut(rows[0]) : null;
+}
+
+// Strip anything that could escape the per-game-type directory or upset the
+// asset protocol, while keeping the extension (the <video> element picks its
+// decoder off the file's own bytes, but a sane name keeps the folder readable
+// when the operator opens it from the settings page).
+function sanitizeVideoFilename(name: string): string {
+  const bare = name.split(/[\\/]/).pop() || 'tutorial.mp4';
+  const cleaned = bare.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+/, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 120) : 'tutorial.mp4';
+}
+
+// Copy `file` into this device's local store for `code`, replacing whatever was
+// there. Streams chunk-by-chunk: tutorial videos run to hundreds of MB and
+// buffering one into a single Uint8Array blows the Android WebView heap.
+// `onProgress` reports bytes written so the UI can show a bar.
+export async function saveLocalVideo(
+  code: string,
+  file: File,
+  onProgress?: (written: number, total: number) => void
+): Promise<LocalGameTypeVideoRow> {
+  code = code.toLowerCase();
+  const filename = sanitizeVideoFilename(file.name);
+  const dirRel = localGameTypeDirRel(code);
+
+  // Drop any previous import first - a different extension would otherwise
+  // leave an orphan file sitting next to the new one.
+  await removeRecursive(dirRel);
+
+  const total = file.size;
+  let written = 0;
+  await streamBinary(`${dirRel}/${filename}`, async (write) => {
+    const reader = file.stream().getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      await write(value);
+      written += value.byteLength;
+      onProgress?.(written, total);
+    }
+  });
+
+  const db = await getDb();
+  await db.execute(
+    `INSERT INTO local_game_type_videos (game_type_code, filename, size_bytes)
+     VALUES ($1, $2, $3)
+     ON CONFLICT(game_type_code) DO UPDATE SET
+       filename = excluded.filename,
+       size_bytes = excluded.size_bytes,
+       created_at = CURRENT_TIMESTAMP`,
+    [code, filename, total]
+  );
+
+  const saved = await getLocalVideo(code);
+  if (!saved) throw new Error('local video row missing after save');
+  return saved;
+}
+
+export async function removeLocalVideo(code: string): Promise<void> {
+  code = code.toLowerCase();
+  const db = await getDb();
+  await db.execute('DELETE FROM local_game_type_videos WHERE game_type_code = $1', [code]);
+  await removeRecursive(localGameTypeDirRel(code));
+}
+
+// Resolved tutorial video at runtime. Precedence, highest first:
+//   local    - imported by the operator on this device (Settings > Videos)
+//   override - this client's own upload, synced from studio
+//   admin    - the Tag Hunter default, synced from studio
+// Returns null when none of the three has a playable file on disk.
 export async function resolveTutorialVideoUrl(code: string): Promise<{
   videoUrl: string;
   subtitleUrls: Record<string, string>;
-  variant: 'admin' | 'override';
+  variant: 'local' | 'admin' | 'override';
   version: number;
 } | null> {
   // `game_types.code` is canonically lowercase ('mystery', 'tagquest', …), but
@@ -304,6 +427,19 @@ export async function resolveTutorialVideoUrl(code: string): Promise<{
   // WHERE code = ? lookups are case-sensitive, so normalize here or every
   // capitalized code silently resolves to "no tutorial video".
   code = code.toLowerCase();
+
+  // Operator's own import beats anything synced. It carries no subtitles (the
+  // picker only takes a video file) and no version - `0` stands for "unversioned".
+  const local = await getLocalVideo(code);
+  if (local) {
+    const dirRel = localGameTypeDirRel(code);
+    if (await exists(`${dirRel}/${local.filename}`, { baseDir: BaseDirectory.AppData })) {
+      const dirAbs = await localGameTypeDirAbs(code);
+      const videoAbs = await join(dirAbs, local.filename);
+      return { videoUrl: assetUrl(videoAbs), subtitleUrls: {}, variant: 'local', version: 0 };
+    }
+  }
+
   const override = await getOverride(code);
   if (override && override.tutorial_video_filename && override.local_version !== null) {
     const dirAbs = await gameTypeClientVersionDirAbs(code, override.local_version);

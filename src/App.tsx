@@ -36,6 +36,7 @@ import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMo
 import { refreshLaunchedGamesRoute, installLanReauth } from './services/childControlLink';
 import { ensureFirewallRuleOnce } from './services/firewall';
 import { installMotherFailover } from './services/motherFailover';
+import { reconcileSupersededGamesTick } from './services/motherStateReconcile';
 import { getPairedMother, describeLocalRole } from './services/lanPairing';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './services/device';
 import { DatabaseInspector } from './components/DatabaseInspector';
@@ -451,6 +452,11 @@ function App() {
   // satellite of the winner - otherwise it keeps its server up and its "Mother"
   // footer icon stays green (split-brain). The boot fence only checks at start,
   // so we poll here. Only a running mother pays the mDNS browse.
+  //
+  // The same tick carries the other half of the story for NON-hosting devices
+  // (Ludiom #76): a device that already stood down still holds its own copy of
+  // the game and would otherwise show it as running for ever. The two branches
+  // are mutually exclusive, so this stays one timer.
   useEffect(() => {
     const clientId = auth.user?.client_id;
     if (clientId == null) return;
@@ -458,11 +464,18 @@ function App() {
     const id = setInterval(async () => {
       try {
         const role = await invoke<{ mother_server_running: boolean }>('client_describe_local_role');
-        if (cancelled || !role?.mother_server_running) return;
+        if (cancelled) return;
+        if (!role?.mother_server_running) {
+          await reconcileSupersededGamesTick();
+          return;
+        }
         const target = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId });
         if (!cancelled && target) {
           console.warn('[App] superseded by a higher-epoch mother - yielding.');
           await yieldToMother(target);
+          // Converge routing immediately instead of waiting for the 15s tick:
+          // we just dropped our own local route.
+          await refreshLaunchedGamesRoute().catch(() => {});
         }
       } catch {
         /* best-effort */

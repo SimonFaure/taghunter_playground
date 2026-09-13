@@ -178,6 +178,7 @@
   "colPlayers": "Players",
   "colSynced": "Synced",
   "trackRoute_default": "All checkpoints",
+  "trackRoute_reverse": "Reversed course",
   "trackRoute_first_half": "First half",
   "trackRoute_last_half": "Last half",
   "trackRoute_odd": "Odd checkpoints",
@@ -185,5 +186,7 @@
   "validationsBadge_one": "{{count}} validation",
   "validationsBadge_other": "{{count}} validations",
   "membersHeading": "Members ({{count}})",
-  "noChipsBound": "No chips bound to this clan yet."
+  "noChipsBound": "No chips bound to this clan yet.",
+  "chipsInTeam": "Chips in this team",
+  "chipsInClan": "Chips in this clan"
 }

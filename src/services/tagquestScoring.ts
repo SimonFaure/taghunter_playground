@@ -17,6 +17,10 @@
  *
  *   score = max(0, round((questPoints + comboBonus) × weight − malus))
  *
+ * `malus` above is the sum of the time-based late malus and the station malus
+ * (every punch on the scenario's `malus_station` costs `malus_points`). Both
+ * are penalties, not earned points, so neither is weighted.
+ *
  * Headcount = the team's live chip count (min 1): the pre-built roster
  * (leader + teammates) for predetermined teams, or the lg_clash_members
  * bindings for self-register teams. Live - a mid-game join/leave re-scales the
@@ -24,6 +28,38 @@
  * frozen start-time snapshot: TagQuest recomputes from scratch anyway and its
  * rosters legitimately change via late arrivals / manual add-player).
  */
+
+/**
+ * Sentinel `quest_number` used to persist a malus-station hit as a row in
+ * `lg_team_completed_quests` (one row per punch, `points_awarded` = −malus).
+ * Real quest numbers are the 1-based quest index ("1".."6"), so this can never
+ * collide. Storing it there (rather than in a new table) is what makes the
+ * malus survive a kiosk reload and stay visible to every device reading the
+ * mother - the punch scorer recomputes the score from scratch on every bip.
+ *
+ * EVERY consumer of `listCompletedQuests` must split these rows out before
+ * counting quests or computing combos - use `partitionMalusRows`.
+ */
+export const MALUS_QUEST_NUMBER = '__malus__';
+
+/**
+ * Splits completion rows into real quest completions and the accumulated
+ * station malus (a POSITIVE number of points to subtract).
+ */
+export function partitionMalusRows<T extends { quest_number: string; points_awarded?: number | null }>(
+  rows: readonly T[],
+): { questRows: T[]; stationMalus: number } {
+  const questRows: T[] = [];
+  let stationMalus = 0;
+  for (const r of rows) {
+    if (r.quest_number === MALUS_QUEST_NUMBER) {
+      stationMalus += Math.abs(r.points_awarded ?? 0);
+    } else {
+      questRows.push(r);
+    }
+  }
+  return { questRows, stationMalus };
+}
 
 /** Minimal roster shape (LaunchGameModal.Team / reportStats.ConfigTeam both fit). */
 export interface RosterTeam {

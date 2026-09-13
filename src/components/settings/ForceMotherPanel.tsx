@@ -11,6 +11,7 @@ import { useTranslation } from 'react-i18next';
 import { Crown } from 'lucide-react';
 import { useAuth } from '../auth/AuthProvider';
 import { forceBecomeMother } from '../../services/lanMotherBoot';
+import { failoverErrorText } from '../../services/failoverErrors';
 
 export function ForceMotherPanel() {
   const { t } = useTranslation('devicesLan');
@@ -40,7 +41,7 @@ export function ForceMotherPanel() {
               }),
       });
     } catch (e) {
-      setMsg({ kind: 'err', text: String((e as { message?: string })?.message ?? e) });
+      setMsg({ kind: 'err', text: failoverErrorText(e, t) });
     } finally {
       setBusy(false);
       setConfirming(false);
@@ -50,7 +51,7 @@ export function ForceMotherPanel() {
   return (
     <div className="pg-panel">
       <div className="flex items-start gap-3">
-        <Crown className="w-5 h-5 mt-0.5 shrink-0 text-yellow-400" />
+        <Crown className="w-5 h-5 mt-0.5 shrink-0 text-[var(--pg-warn-icon)]" />
         <div className="flex-1">
           <div className="text-sm font-semibold text-[var(--pg-text)] mb-0.5">
             {t('forceMotherTitle', { defaultValue: 'Take control as mother' })}
@@ -86,7 +87,7 @@ export function ForceMotherPanel() {
             </div>
           )}
           {msg && (
-            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-green-400' : 'text-red-400'}`}>
+            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-danger-icon)]'}`}>
               {msg.text}
             </p>
           )}

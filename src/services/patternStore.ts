@@ -178,23 +178,37 @@ export async function getMysteryEnigmas(patternUniqid: string): Promise<PatternE
     }));
 }
 
-// Tracks: map each checkpoint index → the station key number(s) that count as
-// a "hit" for that checkpoint. A checkpoint is binary (reached or not), so we
-// bucket ALL routing stations by item_index regardless of `assignment_type`
-// (tracks patterns may use a single `checkpoint_station` assignment or reuse
-// the mystery `good_answer_station` label - either works here).
+// Tracks: map each checkpoint's 1-based ORDINAL POSITION → the station key
+// number(s) that count as a "hit" for that checkpoint. A checkpoint is binary
+// (reached or not), so we bucket ALL routing stations of a pattern row
+// regardless of `assignment_type` (tracks patterns may use a single
+// `checkpoint_station` assignment or reuse the mystery `good_answer_station`
+// label - either works here).
 //
-// NOTE (Slice C): this mapping is the one piece the design grill left open
-// (checkpoint → station code). Verify against a real tracks pattern once one
-// exists; the any-station-hit interpretation is intentionally liberal.
+// The binding is POSITIONAL, not by item_index value: pattern rows are sorted
+// by item_index and the Nth row binds to the Nth checkpoint. This is the
+// contract the studio side already implements (`useTracksPatternStations`, which
+// is what the author sees in the Checkpoints section) and what the launch
+// modal's row-count guardrail assumes. Keying on the raw item_index instead -
+// as this did until 2026-09-07 - broke every checkpoint from the first gap
+// onwards whenever a pattern row had been deleted (`removeRow` in the pattern
+// editor does NOT reindex, so indices go 1,2,3,4,6,7,…): studio showed the
+// right stations, the game looked up ones that did not exist and scored the
+// whole course as missed. Retours points 87 + 89.
 export async function getTracksCheckpointStations(patternUniqid: string): Promise<Map<number, number[]>> {
   const routing = await getRouting(patternUniqid);
-  const map = new Map<number, number[]>();
+  const byItemIndex = new Map<number, number[]>();
   for (const r of routing) {
-    const arr = map.get(r.item_index) ?? [];
+    const arr = byItemIndex.get(r.item_index) ?? [];
     arr.push(r.station_key_number);
-    map.set(r.item_index, arr);
+    byItemIndex.set(r.item_index, arr);
   }
+  const map = new Map<number, number[]>();
+  Array.from(byItemIndex.keys())
+    .sort((a, b) => a - b)
+    .forEach((itemIndex, pos) => {
+      map.set(pos + 1, byItemIndex.get(itemIndex)!);
+    });
   return map;
 }
 

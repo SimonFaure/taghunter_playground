@@ -2,6 +2,7 @@ import { WebviewWindow, getCurrentWebviewWindow } from '@tauri-apps/api/webviewW
 import { availableMonitors, primaryMonitor, type Monitor } from '@tauri-apps/api/window';
 import type { RankingTarget } from './rankingTarget';
 import { rankingTargetKey, encodeRankingTarget, decodeRankingTarget } from './rankingTarget';
+import { tError } from '../i18n/errors';
 
 const PROJECTOR_LABEL = 'projector';
 const PROJECTED_KEY = 'projector.targetKey';
@@ -42,7 +43,7 @@ async function pickProjectorMonitor(): Promise<{ monitor: Monitor; fullscreen: b
   if (monitors.length <= 1 || !primary) {
     const fallback = monitors[0] ?? primary;
     if (!fallback) {
-      throw new Error('No monitors detected');
+      throw new Error(tError('noMonitors'));
     }
     return { monitor: fallback, fullscreen: false };
   }

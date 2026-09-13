@@ -35,5 +35,32 @@
     "id": "ID: {{id}}",
     "punches_one": "Marcaje: {{count}}",
     "punches_other": "Marcajes: {{count}}"
+  },
+  "gamePanel": {
+    "loading": "Cargando…",
+    "unsupportedType": "El tipo de juego «{{type}}» aún no es compatible",
+    "unknownGame": "Partida desconocida",
+    "pinToLeave": "Introduce el PIN del dispositivo para salir de la partida.",
+    "pinToOpenControls": "Introduce el PIN del dispositivo para abrir los controles de la partida.",
+    "configure": "Configurar",
+    "test": "Prueba",
+    "rankings": "Clasificación",
+    "devices": "Dispositivos",
+    "playVideo": "Reproducir vídeo",
+    "addFiveMin": "+5 min",
+    "endGame": "Terminar partida",
+    "delete": "Eliminar",
+    "backToLaunched": "Volver a las partidas lanzadas",
+    "endGameTitle": "Terminar partida",
+    "endGameMessage": "¿Seguro que quieres terminar esta partida? Se marcará como completada.",
+    "deleteTitle": "Eliminar partida",
+    "deleteMessage": "¿Seguro que quieres eliminar esta partida? Se borrarán definitivamente todos los datos. Esta acción no se puede deshacer.",
+    "noTeams": "Todavía no hay equipos.",
+    "teamLabel": "Equipo {{number}}: {{name}}",
+    "chipLabel": "Tarjeta n.º {{id}}",
+    "points": "puntos",
+    "startLabel": "Inicio:",
+    "endLabel": "Fin:",
+    "notStarted": "Sin empezar"
   }
 }

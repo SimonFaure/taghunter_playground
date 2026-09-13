@@ -3,6 +3,11 @@
 // previous one is still on screen. Shared by all game types. Purely visual:
 // pointer-events are off so taps reach the game / operator UI underneath (same
 // as GameMessageOverlay). Renders nothing when the queue is empty.
+//
+// Player-facing, so the "waiting" label follows the game's launch language
+// (like every other in-game string), not the operator's chrome language.
+
+import { tIngame } from '../i18n/ingame';
 
 interface PendingTeamsBarProps {
   /** Labels of waiting items, arrival order (= usePresentationQueue().pending). */
@@ -11,7 +16,9 @@ interface PendingTeamsBarProps {
   fontFamily?: string;
   /** Separator between names. */
   separator?: string;
-  /** Leading label shown before the team list. */
+  /** Game (launch/team) language the leading label is resolved in. */
+  lang?: string;
+  /** Leading label shown before the team list. Overrides the localized one. */
   prefix?: string;
   /** Hide the bar entirely (e.g. while a full-screen game message is on screen,
    *  so the waiting line doesn't show through under the "C'est parti …" wash). */
@@ -22,12 +29,14 @@ export function PendingTeamsBar({
   labels,
   fontFamily,
   separator = ' · ',
-  prefix = 'En attente :',
+  lang,
+  prefix,
   hidden = false,
 }: PendingTeamsBarProps) {
   if (hidden || !labels.length) return null;
 
-  const text = (prefix ? `${prefix} ` : '') + labels.join(separator);
+  const label = prefix ?? tIngame('ingame_common', 'pending_teams_prefix', lang ?? '');
+  const text = (label ? `${label} ` : '') + labels.join(separator);
 
   return (
     <div

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Loader2, Stethoscope, RefreshCw, Pin, Undo2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { renewDhcp, assignStaticIp, restoreDhcpFromStatic, staticIpSsid } from '../../services/wifi';
@@ -30,6 +31,7 @@ interface LanDiag {
 }
 
 export function LanDiagnostics() {
+  const { t } = useTranslation('devicesLan');
   const [diag, setDiag] = useState<LanDiag | null>(null);
   const [busy, setBusy] = useState(false);
   const [renewing, setRenewing] = useState(false);
@@ -92,7 +94,7 @@ export function LanDiagnostics() {
       // no mother address was captured. The /24 is derived from this.
       const gw = gateway ?? '192.168.137.1';
       const ip = await assignStaticIp(gw);
-      setMsg(`Adresse IP fixe attribuée : ${ip}. Reconnexion à la mère…`);
+      setMsg(t('diagStaticAssigned', { ip }));
       await refreshStatic();
       // Give Windows a moment to apply, then re-diagnose.
       setDiag(await invoke<LanDiag>('lan_diag'));
@@ -101,7 +103,7 @@ export function LanDiagnostics() {
     } finally {
       setStaticBusy(false);
     }
-  }, [gateway, refreshStatic]);
+  }, [gateway, refreshStatic, t]);
 
   const restore = useCallback(async () => {
     setRestoreBusy(true);
@@ -109,7 +111,7 @@ export function LanDiagnostics() {
     setMsg(null);
     try {
       await restoreDhcpFromStatic();
-      setMsg('Adresse IP rétablie en DHCP.');
+      setMsg(t('diagDhcpRestored'));
       await refreshStatic();
       setDiag(await invoke<LanDiag>('lan_diag'));
     } catch (e) {
@@ -117,7 +119,7 @@ export function LanDiagnostics() {
     } finally {
       setRestoreBusy(false);
     }
-  }, [refreshStatic]);
+  }, [refreshStatic, t]);
 
   const anyBusy = busy || renewing || staticBusy || restoreBusy;
 
@@ -125,103 +127,97 @@ export function LanDiagnostics() {
     <div className="pg-panel">
       <div className="flex items-center gap-2 mb-1">
         <Stethoscope className="w-5 h-5 text-[var(--pg-accent-bright)]" />
-        <h3 className="pg-panel-title">Diagnostics réseau</h3>
+        <h3 className="pg-panel-title">{t('diagTitle')}</h3>
       </div>
-      <p className="text-sm text-[var(--pg-text-dim)] mb-3">
-        Lance une recherche des mères et affiche l'état mDNS de cet appareil. Faites une
-        capture d'écran sur la mère ET sur l'enfant.
-      </p>
+      <p className="text-sm text-[var(--pg-text-dim)] mb-3">{t('diagIntro')}</p>
       <div className="flex flex-wrap gap-2">
         <button onClick={() => void run()} disabled={anyBusy} className="pg-btn">
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Stethoscope className="w-4 h-4" />}
-          Lancer le diagnostic
+          {t('diagRun')}
         </button>
         {stuckApipa && (
           <button onClick={() => void renew()} disabled={anyBusy} className="pg-btn">
             {renewing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-            Réparer l'adresse IP (DHCP)
+            {t('diagRepairIp')}
           </button>
         )}
         {/* Always visible: the static-IP fallback is the reliable way to reach the
             mother in hotspot mode when Windows ICS DHCP won't lease. */}
         <button onClick={() => void forceStatic()} disabled={anyBusy} className="pg-btn">
           {staticBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Pin className="w-4 h-4" />}
-          Forcer une adresse IP fixe
+          {t('diagForceStatic')}
         </button>
         {hasStatic && (
           <button onClick={() => void restore()} disabled={anyBusy} className="pg-btn">
             {restoreBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
-            Rétablir le DHCP
+            {t('diagRestoreDhcp')}
           </button>
         )}
       </div>
 
       {stuckApipa && (
-        <div className="mt-3 text-sm rounded-lg p-2 border bg-amber-500/15 border-amber-500/40 text-amber-200">
-          Cet appareil est connecté au Wi-Fi mais n'a pas reçu d'adresse de la mère (adresse
-          169.254.x). Essayez « Réparer l'adresse IP (DHCP) » ; si l'adresse reste en 169.254.x,
-          utilisez « Forcer une adresse IP fixe » (nécessite une confirmation Windows) pour obtenir
-          une adresse {gateway ? gateway.split('.').slice(0, 3).join('.') + '.x' : '192.168.137.x'}.
+        <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-warn-bg)] border-[var(--pg-warn-line)] text-[var(--pg-warn-text)]">
+          {t('diagApipaWarning', {
+            range: gateway ? gateway.split('.').slice(0, 3).join('.') + '.x' : '192.168.137.x',
+          })}
         </div>
       )}
 
       {hasStatic && !stuckApipa && (
         <div className="mt-3 text-sm rounded-lg p-2 border bg-blue-500/15 border-blue-500/40 text-blue-200">
-          Une adresse IP fixe est active sur cet appareil (utilisée quand le point d'accès ne
-          distribue pas d'adresse). Le DHCP reste actif : Internet continue de fonctionner
-          normalement sur les autres réseaux Wi-Fi. Vous pouvez la retirer via « Rétablir le DHCP ».
+          {t('diagStaticActive')}
         </div>
       )}
 
       {msg && (
-        <div className="mt-3 text-sm rounded-lg p-2 border bg-green-500/15 border-green-500/40 text-green-200">
+        <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]">
           {msg}
         </div>
       )}
 
       {err && (
-        <div className="mt-3 text-sm rounded-lg p-2 border bg-red-500/15 border-red-500/40 text-red-300">
+        <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]">
           {err}
         </div>
       )}
 
       {diag && (
         <div className="mt-3 space-y-1 text-xs font-mono bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-lg p-3 overflow-x-auto">
-          <Row label="Serveur mère actif (cet appareil)" value={diag.server_running ? 'OUI' : 'non'} />
-          {diag.server_running && <Row label="Port" value={String(diag.port)} />}
-          <Row label="Source réseau" value={diag.source} />
+          <Row label={t('diagRowServer')} value={diag.server_running ? t('diagYes') : t('diagNo')} />
+          {diag.server_running && <Row label={t('diagRowPort')} value={String(diag.port)} />}
+          <Row label={t('diagRowSource')} value={diag.source} />
           <Row
-            label="mDNS annoncé"
-            value={diag.server_running ? (inert ? 'INERTE (rien annoncé !)' : diag.mdns_full_name) : '—'}
+            label={t('diagRowMdns')}
+            value={diag.server_running ? (inert ? t('diagInert') : diag.mdns_full_name) : '—'}
             bad={!!inert}
           />
-          <Row label="IPv4 locales" value={diag.local_ipv4s.join(', ') || '—'} />
+          <Row label={t('diagRowLocalIps')} value={diag.local_ipv4s.join(', ') || '—'} />
           <Row
-            label="Adresses annoncées (verrou LAN)"
-            value={diag.designated_addrs.join(', ') || 'VIDE (aucune 192.168.137.* !)'}
+            label={t('diagRowDesignated')}
+            value={diag.designated_addrs.join(', ') || t('diagEmptyDesignated')}
             bad={!!noDesignated}
           />
           <Row
-            label="Pare-feu (règle TagHunter)"
+            label={t('diagRowFirewall')}
             value={
               diag.firewall_rule_ok === true
-                ? 'OK'
+                ? t('diagFirewallOk')
                 : diag.firewall_rule_ok === false
-                  ? 'ABSENTE ou obsolète (autre version de l’app) — utilisez « Autoriser l’accès réseau » ci-dessus'
-                  : 'inconnue'
+                  ? t('diagFirewallMissing')
+                  : t('diagFirewallUnknown')
             }
             bad={diag.firewall_rule_ok === false}
           />
           <div className="pt-2 border-t border-[var(--pg-line)] mt-2">
-            <span className="text-[var(--pg-text-dim)]">Mères détectées : </span>
-            <span className={diag.discovered.length === 0 ? 'text-red-300' : 'text-green-300'}>
+            <span className="text-[var(--pg-text-dim)]">{t('diagMothersFound')} </span>
+            <span className={diag.discovered.length === 0 ? 'text-[var(--pg-danger-text)]' : 'text-[var(--pg-ok-text)]'}>
               {diag.discovered.length}
             </span>
           </div>
           {diag.discovered.map((m) => (
             <div key={m.mother_uuid} className="pl-2 text-[var(--pg-text-muted)]">
-              • {m.label || m.mother_uuid.slice(0, 8)} @ {m.addresses.join(', ') || '(aucune adresse)'}:{m.port}
-              {' '}(client {m.client_id ?? '?'}, epoch {m.epoch ?? '?'})
+              • {m.label || m.mother_uuid.slice(0, 8)} @ {m.addresses.join(', ') || t('diagNoAddress')}:{m.port}
+              {' '}{t('diagMotherLine', { client: m.client_id ?? '?', epoch: m.epoch ?? '?' })}
             </div>
           ))}
         </div>
@@ -234,7 +230,7 @@ function Row({ label, value, bad }: { label: string; value: string; bad?: boolea
   return (
     <div className="flex gap-2">
       <span className="text-[var(--pg-text-dim)] shrink-0">{label}:</span>
-      <span className={bad ? 'text-red-300 font-semibold' : 'text-[var(--pg-text)]'}>{value}</span>
+      <span className={bad ? 'text-[var(--pg-danger-text)] font-semibold' : 'text-[var(--pg-text)]'}>{value}</span>
     </div>
   );
 }

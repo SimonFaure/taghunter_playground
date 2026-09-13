@@ -8,6 +8,7 @@
   "summaryQuests": "Misiones",
   "summaryQuestPts": "Pts de misión",
   "summaryComboBonus": "Bonus de combo",
+  "summaryStationMalus": "Penalización de estación",
   "summaryTotalScore": "Puntuación total",
   "comboBreakdown": "Desglose de combos",
   "comboPill6": "{{count}}× combo-6 = +{{points}} pts",
@@ -59,5 +60,7 @@
   "editSave": "Guardar",
   "editSaving": "Guardando...",
   "editSaveChanges": "Guardar cambios",
-  "editSaveFailed": "No se pudo actualizar el equipo."
+  "editSaveFailed": "No se pudo actualizar el equipo.",
+  "summaryLateMalus": "Penalización por retraso",
+  "lateMalusRevert": "Volver a la penalización por retraso calculada automáticamente ({{value}})"
 }

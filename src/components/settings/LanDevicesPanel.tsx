@@ -8,6 +8,7 @@ import { SatelliteLanSection } from './SatelliteLanSection';
 import { LanDiagnostics } from './LanDiagnostics';
 import { FirewallPanel } from './FirewallPanel';
 import { ForceMotherPanel } from './ForceMotherPanel';
+import { RejoinMotherPanel } from './RejoinMotherPanel';
 import { NotMotherPanel } from './NotMotherPanel';
 import { DefaultRolesPanel } from './DefaultRolesPanel';
 
@@ -107,6 +108,9 @@ export function LanDevicesPanel() {
           <div className="space-y-5">
             <FirewallPanel hintKey={mode === 'host' ? 'firewallHint' : 'firewallHintChild'} />
             <LanDiagnostics />
+            {/* Rejoin before promote: reconnecting to the mother that already
+                exists is the safe repair, taking control is the heavy one. */}
+            <RejoinMotherPanel />
             <ForceMotherPanel />
             <NotMotherPanel />
           </div>

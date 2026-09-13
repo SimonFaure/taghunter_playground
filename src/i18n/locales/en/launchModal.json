@@ -44,6 +44,7 @@
   "tracksCluesShowText": "Show checkpoint descriptions on the clues page",
   "tracksCluesShowImage": "Show checkpoint images on the clues page",
   "routeDefault": "All checkpoints",
+  "routeReverse": "Reversed course",
   "routeFirstHalf": "First half",
   "routeLastHalf": "Last half",
   "routeOdd": "Odd checkpoints",

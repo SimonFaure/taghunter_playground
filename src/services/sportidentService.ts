@@ -41,6 +41,24 @@ export interface USBPort {
 
 export type SICardType = 'SI8' | 'SI9' | 'SI10' | 'SI11';
 
+/**
+ * How many punches each card family can physically hold. Mirrors the
+ * `max_punches` column of `LAYOUTS` in `src-tauri/src/sportident/cards/layout.rs`,
+ * which is the source of truth (the Rust parser refuses a readout claiming
+ * more) - keep the two in step.
+ *
+ * A full card is not an error: the station simply stops writing to it, with
+ * nothing but a beep to tell the player. Chaining several scenarios on one chip
+ * without wiping is what gets you there (client report #101), so surface it
+ * rather than letting punches quietly vanish.
+ */
+export const SI_CARD_CAPACITY: Record<SICardType, number> = {
+  SI8: 30,
+  SI9: 50,
+  SI10: 64,
+  SI11: 128,
+};
+
 export interface CardData {
   id: number;
   /**
@@ -109,9 +127,22 @@ interface ErrorPayload {
   message: string;
 }
 
+interface ReaderStatePayload {
+  /** `"idle" | "awakening" | "listening" | "reading" | "error" | "stopped"`. */
+  state: string;
+}
+
 // Same window the legacy reader uses, kept TS-side so we can tune it
 // per consumer without restarting the Rust task. Lock-in for now.
 const CARD_DEBOUNCE_MS = 5000;
+
+/**
+ * How long to wait between reconnect attempts after the native reader dies
+ * on its own (USB unplug, driver reset, cable knocked loose). Short enough
+ * that a replug is back in service before the operator has finished
+ * re-seating the dongle, long enough not to spin on `si_list_ports`.
+ */
+const RECONNECT_RETRY_MS = 1500;
 
 /**
  * Card-type string → numeric `series` byte. Legacy callers (e.g.
@@ -157,6 +188,16 @@ class SportIdentService {
    * each fire, so we publish `Array.from(map.values())`.
    */
   private stations = new Map<number, StationData>();
+  /**
+   * True between `stop()` and the next `initializePort()`. Distinguishes a
+   * reader we deliberately shut down (page unmount, test panel closed) from
+   * one that died under us - only the latter should trigger a reconnect.
+   */
+  private intentionalStop = false;
+  /** Pending reconnect attempt, if any. Cleared by `stop()`. */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True while a reconnect attempt is in flight, so retries don't overlap. */
+  private reconnecting = false;
 
   /** True when running inside the Tauri shell (desktop or mobile). */
   isAvailable(): boolean {
@@ -204,6 +245,10 @@ class SportIdentService {
       // hotplug poll firing twice) is now a clean no-op instead of a needless
       // stop/start restart.
       if (this.isStarted && this.currentPort === portPath) return true;
+      // An explicit start supersedes any pending self-heal: cancel the
+      // retry timer and re-arm death detection for the new session.
+      this.cancelReconnect();
+      this.intentionalStop = false;
       try {
         await this.attachListeners();
         try {
@@ -263,6 +308,11 @@ class SportIdentService {
 
   async stop(): Promise<void> {
     if (!this.isAvailable()) return;
+    // Flag the shutdown as deliberate BEFORE detaching, so the `stopped`
+    // state event si_stop is about to emit isn't mistaken for a reader
+    // that died on its own and doesn't kick off a reconnect loop.
+    this.intentionalStop = true;
+    this.cancelReconnect();
     await this.detachListeners();
     // Reset JS-side state BEFORE awaiting si_stop. Game-page cleanup
     // calls stop() fire-and-forget; if the user immediately navigates
@@ -285,6 +335,103 @@ class SportIdentService {
           console.warn('[si] si_stop warn:', err);
         }
       });
+    }
+  }
+
+  // ─── Hotplug self-heal ────────────────────────────────────────────
+  //
+  // Unplugging the dongle mid-game kills the native reader for good: the
+  // serial read returns EOF/error, the Rust reader task emits `error` and
+  // returns (see reader_task in src-tauri/src/sportident/reader.rs). Nothing
+  // used to tell JS about it, so `isStarted`/`currentPort` stayed
+  // optimistically true and the next `initializePort` for the same COM port
+  // short-circuited to `return true` - the reader never reopened and cards
+  // stopped punching until the app was restarted.
+  //
+  // We now watch `si://reader-state` for that death and re-open the port
+  // ourselves. The card/station callbacks live on this instance, not on the
+  // native session, so a successful reconnect resumes punching with no
+  // involvement from the game page.
+
+  /**
+   * The native reader stopped without us asking. Reset local state so the
+   * next `initializePort` really re-opens, release the dead handle Rust-side,
+   * and start retrying until the dongle comes back.
+   */
+  private handleUnexpectedReaderStop(reason: string) {
+    if (this.intentionalStop || !this.isStarted) return;
+    console.warn(`[si] native reader stopped unexpectedly (${reason}) - reconnecting`);
+    this.isStarted = false;
+    this.currentPort = null;
+    this.lastCardTimestamps.clear();
+    this.stations.clear();
+    void this.detachListeners();
+    // Drop the dead ReaderHandle the Rust side is still holding, otherwise
+    // the next si_start is refused with "reader already running". (The
+    // retry path self-heals that too, but clearing it here keeps the
+    // reconnect a single clean open.)
+    void this.runExclusive(async () => {
+      try {
+        await invoke('si_stop');
+      } catch {
+        // Already gone - nothing to release.
+      }
+    }).catch(() => {});
+    this.scheduleReconnect();
+  }
+
+  private cancelReconnect() {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer !== null || this.reconnecting) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.tryReconnect();
+    }, RECONNECT_RETRY_MS);
+  }
+
+  /**
+   * One reconnect attempt: re-run VID/PID detection (the OS may hand the
+   * dongle a different COM port after a replug) and re-open. Reschedules
+   * itself until it succeeds or `stop()` cancels the loop.
+   */
+  private async tryReconnect(): Promise<void> {
+    if (this.intentionalStop || this.isStarted) return;
+    this.reconnecting = true;
+    let reconnected = false;
+    try {
+      const found = await detectReaderPort();
+      // Re-check after the await: a page unmount may have called stop()
+      // while we were probing the port list.
+      if (found && !this.intentionalStop && !this.isStarted) {
+        reconnected = await this.initializePort(found.path);
+        if (reconnected) {
+          console.log('[si] reader reconnected on', found.path);
+          // Same signal TopbarStatus's 10 s poll emits, so the game pages'
+          // 'reader:status' handlers refresh their own detection state
+          // without waiting for the next tick.
+          window.dispatchEvent(
+            new CustomEvent('reader:status', { detail: { state: 'ok' } }),
+          );
+        }
+      }
+    } catch (err) {
+      console.warn('[si] reconnect attempt failed:', err);
+    } finally {
+      this.reconnecting = false;
+    }
+    // Keep retrying while there's still no live reader. Deliberately not
+    // gated on `reconnected`: if the dongle came back and was yanked again
+    // during this attempt, `isStarted` is false once more and we must keep
+    // going (the death handler's own scheduleReconnect is a no-op while
+    // `reconnecting` is set).
+    if (!this.intentionalStop && !this.isStarted) {
+      this.scheduleReconnect();
     }
   }
 
@@ -335,10 +482,23 @@ class SportIdentService {
     this.unlisteners.push(
       await listen<ErrorPayload>('si://error', e => {
         // Error events are logged; the UI's existing setTimeout-based
-        // dismissal handles user feedback. We could surface these via
-        // a dedicated callback in a future iteration if the dashboard
-        // wants to show them.
+        // dismissal handles user feedback. The reconnect is driven off
+        // 'si://reader-state' below rather than from here - a transport
+        // error is always followed by the matching state transition, and
+        // the state machine is the authority on whether the task died.
         console.warn('[si] reader error:', e.payload.message);
+      }),
+    );
+
+    this.unlisteners.push(
+      await listen<ReaderStatePayload>('si://reader-state', e => {
+        const state = e.payload.state;
+        // 'error' = transport blew up (unplug, driver reset).
+        // 'stopped' = the reader task wound down; when we didn't ask for
+        // it, that means the byte channel closed under us.
+        if (state === 'error' || state === 'stopped') {
+          this.handleUnexpectedReaderStop(state);
+        }
       }),
     );
   }

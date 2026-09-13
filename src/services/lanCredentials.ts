@@ -149,7 +149,10 @@ export async function setPreferredHotspotSsid(ssid: string): Promise<void> {
  * Children learn whatever SSID the mother actually broadcasts via the ping
  * relay, and when studio creds later sync they win again (the SSID-mismatch
  * restart in raiseMotherHotspotIfConfigured migrates the fleet automatically).
- * Returns null only when there is neither. We still never auto-generate creds.
+ * Last of all, fall back to the schema_meta pair - the creds this device is set
+ * up to broadcast - which is what a mid-game PROMOTED mother has (become_mother
+ * mirrors the dead mother's creds there; it never synced nor typed them).
+ * Returns null only when there is none of the three. We never auto-generate.
  */
 export async function getPreferredHotspotCreds(): Promise<HotspotCreds | null> {
   const preferred = await getPreferredHotspotSsid();
@@ -170,8 +173,18 @@ export async function getPreferredHotspotCreds(): Promise<HotspotCreds | null> {
       r.password.length >= 8 &&
       r.password.length <= 63
   );
-  if (manual.length === 0) return null;
-  const match = preferred ? manual.find((h) => h.ssid === preferred) : undefined;
-  const pick = match ?? manual[0];
-  return { ssid: pick.ssid, password: pick.password };
+  if (manual.length > 0) {
+    const match = preferred ? manual.find((h) => h.ssid === preferred) : undefined;
+    const pick = match ?? manual[0];
+    return { ssid: pick.ssid, password: pick.password };
+  }
+  // Last resort: the schema_meta pair - the AP creds this device is set up to
+  // broadcast. On a satellite PROMOTED mid-game these are the only ones present:
+  // become_mother mirrors the dead mother's creds there (step 5c-bis), but the
+  // device never synced them from studio and never typed them by hand, so both
+  // lookups above come back empty. Without this, the AP-retry path and the
+  // hotspot watchdog no-op on exactly the device that just took over the game.
+  const [ssid, password] = await Promise.all([readMeta(SSID_KEY), readMeta(PASSWORD_KEY)]);
+  if (ssid && password) return { ssid, password };
+  return null;
 }

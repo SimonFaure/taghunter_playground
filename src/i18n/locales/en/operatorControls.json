@@ -35,5 +35,32 @@
     "id": "ID: {{id}}",
     "punches_one": "Punch: {{count}}",
     "punches_other": "Punches: {{count}}"
+  },
+  "gamePanel": {
+    "loading": "Loading…",
+    "unsupportedType": "Game type \"{{type}}\" is not supported yet",
+    "unknownGame": "Unknown game",
+    "pinToLeave": "Enter the device PIN to leave the game.",
+    "pinToOpenControls": "Enter the device PIN to open game controls.",
+    "configure": "Configure",
+    "test": "Test",
+    "rankings": "Rankings",
+    "devices": "Devices",
+    "playVideo": "Play video",
+    "addFiveMin": "+5 min",
+    "endGame": "End game",
+    "delete": "Delete",
+    "backToLaunched": "Back to launched games",
+    "endGameTitle": "End game",
+    "endGameMessage": "Are you sure you want to end this game? This will mark it as completed.",
+    "deleteTitle": "Delete game",
+    "deleteMessage": "Are you sure you want to delete this game? This will permanently remove all data. This action cannot be undone.",
+    "noTeams": "No teams yet.",
+    "teamLabel": "Team {{number}}: {{name}}",
+    "chipLabel": "Chip #{{id}}",
+    "points": "points",
+    "startLabel": "Start:",
+    "endLabel": "End:",
+    "notStarted": "Not started"
   }
 }

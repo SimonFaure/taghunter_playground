@@ -15,7 +15,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { pointLaunchedGamesAtMother, restoreLocalLaunchedGames, autoJoinSameClientMother } from './lanMotherBoot';
-import { setLanReauthHandler } from './api';
+import { setLanReauthHandler, setLanNoRouteHandler } from './api';
+import { reportMotherRouteState, rejoinMotherNow } from './motherFailover';
 import { getAuthUser } from './authStore';
 
 interface MotherLink {
@@ -50,6 +51,11 @@ export function onLaunchedGamesRouteChange(l: RouteListener): () => void {
 }
 
 function emitRoute(route: LaunchedGamesRoute, motherBase: string | null): void {
+  // Tell the failover badge what routing thinks, every tick - not only on a
+  // change. "We're a child, we have a paired mother, it won't resolve" is a
+  // loss signal in its own right, and it needs consecutive ticks to count
+  // (see reportMotherRouteState).
+  reportMotherRouteState(route);
   if (route === lastRoute && motherBase === lastMotherBase) return;
   lastRoute = route;
   lastMotherBase = motherBase;
@@ -103,11 +109,21 @@ export async function refreshLaunchedGamesRoute(): Promise<LaunchedGamesRoute> {
           () => {},
         );
         link = await invoke<MotherLink | null>('client_resolve_mother_link');
-      } else if (role && !hosting && autoJoinThrottleOk()) {
-        // Not hosting and not paired yet - discover + auto-pair a same-client
-        // mother on the LAN (auto-approved by client_id), then resolve its link.
-        // This is what makes a willing device that STOOD DOWN at boot, and a
-        // plain satellite, converge on the mother without any manual pairing.
+      }
+      // Not hosting and still no link - discover + auto-pair a same-client
+      // mother on the LAN (auto-approved by client_id), then resolve its link.
+      // This is what makes a willing device that STOOD DOWN at boot, and a
+      // plain satellite, converge on the mother without any manual pairing.
+      //
+      // This deliberately runs even when we ALREADY have a paired mother whose
+      // link won't resolve. After a failover the dead mother's paired_mothers
+      // row survives, so paired_mothers_count stays > 0 forever; gating auto-join
+      // on "not paired yet" meant a satellite could never discover the PROMOTED
+      // mother (whose uuid isn't in paired_mothers, so client_refresh_mother_endpoints
+      // - which intersects mDNS with that table - can never cache it either).
+      // That was a permanent dead end. An unresolvable link is exactly the signal
+      // that our paired set is stale, so re-discovery is the right response.
+      if (!link && role && !hosting && autoJoinThrottleOk()) {
         const me = await getAuthUser().catch(() => null);
         if (me?.client_id != null) {
           const joined = await autoJoinSameClientMother(me.client_id).catch(() => false);
@@ -158,10 +174,54 @@ async function reauthPairedMother(): Promise<boolean> {
   return (await refreshLaunchedGamesRoute()) === 'mother';
 }
 
+// A routeless launched_games call asks us to resolve a route NOW. Throttled on
+// its own clock: a page can fire a burst of these (list + nav badge + poll) and
+// they must collapse into one resolution attempt, not a browse each.
+let lastNoRouteKick = 0;
+const NO_ROUTE_MIN_INTERVAL_MS = 5_000;
+function kickRouteResolution(): void {
+  const now = Date.now();
+  if (now - lastNoRouteKick < NO_ROUTE_MIN_INTERVAL_MS) return;
+  lastNoRouteKick = now;
+  void refreshLaunchedGamesRoute().catch(() => {});
+}
+
+export type RejoinOutcome = 'repointed' | 'repaired' | 'not_found';
+
+/**
+ * The operator's "reconnect to the mother" gesture (Ludiom #74), behind the
+ * banner button and the Network-tab panel. Two attempts, safest first:
+ *
+ *  1. Re-point at a mother that already honours a secret we hold - the normal
+ *     post-failover case, and the one that keeps us in the running game.
+ *  2. Failing that, discover + pair afresh (a same-client mother auto-approves)
+ *     and resolve the route. This covers the device that holds no usable
+ *     secret at all, e.g. one whose route was cleared.
+ *
+ * Deliberately NOT a promotion: this rejoins the mother that exists. Promoting
+ * this device is the other, heavier button next to it.
+ */
+export async function rejoinCurrentMother(): Promise<RejoinOutcome> {
+  if (await rejoinMotherNow().catch(() => false)) return 'repointed';
+  const me = await getAuthUser().catch(() => null);
+  if (me?.client_id != null) {
+    const joined = await autoJoinSameClientMother(me.client_id).catch(() => false);
+    if (joined) {
+      await invoke('client_refresh_mother_endpoints', { timeoutMs: 2500 }).catch(() => {});
+      if ((await refreshLaunchedGamesRoute()) === 'mother') return 'repaired';
+    }
+  }
+  return 'not_found';
+}
+
 let reauthInstalled = false;
-/** Register the 401 re-auth/re-pair handler with api.ts. Idempotent; call once at boot. */
+/**
+ * Register the api.ts hooks this module owns: the 401 re-auth/re-pair handler
+ * and the "no route at all" kick. Idempotent; call once at boot.
+ */
 export function installLanReauth(): void {
   if (reauthInstalled) return;
   reauthInstalled = true;
   setLanReauthHandler(reauthPairedMother);
+  setLanNoRouteHandler(kickRouteResolution);
 }

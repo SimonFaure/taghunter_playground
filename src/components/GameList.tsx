@@ -30,7 +30,8 @@ import {
   type PatternOption,
 } from '../services/launchResolve';
 import { scenarioAssetUrl } from '../services/contentFs';
-import { gameTypeLabel, audienceLabelKey, normalizeAudience, titleCaseSlug } from '../utils/labels';
+import { gameTypeLabel, normalizeAudience } from '../utils/labels';
+import { AUDIENCE_BANDS, bandLabel, resolveBands, type AudienceBand } from '../utils/audienceBands';
 import { on as onSyncEvent } from '../services/syncEvents';
 import { setGameActive } from '../services/activeSession';
 import {
@@ -48,7 +49,7 @@ import {
   serializeRegAssignments,
   REG_ASSIGNMENTS_META_KEY,
 } from '../services/regAssignments';
-import { getClashState, clashRegister } from '../services/clash';
+import { getClashState, clashRegister, DEFAULT_CLASH_PURGE_STATION } from '../services/clash';
 import { useAuth } from './auth/AuthProvider';
 import { isOperatorOnly } from '../services/operatorMode';
 import { refreshLaunchedGamesRoute } from '../services/childControlLink';
@@ -73,9 +74,9 @@ interface Scenario {
   /** Normalized audience (game_meta.game_public): mini_kids | kids | ado_adultes.
    *  Single tier - used for the server-side name-pool draw. */
   audience: string | null;
-  /** Coarse name-pool tiers any of the scenario's age bands fall into. Drives the
-   *  three audience filter pills (a scenario shows under every tier it spans). */
-  audienceTiers: string[];
+  /** Authored age bands (game_meta.audience_bands). Drives the audience filter
+   *  pills, which use the same six ranges as the studio catalog. */
+  audienceBands: AudienceBand[];
   /** Free-text univers/theme tags (game_meta.univers). Display only. */
   univers: string[];
   uniqid?: string;
@@ -112,23 +113,6 @@ function coerceDifficulty(raw: unknown): number {
 }
 function clampDifficulty(n: number): number {
   return n < 1 ? 1 : n > 5 ? 5 : n;
-}
-
-// Band → name-pool tier, and the set of tiers a band list spans.
-const BAND_TIER: Record<string, string> = {
-  age_4_5: 'mini_kids',
-  age_6_7: 'mini_kids',
-  age_8_10: 'kids',
-  age_11_12: 'kids',
-  age_13_plus: 'ado_adultes',
-  age_adultes: 'ado_adultes',
-};
-function bandsToTiers(bands: unknown): string[] {
-  if (!Array.isArray(bands)) return [];
-  const order = ['mini_kids', 'kids', 'ado_adultes'];
-  const tiers = new Set<string>();
-  for (const b of bands) if (typeof b === 'string' && BAND_TIER[b]) tiers.add(BAND_TIER[b]);
-  return order.filter((t_) => tiers.has(t_));
 }
 
 function DifficultyMeter({ level }: { level: number }) {
@@ -381,7 +365,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           let difficulty: string | null = 'medium';
           let durationMinutes = 60;
           let audience: string | null = null;
-          let audienceTiers: string[] = [];
+          let audienceBands: AudienceBand[] = [];
           let univers: string[] = [];
           if (row.local_version !== null) {
             try {
@@ -419,12 +403,10 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
               difficulty = String(gd?.game_meta?.difficulty ?? gd?.difficulty ?? gd?.game?.difficulty ?? 'medium');
               durationMinutes = gd?.duration_minutes ?? gd?.game?.duration_minutes ?? 60;
               // Audience: game_public (single tier) feeds the server-side name
-              // draw; the age bands feed the coarse pills + display.
+              // draw; the age bands feed the filter pills + display. Un-backfilled
+              // rows fall back to bands derived from the tier.
               audience = gd?.game_meta?.game_public ? normalizeAudience(gd.game_meta.game_public) : null;
-              const bands = gd?.game_meta?.audience_bands;
-              audienceTiers = bandsToTiers(bands);
-              // Fallback for un-backfilled rows: derive a single tier from game_public.
-              if (audienceTiers.length === 0 && audience) audienceTiers = [audience];
+              audienceBands = resolveBands(gd?.game_meta?.audience_bands, audience);
               univers = Array.isArray(gd?.game_meta?.univers)
                 ? (gd!.game_meta!.univers as unknown[]).filter((u): u is string => typeof u === 'string' && u.trim() !== '')
                 : [];
@@ -448,7 +430,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             difficulty,
             duration_minutes: durationMinutes,
             audience,
-            audienceTiers,
+            audienceBands,
             univers,
             uniqid: row.uniqid,
             available_for_purchase: false,
@@ -472,8 +454,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       const matchesType = selectedGameType === 'all' || scenario.game_type.name === selectedGameType;
       const matchesDifficulty =
         selectedDifficulty === 'all' || coerceDifficulty(scenario.difficulty) === Number(selectedDifficulty);
-      // A scenario matches a coarse audience pill if any of its bands' tiers do.
-      const matchesAudience = selectedAudience === 'all' || scenario.audienceTiers.includes(selectedAudience);
+      // A scenario matches an age pill if it targets that band.
+      const matchesAudience =
+        selectedAudience === 'all' || scenario.audienceBands.includes(selectedAudience as AudienceBand);
       return matchesSearch && matchesType && matchesDifficulty && matchesAudience;
     })
     .sort((a, b) => {
@@ -488,20 +471,11 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   const availableForPurchaseScenarios = filteredScenarios.filter(s => s.available_for_purchase);
 
   const gameTypes = [...new Set(scenarios.map((s) => s.game_type.name))];
-  // Audiences actually present among loaded scenarios, ordered by the canonical
-  // trio so the pills read mini → kids → teens/adults; off-list values append.
-  const audienceOrder = ['mini_kids', 'kids', 'ado_adultes'];
-  const audiences = [...new Set(scenarios.flatMap((s) => s.audienceTiers))].sort(
-    (a, b) => {
-      const ia = audienceOrder.indexOf(a);
-      const ib = audienceOrder.indexOf(b);
-      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
-    }
-  );
-  const audienceLabel = (a: string): string => {
-    const key = audienceLabelKey(a);
-    return key ? t(`home:${key}`) : titleCaseSlug(a);
-  };
+  // Age bands actually present among loaded scenarios, in canonical young→old
+  // order - the same six ranges the studio catalog uses.
+  const presentBands = new Set(scenarios.flatMap((s) => s.audienceBands));
+  const audiences = AUDIENCE_BANDS.map((b) => b.value).filter((b) => presentBands.has(b));
+  const audienceLabel = (band: AudienceBand): string => bandLabel(band, t);
 
   const showAlert = (type: 'success' | 'error', message: string) => {
     setAlert({ show: true, type, message });
@@ -713,11 +687,16 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           const scenarioBalises: number[] = Array.isArray(t.balises)
             ? t.balises.map((x: unknown) => Number(x)).filter((n: number) => !Number.isNaN(n))
             : [];
-          const balises = (override && override.length ? override : scenarioBalises).map(resolveStation);
+          const authoredNumbers = override && override.length ? override : scenarioBalises;
           return {
             index: ti,
             points: parseInt(String(t.points ?? '0'), 10) || 0,
-            balises,
+            balises: authoredNumbers.map(resolveStation),
+            // Keep the authored NUMBERS alongside the resolved ids, positionally
+            // paired. The mother uses them to tell a team which balises it is
+            // still missing in the numbers printed on them (retours #96) -
+            // nothing on the wire ever showed the player-facing label before.
+            balise_numbers: authoredNumbers,
           };
         });
 
@@ -729,7 +708,15 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         // The purge station is authored as a station number too - resolve it
         // through the same map so the collision check below and the mother's
         // punch matching compare like with like (id space).
-        const purgeStation = resolveStation(config.clashPurgeStation ?? 25);
+        // Headless/saved-config launches may carry no station at all - fall back
+        // to the scenario's authored one (retours #50), then to the historic 25.
+        const authoredPurgeStation = parseInt(String(gm.purge_station ?? ''), 10);
+        const purgeStation = resolveStation(
+          config.clashPurgeStation ??
+            (Number.isFinite(authoredPurgeStation) && authoredPurgeStation > 0
+              ? authoredPurgeStation
+              : DEFAULT_CLASH_PURGE_STATION),
+        );
         const hasPurgeImage = typeof gm.purge_image === 'string' && gm.purge_image.length > 0;
         let purgeEnabled = !!config.clashPurgeEnabled && hasPurgeImage;
         if (purgeEnabled && territories.some((t) => t.balises.includes(purgeStation))) {
@@ -1339,8 +1326,14 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           </div>
           <div className="pg-card-title">{scenario.title || t('home:untitledScenario')}</div>
           <div className="pg-card-desc">{scenario.description}</div>
-          {scenario.univers.length > 0 && (
+          {(scenario.audienceBands.length > 0 || scenario.univers.length > 0) && (
             <div className="flex flex-wrap gap-1 mb-2">
+              {/* Age ranges first - same six bands as the studio catalog. */}
+              {scenario.audienceBands.length > 0 && (
+                <span className="pg-pill" style={{ fontSize: '0.7rem' }}>
+                  {scenario.audienceBands.map((b) => audienceLabel(b)).join(' · ')}
+                </span>
+              )}
               {scenario.univers.map((tag) => (
                 <span key={tag} className="pg-pill" style={{ fontSize: '0.7rem' }}>
                   {tag}

@@ -9,12 +9,23 @@ import { withRetry } from './apiRetry';
 
 // ---------- config (persisted into the launch's clash_config meta) ----------
 
+/**
+ * Fallback "The Purge" station for scenarios authored before retours #50 put
+ * the number in Studio (game_meta.purge_station). The launch field prefills
+ * from the scenario and only lands here when the scenario says nothing.
+ */
+export const DEFAULT_CLASH_PURGE_STATION = 25;
+
 export interface ClashConfigTerritory {
   index: number;
   /** Points-per-minute paid to the controlling clan (V2 domination scoring). */
   points: number;
   /** Physical balise station codes composing this territory (V2, variable count). */
   balises: number[];
+  /** The authored station NUMBERS, positionally paired with `balises` (which
+   *  hold the ids the SI punches carry). Lets the mother name a missing balise
+   *  the way it is labelled in the field (retours #96). */
+  balise_numbers?: number[];
   /** @deprecated V1 volume/last-bipper size. */
   size?: 'large' | 'medium' | 'small';
   /** @deprecated V1 combination indices. */
@@ -107,6 +118,17 @@ export interface ClashValidateResult {
   /** V2: at most one entry - the single territory credited by this read. */
   credited: Array<{ territory_index: number; combo_index?: number }>;
   standings?: Omit<ClashStandings, 'status' | 'max_per_clan'> & { status?: string };
+  /** Present when nothing was credited AND at least one territory had a fresh
+   *  punch: the territory the read came closest to completing. Absent means no
+   *  fresh punch matched any territory (card already spent, or nothing new). */
+  partial?: {
+    territory_index: number;
+    have: number;
+    need: number;
+    /** The balises of that territory the read is still missing, in the numbers
+     *  printed on them (retours #96). Absent on pre-2026-09 mothers. */
+    missing?: number[];
+  };
   /** Present when the read carried a purge-station punch. `ok` = the purge
    *  fired on territory_index; rejections keep the clan's quota (but the
    *  physical punch is consumed either way - re-punch to retry). */

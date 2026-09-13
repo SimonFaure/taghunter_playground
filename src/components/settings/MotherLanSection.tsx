@@ -231,8 +231,8 @@ export function MotherLanSection() {
 
           <WifiQr ssid={routerSsid} password={routerPassword} caption={t('routerQrCaption')} />
 
-          <div className="text-xs text-amber-200/90 bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 space-y-1">
-            <p className="font-medium text-amber-200">{t('routerChecklistTitle')}</p>
+          <div className="text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-3 space-y-1">
+            <p className="font-medium text-[var(--pg-warn-text)]">{t('routerChecklistTitle')}</p>
             <ul className="list-disc pl-4 space-y-0.5">
               <li>{t('routerChecklistIsolation')}</li>
               <li>{t('routerChecklistSameNetwork')}</li>
@@ -245,10 +245,10 @@ export function MotherLanSection() {
       <div className="pg-panel">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
-            {running ? <Wifi className="w-5 h-5 text-green-400" /> : <WifiOff className="w-5 h-5 text-[var(--pg-text-dim)]" />}
+            {running ? <Wifi className="w-5 h-5 text-[var(--pg-ok-icon)]" /> : <WifiOff className="w-5 h-5 text-[var(--pg-text-dim)]" />}
             <h3 className="pg-panel-title">{t('hotspotTitle')}</h3>
             <span className={`text-xs px-2 py-0.5 rounded-full border ${
-              running ? 'bg-green-500/20 text-green-300 border-green-500/40'
+              running ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
                       : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
               {running ? t('hotspotRunning') : t('hotspotStopped')}
             </span>
@@ -305,18 +305,18 @@ export function MotherLanSection() {
         {/* The live AP is broadcasting a different SSID than the configured one
             (creds changed in studio since it was raised). Cold-start to apply. */}
         {running && status?.ssid && ssid && status.ssid !== ssid && (
-          <div className="mt-3 text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2">
+          <div className="mt-3 text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
             {t('hotspotBroadcastMismatch', { current: status.ssid })}
           </div>
         )}
 
         {windowsOnly && (
-          <div className="mt-3 text-xs text-amber-300/90 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2">
+          <div className="mt-3 text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
             {t('hotspotWindowsOnly')}
           </div>
         )}
         {hotspotErr && (
-          <div className="mt-3 text-xs text-red-300 bg-red-500/15 border border-red-500/40 rounded-lg p-2">
+          <div className="mt-3 text-xs text-[var(--pg-danger-text)] bg-[var(--pg-danger-bg)] border border-[var(--pg-danger-line)] rounded-lg p-2">
             {t('hotspotError', { message: hotspotErr })}
           </div>
         )}
@@ -365,10 +365,10 @@ function CredField({
         />
         <button type="button" onClick={onCopy} title={copyLabel}
           className="p-2 rounded-lg text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)]">
-          {copied ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+          {copied ? <Check className="w-4 h-4 text-[var(--pg-ok-icon)]" /> : <Copy className="w-4 h-4" />}
         </button>
       </div>
-      {copied && <div className="text-[10px] text-green-400 mt-0.5">{copiedLabel}</div>}
+      {copied && <div className="text-[10px] text-[var(--pg-ok-icon)] mt-0.5">{copiedLabel}</div>}
     </div>
   );
 }

@@ -20,6 +20,7 @@ import { recordPunch, startLaunchedGame, endLaunchedGame, getLaunchedGameState, 
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { clashValidate, clashRegister, getClashState, type ClashStandings } from '../services/clash';
 import { onPendingConfigReload } from '../services/pendingJoinStore';
+import { tIngame } from '../i18n/ingame';
 // Station-based registration assignment: this device may be hard-locked to
 // specific clan(s) during self-registration (meta.regAssignments, keyed by
 // device_id). Design: project_selfregister_team_device_assignment.
@@ -30,7 +31,7 @@ import {
   REG_ASSIGNMENTS_META_KEY,
   type RegAssignmentMap,
 } from '../services/regAssignments';
-import { ClashGameRenderer, type ClashClanVisual } from './ClashGameRenderer';
+import { ClashGameRenderer, type ClashClanVisual, type ClashSizes } from './ClashGameRenderer';
 import { ClashRegistrationScreen } from './ClashRegistrationScreen';
 import { ClashResultsScreen } from './ClashResultsScreen';
 
@@ -74,9 +75,30 @@ interface ClashTextElementMeta {
 }
 interface ClashGameMetaRuntime {
   game_visual?: string;
-  background_image?: string;
   map_image?: string;
-  timer_position?: { top: number; left: number };
+  /** Timer plate: centre anchor + (since retours #52/#54) its box. */
+  timer_position?: { top: number; left: number; width?: number; height?: number };
+  /** Clock nudge inside the plate, % of the plate box (retours #54). */
+  timer_text_offset?: { x: number; y: number };
+  /** Clan-ranking panel box, % of the map box (retours #52). */
+  ranking_position?: { left: number; top: number; width: number; height: number };
+  /* On-map sizes (retours #57) - % of map width, or % scale for text. */
+  banner_size_percentage?: number;
+  purge_size_percentage?: number;
+  gauge_size_percentage?: number;
+  territory_name_scale?: number;
+  timer_scale?: number;
+  /* Per-element text colours (retours #53). */
+  timer_color?: string;
+  ranking_color?: string;
+  territory_name_color?: string;
+  event_color?: string;
+  /* Scenario-authored event-banner sentences (retours #56). */
+  event_text_conquest?: Record<string, string> | string;
+  event_text_attack?: Record<string, string> | string;
+  event_text_neutralized?: Record<string, string> | string;
+  event_text_purge?: Record<string, string> | string;
+  ranking_title?: Record<string, string> | string;
   clans?: ClashClanMeta[];
   territories?: ClashTerritoryMeta[];
   text_elements?: ClashTextElementMeta[];
@@ -137,6 +159,13 @@ function pickLocalized(v: Record<string, string> | string | undefined, lang: str
 
 export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: ClashGamePageProps) {
   const lang = config.language || 'fr';
+  // Every player-facing Clash string resolves against the LAUNCH language, not
+  // the operator's chrome language. Scenario-authored names (clans,
+  // territories) go through pickLocalized with the same `lang`.
+  const tc = useCallback(
+    (key: string, vars?: Record<string, string | number>) => tIngame('ingame_clash', key, lang, vars),
+    [lang],
+  );
   const registrationMode: 'self' | 'bulk' = config.clashRegistrationMode ?? 'self';
   const [meta, setMeta] = useState<ClashGameMetaRuntime | null>(null);
   const [standings, setStandings] = useState<ClashStandings | null>(null);
@@ -201,7 +230,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       map[s.team_id] = {
         team_id: s.team_id,
         team_number: s.team_number,
-        name: s.team_name || pickLocalized(sc?.name, lang) || `Clan ${s.team_number}`,
+        name: s.team_name || pickLocalized(sc?.name, lang) || tc('clan_fallback', { n: s.team_number }),
         color: sc?.color || FALLBACK_COLORS[idx % FALLBACK_COLORS.length],
         banner: sc?.banner || '',
         logo: sc?.logo || '',
@@ -209,15 +238,15 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       };
     }
     return map;
-  }, [standings, meta, lang]);
+  }, [standings, meta, lang, tc]);
 
   const territoryNames = useMemo(() => {
     const names: Record<number, string> = {};
     (meta?.territories ?? []).forEach((t, i) => {
-      names[i] = pickLocalized(t.name, lang) || `Territory ${i + 1}`;
+      names[i] = pickLocalized(t.name, lang) || tc('territory_fallback', { n: i + 1 });
     });
     return names;
-  }, [meta, lang]);
+  }, [meta, lang, tc]);
 
   // Authored anchors (percent of map) keyed by territory index: the banner
   // plants at banner_position, the name+gauge cluster at label_position. Missing
@@ -267,13 +296,76 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     purgeAudioRef.current = meta?.purge_sound ? new Audio(resolveMedia(meta.purge_sound)) : null;
   }, [meta, resolveMedia]);
 
-  // Authored timer anchor (percent of map); null ⇒ renderer default (top-centre).
+  // Authored timer plate (percent of map); null ⇒ renderer default (top-centre
+  // at its natural size). width/height are absent on pre-#52 scenarios, which
+  // the renderer reads as "no box".
   const timerPos = useMemo(
     () =>
       meta?.timer_position
-        ? { leftPct: meta.timer_position.left, topPct: meta.timer_position.top }
+        ? {
+            leftPct: meta.timer_position.left,
+            topPct: meta.timer_position.top,
+            widthPct: meta.timer_position.width,
+            heightPct: meta.timer_position.height,
+          }
         : null,
     [meta],
+  );
+  // Clock nudge inside the timer plate (retours #54).
+  const timerTextOffset = useMemo(
+    () =>
+      meta?.timer_text_offset
+        ? { x: Number(meta.timer_text_offset.x) || 0, y: Number(meta.timer_text_offset.y) || 0 }
+        : null,
+    [meta],
+  );
+  // Authored clan-ranking panel box (retours #52); null ⇒ renderer fallback.
+  const rankingPos = useMemo(() => {
+    const rp = meta?.ranking_position;
+    if (!rp) return null;
+    return { leftPct: rp.left, topPct: rp.top, widthPct: rp.width, heightPct: rp.height };
+  }, [meta]);
+
+  // On-map element sizes (retours #57). Undefined entries fall back to the
+  // renderer's defaults, so a pre-#57 scenario looks exactly as it did.
+  const sizes = useMemo(() => {
+    // Only DEFINED entries are handed over: the renderer spreads this over its
+    // defaults, so an explicit `undefined` would wipe one out.
+    const out: Partial<ClashSizes> = {};
+    const put = (key: keyof ClashSizes, v: unknown) => {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) out[key] = n;
+    };
+    put('bannerPct', meta?.banner_size_percentage);
+    put('purgePct', meta?.purge_size_percentage);
+    put('gaugePct', meta?.gauge_size_percentage);
+    put('territoryNameScale', meta?.territory_name_scale);
+    put('timerScale', meta?.timer_scale);
+    return out;
+  }, [meta]);
+
+  // Per-element text colours (retours #53); '' ⇒ the renderer's white.
+  const colors = useMemo(
+    () => ({
+      timer: meta?.timer_color || '',
+      ranking: meta?.ranking_color || '',
+      territoryName: meta?.territory_name_color || '',
+      event: meta?.event_color || '',
+    }),
+    [meta],
+  );
+
+  // Scenario-authored event-banner sentences (retours #56), resolved against
+  // the LAUNCH language like every other player-facing Clash string.
+  const eventTexts = useMemo(
+    () => ({
+      conquest: pickLocalized(meta?.event_text_conquest, lang),
+      attack: pickLocalized(meta?.event_text_attack, lang),
+      neutralized: pickLocalized(meta?.event_text_neutralized, lang),
+      purge: pickLocalized(meta?.event_text_purge, lang),
+      rankingTitle: pickLocalized(meta?.ranking_title, lang),
+    }),
+    [meta, lang],
   );
 
   // Optional dashboard chrome frame images (resolved; '' ⇒ default styling).
@@ -332,9 +424,9 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     (teamId: number | null, terrIndex: number) => {
       const clan = teamId != null ? clanByTeamId[teamId] : undefined;
       setPurgeFlash({
-        clanName: clan?.name ?? `Clan`,
+        clanName: clan?.name ?? tc('clan_fallback', { n: '' }).trim(),
         clanColor: clan?.color ?? '#fff',
-        terrName: territoryNames[terrIndex] || `Territory ${terrIndex + 1}`,
+        terrName: territoryNames[terrIndex] || tc('territory_fallback', { n: terrIndex + 1 }),
       });
       const audio = purgeAudioRef.current;
       if (audio) {
@@ -344,7 +436,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       if (purgeFlashTimerRef.current) clearTimeout(purgeFlashTimerRef.current);
       purgeFlashTimerRef.current = setTimeout(() => setPurgeFlash(null), 4000);
     },
-    [clanByTeamId, territoryNames],
+    [clanByTeamId, territoryNames, tc],
   );
 
   useEffect(() => {
@@ -532,11 +624,11 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     try {
       const res = await clashValidate(launchedGameId, card.id, card.punches ?? []);
       if (res.status === 'not_registered') {
-        showMessage('Chip not registered to a clan', 'warning');
+        showMessage(tc('msg_not_registered'), 'warning');
         return;
       }
       if (res.status === 'game_over') {
-        showMessage('Game over', 'info');
+        showMessage(tc('msg_game_over'), 'info');
         return;
       }
       if (res.status !== 'ok') return;
@@ -555,31 +647,53 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
             );
           firePurgeAnnouncement(res.team_id ?? null, res.purge.territory_index);
         } else if (res.purge.status === 'already_used') {
-          showMessage('Purge déjà utilisée par votre clan', 'warning');
+          showMessage(tc('msg_purge_already_used'), 'warning');
         } else if (res.purge.status === 'own_territory') {
-          showMessage('Impossible de purger votre propre territoire', 'warning');
+          showMessage(tc('msg_purge_own_territory'), 'warning');
         } else if (res.purge.status === 'no_target') {
-          showMessage('Aucun territoire à purger pour le moment', 'info');
+          showMessage(tc('msg_purge_no_target'), 'info');
         }
       }
       if (res.credited.length === 0) {
         // A purge attempt already produced its own feedback - skip the
         // "keep going" filler in that case.
-        if (!res.purge?.attempted) showMessage('Continue - aucun territoire complété', 'info');
+        if (!res.purge?.attempted) {
+          // Name the territory the read got closest to ("Hélico incomplet")
+          // rather than a generic line - the operator sees WHICH lot is short.
+          // No partial at all ⇒ every punch on the badge was already spent on
+          // an earlier validation, so say that instead.
+          const partialName =
+            res.partial != null ? territoryNames[res.partial.territory_index] : undefined;
+          const base = partialName
+            ? tc('msg_territory_incomplete', { territory: partialName })
+            : res.partial != null
+              ? tc('msg_territory_incomplete_generic')
+              : tc('msg_no_fresh_punch');
+          // Say WHICH balises are still missing, in the numbers printed on them.
+          // "incomplete" on its own gave a team nothing to act on (retours #96).
+          // Absent on a pre-2026-09 mother ⇒ the bare sentence, as before.
+          const missing = res.partial?.missing ?? [];
+          const detail = missing.length
+            ? ` - ${tc('msg_missing_balises', { list: missing.join(', ') })}`
+            : '';
+          showMessage(`${base}${detail}`, 'info');
+        }
         return;
       }
       // V2: at most one territory credited per read (no combo/piece art).
       const clan = res.team_id != null ? clanByTeamId[res.team_id] : undefined;
       const terrName = territoryNames[res.credited[0].territory_index];
       showMessage(
-        terrName ? `${terrName} complété !` : 'Territoire complété !',
+        terrName
+          ? tc('msg_territory_captured', { territory: terrName })
+          : tc('msg_territory_captured_generic'),
         'success',
         clan?.name ?? null,
       );
     } catch (err) {
       console.error('[Clash] validate failed', err);
     }
-  }, [launchedGameId, registrationMode, clanByTeamId, territoryNames, queue.enqueue, showMessage, firePurgeAnnouncement]);
+  }, [launchedGameId, registrationMode, clanByTeamId, territoryNames, queue.enqueue, showMessage, firePurgeAnnouncement, tc]);
 
   const handleLocalCardRef = useRef(handleLocalCard);
   useEffect(() => { handleLocalCardRef.current = handleLocalCard; });
@@ -666,8 +780,10 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
 
   if (phase === 'register' && launchedGameId) {
     // Scenario visual shown as the registration background; the screen falls
-    // back to the clan banners when the scenario has none.
-    const regVisualUrl = resolveMedia(meta?.game_visual || meta?.background_image || '');
+    // back to the clan banners when the scenario has none. Clash has no
+    // `background_image` any more (retours #49) - `game_visual` is the only
+    // cover art it carries.
+    const regVisualUrl = resolveMedia(meta?.game_visual || '');
     return (
       <ClashRegistrationScreen
         standings={standings}
@@ -681,6 +797,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         visualUrl={regVisualUrl}
         resolveMedia={resolveMedia}
         assignedTeamNumbers={assignedTeamNumbers}
+        lang={lang}
       />
     );
   }
@@ -693,6 +810,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         territoryNames={territoryNames}
         resolveMedia={resolveMedia}
         fontFamily={fontFamily}
+        lang={lang}
         onBack={onBack}
       />
     );
@@ -712,8 +830,14 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         fontFamily={fontFamily}
         remainingSec={remainingSec}
         timerPos={timerPos}
+        timerTextOffset={timerTextOffset}
+        rankingPos={rankingPos}
+        sizes={sizes}
+        colors={colors}
+        eventTexts={eventTexts}
         purge={standings?.purge ?? null}
         purgeImageUrl={purgeImageUrl}
+        lang={lang}
       />
 
       {/* The Purge announcement - the game's biggest twist moment, flashed on
@@ -728,14 +852,17 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
           />
           <div className="mt-6 text-4xl font-bold text-center px-8" style={{ fontFamily }}>
             <span style={{ color: purgeFlash.clanColor }}>{purgeFlash.clanName}</span>
-            <span className="text-white"> a purgé {purgeFlash.terrName} !</span>
+            <span className="text-white">
+              {' '}
+              {tc('purge_announcement', { territory: purgeFlash.terrName })}
+            </span>
           </div>
         </div>
       )}
 
       <GameMessageOverlay message={message} type={messageType} fontFamily={fontFamily} />
 
-      <PendingTeamsBar labels={queue.pending} fontFamily={fontFamily} />
+      <PendingTeamsBar labels={queue.pending} lang={lang} fontFamily={fontFamily} />
     </>
   );
 }

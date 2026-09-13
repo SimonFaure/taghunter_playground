@@ -74,6 +74,21 @@ export function gameTypeClientRootDirRel(code: string): string {
   return `media/game_types/${code}/client`;
 }
 
+// Game-type media - OPERATOR-UPLOADED variant, local to this device.
+// Layout: media/local_game_types/<code>/<original filename>
+// Deliberately OUTSIDE media/game_types/: that subtree is owned by the sync
+// orchestrator, whose tombstone sweeps (tombstoneMissingGameTypes /
+// tombstoneMissingOverrides / resetVideosForRedownload) delete it wholesale.
+// A file the operator imported by hand has no remote copy to re-download, so
+// it must live where sync never reaches. Design: project_playground_local_tutorial_video.
+export async function localGameTypeDirAbs(code: string): Promise<string> {
+  const root = await mediaRootAbs();
+  return join(root, 'local_game_types', code);
+}
+export function localGameTypeDirRel(code: string): string {
+  return `media/local_game_types/${code}`;
+}
+
 // ---------- relative paths (for BaseDirectory.AppData APIs) ----------
 
 export function scenarioRootDirRel(uniqid: string): string {
@@ -355,5 +370,8 @@ export async function wipeAllContent(): Promise<void> {
   await db.execute('DELETE FROM cards_state');
   await db.execute('DELETE FROM cards');
   await db.execute('DELETE FROM name_pools_state');
+  // Operator-imported tutorial videos belong to the previous owner too - the
+  // files go with `media`, so the rows pointing at them must go as well.
+  await db.execute('DELETE FROM local_game_type_videos');
   await removeRecursive('media');
 }

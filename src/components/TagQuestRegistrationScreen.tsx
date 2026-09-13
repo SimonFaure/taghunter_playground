@@ -11,9 +11,14 @@
 //
 // Purely presentational: the reader→register wiring lives in TagQuestGamePage
 // (handleRegisterCard), which also polls the live counts fed in via props.
+//
+// Every string here is player-facing, so it resolves against the LAUNCH
+// language (`ingame_tagquest`, `reg_*` keys) exactly like ClashRegistrationScreen
+// - never the operator's chrome language. Retours Ludiom #72.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Play, Users, ArrowLeft, Check, AlertTriangle } from 'lucide-react';
+import { tIngame } from '../i18n/ingame';
 
 export interface TagQuestRegTeam {
   team_id: number;
@@ -50,6 +55,8 @@ interface TagQuestRegistrationScreenProps {
    *  "station complete" state when every assigned team fills up.
    *  Design: project_selfregister_team_device_assignment. */
   restricted?: boolean;
+  /** Launch language - every string on this screen resolves against it. */
+  language?: string;
 }
 
 function teamIsFull(memberCount: number, maxPerTeam: number): boolean {
@@ -59,31 +66,41 @@ function teamIsFull(memberCount: number, maxPerTeam: number): boolean {
 // How long the join flash stays on screen.
 const JOIN_FLASH_MS = 2600;
 
+type Translate = (key: string, vars?: Record<string, string | number>) => string;
+
 function joinFlashCopy(
   status: string,
   teamName: string,
   playMode: 'solo' | 'team',
+  tq: Translate,
 ): { text: string; tone: 'ok' | 'warn' } {
   switch (status) {
     case 'ok':
       // Solo can flash before the poll delivers the freshly-created team row -
       // fall back to a generic line rather than an empty name.
-      if (!teamName) return { text: playMode === 'team' ? 'Joined!' : 'Player enrolled!', tone: 'ok' };
+      if (!teamName) {
+        return {
+          text: tq(playMode === 'team' ? 'reg_join_ok_generic' : 'reg_join_ok_solo_generic'),
+          tone: 'ok',
+        };
+      }
       return {
-        text: playMode === 'team' ? `Joined ${teamName}!` : `${teamName} enrolled!`,
+        text: tq(playMode === 'team' ? 'reg_join_ok' : 'reg_join_ok_solo', { team: teamName }),
         tone: 'ok',
       };
     case 'clan_full':
-      return { text: 'Team full - moved to the next team, bip again', tone: 'warn' };
+      return { text: tq('reg_join_team_full'), tone: 'warn' };
     case 'already_in_clan':
       return {
-        text: playMode === 'team' ? `Already in ${teamName}` : 'Already enrolled',
+        text: playMode === 'team'
+          ? tq('reg_join_already_in_team', { team: teamName })
+          : tq('reg_join_already_enrolled'),
         tone: 'warn',
       };
     case 'already_in_other_clan':
-      return { text: 'Chip already belongs to another team', tone: 'warn' };
+      return { text: tq('reg_join_already_other_team'), tone: 'warn' };
     default:
-      return { text: 'Team not found', tone: 'warn' };
+      return { text: tq('reg_join_team_not_found'), tone: 'warn' };
   }
 }
 
@@ -98,7 +115,24 @@ export function TagQuestRegistrationScreen({
   lastJoin,
   backgroundUrl,
   restricted = false,
+  language,
 }: TagQuestRegistrationScreenProps) {
+  const lang = language || 'fr';
+  const tq = useCallback<Translate>(
+    (key, vars) => tIngame('ingame_tagquest', key, lang, vars),
+    [lang],
+  );
+  /** A team's display name, falling back to the numbered placeholder. */
+  const teamLabel = useCallback(
+    (t: TagQuestRegTeam | null | undefined): string => {
+      if (!t) return '';
+      return (
+        t.team_name ||
+        tq(playMode === 'team' ? 'reg_team_fallback' : 'reg_player_fallback', { n: t.team_number })
+      );
+    },
+    [tq, playMode],
+  );
   const selectedTeam = teams.find((t) => t.team_id === selectedTeamId) ?? null;
   // Station assignment: every assigned team full ⇒ this station's job is done.
   const stationComplete =
@@ -119,14 +153,7 @@ export function TagQuestRegistrationScreen({
 
   const flashTeam = joinFlash ? teams.find((t) => t.team_id === joinFlash.teamId) ?? null : null;
   const flash = joinFlash
-    ? joinFlashCopy(
-        joinFlash.status,
-        flashTeam?.team_name ||
-          (flashTeam
-            ? (playMode === 'team' ? `Équipe ${flashTeam.team_number}` : `Joueur ${flashTeam.team_number}`)
-            : ''),
-        playMode,
-      )
+    ? joinFlashCopy(joinFlash.status, teamLabel(flashTeam), playMode, tq)
     : null;
   // The tile that just gained a member pulses green while the flash is up.
   const flashOkTeamId = joinFlash?.status === 'ok' ? joinFlash.teamId : null;
@@ -160,10 +187,10 @@ export function TagQuestRegistrationScreen({
       <div className="relative flex-1 max-w-5xl w-full mx-auto p-8 space-y-6">
         <div className="flex items-center justify-between">
           <h1 className="text-3xl font-bold">
-            {playMode === 'team' ? 'Team registration' : 'Player registration'}
+            {tq(playMode === 'team' ? 'reg_title_team' : 'reg_title_solo')}
           </h1>
           <button onClick={onBack} className="text-sm text-white/60 hover:text-white flex items-center gap-1">
-            <ArrowLeft size={16} /> Back
+            <ArrowLeft size={16} /> {tq('reg_back')}
           </button>
         </div>
 
@@ -171,16 +198,15 @@ export function TagQuestRegistrationScreen({
           {playMode === 'team'
             ? restricted
               ? teams.length === 1
-                ? 'This station registers one team only - players bip their chip here to join it.'
-                : 'This station registers the teams below only - pick one, then players bip their chip to join it.'
-              : 'Select a team on this station, then players bip their chip to join it. Leave a station on one team to use it as a dedicated join reader.'
-            : 'Each player bips their chip to enrol - a team is created per chip. Start the game once everyone has joined.'}
+                ? tq('reg_intro_locked_one')
+                : tq('reg_intro_locked_many')
+              : tq('reg_intro_team')
+            : tq('reg_intro_solo')}
         </p>
 
         {restricted && playMode === 'team' && teams.length === 0 && (
           <div className="rounded-xl border-2 border-amber-400 bg-amber-500/15 p-4 text-amber-200">
-            No team matches this station's assignment - ask the operator to update it from the
-            Devices panel.
+            {tq('reg_no_assigned_team')}
           </div>
         )}
 
@@ -223,11 +249,11 @@ export function TagQuestRegistrationScreen({
                     )}
                     {full && (
                       <span className="absolute top-3 right-3 text-[10px] font-bold uppercase tracking-wider text-amber-300 border border-amber-300/60 rounded px-1.5 py-0.5">
-                        Full
+                        {tq('reg_full')}
                       </span>
                     )}
                     <div className="text-2xl font-bold leading-tight break-words mb-4">
-                      {t.team_name || `Équipe ${t.team_number}`}
+                      {teamLabel(t)}
                     </div>
                     <div
                       className={`flex items-baseline justify-center gap-2 ${
@@ -261,19 +287,17 @@ export function TagQuestRegistrationScreen({
 
             {stationComplete ? (
               <div className="rounded-xl border-2 border-green-400 bg-green-500/15 p-5 text-center">
-                <p className="text-2xl font-bold text-green-300">Registration complete on this station</p>
+                <p className="text-2xl font-bold text-green-300">{tq('reg_station_complete')}</p>
                 <p className="text-white/70 mt-1">
-                  {teams.length === 1 ? 'The assigned team is full.' : 'All assigned teams are full.'}
+                  {tq(teams.length === 1 ? 'reg_station_complete_one' : 'reg_station_complete_many')}
                 </p>
               </div>
             ) : (
               <div className="rounded-xl bg-slate-800/50 p-4 text-center">
                 {selectedTeam ? (
-                  <p className="text-lg">
-                    Bip a chip to join <span className="font-bold">{selectedTeam.team_name || `Équipe ${selectedTeam.team_number}`}</span>
-                  </p>
+                  <p className="text-lg">{tq('reg_bip_to_join', { team: teamLabel(selectedTeam) })}</p>
                 ) : (
-                  <p className="text-white/60">Select a team above to start enrolling players.</p>
+                  <p className="text-white/60">{tq('reg_select_team_hint')}</p>
                 )}
               </div>
             )}
@@ -283,10 +307,10 @@ export function TagQuestRegistrationScreen({
           <div className="rounded-xl bg-slate-800/50 p-4 space-y-3">
             <div className="flex items-center gap-2 text-white/70">
               <Users size={16} />
-              {teams.length} {teams.length === 1 ? 'player enrolled' : 'players enrolled'}
+              {tq('reg_players_enrolled', { count: teams.length })}
             </div>
             {teams.length === 0 ? (
-              <p className="text-white/50 text-sm">Waiting for the first bip…</p>
+              <p className="text-white/50 text-sm">{tq('reg_waiting_first_bip')}</p>
             ) : (
               <ul className="grid grid-cols-2 md:grid-cols-3 gap-2">
                 {teams.map((t) => {
@@ -299,7 +323,7 @@ export function TagQuestRegistrationScreen({
                         justJoined ? 'bg-green-500/20 border border-green-400 font-semibold' : 'bg-slate-900/60'
                       }`}
                     >
-                      {t.team_name || `Joueur ${t.team_number}`}
+                      {teamLabel(t)}
                     </li>
                   );
                 })}
@@ -336,7 +360,7 @@ export function TagQuestRegistrationScreen({
           onClick={onStart}
           className="inline-flex items-center gap-2 px-8 py-3 bg-green-600 hover:bg-green-700 rounded-xl text-lg font-semibold"
         >
-          <Play size={22} /> Start game
+          <Play size={22} /> {tq('reg_start_game')}
         </button>
       </div>
     </div>

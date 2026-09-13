@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { ArrowLeft, Users, Trophy } from 'lucide-react';
 import { GameConfig } from './LaunchGameModal';
 import { sportidentService as usbReaderService, CardData, detectReaderPort, isReaderConnected } from '../services/sportidentService';
@@ -7,7 +8,7 @@ import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
-import { describePunchStatus, type GameMessageType } from '../services/gameMessages';
+import { describePunchStatus, localizedStatus, type GameMessageType } from '../services/gameMessages';
 import { PunchAnimationOverlay } from './PunchAnimationOverlay';
 import * as scenarioStore from '../services/scenarioStore';
 import { tIngame } from '../i18n/ingame';
@@ -20,14 +21,34 @@ import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
 // migration). Keep this file in lockstep with the canonical TS source.
 import bundledTagquestLayout from '../scenarios/tagquest/defaultLayout.json';
 import {
+  mergeTagquestTypography,
+  readTagquestTypography,
+  resolveTagquestTextStyle,
+  type TagquestTypography,
+} from '../scenarios/tagquest/typography';
+import {
+  applyTagquestLayoutOverrides,
+  readTagquestLayoutOverrides,
+  tagquestMainImageInsetPx,
+  type TagquestLayoutOverrides,
+} from '../scenarios/tagquest/layoutOverrides';
+import * as translationsStore from '../services/translationsStore';
+import {
   getLaunchedGameState,
   getLaunchedGameMeta,
+  patchLaunchedGameMeta,
   recordPunch,
+  getRawDataForChip,
   updateTeam,
   startLaunchedGame,
 } from '../services/launchedGames';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
-import { processTagQuestPunch } from '../services/tagquestPunchLogic';
+import {
+  processTagQuestPunch,
+  baselineMetaKey,
+  baselineIdsFromCard,
+  parseBaselineMeta,
+} from '../services/tagquestPunchLogic';
 import type { PunchAnimationData } from '../services/tagquestPunchLogic';
 import { logApiCall } from '../services/apiLogger';
 import { onPendingConfigReload } from '../services/pendingJoinStore';
@@ -49,6 +70,44 @@ import {
 } from '../services/regAssignments';
 
 type AnimPhase = 'idle' | 'enter' | 'images' | 'main' | 'update' | 'exit';
+
+// How quest artwork (the four reveal slots, the completed image) is detached
+// from the scenario backdrop.
+//
+// Retours Ludiom #61 and #100 land on the SAME screen and pull opposite ways:
+// #61 wants a whitish backing so icons authored on a transparent background stop
+// vanishing into a dark backdrop, #100 wants no visible frame around the
+// completed image ("le cadre se voit alors nettement et casse le visuel").
+// A rectangular plate can only satisfy one of them - and once the image is drawn
+// `contain` rather than `cover` (it no longer fills its square box) the plate
+// shows as white bars, i.e. exactly the frame #100 rejected.
+//
+// Stacked white drop-shadows solve both: `drop-shadow` follows the image's ALPHA
+// channel, so the halo hugs the artwork's own outline instead of its bounding
+// box. Transparent icons get a white edge that lifts them off any backdrop; no
+// rectangle is ever drawn. Deliberately not authorable per scenario - the point
+// is that a visual stays legible whatever backdrop it ships with.
+//
+// Caveat to watch in QA: on a fully OPAQUE image the alpha channel is the
+// rectangle, so the halo traces its edges as a soft white glow. Judged
+// acceptable (and far milder than the old green border); revert the whole
+// treatment by making `artHalo()` return '' below.
+//
+// The outer ring also carries the slot's status (green = matched, red = not),
+// which used to be a tint painted over the whole cell. That tint only worked
+// while the artwork filled its box; with `contain` it would paint a coloured
+// SQUARE on the backdrop, so it moved into the halo where it follows the icon.
+const ART_HALO_INNER = 'drop-shadow(0 0 3px rgba(255,255,255,0.95))';
+const ART_HALO_OUTER = {
+  neutral: 'drop-shadow(0 0 10px rgba(255,255,255,0.7))',
+  matched: 'drop-shadow(0 0 10px rgba(74,222,128,0.9))',
+  missed: 'drop-shadow(0 0 10px rgba(248,113,113,0.9))',
+} as const;
+
+/** The single knob for how quest artwork is lifted off the backdrop. */
+function artHalo(status: keyof typeof ART_HALO_OUTER = 'neutral'): string {
+  return ART_HALO_INNER + ' ' + ART_HALO_OUTER[status];
+}
 
 // The four admin-managed HUD label keys (resolved via the `ingame_tagquest`
 // i18next namespace - bundled baselines, synced overrides applied at sync time).
@@ -113,6 +172,14 @@ interface TagquestGameMetaRuntime {
 }
 
 const DEFAULT_TAGQUEST_TEMPLATE_URL = '/default_templates/tagquest_template.png';
+
+/**
+ * Anchor for each of the four quest pieces (slot order = top-left, top-right,
+ * bottom-left, bottom-right). The pieces are quadrants of the main image, so
+ * each is pulled towards the centre of the 2×2 block; artwork that fills its
+ * cell is unaffected. Mirrors the studio preview (#9).
+ */
+const QUEST_PIECE_POSITION = ['bottom right', 'bottom left', 'top right', 'top left'] as const;
 
 // Per-scenario UI-string overrides. When the editor's "UI text strings" section
 // has a value for one of these punch statuses, it replaces the default in-game
@@ -220,6 +287,10 @@ function nextRegSelection(
 }
 
 export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, onGameEnd, postAnimExitDelayMs: postAnimExitDelayMsProp = 0 }: TagQuestGamePageProps) {
+  // Operator-console chrome (the leaderboard block below the game surface) runs
+  // in the OPERATOR's language - `tr`, not `t`, because `t` is already the loop
+  // variable for a team throughout this file. Retours Ludiom #69/#70.
+  const { t: tr } = useTranslation('rankings');
   // The final frame stays on screen this long after the animation ends before
   // the page resets to its all-hidden state. Configurable per launch via
   // visibilityHideDelaySec; the Test modal may override it via the prop.
@@ -232,6 +303,13 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const [gameData, setGameData] = useState<GameData | null>(null);
   const [layout, setLayout] = useState<GameLayout | null>(null);
   const [layoutLoading, setLayoutLoading] = useState(true);
+  // Studio-wide Quest text defaults (admin "Default layouts" page), synced as a
+  // `default_config` row. Null until the read settles / when never authored, in
+  // which case only the scenario's own values apply - the previous behaviour.
+  const [typographyDefaults, setTypographyDefaults] = useState<TagquestTypography | null>(null);
+  // The element geometry from this blob is baked into `layout`; the HUD-wide
+  // `mainImageMargin` is needed at render time, so the blob is kept as well.
+  const [layoutDefaults, setLayoutDefaults] = useState<TagquestLayoutOverrides | null>(null);
   const [lastCardData, setLastCardData] = useState<CardData | null>(null);
   const [showCardAlert, setShowCardAlert] = useState(false);
   // Banner shown when the SportIdent reader isn't plugged in - the game
@@ -272,6 +350,15 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   // chip_id → team_id bindings from lg_clash_members (team self-register). Used
   // at play time to resolve a bipped chip to the team it joined at registration.
   const [memberTeamByChip, setMemberTeamByChip] = useState<Map<number, number>>(new Map());
+  // chip_id → the "code@time" punches that were already on that card the first
+  // time this game saw it (meta `tqbase:*`). Subtracted at scoring so an
+  // un-wiped card can't cash in a previous game's punches - without comparing
+  // any clocks. This is what replaced the pre-start time-of-day test that
+  // caused client reports 2.2/78 and 2.2/101.
+  // A ref, not state: nothing renders from this map, and a predetermined-roster
+  // chip is baselined and scored on the SAME bip - a setState would not land
+  // until the next render, so scoring would miss the snapshot it just took.
+  const baselineByChipRef = useRef<Map<number, Set<string>>>(new Map());
   // Station assignment: the meta.regAssignments map + this device's paired id.
   // When this device has an entry, the registration screen hard-locks to those
   // team_numbers (no entry ⇒ the legacy pick-any-team grid).
@@ -328,6 +415,12 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const animIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Audio for the active quest's sound, played when its full image appears.
   const questAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Audio for the scenario-level event sounds (cheating / malus / retard),
+  // one slot per meta key: replaying the SAME event cuts its previous take
+  // (a second malus punch shouldn't stack on itself) while DIFFERENT events
+  // may overlap - a read can legitimately charge a station malus and a late
+  // malus at once, and both deserve to be heard.
+  const eventAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   // Serial presentation queue. Punch animations AND status messages share it,
   // so a punch (or message) arriving while one is on screen - including during
   // the post-animation hold - waits its turn instead of overlapping, and the
@@ -386,6 +479,26 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }
   }, [animPhase, animRevealedSlots, punchAnimation]);
 
+  /**
+   * Play one of the scenario's authored event sounds (`cheating_sound`,
+   * `malus_sound`, `late_malus_sound` in game_meta). Silent when the author
+   * uploaded nothing for that slot, which is the common case - these are
+   * optional. Read from the REF so a sound fired inside an animation effect
+   * doesn't depend on the render's captured gameData.
+   */
+  const playScenarioSound = useCallback((metaKey: string) => {
+    const filename = gameDataRef.current?.game_meta?.[metaKey];
+    if (typeof filename !== 'string' || !filename) return;
+    try {
+      eventAudioRef.current.get(metaKey)?.pause();
+      const audio = new Audio(scenarioAssetUrl(gameUniqid, filename.replace(/^media\//, '')));
+      eventAudioRef.current.set(metaKey, audio);
+      void audio.play().catch((e) => console.error(`[TagQuest] ${metaKey} play error:`, e));
+    } catch (e) {
+      console.error(`[TagQuest] ${metaKey} load error:`, e);
+    }
+  }, [gameUniqid]);
+
   useEffect(() => {
     if (animPhase !== 'main') return;
     // The full (complete) quest image is now appearing. Play that quest's
@@ -423,6 +536,14 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       setAnimDisplayedCombos(fromCombos);
       setAnimDisplayedMalus(fromMalus);
       setAnimDisplayedLateMalus(fromLateMalus);
+
+      // The scenario's malus sounds fire HERE, not at punch time: this is the
+      // moment the two malus counters start climbing on screen. Punches are
+      // serialised through the presentation queue, so a punch that waits its
+      // turn would otherwise be heard long before it is seen. Each sound is
+      // tied to its own counter - a read can raise both.
+      if (toMalus > fromMalus) playScenarioSound('malus_sound');
+      if (toLateMalus > fromLateMalus) playScenarioSound('late_malus_sound');
 
       if (toScore !== fromScore || toMalus !== fromMalus || toLateMalus !== fromLateMalus) {
         const steps = 20;
@@ -514,6 +635,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       if (animTimerRef.current) clearTimeout(animTimerRef.current);
       clearAnimInterval();
       questAudioRef.current?.pause();
+      for (const audio of eventAudioRef.current.values()) audio.pause();
+      eventAudioRef.current.clear();
       // Settle a mid-animation slot so the queue chain doesn't wedge on unmount.
       animResolveRef.current?.();
       animResolveRef.current = null;
@@ -567,9 +690,23 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         }
 
         // Layout source: the bundled JSON (a hand-mirror of studio's
-        // defaultLayout.ts). Studio retired the per-game-type `layouts` table
-        // publish pipeline, so the bundled layout is the offline default here.
+        // defaultLayout.ts) as the SKELETON, plus the studio-wide geometry
+        // overrides an admin authored on the "Default layouts" page (synced as a
+        // `default_config` row). Overriding per element id rather than shipping a
+        // whole layout is what keeps an older saved blob safe: elements added to
+        // the bundle since keep their built-in geometry instead of vanishing.
         const layoutConfig = bundledTagquestLayout as unknown as GameLayout;
+        const [rawLayoutDefaults, typoDefaults] = await Promise.all([
+          translationsStore.getValue<unknown>('default_layout_tagquest').catch(() => null),
+          translationsStore.getValue<unknown>('default_typography_tagquest').catch(() => null),
+        ]);
+        setTypographyDefaults(readTagquestTypography(typoDefaults));
+        const resolvedLayoutDefaults = readTagquestLayoutOverrides(rawLayoutDefaults);
+        setLayoutDefaults(resolvedLayoutDefaults);
+        const layoutElements = applyTagquestLayoutOverrides(
+          layoutConfig.elements ?? [],
+          resolvedLayoutDefaults,
+        );
 
         // Leave element.filename as-is - sentinel filenames (`@template`,
         // `@background`, `@malus_image`, `@quest_main_image_N`) are resolved
@@ -578,7 +715,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         setLayout({
           ...layoutConfig,
           background: layoutConfig.background || '@background',
-          elements: layoutConfig.elements || [],
+          elements: layoutElements,
         });
       } catch (error) {
         console.error('Error loading game data:', error);
@@ -916,6 +1053,104 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     return () => { cancelled = true; };
   }, [launchedGameId, phase, selfRegister, playMode]);
 
+  // ── Play time: load the per-chip baselines (meta `tqbase:*`) so punches that
+  // were already on a card the first time it was seen never score. Loaded for
+  // EVERY game, not just self-register: predetermined rosters have no
+  // registration bip, so they take their baseline on a chip's first read
+  // instead (see `snapshotFirstReadBaseline`), and they need the same map. ────
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'playing') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const map = await getLaunchedGameMeta(launchedGameId);
+        // An empty map is a failed-open read (wrong LAN route), not "no
+        // baselines" - keep whatever we already have rather than clearing it.
+        if (cancelled || Object.keys(map).length === 0) return;
+        baselineByChipRef.current = parseBaselineMeta(map);
+      } catch (err) {
+        console.error('[TagQuest] load registration baselines failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [launchedGameId, phase]);
+
+  // Snapshot whatever is already on a card at its registration bip, so a card
+  // the player forgot to wipe cannot score its old punches. Clock-agnostic, and
+  // the reason the pre-start time-of-day test no longer has to carry that job
+  // alone. One meta key per chip + an atomic patch, because several
+  // registration stations write these at the same time.
+  const snapshotRegistrationBaseline = useCallback(async (card: CardData) => {
+    if (!launchedGameId) return;
+    const ids = baselineIdsFromCard(card);
+    try {
+      // Nothing on the card ⇒ clear any stale key from an earlier registration
+      // of the same chip (it was re-wiped between the two bips).
+      await patchLaunchedGameMeta(launchedGameId, {
+        [baselineMetaKey(card.id)]: ids.length > 0 ? JSON.stringify(ids) : null,
+      });
+      // Written synchronously: on the predetermined-roster path this same bip
+      // goes straight on to scoring, which reads this map.
+      const next = new Map(baselineByChipRef.current);
+      if (ids.length > 0) next.set(card.id, new Set(ids));
+      else next.delete(card.id);
+      baselineByChipRef.current = next;
+      if (ids.length > 0) {
+        console.warn(
+          `[TagQuest] chip ${card.id} was not empty when first seen: ${ids.length} pre-existing punch(es) will be ignored`,
+        );
+      }
+    } catch (err) {
+      console.error('[TagQuest] baseline snapshot failed:', err);
+    }
+  }, [launchedGameId]);
+
+  // Punches found on a chip the first time a predetermined-roster game saw it,
+  // waiting to be reported once. Consumed by `reportIgnoredPunches`, which runs
+  // in the always-fresh handleCardPunchLogic (saveCardData is a stale closure
+  // and cannot reach showMessage).
+  const pendingNotWipedRef = useRef(0);
+
+  // Predetermined rosters never bip a card before play - `init` above
+  // auto-starts the game and stamps start_time on mount - so there is NO moment
+  // at which we can honestly say "everything on this card is from a previous
+  // session". The player's first trip out and back arrives on that very first
+  // bip.
+  //
+  // So we do NOT baseline here. Baselining the first read would swallow a real
+  // trip, which is the exact failure mode of the bug this whole change exists
+  // to fix (a punch on the card that doesn't count). We warn instead: the
+  // operator is told the card wasn't wiped, on the one read where that is still
+  // worth knowing, and the punches are scored.
+  //
+  // The residual risk is a genuinely un-wiped card cashing in a previous game's
+  // punches. That is a fairness problem, and a visible one; losing a real trip
+  // is a blocker. See the memory note for the two ways to close it properly (a
+  // cross-game "last seen" baseline, or a pre-play chip check).
+  //
+  // "First time" is game-WIDE, not device-wide: `raw_data_for_chip` asks the
+  // mother. Must run BEFORE `recordPunch` writes this read's own row.
+  const noteIfCardNotWiped = useCallback(async (card: CardData): Promise<void> => {
+    if (!launchedGameId) return;
+    // Self-register games have a real registration bip and baseline there.
+    if (selfRegister) return;
+    if (card.punches.length === 0) return;
+    try {
+      const prior = await getRawDataForChip(launchedGameId, card.id, 1);
+      if (prior.length > 0) return;
+      pendingNotWipedRef.current = card.punches.length;
+      console.warn(
+        `[TagQuest] chip ${card.id} was not wiped: ${card.punches.length} punch(es) were already on it the first ` +
+          'time this game saw it. They are being COUNTED - a predetermined roster has no pre-play bip to tell them ' +
+          'apart from the player\'s first trip. Wipe cards before handing them out.',
+      );
+    } catch (err) {
+      console.error('[TagQuest] not-wiped check failed:', err);
+    }
+  }, [launchedGameId, selfRegister]);
+  const noteIfCardNotWipedRef = useRef(noteIfCardNotWiped);
+  useEffect(() => { noteIfCardNotWipedRef.current = noteIfCardNotWiped; });
+
   // Reader bip during registration: bind the chip to the station's selected
   // team (team mode, reuses clash_register) or enrol the chip as its own team
   // (solo mode). Play-time bips go through saveCardData instead - the reader
@@ -932,6 +1167,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         // would lag one bip behind), then hop the station's selection to the
         // next team with room when this bip filled the team - or when the
         // team had already filled from another station (clan_full race).
+        if (res.status === 'ok') await snapshotRegistrationBaseline(card);
         if (res.status === 'ok' || res.status === 'clan_full') {
           const rows = regTeamsRef.current.map((t) =>
             t.team_id === teamId ? { ...t, member_count: res.member_count } : t,
@@ -958,12 +1194,15 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           return;
         }
         const created = await ensureTeamForCard(launchedGameId, card.id, state);
-        if (created) setLastJoin({ teamId: created.id, status: 'ok', nonce: Date.now() });
+        if (created) {
+          await snapshotRegistrationBaseline(card);
+          setLastJoin({ teamId: created.id, status: 'ok', nonce: Date.now() });
+        }
       } catch (err) {
         console.error('[TagQuest] solo enrol failed:', err);
       }
     }
-  }, [launchedGameId, maxPerTeam]);
+  }, [launchedGameId, maxPerTeam, snapshotRegistrationBaseline]);
   const handleRegisterCardRef = useRef(handleRegisterCard);
   useEffect(() => { handleRegisterCardRef.current = handleRegisterCard; });
 
@@ -999,6 +1238,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const saveCardData = async (card: CardData) => {
     if (!launchedGameId) return;
     try {
+      // Before recordPunch writes this read's own raw_data row: note (do not
+      // filter) a card that arrives un-wiped the first time this game sees it.
+      // No-op for a properly wiped card and for self-register games.
+      await noteIfCardNotWipedRef.current(card);
       const rawDataJson = JSON.parse(JSON.stringify(card));
       // Server resolves device_id from the JWT (slice 1's auth_tokens.device_id);
       // no need to send it from the client.
@@ -1027,6 +1270,19 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     gameData?.game_meta?.font as string | undefined,
   );
 
+  // Per-role HUD text size + colour authored in Studio (retours #1/#2). Resolved
+  // through the shared helper that the Studio preview also uses, so what the
+  // author validated in the preview is what the projector draws. Absent on
+  // every scenario authored before the feature → the layout's own values.
+  const tagquestTypography = useMemo(
+    () =>
+      mergeTagquestTypography(
+        typographyDefaults ?? undefined,
+        readTagquestTypography(gameData?.game_meta?.tagquest_typography),
+      ),
+    [typographyDefaults, gameData?.game_meta?.tagquest_typography],
+  );
+
   // Enqueue a punch animation onto the shared serial queue. The slot's run wraps
   // the existing state-machine: it stores a resolver, then sets punchAnimation
   // (kicking the idle→enter effect). The queue runs one slot at a time, so the
@@ -1039,6 +1295,51 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       setPunchAnimation(data);
     }));
   }, [queue.enqueue]);
+
+  // Operator-facing note about punches this read deliberately ignored, and
+  // about a card that can hold no more. Both are silent-failure modes: the
+  // player sees a slot that just says "false", or punches that never landed at
+  // all. Kept out of the `status !== 'ok'` branch below because a perfectly
+  // successful read can still ignore punches.
+  const reportIgnoredPunches = (result: {
+    status: string;
+    dropped_punches?: Array<{ code: number; reason: string }>;
+    card_full?: boolean;
+    team_name?: string;
+  }) => {
+    const lang = config.language || gameData?.default_language || 'fr';
+    if (result.card_full) {
+      showMessage(localizedStatus('card_full', lang), undefined, 'warning', result.team_name ?? null);
+    }
+    // Predetermined roster, chip seen for the first time carrying punches. They
+    // ARE scored (we cannot tell them from the player's first trip) - this tells
+    // the operator to wipe cards, it does not report a rejection.
+    if (pendingNotWipedRef.current > 0) {
+      const n = pendingNotWipedRef.current;
+      pendingNotWipedRef.current = 0;
+      showMessage(
+        `${localizedStatus('card_not_wiped', lang)} (${n})`,
+        undefined,
+        'warning',
+        result.team_name ?? null,
+      );
+    }
+    // When the read failed *because* of this, the status message below already
+    // says so - don't say it twice.
+    if (result.status === 'punches_not_wiped') return;
+    const notWiped = (result.dropped_punches ?? []).filter((d) => d.reason === 'baseline');
+    if (notWiped.length === 0) return;
+    // Station codes are si_balises ids (the same space the pattern uses), which
+    // is what the operator needs to match against the studio's picker - not the
+    // "balise 23" label printed on the box.
+    const stations = [...new Set(notWiped.map((d) => d.code))].join(', ');
+    showMessage(
+      `${localizedStatus('punches_not_wiped', lang)} — ${notWiped.length} (${stations})`,
+      undefined,
+      'warning',
+      result.team_name ?? null,
+    );
+  };
 
   const handleCardPunchLogic = async (card: CardData) => {
     if (!launchedGameId) return;
@@ -1054,6 +1355,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       // Team self-register: resolve a bipped chip to the team it joined at
       // registration (empty for predetermined rosters / solo).
       memberTeamByChip,
+      // Punches already on each card the first time this game saw it - never
+      // scored. The REF, not the state: a predetermined-roster chip is
+      // baselined moments earlier in this same bip (snapshotFirstReadBaseline),
+      // and the state copy would not have landed yet.
+      baselineByChipRef.current,
     );
 
     await logApiCall({
@@ -1070,6 +1376,16 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     // logApiCall above. If we want a dedicated response audit log later, add
     // an endpoint then re-enable a write here.
 
+    // A read can succeed and still have ignored punches - and an ignored punch
+    // draws its quest slot as unmatched, exactly like one that was never made.
+    // That silence is what let report 2.2/101 run for a whole morning, so say
+    // which stations were ignored and why, on success and failure alike.
+    reportIgnoredPunches(result);
+
+    // Player-facing punch feedback: the game's launch language, like every
+    // other in-game string (falls back to the scenario's default language).
+    const lang = config.language || gameData?.default_language || 'fr';
+
     if (result.status === 'ok') {
       if (result.animationData) {
         // Queue + play through the shared serial queue. If an animation/message
@@ -1077,17 +1393,46 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         // shows in the bottom line - instead of clobbering the current one.
         enqueueAnimation(result.animationData);
       } else if (result.game_ended) {
-        showMessage(`${result.team_name} - Game finished!`, undefined, 'success', result.team_name);
+        showMessage(
+          tIngame('ingame_tagquest', 'msg_game_finished', lang, { team: result.team_name }),
+          undefined,
+          'success',
+          result.team_name,
+        );
       } else if (result.completed_quest) {
-        const mainMsg = `${result.team_name} - ${result.completed_quest.name} complete! +${result.completed_quest.points} pts${result.malus_applied > 0 ? ` (−${result.malus_applied} late malus)` : ''}`;
-        const levelPart = result.level_up ? `Level up: ${result.level_up.name}!` : undefined;
+        const mainMsg = tIngame(
+          'ingame_tagquest',
+          result.malus_applied > 0 ? 'msg_quest_complete_malus' : 'msg_quest_complete',
+          lang,
+          {
+            team: result.team_name,
+            quest: result.completed_quest.name,
+            points: result.completed_quest.points,
+            malus: result.malus_applied,
+          },
+        );
+        const levelPart = result.level_up
+          ? tIngame('ingame_tagquest', 'msg_level_up_short', lang, { level: result.level_up.name })
+          : undefined;
         showMessage(mainMsg, levelPart, 'success', result.team_name);
       } else if (result.level_up) {
-        showMessage(`${result.team_name} - Level up: ${result.level_up.name}!`, undefined, 'success', result.team_name);
+        showMessage(
+          tIngame('ingame_tagquest', 'msg_level_up', lang, {
+            team: result.team_name,
+            level: result.level_up.name,
+          }),
+          undefined,
+          'success',
+          result.team_name,
+        );
       } else if (result.best_partial_quest) {
         // Partial progress - neutral info (not a completion).
         showMessage(
-          `${result.team_name} - ${result.best_partial_quest.name}: ${result.best_partial_quest.matched} image(s) found`,
+          tIngame('ingame_tagquest', 'msg_partial_quest', lang, {
+            team: result.team_name,
+            quest: result.best_partial_quest.name,
+            count: result.best_partial_quest.matched,
+          }),
           undefined,
           'info',
           result.team_name,
@@ -1095,6 +1440,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       }
       loadTeams();
     } else {
+      // A caught cheat is the one rejection with an authored sound: it is shown
+      // to the room, so it is also heard. Played at rejection time - a rejected
+      // punch draws no animation to sync with.
+      if (result.status === 'cheat_detected') playScenarioSound('cheating_sound');
       // Surface every non-ok outcome (unknown card, cheat, team already
       // finished, error) on screen so a detected bip is never silently dropped.
       const lang = config.language || gameData?.default_language || 'fr';
@@ -1383,7 +1732,19 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         const gridCols = slots.length > 0 && slots.length <= 2 ? slots.length : 2;
         const gridRows = Math.max(1, Math.ceil(Math.max(slots.length, 1) / gridCols));
         const cellPx = boxW != null && boxH != null ? Math.min(boxW / gridCols, boxH / gridRows) : null;
-        const mainPx = boxW != null && boxH != null ? Math.min(boxW, boxH) : null;
+        // Inner margin for the COMPLETED image only (admin "Default layouts"):
+        // the green/red status colour is a drop-shadow glow hugging the artwork's
+        // alpha, and on artwork that fills its square it bled past the box onto
+        // the template frame. The slot grid is left alone - its cells are a
+        // fitted grid whose quadrants are authored to meet in the middle.
+        const mainInset =
+          boxW != null && boxH != null
+            ? tagquestMainImageInsetPx(layoutDefaults ?? undefined, boxW, boxH)
+            : 0;
+        const mainPx =
+          boxW != null && boxH != null
+            ? Math.max(1, Math.min(boxW, boxH) - 2 * mainInset)
+            : null;
 
         return (
           <div
@@ -1404,16 +1765,29 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                     transform: 'translate(-50%, -50%)',
                     width: mainPx != null ? `${mainPx}px` : '100%',
                     height: mainPx != null ? `${mainPx}px` : '100%',
-                    borderRadius: '8px',
-                    overflow: 'hidden',
-                    border: '2px solid rgba(74,222,128,0.6)',
-                    boxShadow: '0 0 32px rgba(74,222,128,0.3)',
+                    // No frame of any kind around the completed image (#100): the
+                    // green border + glow are gone, and nothing clips the box -
+                    // `overflow: hidden` would cut the halo off at the edges.
                     opacity: showMain ? 1 : 0,
                     transition: 'opacity 0.5s ease',
                     zIndex: 2,
                   }}
                 >
-                  <img src={mainSrc} alt={quest.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                  {/* `contain`, not `cover`: the box is square while the artwork
+                      usually isn't, and cropping it lost the edges of every
+                      non-square visual. The halo then lifts it off the backdrop
+                      without drawing a rectangle (#61). */}
+                  <img
+                    src={mainSrc}
+                    alt={quest.name}
+                    style={{
+                      width: '100%',
+                      height: '100%',
+                      objectFit: 'contain',
+                      display: 'block',
+                      filter: artHalo(),
+                    }}
+                  />
                   {config.colorblindMode && (
                     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.15)' }}>
                       <div style={{ background: 'rgba(74,222,128,0.9)', borderRadius: '50%', width: '20%', height: 'auto', aspectRatio: '1', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -1439,10 +1813,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                         key={slot.key}
                         style={{
                           position: 'relative',
-                          overflow: 'hidden',
                           // Square cell (the fixed cellPx grid already is; the
-                          // fluid fallback enforces it per cell). No background -
-                          // the artwork sits directly on the scenario backdrop.
+                          // fluid fallback enforces it per cell). Nothing clips
+                          // it: `overflow: hidden` would cut the halo off, and
+                          // `contain` already insets the artwork so neighbouring
+                          // halos don't run into each other.
                           ...(cellPx == null ? { aspectRatio: '1 / 1' } : {}),
                           // Ghost preview: unrevealed slots show dimmed unless the
                           // launch disabled it (adult audiences) - then they stay
@@ -1453,12 +1828,41 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                         }}
                       >
                         {slot.src ? (
-                          <img src={slot.src} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', filter: revealed && !slot.matched ? 'grayscale(60%) brightness(0.5)' : 'none', transition: 'filter 0.3s ease' }} />
+                          <img
+                            src={slot.src}
+                            alt=""
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              // `contain` like the completed image: these are
+                              // icons, and cropping them to a square cut their
+                              // edges off (#61).
+                              objectFit: 'contain',
+                              // Each piece is a quadrant of the main image, so a
+                              // piece that doesn't fill its square cell is pulled
+                              // towards the CENTRE of the 2×2 block - the four
+                              // quadrants meet there instead of drifting apart
+                              // (#9). No effect on artwork that fills its cell.
+                              objectPosition:
+                                slots.length === 4 && gridCols === 2
+                                  ? QUEST_PIECE_POSITION[si]
+                                  : 'center',
+                              display: 'block',
+                              // Dimming first, halo last: filters apply in order,
+                              // so putting the halo after grayscale/brightness
+                              // keeps the ring at full strength on a dimmed icon.
+                              filter: [
+                                revealed && !slot.matched ? 'grayscale(60%) brightness(0.5)' : '',
+                                artHalo(revealed ? (slot.matched ? 'matched' : 'missed') : 'neutral'),
+                              ].filter(Boolean).join(' '),
+                              transition: 'filter 0.3s ease',
+                            }}
+                          />
                         ) : (
                           <div style={{ width: '100%', height: '100%' }} />
                         )}
                         {revealed && (
-                          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: slot.matched ? 'rgba(74,222,128,0.12)' : 'rgba(248,113,113,0.18)' }}>
+                          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                             {config.colorblindMode && (
                               <div style={{ background: slot.matched ? 'rgba(74,222,128,0.85)' : 'rgba(248,113,113,0.85)', borderRadius: '50%', width: '30%', aspectRatio: '1', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }}>
                                 {slot.matched
@@ -1525,8 +1929,9 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     const isTeamName = elementId === 'team_name_text';
     const isTimer = elementId.includes('timer') || elementId.includes('countdown');
 
-    // fontSize is a fixed pixel value defined in defaultLayout.ts - no
-    // adaptive scaling. The author tunes it directly against the artwork.
+    // fontSize comes from defaultLayout.json, authored against a 1920-wide
+    // stage, then scaled to the real stage and multiplied by the author's
+    // per-role percentage (see resolveTagquestTextStyle in the text branch).
 
     const questIndexForElement = (() => {
       const m = elementId.match(/quest_(\d+)_/);
@@ -1569,7 +1974,26 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }
 
     switch (element.type) {
-      case 'image':
+      case 'image': {
+        // Retours #4 - an element authored with an `auto` dimension (the two
+        // malus icons: fixed height, width from the artwork's own ratio) must
+        // NOT go through a wrapper. The wrapper would have no definite width
+        // while the <img> asks for `width: 100%` of it, so the box shrink-fits
+        // to the image's intrinsic width and `contain` letterboxes the icon
+        // tiny in the middle of it. Positioning the <img> itself lets the
+        // absolutely-positioned replaced element derive the missing side from
+        // its aspect ratio, which is what 'auto' was authored to mean.
+        const hasAutoDim = typeof element.width === 'string' || typeof element.height === 'string';
+        if (hasAutoDim) {
+          return (
+            <img
+              key={`${element.id}-${index}`}
+              src={imageSrc || ''}
+              alt={element.id}
+              style={{ ...wrapperStyle, display: imageVisible ? 'block' : 'none', objectFit: 'contain' }}
+            />
+          );
+        }
         return (
           <div key={`${element.id}-${index}`} style={{ ...wrapperStyle, display: imageVisible ? 'block' : 'none' }}>
             <img
@@ -1579,6 +2003,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
             />
           </div>
         );
+      }
       case 'text': {
         let displayText: string | number | undefined;
         let showElement = false;
@@ -1604,9 +2029,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           displayText = isAnimating ? animDisplayedScore : lastKnownScore;
         } else if (adminLabelKey) {
           // Admin-managed HUD label (score/malus/late_malus/combo_points).
-          // Tracks the values' visibility so labels hide together with their
-          // numbers. Language defaults to fr unless the scenario carries one.
-          showElement = valuesShow;
+          // Always visible: the labels frame the board from the start, only
+          // their numbers appear on a punch. Language defaults to fr unless
+          // the scenario carries one.
+          showElement = true;
           const lang = gameData?.default_language || 'fr';
           displayText = tIngame('ingame_tagquest', adminLabelKey, lang);
         } else if (isActiveQuestName) {
@@ -1669,6 +2095,14 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           displayText = element.text ?? element.previewText;
         }
 
+        // The author's per-role size percentage + colour (#1/#2) applied on top
+        // of the element's authored values, before the stage scaling below.
+        const styled = resolveTagquestTextStyle(
+          element.id ?? '',
+          tagquestTypography,
+          element.fontSize,
+          element.color,
+        );
         return (
           <div key={`${element.id}-${index}`} style={{ ...wrapperStyle, display: showElement ? (wrapperStyle.display ?? 'block') : 'none' }}>
             <div
@@ -1678,10 +2112,14 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 // fontSize in defaultLayout.json is authored against a 1920-wide
                 // canonical stage. Scale to the actual stage so the text keeps
                 // its proportion against the template artwork at any size.
-                fontSize: element.fontSize !== undefined
-                  ? `${element.fontSize * (bgDimensions.width / 1920)}px`
+                fontSize: styled.fontSize !== undefined
+                  ? `${styled.fontSize * (bgDimensions.width / 1920)}px`
                   : undefined,
-                color: isOvertimeTimer ? '#ef4444' : element.color,
+                color: isOvertimeTimer ? '#ef4444' : styled.color,
+                // The author's plate behind this role, absent on every role by
+                // default (the template artwork carries the plaques). Mainly for
+                // the centre quest name, which floats free on the artwork.
+                background: styled.background,
                 fontFamily: scenarioFontFamily || element.fontFamily,
                 display: 'flex',
                 alignItems: 'center',
@@ -1743,6 +2181,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         lastJoin={lastJoin}
         backgroundUrl={regBackgroundUrl}
         restricted={playMode === 'team' && assignedTeamNumbers != null}
+        language={config.language || gameData?.default_language || 'fr'}
       />
     );
   }
@@ -1750,7 +2189,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   if (!gameData || layoutLoading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
-        <div className="text-white text-xl">Loading game data...</div>
+        <div className="text-white text-xl">{tr('loadingGameData')}</div>
       </div>
     );
   }
@@ -1807,7 +2246,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           fontFamily={scenarioFontFamily || undefined}
         />
 
-        <PendingTeamsBar labels={queue.pending} fontFamily={scenarioFontFamily || undefined} />
+        <PendingTeamsBar labels={queue.pending} lang={config.language ?? ''} fontFamily={scenarioFontFamily || undefined} />
 
         {/* Dev-only punch/hardware debug indicator - removed from production builds. */}
         {import.meta.env.DEV && (
@@ -1904,31 +2343,29 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         fontFamily={scenarioFontFamily || undefined}
       />
 
-      <PendingTeamsBar labels={queue.pending} fontFamily={scenarioFontFamily || undefined} />
+      <PendingTeamsBar labels={queue.pending} lang={config.language ?? ''} fontFamily={scenarioFontFamily || undefined} />
 
       <button
         onClick={onBack}
         className="text-white/70 hover:text-white transition-colors flex items-center gap-2 mb-6"
       >
         <ArrowLeft className="w-5 h-5" />
-        Back
+        {tr('back')}
       </button>
 
       <div className="max-w-6xl mx-auto">
         {config.testMode && (
-          <div className="flex items-center justify-center gap-3 mb-6 px-4 py-3 bg-amber-500/20 border border-amber-500/50 rounded-lg">
-            <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-            <span className="text-amber-400 font-semibold text-sm tracking-wide uppercase">Test Mode - Max 5 Teams</span>
-            <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          <div className="flex items-center justify-center gap-3 mb-6 px-4 py-3 bg-amber-400 border-2 border-amber-200 rounded-lg shadow-lg">
+            <div className="w-2 h-2 rounded-full bg-black/70 animate-pulse" />
+            <span className="font-sans text-black font-bold text-sm tracking-wide uppercase">{tr('testMode')}</span>
+            <div className="w-2 h-2 rounded-full bg-black/70 animate-pulse" />
           </div>
         )}
 
         {usbReaderService.isAvailable() && !detectedReader.isPresent && (
-          <div className="flex items-center justify-center gap-3 mb-6 px-4 py-3 bg-orange-500/20 border border-orange-500/50 rounded-lg">
-            <div className="w-2 h-2 rounded-full bg-orange-400 animate-pulse" />
-            <span className="text-orange-300 text-sm">
-              Reader not connected - waiting for SportIdent dongle. The game will autobind when you plug it in.
-            </span>
+          <div className="flex items-center justify-center gap-3 mb-6 px-4 py-3 bg-orange-600 border-2 border-orange-300 rounded-lg shadow-lg">
+            <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
+            <span className="font-sans normal-case tracking-normal text-white font-semibold text-sm">{tr('readerNotConnected')}</span>
           </div>
         )}
 
@@ -1949,20 +2386,20 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           <div className="flex items-center justify-between text-white mb-4">
             <div className="flex items-center gap-3">
               <Trophy className="w-6 h-6" />
-              <h2 className="text-2xl font-bold">Leaderboard</h2>
+              <h2 className="text-2xl font-bold">{tr('leaderboard')}</h2>
             </div>
             <span className={`text-xs font-semibold px-3 py-1 rounded-full ${
               victoryType === 'speed'
                 ? 'bg-orange-500/20 text-orange-400 border border-orange-500/40'
                 : 'bg-blue-500/20 text-blue-400 border border-blue-500/40'
             }`}>
-              {victoryType === 'speed' ? 'Rapidite' : 'Score'}
+              {victoryType === 'speed' ? tr('speed') : tr('score')}
             </span>
           </div>
 
           <div className="space-y-3">
             {teams.length === 0 ? (
-              <p className="text-white/60 text-center py-8">No teams have started yet</p>
+              <p className="text-white/60 text-center py-8">{tr('noTeamsStarted')}</p>
             ) : (
               teams.map((team, index) => {
                 const configTeam = teamsConfig.find(
@@ -1994,11 +2431,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                           <div className="text-white font-semibold text-lg">{team.team_name}</div>
                           <div className="text-white/60 text-sm">
                             {team.start_time && team.end_time ? (
-                              <>Finished &mdash; {formatTime(team.end_time - team.start_time)}</>
+                              <>{tr('statusFinished')} &mdash; {formatTime(team.end_time - team.start_time)}</>
                             ) : team.start_time ? (
-                              <>In progress...</>
+                              <>{tr('statusInProgress')}</>
                             ) : (
-                              <>Not started</>
+                              <>{tr('statusNotStarted')}</>
                             )}
                           </div>
                         </div>
@@ -2037,7 +2474,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                     {teammates.length === 0 && regMemberCount > 0 && (
                       <div className="mt-3 pt-3 border-t border-white/10 flex items-center gap-1.5 text-xs text-white/70">
                         <Users size={12} />
-                        {regMemberCount} {regMemberCount === 1 ? 'player' : 'players'}
+                        {tr('playersCount', { count: regMemberCount })}
                       </div>
                     )}
                   </div>
@@ -2048,11 +2485,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         </div>
 
         <div className="bg-yellow-600/20 border border-yellow-600 text-yellow-100 p-4 rounded-lg">
-          <p className="font-semibold mb-2">No Layout Found</p>
-          <p className="text-sm">
-            To display the custom game layout, please upload a TagQuest layout file or sync with the server.
-            Currently showing the default leaderboard view.
-          </p>
+          <p className="font-semibold mb-2">{tr('noLayoutTitle')}</p>
+          <p className="text-sm">{tr('noLayoutBody')}</p>
         </div>
       </div>
 

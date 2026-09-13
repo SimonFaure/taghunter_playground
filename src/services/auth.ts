@@ -16,6 +16,7 @@ import {
 } from './authStore';
 import { wipeAllContent } from './contentFs';
 import { clearPin, setPin as savePin } from './pinStore';
+import { tError } from '../i18n/errors';
 
 export type LoginOutcome =
   | { kind: 'success'; authUser: AuthUser }
@@ -163,7 +164,7 @@ export async function verifyOtp(email: string, code: string): Promise<LoginOutco
   });
 
   const user = await getAuthUser();
-  if (!user) throw new Error('Failed to persist auth user after login');
+  if (!user) throw new Error(tError('authPersistFailed'));
   return { kind: 'success', authUser: user };
 }
 
@@ -200,7 +201,7 @@ export async function evictAndVerify(
   });
 
   const user = await getAuthUser();
-  if (!user) throw new Error('Failed to persist auth user after eviction-login');
+  if (!user) throw new Error(tError('authPersistFailedEviction'));
   return user;
 }
 
@@ -288,7 +289,7 @@ export async function signOutOfThisDevice(): Promise<void> {
 export async function requestPinResetOtp(): Promise<void> {
   const user = await getAuthUser();
   if (!user?.email) {
-    throw new Error('No cached account on this device - cannot reset PIN.');
+    throw new Error(tError('noCachedAccount'));
   }
   await requestOtp(user.email);
 }
@@ -296,7 +297,7 @@ export async function requestPinResetOtp(): Promise<void> {
 export async function verifyPinResetOtpAndSet(code: string, newPin: string): Promise<void> {
   const user = await getAuthUser();
   if (!user?.email) {
-    throw new Error('No cached account on this device - cannot reset PIN.');
+    throw new Error(tError('noCachedAccount'));
   }
 
   // Re-run the standard verify-code endpoint. The server treats this as a
@@ -336,7 +337,7 @@ export async function verifyPinResetOtpAndSet(code: string, newPin: string): Pro
     // the admin revoked us between cold-start and Forgot-PIN. Surface a
     // distinct error so the caller can decide whether to route to the full
     // CapReachedDialog or just message the user.
-    throw new Error('Device cap reached - sign out via Settings and log in again.');
+    throw new Error(tError('deviceCapReached'));
   }
 
   // Refresh the JWT + auth_user from the server (the new token replaces the

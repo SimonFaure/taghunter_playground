@@ -10,6 +10,7 @@
 import type { GameConfig, Team, Teammate, LaunchDeviceSelection } from '../components/LaunchGameModal';
 import { listPairedDevicesForLaunch, listBusyDeviceIds } from './launchedGames';
 import { isOperatorOnly } from './operatorMode';
+import { tError } from '../i18n/errors';
 
 // The saved-config shape: step-1 settings without the per-instance name/teams.
 export type ResolvableConfig = Omit<GameConfig, 'name' | 'teams'>;
@@ -292,14 +293,14 @@ export function validateForHeadless(config: ResolvableConfig, world: HeadlessWor
   const gt = world.gameTypeName.toLowerCase();
 
   if (!world.scenarioDownloaded) {
-    critical.push("This scenario isn't downloaded yet - open the full launch screen to sync it.");
+    critical.push(tError('scenarioNotDownloaded'));
   }
 
   // Pattern: missing entirely is critical; a stale id falls back to the
   // scenario/type default (NOT blindly the first - a wrong pattern silently
   // breaks scoring since no station ever matches).
   if (world.patterns.length === 0) {
-    critical.push('No pattern is available for this scenario.');
+    critical.push(tError('noPatternAvailable'));
   } else if (!world.patterns.some((p) => p.uniqid === config.pattern)) {
     resolved.pattern = resolveDefaultPattern(world.patterns, world.scenarioDefaultPatternId);
   }

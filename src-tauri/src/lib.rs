@@ -105,6 +105,7 @@ pub fn run() {
             lan_server::mother_server_status,
             lan_server::mother_get_server_info,
             lan_server::become_mother,
+            lan_server::apply_mother_snapshot,
             lan_server::get_takeover_target,
             lan_server::fetch_snapshot_from_mother,
             lan_server::get_self_peer_secret,
@@ -117,6 +118,7 @@ pub fn run() {
             lan_server::client_get_device_identity,
             lan_server::client_discover_mothers,
             lan_server::client_probe_mother,
+            lan_server::client_verify_mother_candidate,
             lan_server::client_pair_with_mother,
             lan_server::client_refresh_mother_endpoints,
             lan_server::client_resolve_mother_link,
@@ -1154,6 +1156,28 @@ fn playground_migrations() -> Vec<Migration> {
                 CREATE INDEX IF NOT EXISTS idx_lgcp_game ON lg_clash_purges(launched_game_id);
 
                 UPDATE schema_meta SET value = '32' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 33,
+            description: "operator-uploaded tutorial video, local to this device",
+            sql: r#"
+                -- A tutorial video the operator imported from Settings > Videos.
+                -- It lives OUTSIDE media/game_types/ (in media/local_game_types/)
+                -- precisely so the sync orchestrator's tombstone sweeps, which
+                -- wipe media/game_types/<code>, can never delete it. It is local
+                -- to this device: it is never uploaded to studio and never
+                -- reaches satellites. resolveTutorialVideoUrl checks it FIRST,
+                -- ahead of the studio client override and the Tag Hunter default.
+                CREATE TABLE IF NOT EXISTS local_game_type_videos (
+                    game_type_code TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                UPDATE schema_meta SET value = '33' WHERE key = 'version';
             "#,
             kind: MigrationKind::Up,
         },

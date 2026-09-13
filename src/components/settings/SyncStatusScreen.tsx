@@ -14,6 +14,7 @@ import {
   Circle,
   Clock,
   ShieldCheck,
+  Film,
 } from 'lucide-react';
 import { getState, runCycleNow } from '../../services/syncOrchestrator';
 import { on } from '../../services/syncEvents';
@@ -46,9 +47,11 @@ export function SyncStatusScreen() {
   const [counts, setCounts] = useState<ContentCounts | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [failures, setFailures] = useState<SyncFailureRow[]>([]);
+  const [partial, setPartial] = useState<scenarioStore.ScenarioRow[]>([]);
 
   const refreshFailures = async () => {
     setFailures(await listCurrentFailures());
+    setPartial(await scenarioStore.listPartiallyReady().catch(() => []));
   };
 
   const refreshCounts = async () => {
@@ -235,6 +238,8 @@ export function SyncStatusScreen() {
         <FailedItemsPanel failures={failures} onRetry={handleSync} retrying={inFlight} />
       )}
 
+      {partial.length > 0 && <PartiallyReadyPanel scenarios={partial} />}
+
       {log.entries.length > 0 && (
         <ActivityLog log={log} inFlight={inFlight} />
       )}
@@ -342,6 +347,37 @@ function FailedItemsPanel({
         {failures.map((f) => (
           <li key={f.item_key}>
             <FailedItemRow row={f} />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// Scenarios that were committed with a video still missing (commitPartialManifest).
+// They ARE launchable - everything but the video is on disk - so this is an
+// informational note, not a failure: without it an operator would just find the
+// intro greyed out with no explanation.
+function PartiallyReadyPanel({ scenarios }: { scenarios: scenarioStore.ScenarioRow[] }) {
+  const { t } = useTranslation();
+  return (
+    <div className="pg-panel space-y-3">
+      <div className="flex items-center gap-2 text-sm text-[var(--pg-text)]">
+        <Film className="w-4 h-4 text-[var(--pg-text-dim)]" />
+        <span className="font-medium">{t('sync:partiallyReadyTitle')}</span>
+        <span className="text-[var(--pg-text-dim)]">({scenarios.length})</span>
+      </div>
+      <div className="text-xs text-[var(--pg-text-dim)]">{t('sync:partiallyReadyHint')}</div>
+      <ul className="space-y-2">
+        {scenarios.map((s) => (
+          <li
+            key={s.uniqid}
+            className="rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] p-3"
+          >
+            <div className="truncate text-sm text-[var(--pg-text)]">{s.title}</div>
+            <div className="mt-0.5 text-xs text-[var(--pg-text-dim)]">
+              {t('sync:partiallyReadyRow')}
+            </div>
           </li>
         ))}
       </ul>

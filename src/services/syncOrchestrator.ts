@@ -77,10 +77,35 @@ const DEBOUNCE_MS = 60_000;
 const TIMER_MS = 30 * 60 * 1000;
 const FOREGROUND_THRESHOLD_MS = 5 * 60 * 1000;
 const POOL_SIZE = 3;
-// Defense-in-depth wall-clock cap on a single cycle. Per-request timeouts in
-// api.ts should already bound every call; this is the backstop guaranteeing
-// runCycle() always terminates even if a future path forgets a timeout.
-const CYCLE_HARD_CAP_MS = 10 * 60 * 1000;
+// Defense-in-depth cap on a single cycle. Per-request timeouts in api.ts should
+// already bound every call; this is the backstop guaranteeing runCycle() always
+// terminates even if a future path forgets a timeout.
+//
+// It is deliberately an IDLE cap, not a wall-clock one. A flat wall-clock cap
+// (it used to be 10 minutes) killed cycles that were downloading perfectly
+// well: a scenario carrying a few 100-200 MB videos, split three ways by the
+// worker pool, simply needs longer than that. Because there is no resume
+// (streamBinary truncates, and the studio's get_media ignores Range), the next
+// cycle restarted those videos from byte 0 and was cut off at the same point -
+// a livelock in which heavy videos could never land and their scenario was
+// never committed. Mirrors DOWNLOAD_STALL_TIMEOUT_MS in api.ts: what matters is
+// that progress is being made, not how long the whole job takes.
+const CYCLE_IDLE_CAP_MS = 5 * 60 * 1000; // no progress of any kind
+const CYCLE_ABSOLUTE_CAP_MS = 4 * 60 * 60 * 1000; // runaway guard only
+const CYCLE_CAP_CHECK_MS = 15 * 1000;
+
+// Video extensions get partial-readiness treatment in the post-pool sweep: a
+// scenario whose ONLY missing files are videos is still committed as usable.
+// NOTE: .ogg is deliberately absent. The studio accepts it as a video container,
+// but in practice scenario sounds use it far more often, and treating a missing
+// SOUND as "just a video" would commit a scenario that is silently broken. A
+// genuine .ogg video simply doesn't get partial treatment - the safe way round.
+const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.ogv', '.mov', '.m4v'];
+
+function isVideoFile(relPath: string): boolean {
+  const lower = relPath.toLowerCase();
+  return VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
 
 // ---------- types ----------
 
@@ -148,6 +173,17 @@ let cycleAbort: AbortController | null = null;
 let disposers: Array<() => void> = [];
 let timerHandle: ReturnType<typeof setInterval> | null = null;
 let lastVisibleAtMs = Date.now();
+
+// Wall-clock of the last observable forward step in the running cycle: a phase
+// transition, an item starting or finishing, or a single streamed chunk landing.
+// The idle cap (CYCLE_IDLE_CAP_MS) is measured from here, so a large file
+// downloading slow-but-steady keeps the cycle alive indefinitely while a truly
+// wedged one still gets aborted.
+let lastCycleProgressAtMs = 0;
+
+function bumpCycleProgress(): void {
+  lastCycleProgressAtMs = Date.now();
+}
 
 // Per-cycle scratch - used by the catch block to attach diagnostic context to
 // cycle:failed events. Reset at the top of every cycle. Mirrors what the UI
@@ -320,14 +356,25 @@ async function runCycle(trigger: Trigger): Promise<void> {
     .then((c) => c.operatorOnlyDevice === true)
     .catch(() => false);
 
-  // Hard cap (see CYCLE_HARD_CAP_MS). Firing aborts the cycle: the pool stops
+  // Cycle cap (see CYCLE_IDLE_CAP_MS). Firing aborts the cycle: the pool stops
   // dispatch, Promise.all resolves, and the cycle ends as a recoverable
   // failure rather than hanging. Cleared in the finally block below.
   const thisCycleAbort = cycleAbort;
-  const hardCap = setTimeout(() => {
-    console.warn('[syncOrchestrator] cycle exceeded hard cap, aborting');
-    thisCycleAbort.abort();
-  }, CYCLE_HARD_CAP_MS);
+  const cycleStartedAtMs = Date.now();
+  bumpCycleProgress();
+  const capTimer = setInterval(() => {
+    // Workers can take a moment to unwind after the abort; don't re-log each tick.
+    if (thisCycleAbort.signal.aborted) return;
+    const now = Date.now();
+    if (now - lastCycleProgressAtMs > CYCLE_IDLE_CAP_MS) {
+      console.warn('[syncOrchestrator] cycle made no progress for the idle cap, aborting');
+      thisCycleAbort.abort();
+    } else if (now - cycleStartedAtMs > CYCLE_ABSOLUTE_CAP_MS) {
+      console.warn('[syncOrchestrator] cycle exceeded absolute cap, aborting');
+      thisCycleAbort.abort();
+    }
+  }, CYCLE_CAP_CHECK_MS);
+
 
   const startedAtIso = new Date().toISOString();
   currentTrigger = trigger;
@@ -351,6 +398,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     // Pre-checked so we emit 'skipped' for the common no-op case, instead of
     // a started→finished pair for zero work.
     currentPhase = 'push_pending';
+    bumpCycleProgress();
     const hasPending = await cardsStore.hasPendingMutations();
     if (hasPending) {
       emit('cycle:phase', { phase: 'push_pending', status: 'started' });
@@ -371,14 +419,17 @@ async function runCycle(trigger: Trigger): Promise<void> {
 
     // Phase 2: manifest fetch + DB apply.
     currentPhase = 'manifest';
+    bumpCycleProgress();
     emit('cycle:phase', { phase: 'manifest', status: 'started' });
     const work = await fetchManifestAndApply(cycleAbort.signal);
     total = work.length;
+    bumpCycleProgress();
     emit('cycle:progress', { total, completed: 0, failed: 0 });
     emit('cycle:phase', { phase: 'manifest', status: 'finished' });
 
     // Phase 3: download pool.
     currentPhase = 'download';
+    bumpCycleProgress();
     emit('cycle:phase', { phase: 'download', status: 'started' });
     const result = await runDownloadPool(work, cycleAbort.signal);
     // Pull counts BEFORE checking for auth error. The pool returns partial
@@ -441,7 +492,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
         });
     }
   } finally {
-    clearTimeout(hardCap);
+    clearInterval(capTimer);
     cycleInFlight = false;
     cycleAbort = null;
     currentPhase = null;
@@ -786,6 +837,9 @@ async function runDownloadPool(
       const item = queue.shift();
       if (!item) return;
       lastCurrentLabel = item.label;
+      // An item starting is forward progress, so kinds that never stream
+      // (patterns, cards, ...) also hold the idle cap open while they run.
+      bumpCycleProgress();
       try {
         const { enqueued, bytes } = await downloadOne(item, signal);
         if (enqueued && enqueued.length) {
@@ -818,6 +872,16 @@ async function runDownloadPool(
         if (err instanceof ApiError && err.status === 401) {
           authInvalid = true;
           authError = err;
+          return;
+        }
+        // Cycle teardown (idle/absolute cap, stop(), sign-out) is OUR doing, not
+        // the item's. Recording it would mark a perfectly good file failed,
+        // churn failed_attempts, and - after two such cycles - promote it to the
+        // studio as a real sync failure, filling the admin report with noise we
+        // caused. Leave the item in `remaining` so the scenario is not committed
+        // as complete, and let the next cycle retry it cleanly.
+        if (signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          emitItemProgress(item.label, item.kind, 0, null, true);
           return;
         }
         failed += 1;
@@ -863,6 +927,25 @@ async function runDownloadPool(
       emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
       // Scenario fully downloaded - clear any stale media failure rows for it.
       await recordScenarioComplete(uniqid).catch(() => {});
+    } else if (isPartiallyReady(progress)) {
+      // Everything except one or more VIDEOS is on disk. Commit a partial
+      // manifest so the scenario is launchable now instead of being held back -
+      // a 200 MB video that needs several cycles used to block its whole
+      // scenario, images included. local_content_hash is left untouched, so the
+      // next cycle picks the videos back up and eventually commits in full.
+      const present = progress.manifest.filter(
+        (f) => !progress.remaining.has(f.rel_path) && !progress.failed.has(f.rel_path)
+      );
+      await scenarioStore.commitPartialManifest(
+        uniqid,
+        present,
+        progress.manifest,
+        progress.remoteVersion
+      );
+      emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
+      if (progress.failed.size > 0) {
+        await scenarioStore.incrementFailedAttempts(uniqid).catch(() => {});
+      }
     } else if (progress.failed.size > 0) {
       await scenarioStore.incrementFailedAttempts(uniqid).catch(() => {});
     }
@@ -882,6 +965,9 @@ function emitItemProgress(
   total: number | null,
   done = false,
 ): void {
+  // Called once per streamed chunk - the finest-grained proof of life we have,
+  // and what keeps the cycle's idle cap from firing on a long download.
+  bumpCycleProgress();
   emit('cycle:item_progress', {
     key: label,
     label,
@@ -890,6 +976,21 @@ function emitItemProgress(
     total,
     done,
   });
+}
+
+// True when a scenario is missing something, but everything it is missing is a
+// video. Such a scenario is worth committing as launchable: a missing image
+// visibly breaks the HUD, whereas an absent video already degrades gracefully -
+// resolveVideosByKind() resolves through getMediaPath(...).catch(() => null) and
+// silently drops sources it can't find, so "Play -> Intro" is simply unavailable
+// until the file lands.
+//
+// markFailed() moves an entry out of `remaining` into `failed`, so the missing
+// set is the union of the two.
+function isPartiallyReady(progress: ScenarioProgress): boolean {
+  const missing = [...progress.remaining, ...progress.failed];
+  if (missing.length === 0) return false;
+  return missing.every(isVideoFile);
 }
 
 // Scenario-meta items + their dependent scenario_media items share a group
@@ -1250,9 +1351,21 @@ async function downloadScenarioMeta(
 
   // Enqueue downloads only for media blobs not already in the pool - the dedup
   // that makes a content change carry just the changed bytes over the network.
+  //
+  // Cheap files first (non-video, then smallest): the scenario reaches
+  // partial readiness - everything but its videos - on the first cycle rather
+  // than after the heavy files, and a cycle interrupted mid-video still leaves
+  // a launchable scenario behind.
+  const ordered = [...targetMedia].sort((a, b) => {
+    const av = isVideoFile(a.rel_path) ? 1 : 0;
+    const bv = isVideoFile(b.rel_path) ? 1 : 0;
+    if (av !== bv) return av - bv;
+    return (a.size ?? 0) - (b.size ?? 0);
+  });
+
   const remaining = new Set<string>();
   const enqueued: WorkItem[] = [];
-  for (const f of targetMedia) {
+  for (const f of ordered) {
     if (await blobExists(f.hash)) continue;
     remaining.add(f.rel_path);
     enqueued.push({
@@ -1292,29 +1405,19 @@ async function downloadScenarioMedia(
   const tmpRel = blobTmpPathRel(`${item.hash}.${blobTmpSeq++}`);
   const tmpAbs = await join(await appDataDir(), tmpRel);
 
+  // Any exit that did not commit the blob must drop its partial. pruneOrphanBlobs
+  // wipes media/blobs/.tmp, but only at app boot - without this a long-running
+  // session leaks one partial per aborted attempt, which for videos is hundreds
+  // of MB an hour.
   const total = await withRetry(async () => {
-    const n = await streamBinary(tmpRel, (write) =>
-      apiDownloadStreamed(
-        'playground',
-        'get_media',
-        {
-          bearer: true,
-          query: { uniqid: item.uniqid, filename: item.filename },
-          signal,
-          onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-        },
-        write
-      )
-    );
-    const got = await invoke<string>('sha256_file', { path: tmpAbs });
-    if (got !== item.hash) {
-      await removeRecursive(tmpRel);
-      throw new Error(
-        `hash mismatch for ${item.uniqid}/${item.filename}: expected ${item.hash}, got ${got}`
-      );
+    let committed = false;
+    try {
+      return await runScenarioMediaAttempt(item, tmpRel, tmpAbs, signal, () => {
+        committed = true;
+      });
+    } finally {
+      if (!committed) await removeRecursive(tmpRel).catch(() => {});
     }
-    await commitBlobFromTemp(tmpRel, item.hash);
-    return n;
   });
   emitItemProgress(item.label, item.kind, total, total, true);
 
@@ -1323,6 +1426,39 @@ async function downloadScenarioMedia(
   const p = scenarioProgress.get(item.uniqid);
   if (p) p.remaining.delete(item.filename);
   return { enqueued: null, bytes: total };
+}
+
+// One download+verify+commit attempt. Split out of downloadScenarioMedia so the
+// temp-file cleanup above can wrap it without nesting three levels of try.
+async function runScenarioMediaAttempt(
+  item: Extract<WorkItem, { kind: 'scenario_media' }>,
+  tmpRel: string,
+  tmpAbs: string,
+  signal: AbortSignal,
+  markCommitted: () => void
+): Promise<number> {
+  const n = await streamBinary(tmpRel, (write) =>
+    apiDownloadStreamed(
+      'playground',
+      'get_media',
+      {
+        bearer: true,
+        query: { uniqid: item.uniqid, filename: item.filename },
+        signal,
+        onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+      },
+      write
+    )
+  );
+  const got = await invoke<string>('sha256_file', { path: tmpAbs });
+  if (got !== item.hash) {
+    throw new Error(
+      `hash mismatch for ${item.uniqid}/${item.filename}: expected ${item.hash}, got ${got}`
+    );
+  }
+  await commitBlobFromTemp(tmpRel, item.hash);
+  markCommitted();
+  return n;
 }
 
 async function downloadGameTypeAdminVideo(

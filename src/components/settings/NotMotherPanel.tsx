@@ -11,6 +11,7 @@ import { demoteFromMother } from '../../services/lanMotherBoot';
 import { refreshLaunchedGamesRoute } from '../../services/childControlLink';
 import { describeLocalRole } from '../../services/lanPairing';
 import { CONFIG_CHANGED_EVENT } from '../../utils/config';
+import { failoverErrorText } from '../../services/failoverErrors';
 
 export function NotMotherPanel() {
   const { t } = useTranslation('devicesLan');
@@ -53,7 +54,7 @@ export function NotMotherPanel() {
               }),
       });
     } catch (e) {
-      setMsg({ kind: 'err', text: String((e as { message?: string })?.message ?? e) });
+      setMsg({ kind: 'err', text: failoverErrorText(e, t) });
     } finally {
       setBusy(false);
       setConfirming(false);
@@ -86,7 +87,7 @@ export function NotMotherPanel() {
           ) : (
             <div>
               {hostingWarn && (
-                <p className="text-xs text-yellow-400 leading-relaxed mb-2">
+                <p className="text-xs text-[var(--pg-warn-icon)] leading-relaxed mb-2">
                   {t('notMotherActiveGameWarn', {
                     defaultValue:
                       'This device is currently hosting. Its running games will be unreachable until another device takes control ("Take control as mother" on that device).',
@@ -106,7 +107,7 @@ export function NotMotherPanel() {
             </div>
           )}
           {msg && (
-            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-green-400' : 'text-red-400'}`}>
+            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-danger-icon)]'}`}>
               {msg.text}
             </p>
           )}

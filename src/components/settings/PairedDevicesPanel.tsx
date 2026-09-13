@@ -92,7 +92,7 @@ export function PairedDevicesPanel() {
                       </span>
                     )}
                     <span className={`text-xs px-2 py-0.5 rounded-full border ${
-                      online ? 'bg-green-500/20 text-green-300 border-green-500/40'
+                      online ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
                              : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
                       {online ? t('online') : t('offline')}
                     </span>
@@ -105,7 +105,7 @@ export function PairedDevicesPanel() {
                 {!d.is_self && online && activeGameId != null && (
                   <button onClick={() => makeMother(d)} disabled={makingMotherId === d.id}
                     title={t('makeMother', { defaultValue: 'Make this device the mother' })}
-                    className="px-2.5 py-1.5 rounded-lg text-yellow-300 hover:bg-yellow-500/15 disabled:opacity-50 flex items-center gap-1.5 text-sm">
+                    className="px-2.5 py-1.5 rounded-lg text-[var(--pg-warn-text)] hover:bg-[var(--pg-warn-bg)] disabled:opacity-50 flex items-center gap-1.5 text-sm">
                     {makingMotherId === d.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crown className="w-4 h-4" />}
                     {t('makeMotherBtn', { defaultValue: 'Make mother' })}
                   </button>
@@ -113,7 +113,7 @@ export function PairedDevicesPanel() {
                 {!d.is_self && (
                   <button onClick={() => revoke(d)} disabled={revokingId === d.id}
                     title={t('revoke')}
-                    className="p-2 rounded-lg text-red-300 hover:bg-red-500/20 disabled:opacity-50">
+                    className="p-2 rounded-lg text-[var(--pg-danger-text)] hover:bg-red-500/20 disabled:opacity-50">
                     {revokingId === d.id ? <Loader2 className="w-5 h-5 animate-spin" /> : <Trash2 className="w-5 h-5" />}
                   </button>
                 )}

@@ -4,7 +4,7 @@
  * Design plan: C:\Users\faure\.claude\plans\tracks-game-type-design.md (§6)
  */
 
-export type TracksRouteKey = 'default' | 'first_half' | 'last_half' | 'odd' | 'even';
+export type TracksRouteKey = 'default' | 'reverse' | 'first_half' | 'last_half' | 'odd' | 'even';
 export type TracksScoreType = 'percentage' | 'points';
 
 export interface TracksCheckpoint {
@@ -18,12 +18,16 @@ export interface TracksCheckpoint {
 }
 
 /**
- * The subset of checkpoints that count for a given route. `odd`/`even` are
- * 1-based on the checkpoint's ordinal position (1st, 3rd, ... = odd).
+ * The subset of checkpoints that count for a given route, IN THE ORDER they
+ * must be reached (itinerary mode walks this array). `odd`/`even` are 1-based
+ * on the checkpoint's ordinal position (1st, 3rd, ... = odd); `reverse` is the
+ * full course walked backwards, so one scenario covers both directions.
  */
 export function checkpointsForRoute(all: TracksCheckpoint[], route: string | undefined): TracksCheckpoint[] {
   const n = all.length;
   switch (route) {
+    case 'reverse':
+      return [...all].reverse();
     case 'first_half':
       return all.slice(0, Math.ceil(n / 2));
     case 'last_half':

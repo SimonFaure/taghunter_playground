@@ -8,11 +8,13 @@ import {
   recordCompletedQuest,
   updateTeam,
 } from './launchedGames';
-import { CardData } from './sportidentService';
+import { CardData, SI_CARD_CAPACITY } from './sportidentService';
 import {
+  MALUS_QUEST_NUMBER,
   computeCombos,
   effectifWeights,
   isWeightingEnabled,
+  partitionMalusRows,
   teamHeadcounts,
   weightedScore,
 } from './tagquestScoring';
@@ -39,6 +41,13 @@ interface GameMeta {
   combo_6_quests?: string | number;
   combo_4_quests?: string | number;
   combo_2_quests?: string | number;
+  // Trap station: every punch on it costs `malus_points`. Authored in the
+  // studio tagquest editor (Malus & combo section) as an `si_balises.id`, the
+  // same space as pattern `station_key_number` and the SI punch `code`, so no
+  // resolution step is needed here. The editor guarantees it is never one of
+  // the pattern's quest stations.
+  malus_points?: string | number;
+  malus_station?: string | number | null;
 }
 
 interface GameDataJson {
@@ -88,6 +97,19 @@ export interface PunchAnimationData {
   teamId?: number;
 }
 
+/** A punch present on the card that this read deliberately did not count. */
+export interface DroppedPunch {
+  code: number;
+  time: string;
+  /**
+   * `baseline` - it was already on the card when the chip was first seen this
+   * game (the player didn't wipe it). `consumed` - it already paid for a quest
+   * or a malus hit. Both are clock-free verdicts: nothing here compares the
+   * kiosk's clock to a station's.
+   */
+  reason: 'baseline' | 'consumed';
+}
+
 interface PunchResult {
   team_name: string;
   team_id: number;
@@ -95,15 +117,96 @@ interface PunchResult {
   completed_quest: { index: number; name: string; points: number } | null;
   points_earned: number;
   combo_bonus: number;
+  /** Late (time-based) malus newly charged by this read. */
   malus_applied: number;
+  /** Points charged by this read for punches on the scenario's malus station. */
+  station_malus_applied: number;
+  /** How many punches on the malus station this read consumed. */
+  malus_station_hits: number;
   new_total_score: number;
   level_up: { new_level: number; name: string } | null;
   best_partial_quest: { index: number; name: string; matched: number } | null;
   end_station_reached: boolean;
   game_ended: boolean;
-  status: 'ok' | 'chip_not_recognized' | 'card_empty' | 'team_already_finished' | 'cheat_detected' | 'no_station_match' | 'no_fresh_punches' | 'error';
+  status:
+    | 'ok'
+    | 'chip_not_recognized'
+    | 'card_empty'
+    | 'team_already_finished'
+    | 'cheat_detected'
+    | 'no_station_match'
+    | 'punches_already_counted'
+    | 'punches_not_wiped'
+    | 'error';
   message?: string;
   animationData?: PunchAnimationData;
+  /**
+   * Punches on the card this read ignored, and why. Populated on every read
+   * that drops something - not only when the drops empty the card - so the
+   * operator can tell "already counted" apart from "never punched" instead of
+   * staring at a slot that just says false. See `DroppedPunch`.
+   */
+  dropped_punches?: DroppedPunch[];
+  /**
+   * The card is at its hardware punch capacity, so stations can write no more
+   * to it. Advisory only: the read still scores. Chaining several scenarios on
+   * one chip without wiping is what fills a card (client report #101).
+   */
+  card_full?: boolean;
+}
+
+// ── Registration baseline ──────────────────────────────────────────────────
+// A player who forgot to wipe their card arrives carrying a previous game's
+// punches. Tracks and Mystery solve this by snapshotting what is already on the
+// card at the team's start bip and subtracting it later (see TracksGamePage's
+// `baseline:{teamId}`); TagQuest's self-register registration bip is the same
+// opportunity, and unlike the time-of-day test it needs no clock agreement at
+// all. Keyed per CHIP because a TagQuest team can hold several chips.
+//
+// Stored one meta key per chip so registration stations can write theirs
+// concurrently (patchLaunchedGameMeta - a whole-map write would drop keys).
+export const TQ_BASELINE_META_PREFIX = 'tqbase:';
+
+export function baselineMetaKey(chipId: number): string {
+  return `${TQ_BASELINE_META_PREFIX}${chipId}`;
+}
+
+/**
+ * The punches worth remembering from a card presented at registration, as
+ * `code@time` ids. `00:00:00` is the empty-slot placeholder, not a real punch.
+ * Returns [] for a properly wiped card - the caller then writes nothing.
+ */
+export function baselineIdsFromCard(card: CardData): string[] {
+  return (card.punches ?? [])
+    .filter((p) => p.time && p.time !== '00:00:00')
+    .map((p) => `${p.code}@${p.time}`);
+}
+
+/** Rebuild the chip → baseline map from a launched game's meta KV map. */
+export function parseBaselineMeta(meta: Record<string, string>): Map<number, Set<string>> {
+  const out = new Map<number, Set<string>>();
+  for (const [key, raw] of Object.entries(meta)) {
+    if (!key.startsWith(TQ_BASELINE_META_PREFIX)) continue;
+    const chipId = parseInt(key.slice(TQ_BASELINE_META_PREFIX.length), 10);
+    if (!Number.isFinite(chipId)) continue;
+    try {
+      const ids = JSON.parse(raw);
+      if (Array.isArray(ids)) out.set(chipId, new Set(ids.map(String)));
+    } catch {
+      console.warn('[TagQuest] unreadable baseline meta for key', key);
+    }
+  }
+  return out;
+}
+
+/**
+ * The card holds as many punches as its family allows, so stations can write no
+ * more to it. `cardType` is absent on synthetic cards (the test simulator), in
+ * which case we can't tell and say no.
+ */
+export function isCardFull(card: CardData): boolean {
+  const capacity = SI_CARD_CAPACITY[card.cardType];
+  return capacity != null && card.punches.length >= capacity;
 }
 
 function getQuests(gdj: GameDataJson): GameQuest[] {
@@ -113,6 +216,22 @@ function getQuests(gdj: GameDataJson): GameQuest[] {
 function getLateMalusPoints(gdj: GameDataJson): number {
   const val = gdj?.game_meta?.late_malus_points ?? gdj?.game_meta?.default_time_malus ?? 0;
   return typeof val === 'string' ? parseFloat(val) || 0 : val;
+}
+
+function getMalusPoints(gdj: GameDataJson): number {
+  const val = gdj?.game_meta?.malus_points ?? 0;
+  const n = typeof val === 'string' ? parseFloat(val) || 0 : val;
+  // Authors type a positive penalty; be tolerant of a signed value.
+  return Math.abs(n);
+}
+
+/** The malus station's code (as a string, to compare with punch codes), or null. */
+function getMalusStationCode(gdj: GameDataJson): string | null {
+  const raw = gdj?.game_meta?.malus_station;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = typeof raw === 'string' ? parseInt(raw, 10) : raw;
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return String(n);
 }
 
 function getComboPoints(gdj: GameDataJson): { pts6: number; pts4: number; pts2: number } {
@@ -127,12 +246,6 @@ function getComboPoints(gdj: GameDataJson): { pts6: number; pts4: number; pts2: 
   };
 }
 
-function toMs(time: number | string): number {
-  const n = typeof time === 'string' ? parseFloat(time) : time;
-  if (n > 1e10) return n;
-  return n * 1000;
-}
-
 // SI punch times arrive as local "HH:MM:SS" time-of-day strings (see the Rust
 // `Punch::time_hms`). Convert one to seconds-since-local-midnight, or null when
 // it isn't a parseable HH:MM:SS (e.g. a numeric legacy value).
@@ -142,29 +255,22 @@ function punchSecondsOfDay(time: string | number): number | null {
   return (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
 }
 
-// Local time-of-day (seconds since midnight) for an epoch-ms instant. Used to
-// line a game's start timestamp up with the reader's local punch clock.
-function localSecondsOfDay(ms: number): number {
-  const d = new Date(ms);
-  return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
-}
-
-// A punch is "pre-start" (stale - e.g. an un-wiped card still carrying a
-// previous game's marks) when it happened comfortably before the game began.
-// The grace window absorbs SI base-station clock skew so we never drop a
-// legitimate punch over a couple of minutes of drift; the 12h ceiling avoids
-// midnight-wrap false positives (a punch with a *smaller* seconds-of-day than
-// the start could be the next day during a late-night game, not stale).
-// Limitation: with only a time-of-day on the card we cannot catch a stale
-// punch from a previous game that ran *later* in the day than today's start.
-const PRE_START_GRACE_SEC = 5 * 60;
-function isPreStartPunch(time: string, refStartMs: number | null): boolean {
-  if (refStartMs == null) return false;
-  const ps = punchSecondsOfDay(time);
-  if (ps == null) return false;
-  const delta = localSecondsOfDay(refStartMs) - ps;
-  return delta > PRE_START_GRACE_SEC && delta < 12 * 3600;
-}
+// ── Why there is no time-of-day staleness test here ───────────────────────
+// There used to be one: `isPreStartPunch` dropped any punch whose time-of-day
+// sat more than a grace window before the team's start. It compared the KIOSK
+// PC's clock against the SI STATION's RTC - two clocks the app can neither read
+// nor set (`si_set_station_time` is still a stub) - so any station whose clock
+// had drifted had its punches silently deleted. That is client report 2.2/78
+// (every station off => the whole card refused) and 2.2/101 (one station off =>
+// that station "ressortait systématiquement en faux", invisibly, for a whole
+// morning of testing).
+//
+// The job it was doing - don't score a card the player forgot to wipe - is done
+// properly by the registration baseline below, which compares punch identities
+// against a snapshot taken from the same card and never looks at a clock. So
+// the test is gone rather than tuned. Punch times are still read, but only as
+// *labels* (the "code@time" identity) and for ordering within one card; no
+// station clock is ever compared to another clock again.
 
 // Collapse double-bips: drop a punch at the same station within `windowMs` of a
 // kept one. Ordered and compared on real time-of-day seconds - a previous
@@ -264,6 +370,12 @@ export async function processTagQuestPunch(
   // since self-register teams have no leader key_id and no teamsConfig roster.
   // Empty for predetermined rosters and solo self-register.
   memberTeamByChip: Map<number, number> = new Map(),
+  // chip_id → the "code@time" punches already on that card when it registered
+  // (meta `tqbase:{chipId}`, written at the registration bip). A card the player
+  // forgot to wipe is caught here without comparing clocks at all - the same
+  // trick Tracks and Mystery use. Only self-register games have a registration
+  // bip to snapshot at; empty for predetermined rosters.
+  baselineByChip: Map<number, Set<string>> = new Map(),
 ): Promise<PunchResult> {
   const errorResult = (message: string): PunchResult => ({
     team_name: '',
@@ -273,6 +385,8 @@ export async function processTagQuestPunch(
     points_earned: 0,
     combo_bonus: 0,
     malus_applied: 0,
+    station_malus_applied: 0,
+    malus_station_hits: 0,
     new_total_score: 0,
     level_up: null,
     best_partial_quest: null,
@@ -337,6 +451,8 @@ export async function processTagQuestPunch(
         points_earned: 0,
         combo_bonus: 0,
         malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
         new_total_score: team?.score ?? 0,
         level_up: null,
         best_partial_quest: null,
@@ -357,6 +473,8 @@ export async function processTagQuestPunch(
         points_earned: 0,
         combo_bonus: 0,
         malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
         new_total_score: 0,
         level_up: null,
         best_partial_quest: null,
@@ -378,6 +496,8 @@ export async function processTagQuestPunch(
         points_earned: 0,
         combo_bonus: 0,
         malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
         new_total_score: team.score,
         level_up: null,
         best_partial_quest: null,
@@ -402,6 +522,8 @@ export async function processTagQuestPunch(
           points_earned: 0,
           combo_bonus: 0,
           malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
           new_total_score: team.score,
           level_up: null,
           best_partial_quest: null,
@@ -432,6 +554,8 @@ export async function processTagQuestPunch(
 
     const quests = gameDataJson ? getQuests(gameDataJson) : [];
     const lateMalusPoints = gameDataJson ? getLateMalusPoints(gameDataJson) : 0;
+    const malusPoints = gameDataJson ? getMalusPoints(gameDataJson) : 0;
+    const malusStationCode = gameDataJson ? getMalusStationCode(gameDataJson) : null;
     const { pts6, pts4, pts2 } = gameDataJson ? getComboPoints(gameDataJson) : { pts6: 0, pts4: 0, pts2: 0 };
     const levels = gameDataJson?.game_meta?.levels;
 
@@ -455,66 +579,82 @@ export async function processTagQuestPunch(
     }
 
     // Step 6: Load already-scored quests for this team
-    // quest_number stores the 1-based item_index (= array index + 1)
-    const completedQuests = await listCompletedQuests(launchedGameId, team.id);
+    // quest_number stores the 1-based item_index (= array index + 1); rows
+    // carrying MALUS_QUEST_NUMBER are malus-station hits, not quests, and are
+    // split out here so they never count towards completions or combos.
+    const completedRowsBefore = await listCompletedQuests(launchedGameId, team.id);
+    const { questRows: completedQuests, stationMalus: prevStationMalus } =
+      partitionMalusRows(completedRowsBefore);
     const completedQuestNumbers = new Set(completedQuests.map((r) => Number(r.quest_number)));
 
     // Step 7: Build the working set - every card punch MINUS the ones we must
-    // not count. Two anti-cheat filters, both keyed on a punch's stable
-    // "code@time" identity (a re-read returns the same time; a fresh physical
-    // punch gets a new one):
-    //   (a) consumed - punches already used to complete a quest this game. This
-    //       replaces the old speed-only "strip completed quests by station"
-    //       pass and works in score mode too, so re-presenting a card never
-    //       re-scores, and a quest only re-completes on genuinely new punches.
-    //   (b) pre-start - punches left on an un-wiped card from a previous game,
-    //       detected by time-of-day vs the team's/game's start.
+    // not count. Two filters, both keyed on a punch's stable "code@time"
+    // identity (a re-read returns the same time; a fresh physical punch gets a
+    // new one), and both clock-free - see the note above `deduplicatePunches`
+    // for why the old time-of-day filter is gone:
+    //   (a) baseline - punches already on the card the first time this chip was
+    //       seen in this game. Catches a card the player forgot to wipe by
+    //       comparing the card against a snapshot of itself.
+    //   (b) consumed - punches already used to complete a quest (or pay a malus)
+    //       this game. Replaces the old speed-only "strip completed quests by
+    //       station" pass and works in score mode too, so re-presenting a card
+    //       never re-scores and a quest only re-completes on genuinely new
+    //       punches.
     const teamConsumed = consumedByTeam.get(team.id) ?? new Set<string>();
     consumedByTeam.set(team.id, teamConsumed);
     const punchId = (p: { code: number; time: string }) => `${p.code}@${p.time}`;
 
-    const refStartMs =
-      team.start_time != null
-        ? team.start_time * 1000
-        : state.start_time
-        ? new Date(state.start_time).getTime()
-        : null;
+    const chipBaseline = baselineByChip.get(card.id);
 
-    let consumedCount = 0;
-    let preStartCount = 0;
+    const droppedPunches: DroppedPunch[] = [];
     let workingPunches = card.punches.filter((p) => {
-      if (teamConsumed.has(punchId(p))) { consumedCount++; return false; }
-      if (isPreStartPunch(p.time, refStartMs)) { preStartCount++; return false; }
+      const id = punchId(p);
+      if (chipBaseline?.has(id)) {
+        droppedPunches.push({ code: p.code, time: p.time, reason: 'baseline' });
+        return false;
+      }
+      if (teamConsumed.has(id)) {
+        droppedPunches.push({ code: p.code, time: p.time, reason: 'consumed' });
+        return false;
+      }
       return true;
     });
+    const baselineCount = droppedPunches.filter((d) => d.reason === 'baseline').length;
+    const consumedCount = droppedPunches.length - baselineCount;
 
-    // Every punch on the card was filtered out (consumed by an earlier quest
-    // or pre-start/stale) - nothing left to score. Without this guard the read
-    // fell through to a silent no-op "ok" (no quest, no partial, unchanged
-    // score), which the operator sees as "the bip did nothing". Most often the
-    // card wasn't cleared before the game, or a field station's clock is more
-    // than PRE_START_GRACE_SEC behind the kiosk (unset clock / winter time),
-    // which makes genuinely fresh punches look pre-start. Skipped on a finish
-    // bip (card.end) so the end-station flow below still runs.
-    if (workingPunches.length === 0 && card.end == null) {
-      const startSec = refStartMs != null ? localSecondsOfDay(refStartMs) : null;
-      console.warn('[TagQuest] Every punch on the card was filtered out:', JSON.stringify({
+    // Warn on ANY drop, not just a total wipe. A partial drop used to be
+    // completely silent, which is what let report 2.2/101 run for a morning: the
+    // slot for the dropped station simply rendered false and nobody could see
+    // why. The station codes here are `si_balises.id` values, the same space the
+    // pattern uses - not the "balise 23" label an operator reads off the box.
+    if (droppedPunches.length > 0) {
+      console.warn('[TagQuest] Punches ignored on this read:', JSON.stringify({
         chip: card.id,
         team: teamName,
-        gameStartLocalTimeOfDaySec: startSec,
-        preStartGraceSec: PRE_START_GRACE_SEC,
-        punches: card.punches.map((p) => ({
-          code: p.code,
-          time: p.time,
-          consumed: teamConsumed.has(punchId(p)),
-          // Positive = this many minutes before the game start (per the
-          // punch's own station clock). Large values with fresh punches ⇒
-          // that station's clock is behind the kiosk.
-          minutesBeforeStart: startSec != null && punchSecondsOfDay(p.time) != null
-            ? Math.round((startSec - punchSecondsOfDay(p.time)!) / 60)
-            : null,
-        })),
+        kept: workingPunches.length,
+        dropped: droppedPunches,
       }));
+    }
+
+    // The card is physically full, so stations can no longer write to it and
+    // the player's next punches will vanish with only a station beep to show
+    // for it. Advisory - we still score what IS on the card.
+    const cardFull = isCardFull(card);
+    if (cardFull) {
+      console.warn(
+        `[TagQuest] Chip ${card.id} (${card.cardType}) is FULL at ${card.punches.length} punch(es) - ` +
+          'stations cannot record any more on it. It must be wiped.',
+      );
+    }
+
+    // Every punch on the card was filtered out - nothing left to score. Without
+    // this guard the read fell through to a silent no-op "ok" (no quest, no
+    // partial, unchanged score), which the operator sees as "the bip did
+    // nothing". Reaching here now means exactly one of two things, and the
+    // status says which: the punches were already counted this game, or they
+    // were already on the card when the chip was first seen. Skipped on a finish
+    // bip (card.end) so the end-station flow below still runs.
+    if (workingPunches.length === 0 && card.end == null) {
       return {
         team_name: teamName,
         team_id: team.id,
@@ -523,18 +663,35 @@ export async function processTagQuestPunch(
         points_earned: 0,
         combo_bonus: 0,
         malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
         new_total_score: team.score,
         level_up: null,
         best_partial_quest: null,
         end_station_reached: false,
         game_ended: false,
-        status: 'no_fresh_punches',
-        message: `All ${card.punches.length} punch(es) on chip ${card.id} were filtered out (${consumedCount} already consumed, ${preStartCount} pre-start) - card not cleared, or a station clock is behind the kiosk`,
+        // "Already counted" wins the tie: it is the common case (the player
+        // bipped twice) and the more actionable thing to tell them.
+        status: consumedCount > 0 ? 'punches_already_counted' : 'punches_not_wiped',
+        message: `All ${card.punches.length} punch(es) on chip ${card.id} were ignored (${baselineCount} already on the card when it was first seen, ${consumedCount} already counted)`,
+        dropped_punches: droppedPunches,
+        card_full: cardFull,
       };
     }
 
     // Step 8: Deduplicate punches (collapse same-station double-bips)
     workingPunches = deduplicatePunches(workingPunches);
+
+    // Step 8b: Malus-station hits. Every fresh punch on the scenario's
+    // `malus_station` costs `malus_points`, once per physical punch - the
+    // punches are consumed below exactly like quest punches, so a re-read (or
+    // a state-poll echo) can never re-charge, and a second visit to the trap
+    // costs again. The studio editor forbids the malus station from also being
+    // a pattern station, so these punches never compete with a quest slot.
+    const malusHitPunches =
+      malusStationCode !== null && malusPoints > 0
+        ? workingPunches.filter((p) => String(p.code) === malusStationCode)
+        : [];
 
     // Step 9: Quest completion analysis
     // item_index is 1-based; quest array index is 0-based (item_index - 1)
@@ -577,7 +734,9 @@ export async function processTagQuestPunch(
     // happened". Surface it as a visible warning + a console dump of the two
     // code sets so the mismatch is obvious. Skipped on a finish bip (card.end)
     // so the end-station flow below still runs.
-    if (workingPunches.length > 0 && card.end == null) {
+    // A malus-station hit IS a recognised station, so it must not trip this
+    // guard: punching only the trap is a legitimate (costly) read.
+    if (workingPunches.length > 0 && card.end == null && malusHitPunches.length === 0) {
       const totalMatchedSlots = [...questProgress.values()].reduce((s, qp) => s + qp.matchedSlots, 0);
       const nothingMatches =
         patternItems.length === 0 ||
@@ -593,12 +752,16 @@ export async function processTagQuestPunch(
           expectedStations,
           punchedCodes,
         }));
+        // Language-neutral diagnostic only. The readable sentence comes from
+        // `ingame_common:no_station_match` in the team's language (this module
+        // has no language to resolve against); describePunchStatus appends this
+        // detail after it so the operator still sees which codes were read.
         const message =
           patternItems.length === 0
-            ? `Modèle de postes introuvable ou vide (pattern : ${patternUniqid || '-'})`
+            ? `pattern=${patternUniqid || '-'} (0 stations)`
             : quests.length === 0
-              ? 'Aucune quête dans les données du scénario'
-              : `Aucun poste bipé ne correspond au modèle (bipés : ${punchedCodes.join(', ')} / attendus : ${expectedStations.join(', ')})`;
+              ? 'quests=0'
+              : `punched=[${punchedCodes.join(', ')}] expected=[${expectedStations.join(', ')}]`;
         return {
           team_name: teamName,
           team_id: team.id,
@@ -607,6 +770,8 @@ export async function processTagQuestPunch(
           points_earned: 0,
           combo_bonus: 0,
           malus_applied: 0,
+        station_malus_applied: 0,
+        malus_station_hits: 0,
           new_total_score: team.score,
           level_up: null,
           best_partial_quest: null,
@@ -614,6 +779,8 @@ export async function processTagQuestPunch(
           game_ended: false,
           status: 'no_station_match',
           message,
+          dropped_punches: droppedPunches,
+          card_full: cardFull,
         };
       }
     }
@@ -705,9 +872,47 @@ export async function processTagQuestPunch(
       }
     }
 
+    // Malus-station hits: one persisted row per punch, so the penalty survives
+    // the from-scratch recompute below (and a kiosk reload / another device
+    // reading the same mother). Stored negative so any consumer that naively
+    // sums `points_awarded` still lands on the right total.
+    let stationMalusApplied = 0;
+    let malusHitsCharged = 0;
+    for (const p of malusHitPunches) {
+      const id = punchId(p);
+      // Defensive: the studio editor forbids the malus station from being a
+      // pattern station, but a launch-time pattern override can still break
+      // that. A punch the quest loop just consumed has already been paid for -
+      // charging it too would count one bip twice. The quest wins.
+      if (teamConsumed.has(id)) {
+        console.warn(
+          `[TagQuest] Punch ${id} completed a quest AND sits on the malus station - malus skipped. The launched pattern uses the scenario's malus station.`,
+        );
+        continue;
+      }
+      // Burn it first: even if the write fails we must not charge it twice on
+      // the next read of the same card.
+      teamConsumed.add(id);
+      const poolEntry = consumablePool.find((c) => !c.used && c.code === String(p.code) && c.time === p.time);
+      if (poolEntry) poolEntry.used = true;
+      const res = await recordCompletedQuest({
+        launched_game_id: launchedGameId,
+        team_id: team.id,
+        teammate_chip_id: teammateChipId ?? card.id,
+        quest_number: MALUS_QUEST_NUMBER,
+        points_awarded: -malusPoints,
+        allow_duplicates: true,
+      });
+      if (res.inserted) {
+        stationMalusApplied += malusPoints;
+        malusHitsCharged++;
+      }
+    }
+
     // Recompute score from scratch based on all completed quests (existing + new)
     // This guarantees the score is always consistent with team_completed_quests
-    const allCompletedRows = await listCompletedQuests(launchedGameId, team.id);
+    const allRows = await listCompletedQuests(launchedGameId, team.id);
+    const { questRows: allCompletedRows, stationMalus } = partitionMalusRows(allRows);
     const allCompleted = allCompletedRows;
     const totalQuestPoints = allCompleted.reduce((sum, r) => sum + (r.points_awarded ?? 0), 0);
 
@@ -726,10 +931,13 @@ export async function processTagQuestPunch(
       beforeCombos.combos4 * pts4 +
       beforeCombos.combos2 * pts2;
     const prevScore = team.score ?? 0;
-    // Invert the score formula to recover the malus already baked into the
-    // stored score (earned × weight − malus = score). Approximate when the
-    // weight changed since the last punch (live headcount) - display-only.
-    const prevMalus = Math.max(0, Math.round((prevTotalQuestPoints + prevTotalComboBonus) * weight) - prevScore);
+    // Invert the score formula to recover the TOTAL malus already baked into
+    // the stored score (earned × weight − malus = score), then take out the
+    // station malus - which we know exactly from the persisted rows - to leave
+    // the late malus. Approximate when the weight changed since the last punch
+    // (live headcount); display-only.
+    const prevTotalMalus = Math.max(0, Math.round((prevTotalQuestPoints + prevTotalComboBonus) * weight) - prevScore);
+    const prevMalus = Math.max(0, prevTotalMalus - prevStationMalus);
 
     const comboBonus =
       (afterCombos.combos6 - beforeCombos.combos6) * pts6 +
@@ -741,7 +949,8 @@ export async function processTagQuestPunch(
       return sum + (typeof rawPts === 'string' ? parseInt(rawPts, 10) || 0 : rawPts);
     }, 0) + comboBonus;
 
-    const newScore = weightedScore(totalQuestPoints + totalComboBonus, weight, malusApplied);
+    // Both penalties are unweighted (see tagquestScoring's contract).
+    const newScore = weightedScore(totalQuestPoints + totalComboBonus, weight, malusApplied + stationMalus);
     const scoreDelta = newScore - prevScore;
 
     // Step 12: Level up check
@@ -759,13 +968,29 @@ export async function processTagQuestPunch(
 
     let gameEnded = false;
     let endTimeToCommit: number | undefined;
+    const scoreNeedsWrite = scoreDelta !== 0 || completedNow.length > 0 || stationMalusApplied > 0;
     if (endStationReached && !team.end_time) {
-      endTimeToCommit = Math.floor(toMs(card.end!.time) / 1000);
+      // Stamp the KIOSK's clock, not the finish station's. `start_time` is
+      // already kiosk-clock (TagQuestGamePage's mass start writes
+      // `Math.floor(Date.now()/1000)`), so this is the only way the pair can be
+      // subtracted into a duration - the leaderboards rank on `end_time` and
+      // show `end_time - start_time`.
+      //
+      // This also fixes a real bug: the old `toMs(card.end.time)` ran parseFloat
+      // over "HH:MM:SS", which stops at the first colon, so every finisher was
+      // stamped with the HOUR as a unix timestamp (14:30:00 -> end_time 14, i.e.
+      // 1970). Ranking was by hour-of-day with mass ties, and durations came out
+      // hugely negative.
+      //
+      // Trade-off: a team punching FINISH out in the field is timed to when they
+      // reach the reader, not to the punch. That offset is roughly equal for
+      // everyone, so the ranking order holds.
+      endTimeToCommit = Math.floor(Date.now() / 1000);
       gameEnded = true;
-      if (scoreDelta !== 0 || completedNow.length > 0) {
+      if (scoreNeedsWrite) {
         await updateTeam(team.id, { score: newScore });
       }
-    } else if (scoreDelta !== 0 || completedNow.length > 0) {
+    } else if (scoreNeedsWrite) {
       await updateTeam(team.id, { score: newScore });
     }
 
@@ -860,14 +1085,16 @@ export async function processTagQuestPunch(
       prevScore: prevScore,
       prevCombos: beforeCombos,
       prevQuestDetails,
-      prevMalus: 0,
+      // `malus` is the station malus, `lateMalus` the time-based one - the HUD
+      // has a slot (and an author-supplied icon) for each.
+      prevMalus: prevStationMalus,
       prevLateMalus: prevMalus,
       comboPoints: { pts6, pts4, pts2 },
       displayQuest,
       newScore,
       newCombos: afterCombos,
       newQuestDetails,
-      newMalus: 0,
+      newMalus: stationMalus,
       newLateMalus: malusApplied,
       gameOver: gameEnded,
       endTimeToCommit,
@@ -882,6 +1109,8 @@ export async function processTagQuestPunch(
       points_earned: pointsEarned,
       combo_bonus: comboBonus,
       malus_applied: Math.max(0, malusApplied - prevMalus),
+      station_malus_applied: stationMalusApplied,
+      malus_station_hits: malusHitsCharged,
       new_total_score: newScore,
       level_up: levelUpResult,
       best_partial_quest: bestPartial,
@@ -889,6 +1118,8 @@ export async function processTagQuestPunch(
       game_ended: gameEnded,
       status: 'ok',
       animationData,
+      dropped_punches: droppedPunches,
+      card_full: cardFull,
     };
 
     console.log('[TagQuest] Punch processed:', JSON.stringify(result, null, 2));

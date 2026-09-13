@@ -189,6 +189,38 @@ export async function mergeLaunchedGameMeta(
   await updateLaunchedGameMeta(id, { ...current, ...patch });
 }
 
+// Atomic per-key upsert - the server touches only the keys in `patch` and
+// leaves the rest of the map alone, so this IS safe to call concurrently from
+// several devices (unlike mergeLaunchedGameMeta above). Use it for any write
+// that fans out across satellites: self-register's per-chip keys, per-team
+// overrides, anything keyed by a thing a station owns. A null value deletes.
+//
+// Falls back to the read-merge-write path when the route is an older mother
+// that predates the `merge_meta` action, so a mixed-version LAN still works -
+// it just reopens the lost-update window on that older mother.
+export async function patchLaunchedGameMeta(
+  id: number,
+  patch: Record<string, string | null>
+): Promise<void> {
+  try {
+    await withRetry(() =>
+      apiCall('launched_games', 'merge_meta', {
+        method: 'POST',
+        bearer: true,
+        body: { id, meta: patch },
+      })
+    );
+  } catch (err) {
+    console.warn('[launchedGames] merge_meta unavailable, falling back to read-merge-write:', err);
+    const current = await getLaunchedGameMeta(id);
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === null) delete current[k];
+      else current[k] = v;
+    }
+    await updateLaunchedGameMeta(id, current);
+  }
+}
+
 export async function removeLaunchedGameMetaKeys(id: number, keys: string[]): Promise<void> {
   const current = await getLaunchedGameMeta(id);
   let changed = false;

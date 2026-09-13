@@ -1,7 +1,7 @@
 {
-  "becomeMotherPromptTitle": "Faire de cet appareil la mère ?",
-  "becomeMotherPromptBody": "Aucun appareil mère n'est joignable sur le réseau ; cet appareil va donc devenir la mère et héberger la partie. Les autres appareils pourront ensuite le rejoindre.",
-  "becomeMotherPromptConfirm": "Devenir mère et lancer",
+  "becomeMotherPromptTitle": "Héberger une nouvelle partie sur cet appareil ?",
+  "becomeMotherPromptBody": "Aucun appareil mère n'est joignable sur le réseau ; cet appareil va donc devenir la mère et héberger une NOUVELLE partie. Les autres appareils pourront ensuite le rejoindre. Pour reprendre une partie en cours dont la mère s'est arrêtée, utilisez plutôt la bannière rouge « Reprendre la partie ».",
+  "becomeMotherPromptConfirm": "Héberger et lancer une nouvelle partie",
   "save": "Enregistrer",
   "cancel": "Annuler",
   "close": "Fermer",

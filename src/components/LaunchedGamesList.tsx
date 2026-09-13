@@ -53,6 +53,7 @@ import { PrePrintModal } from './PrePrintModal';
 import type { PrintPrefs } from '../services/printPrefsStore';
 import { getClashState, getClashMembers, type ClashStandings } from '../services/clash';
 import {
+  MALUS_QUEST_NUMBER,
   comboBonusPoints,
   effectifWeights,
   formatWeight,
@@ -82,6 +83,7 @@ import type { SiPuce } from '../types/database';
 // Tracks route keys → operator-facing labels (Add Team per-team route override).
 const TRACKS_ROUTE_LABELS: Record<string, string> = {
   default: 'All checkpoints',
+  reverse: 'Reversed course',
   first_half: 'First half',
   last_half: 'Last half',
   odd: 'Odd checkpoints',
@@ -126,7 +128,7 @@ interface Team {
 // launched_games stores game_type capitalised ('TagQuest'); we key off the
 // lowercase slug so either casing (and the scenario gameDataMap fallback) works.
 const GAME_TYPE_BADGE: Record<string, { label: string; className: string }> = {
-  tagquest: { label: 'TagQuest', className: 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300' },
+  tagquest: { label: 'Quest', className: 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300' },
   mystery: { label: 'Mystery', className: 'bg-purple-500/15 border-purple-500/40 text-purple-300' },
   tracks: { label: 'Track', className: 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300' },
   clash: { label: 'Clash', className: 'bg-rose-500/15 border-rose-500/40 text-rose-300' },
@@ -584,7 +586,15 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
 
     const scoreByTeam: Record<number, number> = {};
     const questCountByTeam: Record<number, Record<string, number>> = {};
+    // Malus-station hits share the completed-quests table (see
+    // MALUS_QUEST_NUMBER) but are penalties, not completions: they must not
+    // count towards combos, and they are subtracted UNWEIGHTED below.
+    const stationMalusByTeam: Record<number, number> = {};
     for (const row of questRows) {
+      if (row.quest_number === MALUS_QUEST_NUMBER) {
+        stationMalusByTeam[row.team_id] = (stationMalusByTeam[row.team_id] ?? 0) + Math.abs(row.points_awarded ?? 0);
+        continue;
+      }
       scoreByTeam[row.team_id] = (scoreByTeam[row.team_id] ?? 0) + (row.points_awarded ?? 0);
       if (!questCountByTeam[row.team_id]) questCountByTeam[row.team_id] = {};
       questCountByTeam[row.team_id][row.quest_number] = (questCountByTeam[row.team_id][row.quest_number] ?? 0) + 1;
@@ -652,7 +662,11 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
       }
       const questScore = scoreByTeam[t.id] ?? 0;
       const comboBonus = comboBonusPoints(questCountByTeam[t.id] ?? {}, pts6, pts4, pts2);
-      const totalScore = weightedScore(questScore + comboBonus, weights?.get(t.id) ?? 1);
+      const totalScore = weightedScore(
+        questScore + comboBonus,
+        weights?.get(t.id) ?? 1,
+        stationMalusByTeam[t.id] ?? 0,
+      );
       return {
         ...t,
         score: totalScore,
@@ -1903,7 +1917,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                   </span>
                                 )}
                                 {(isClash || tagquestMemberChips.length > 0) && (
-                                  <span className="flex items-center gap-1 text-blue-400 text-xs shrink-0" title="Chips in this team">
+                                  <span className="flex items-center gap-1 text-blue-400 text-xs shrink-0" title={t('launched:chipsInTeam')}>
                                     <Users size={12} />
                                     {clanMemberCount}
                                   </span>
@@ -1979,7 +1993,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                                   </span>
                                 )}
                                 {isClash && (
-                                  <span className="flex items-center gap-1 text-blue-400 text-sm" title="Chips in this clan">
+                                  <span className="flex items-center gap-1 text-blue-400 text-sm" title={t('launched:chipsInClan')}>
                                     <Users size={13} />
                                     {clanMemberCount}
                                   </span>

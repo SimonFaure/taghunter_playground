@@ -262,6 +262,47 @@ export async function commitManifest(
   );
 }
 
+// Partial commit: make the scenario LAUNCHABLE while some of its files are still
+// pending. Used when the only missing files are videos, which the runtime
+// already degrades gracefully over (videoResolution drops unresolvable sources).
+//
+// The two markers that commitManifest() sets together are deliberately split:
+//   - local_version IS set   → list({downloaded:true}) shows the scenario, so it
+//     can be launched with the media that IS on disk.
+//   - local_content_hash is NOT touched → listPendingDownloads() keeps returning
+//     the scenario, so the next cycle retries the missing videos and eventually
+//     promotes it to a full commit.
+//
+// `present` is upserted; `fullManifest` is used ONLY to decide what to delete, so
+// a rel_path that is merely still downloading keeps whatever row it has. That
+// matters when a scenario's video is REPLACED: the old blob stays resolvable and
+// keeps playing until the new one has landed.
+// failed_attempts is intentionally left alone - the scenario is not fully synced.
+export async function commitPartialManifest(
+  uniqid: string,
+  present: ManifestFile[],
+  fullManifest: ManifestFile[],
+  remoteVersion: number
+): Promise<void> {
+  const db = await getDb();
+  for (const f of present) {
+    await db.execute(
+      'INSERT OR REPLACE INTO scenario_files (uniqid, rel_path, content_hash) VALUES ($1, $2, $3)',
+      [uniqid, f.rel_path, f.content_hash]
+    );
+  }
+  const keep = fullManifest.map((f) => f.rel_path);
+  const placeholders = keep.map((_, i) => `$${i + 2}`).join(', ');
+  await db.execute(
+    `DELETE FROM scenario_files WHERE uniqid = $1${keep.length ? ` AND rel_path NOT IN (${placeholders})` : ''}`,
+    [uniqid, ...keep]
+  );
+  await db.execute('UPDATE scenarios SET local_version = $1 WHERE uniqid = $2', [
+    remoteVersion,
+    uniqid,
+  ]);
+}
+
 export async function incrementFailedAttempts(uniqid: string): Promise<void> {
   const db = await getDb();
   await db.execute(
@@ -310,6 +351,22 @@ export async function listPendingDownloads(): Promise<ScenarioRow[]> {
 // from scratch under the current download policy. Used by the Operator-only
 // toggle (services/operatorMode.ts): turning it ON re-pulls slim (game-data +
 // visual), turning it OFF re-pulls the full media set. Returns the count reset.
+// Scenarios committed by commitPartialManifest(): launchable, but still missing
+// at least one file (in practice a heavy video the sync hasn't finished). Drives
+// the "ready, video still downloading" hint in the sync screen so an operator
+// isn't surprised by a greyed-out intro.
+export async function listPartiallyReady(): Promise<ScenarioRow[]> {
+  const db = await getDb();
+  const rows = await db.select<Parameters<typeof rowOut>[0][]>(
+    `SELECT * FROM scenarios
+     WHERE local_version IS NOT NULL
+       AND remote_content_hash IS NOT NULL
+       AND (local_content_hash IS NULL OR local_content_hash <> remote_content_hash)
+     ORDER BY title COLLATE NOCASE ASC`
+  );
+  return rows.map(rowOut);
+}
+
 export async function resetAllForRedownload(): Promise<number> {
   const db = await getDb();
   const rows = await db.select<Array<{ uniqid: string }>>('SELECT uniqid FROM scenarios');

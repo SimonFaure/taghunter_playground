@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Trophy, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, Minus } from 'lucide-react';
 import { getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
 import type { GameConfig, Team as ConfigTeam } from './LaunchGameModal';
@@ -70,7 +71,13 @@ function sortTeams(teams: TeamResult[], victoryType: string): TeamResult[] {
 }
 
 export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compact = false }: LeaderboardPanelProps) {
+  // `tr`, not `t`: this file already uses `t` as the loop variable for a team.
+  const { t: tr } = useTranslation('rankings');
   const [teams, setTeams] = useState<RankedTeam[]>([]);
+  // Retours Ludiom #70 - see LeaderboardPage: after the operator closes the
+  // game, an unfinished team is "did not finish", not "in progress".
+  const [gameEnded, setGameEnded] = useState(false);
+  const [isClash, setIsClash] = useState(false);
   const [teamsConfig, setTeamsConfig] = useState<ConfigTeam[]>(config.teams || []);
   const [playMode, setPlayMode] = useState<'solo' | 'team'>(config.playMode || 'solo');
   const [victoryType, setVictoryType] = useState<'speed' | 'score'>(config.victoryType || 'score');
@@ -111,6 +118,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
     let data: Array<{ id: number; team_number: number; team_name: string; score: number; start_time: number | null; end_time: number | null; key_id: number }> = [];
     try {
       const state = await getLaunchedGameState(launchedGameId, 0);
+      setGameEnded(!!state.ended);
       data = state.teams.map((t) => ({
         id: t.id,
         team_number: t.team_number,
@@ -183,6 +191,11 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
         if (map.teamsConfig) {
           try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
+        // Clash clans never get a start_time or an end_time, so the generic
+        // status line read "Did not start" under every clan for the whole match
+        // (retours #97). A registered clan IS in the match - the only states it
+        // has are "playing" and "over".
+        if (map.clash_config) setIsClash(true);
       } catch (err) {
         console.error('[LeaderboardPanel] meta load failed:', err);
       }
@@ -215,12 +228,12 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
             {playMode === 'team' && (
               <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-teal-500/15 border border-teal-500/25 text-teal-400 text-xs font-semibold">
                 <Users size={10} />
-                Team
+                {tr('teamMode')}
               </span>
             )}
             <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-[var(--pg-surface-2)] border border-[var(--pg-line)] text-[var(--pg-text-dim)] text-xs">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse inline-block" />
-              Live
+              {tr('live')}
             </span>
             {victoryType === 'speed' ? (
               <span className="flex items-center gap-1 text-orange-400 text-xs font-semibold">
@@ -238,11 +251,11 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
       <div className="flex-1 overflow-y-auto min-h-0 p-2 space-y-1.5">
         {loading ? (
           <div className="flex items-center justify-center h-full">
-            <div className="text-[var(--pg-text-dim)] text-xs">Loading...</div>
+            <div className="text-[var(--pg-text-dim)] text-xs">{tr('loadingShort')}</div>
           </div>
         ) : teams.length === 0 ? (
           <div className="flex items-center justify-center h-full">
-            <div className="text-[var(--pg-text-dim)] text-xs text-center">No teams yet</div>
+            <div className="text-[var(--pg-text-dim)] text-xs text-center">{tr('noTeamsYet')}</div>
           </div>
         ) : (
           teams.map(team => {
@@ -288,9 +301,13 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                       {team.team_name}
                     </div>
                     <div className="text-[var(--pg-text-dim)] text-xs mt-0.5">
-                      {team.end_time ? (
-                        <span className="flex items-center gap-0.5"><Clock size={9} /> Done</span>
-                      ) : team.start_time ? 'In progress' : 'Not started'}
+                      {isClash ? (
+                        gameEnded ? tr('statusFinished') : tr('statusInProgress')
+                      ) : team.end_time ? (
+                        <span className="flex items-center gap-0.5"><Clock size={9} /> {tr('statusFinished')}</span>
+                      ) : team.start_time
+                        ? (gameEnded ? tr('statusNotFinished') : tr('statusInProgress'))
+                        : tr('statusNotStarted')}
                     </div>
                     {!compact && teammates.length > 1 && (
                       <div className="flex flex-wrap gap-1 mt-1.5">
@@ -307,7 +324,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                     {victoryType === 'score' ? (
                       <div className={`font-bold ${scoreSize} ${movingUp ? 'text-emerald-400' : 'text-[var(--pg-text)]'}`}>
                         {team.score}
-                        <span className="text-[var(--pg-text-dim)] text-xs font-normal ml-0.5">pts</span>
+                        <span className="text-[var(--pg-text-dim)] text-xs font-normal ml-0.5">{tr('pts')}</span>
                       </div>
                     ) : duration !== null ? (
                       <div className={`font-bold ${scoreSize} ${movingUp ? 'text-emerald-400' : getRankColor(index)}`}>
@@ -317,7 +334,7 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
                       <div className="text-[var(--pg-text-dim)] text-sm">&mdash;</div>
                     )}
                     {victoryType === 'speed' && team.score > 0 && (
-                      <div className="text-[var(--pg-text-dim)] text-xs">{team.score} pts</div>
+                      <div className="text-[var(--pg-text-dim)] text-xs">{team.score} {tr('pts')}</div>
                     )}
                   </div>
                 </div>

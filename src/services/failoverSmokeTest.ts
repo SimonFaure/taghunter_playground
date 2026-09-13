@@ -15,9 +15,11 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
-import { setLanOverride, LOCAL_ONLY_ENDPOINTS } from './api';
+import { setLanOverride, getLanOverride, LOCAL_ONLY_ENDPOINTS } from './api';
 import { getDb } from './db';
-import { becomeMother } from './lanMotherBoot';
+import { becomeMother, applyMotherSnapshot } from './lanMotherBoot';
+import { rejoinMotherNow } from './motherFailover';
+import { reconcileSupersededGamesTick } from './motherStateReconcile';
 import {
   createLaunchedGame,
   getLaunchedGameState,
@@ -253,6 +255,38 @@ export const failoverQA = {
   // Run on a satellite after killing the real mother. Returns the new server
   // info incl. the bumped `epoch`; throws on the content/snapshot guards.
   becomeMother: (launchedGameId: number) => becomeMother(launchedGameId),
+
+  // ── Ludiom #74/#76 QA ──────────────────────────────────────────────────────
+  // Where this device's launched_games traffic actually goes. THE check after a
+  // failover: it must be the promoted mother's routable address (never a
+  // 169.254.* link-local, and never back to the dead mother).
+  lanOverride: () => getLanOverride(),
+  // This device's own copy of the games. After the old mother is superseded and
+  // the game is ended elsewhere, `ended` must flip to 1 here too, `ended_at`
+  // must be non-null, `mother_epoch` must match the new mother's, and
+  // `launched_by_self` must NOT have changed.
+  localGames: async () =>
+    (await getDb()).select(
+      `SELECT id, name, started, ended, ended_at, mother_epoch, launched_by_self
+         FROM lg_launched_games ORDER BY id DESC LIMIT 10`
+    ),
+  // What childControlLink would install on its next tick - i.e. whether the
+  // dead mother is still resolving out of the endpoint cache.
+  resolveLink: () => invoke('client_resolve_mother_link'),
+  describeRole: () => invoke('client_describe_local_role'),
+  pairedMothers: () => invoke('client_list_paired_mothers'),
+  // Which address a hello actually reaches; `reached_addr` is what a re-point
+  // installs, so the two must agree.
+  probe: (addresses: string[], port: number) =>
+    invoke('client_probe_mother', { addresses, port }),
+  // Force the automatic re-point / the operator's rejoin, without waiting for a
+  // failing poll.
+  repointNow: () => rejoinMotherNow(),
+  // Mirror the current mother's state onto this device's rows, and run the
+  // whole superseded-game sweep. `applySnapshot` should refuse with
+  // `serving_locally` on a device that is hosting the game.
+  applySnapshot: (launchedGameId: number) => applyMotherSnapshot(launchedGameId),
+  reconcileNow: () => reconcileSupersededGamesTick(),
 };
 
 declare global {

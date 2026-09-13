@@ -132,14 +132,17 @@ export interface TracksGameRendererProps {
     teamNameFrame: string;
     timerFrame: string;
     scoreFrame: string;
-    timeFrame: string;
   };
   teamName: string;
   timerText: string;
   scoreText: string;
   showScore: boolean;
-  /** Correct-checkpoint count for the simple summary ("X / N"). */
-  hitCount: number;
+  /** Localized caption drawn over the timer frame (`ingame_tracks:hud_time`). */
+  timeLabel: string;
+  /** Localized caption drawn over the score frame (`ingame_tracks:hud_score`). */
+  scoreLabel: string;
+  /** Localized, already-interpolated "X / N checkpoints" line for simple mode. */
+  checkpointsSummary: string;
   language: string;
   clues: TracksRendererCluesConfig;
   /** Top-X reveal image URL (when screen === 'topreveal'); '' to skip. */
@@ -175,12 +178,28 @@ export interface TracksGameRendererProps {
    * sensible top-strip fallback so a partial layout still works.
    */
   hudLayout?: {
-    team_name_background_image?: { x: number; y: number; width: number; height: number };
-    timer_background_image?: { x: number; y: number; width: number; height: number };
-    score_background_image?: { x: number; y: number; width: number; height: number };
-    time_background_image?: { x: number; y: number; width: number; height: number };
+    team_name_background_image?: HudBoxPos;
+    timer_background_image?: HudBoxPos;
+    score_background_image?: HudBoxPos;
   };
 }
+
+/** One saved HUD box: geometry in % of the map image, plus the author's text
+ *  size for the value drawn inside it (% of box height; see `DEFAULT_HUD_TEXT_SCALE`). */
+interface HudBoxPos {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  textScale?: number;
+}
+
+/** Value font size as a % of the box height when the author set none. Mirrors
+ *  `TRACKS_HUD_MOCK[*].defaultScale` in the studio's layoutGroups.ts. */
+const DEFAULT_HUD_TEXT_SCALE = { withLabel: 45, withoutLabel: 55 } as const;
+
+/** Caption size as a fraction of the value size (was .18/.45 hard-coded). */
+const HUD_LABEL_RATIO = 0.4;
 
 function HudBox({
   frameUrl,
@@ -227,7 +246,7 @@ function PositionedHudBox({
   label,
   value,
 }: {
-  pos: { x: number; y: number; width: number; height: number };
+  pos: HudBoxPos;
   imgBounds: { x: number; y: number; width: number; height: number };
   frameUrl: string;
   label?: string;
@@ -239,8 +258,16 @@ function PositionedHudBox({
   const heightPct = (pos.height / 100) * imgBounds.height;
   const heightPx =
     (heightPct / 100) * (typeof window !== 'undefined' ? window.innerHeight : 0);
-  const valueFontSize = Math.max(10, heightPx * (label ? 0.45 : 0.55));
-  const labelFontSize = Math.max(8, heightPx * 0.18);
+  // Text size is authored in the studio layout editor (% of box height); the
+  // legacy ratios stay the default so untouched layouts render unchanged.
+  const scale =
+    typeof pos.textScale === 'number' && pos.textScale > 0
+      ? pos.textScale
+      : label
+        ? DEFAULT_HUD_TEXT_SCALE.withLabel
+        : DEFAULT_HUD_TEXT_SCALE.withoutLabel;
+  const valueFontSize = Math.max(10, heightPx * (scale / 100));
+  const labelFontSize = Math.max(8, valueFontSize * HUD_LABEL_RATIO);
   return (
     <div
       className="absolute pointer-events-none flex flex-col items-center justify-center overflow-hidden text-center"
@@ -291,7 +318,9 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     timerText,
     scoreText,
     showScore,
-    hitCount,
+    timeLabel,
+    scoreLabel,
+    checkpointsSummary,
     language,
     clues,
     topRevealUrl,
@@ -386,15 +415,29 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
   }
 
   // --- Simple mode reveal: minimal centered HUD, no map ----------------------
+  // The scenario background stays behind it (the map is what simple mode drops,
+  // not the whole scene): on a scenario whose font_color is dark, a bare black
+  // ground rendered this screen as an apparently blank display - retours #93.
+  // A scrim + text shadow keep the summary readable over any background.
   if (displayMode === 'simple' && screen === 'reveal') {
     return (
-      <div style={rootStyle} className="flex flex-col items-center justify-center gap-6">
-        <div className="text-5xl font-bold">{teamName}</div>
-        {showScore && <div className="text-7xl font-extrabold">{scoreText}</div>}
-        <div className="text-3xl opacity-80">
-          {hitCount} / {routeCheckpoints.length} checkpoints
+      <div style={rootStyle}>
+        {backgroundUrl && (
+          <img
+            src={backgroundUrl}
+            alt=""
+            className="absolute inset-0 w-full h-full object-cover select-none pointer-events-none"
+          />
+        )}
+        <div
+          className="absolute inset-0 flex flex-col items-center justify-center gap-6 text-center px-10"
+          style={{ background: 'rgba(0,0,0,0.55)', textShadow: '0 2px 8px rgba(0,0,0,0.9)' }}
+        >
+          <div className="text-5xl font-bold">{teamName}</div>
+          {showScore && <div className="text-7xl font-extrabold">{scoreText}</div>}
+          <div className="text-3xl opacity-90">{checkpointsSummary}</div>
+          <div className="text-2xl opacity-75">{timerText}</div>
         </div>
-        <div className="text-2xl opacity-60">{timerText}</div>
       </div>
     );
   }
@@ -422,6 +465,11 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         routeCheckpoints.map((cp) => {
           if (!placedCheckpoints.has(cp.id)) return null;
           const url = placedCheckpoints.get(cp.id) || '';
+          // No image for this status (typically a scenario that never uploaded a
+          // "missing checkpoint" image) → draw NOTHING. The old fallback was a
+          // green disc, which both looked like a success marker and gave away the
+          // position of checkpoints the team never punched. Retours #92.
+          if (!url) return null;
           const pos = cp.position ?? { top: 50, left: 50 };
           const left = imgBounds.x + (Number(pos.left) / 100) * imgBounds.width;
           const top = imgBounds.y + (Number(pos.top) / 100) * imgBounds.height;
@@ -432,14 +480,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
               className="absolute -translate-x-1/2 -translate-y-1/2 tracks-fade-in"
               style={{ top: `${top}%`, left: `${left}%`, width: `${w}%` }}
             >
-              {url ? (
-                <img src={url} alt="" className="w-full h-auto" />
-              ) : (
-                <div
-                  className="rounded-full border-2"
-                  style={{ width: '100%', paddingBottom: '100%', borderColor: '#22c55e', background: 'rgba(34,197,94,0.4)' }}
-                />
-              )}
+              <img src={url} alt="" className="w-full h-auto" />
             </div>
           );
         })}
@@ -535,7 +576,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
                     pos={placedTimer}
                     imgBounds={imgBounds}
                     frameUrl={hud.timerFrame}
-                    label="Time"
+                    label={timeLabel}
                     value={timerText}
                   />
                 )}
@@ -552,7 +593,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
                     pos={placedScore}
                     imgBounds={imgBounds}
                     frameUrl={hud.scoreFrame}
-                    label="Score"
+                    label={scoreLabel}
                     value={scoreText}
                   />
                 )}
@@ -561,9 +602,9 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
           }
           return (
             <div className="absolute top-4 left-0 right-0 flex items-start justify-between px-6 pointer-events-none">
-              <HudBox frameUrl={hud.timerFrame} label="Time" value={timerText} />
+              <HudBox frameUrl={hud.timerFrame} label={timeLabel} value={timerText} />
               <HudBox frameUrl={hud.teamNameFrame} value={teamName} />
-              {showScore && <HudBox frameUrl={hud.scoreFrame} label="Score" value={scoreText} />}
+              {showScore && <HudBox frameUrl={hud.scoreFrame} label={scoreLabel} value={scoreText} />}
             </div>
           );
         })()
@@ -610,13 +651,13 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
               <div className="flex items-center gap-6">
                 {showScore && (
                   <div className="text-right">
-                    <div className="text-[10px] uppercase tracking-wider opacity-60">Score</div>
+                    <div className="text-[10px] uppercase tracking-wider opacity-60">{scoreLabel}</div>
                     <div className="text-2xl font-bold leading-none">{scoreText}</div>
                   </div>
                 )}
                 {timerText && (
                   <div className="text-right">
-                    <div className="text-[10px] uppercase tracking-wider opacity-60">Time</div>
+                    <div className="text-[10px] uppercase tracking-wider opacity-60">{timeLabel}</div>
                     <div className="text-2xl font-bold leading-none">{timerText}</div>
                   </div>
                 )}

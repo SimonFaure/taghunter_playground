@@ -21,7 +21,22 @@ export type StatusKey =
   | 'track_finished'
   | 'no_checkpoints'
   | 'reuse_cooldown'
-  | 'no_fresh_punches';
+  // None of the punched stations is in the scenario's pattern - almost always a
+  // wrong/absent pattern binding. Carries a technical detail (the read codes vs
+  // the expected ones) that is appended to the localized sentence.
+  | 'no_station_match'
+  // Replaces the old `no_fresh_punches`, which blamed either an un-wiped card
+  // OR a skewed station clock because the code genuinely couldn't tell. The
+  // clock test is gone (see tagquestPunchLogic), so each cause now has its own
+  // honest message.
+  | 'punches_already_counted'
+  | 'punches_not_wiped'
+  // Advisory, NOT a rejection: a predetermined-roster chip arrived with punches
+  // already on it. They are scored - with no pre-play bip there is no way to
+  // tell them from the player's first trip - so this only asks the operator to
+  // wipe cards before handing them out.
+  | 'card_not_wiped'
+  | 'card_full';
 
 const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<StatusKey>([
   'chip_not_recognized',
@@ -33,7 +48,11 @@ const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<StatusKey>([
   'track_finished',
   'no_checkpoints',
   'reuse_cooldown',
-  'no_fresh_punches',
+  'no_station_match',
+  'punches_already_counted',
+  'punches_not_wiped',
+  'card_not_wiped',
+  'card_full',
 ]);
 
 /**
@@ -72,10 +91,14 @@ export function localizedStatus(
 const STATUS_TYPE: Partial<Record<StatusKey, GameMessageType>> = {
   chip_not_recognized: 'warning',
   card_empty: 'warning',
+  no_station_match: 'error',
   team_already_finished: 'info',
   cheat_detected: 'error',
   error: 'error',
-  no_fresh_punches: 'warning',
+  punches_already_counted: 'info',
+  punches_not_wiped: 'warning',
+  card_not_wiped: 'warning',
+  card_full: 'warning',
 };
 
 /**
@@ -83,6 +106,13 @@ const STATUS_TYPE: Partial<Record<StatusKey, GameMessageType>> = {
  *
  * `overrideText` - a per-scenario UI string (from the editor's "UI text strings"
  * section) that, when non-empty, replaces the default localized status text.
+ *
+ * `fallbackMsg` is the technical detail the punch logic produced. For an
+ * unknown status it IS the message; for the generic `error` status it is
+ * appended to the message (retours #6): "une erreur est survenue" told the
+ * operator nothing actionable, so the actual cause - unreadable game data,
+ * failed write, unreachable mother - is now shown with it. Player-facing
+ * statuses (empty card, cheat, already finished) stay clean.
  */
 export function describePunchStatus(
   status: string,
@@ -101,6 +131,10 @@ export function describePunchStatus(
       ? tIngame('ingame_common', status, lang)
       : fallbackMsg ?? tIngame('ingame_common', 'error', lang);
   const type = STATUS_TYPE[status as StatusKey] ?? 'warning';
-  const text = teamName && !authorPlacedName ? `${teamName} - ${base}` : base;
+  let text = teamName && !authorPlacedName ? `${teamName} - ${base}` : base;
+  const detail = fallbackMsg?.trim();
+  if ((status === 'error' || status === 'no_station_match') && detail && !text.includes(detail)) {
+    text = `${text} — ${detail}`;
+  }
   return { text, type };
 }

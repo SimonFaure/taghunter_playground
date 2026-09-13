@@ -1,6 +1,7 @@
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { loadJwt } from './strongholdStore';
 import { persistAuthState, AuthStateBlock } from './authStore';
+import { tError } from '../i18n/errors';
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -113,6 +114,18 @@ export function setLanContactHandler(fn: (() => void) | null): void {
   lanContactHandler = fn;
 }
 
+// Fired when a mother-local call finds NO route at all (the override never got
+// installed, so we fail closed with the synthetic 503 below). That 503 is not a
+// transport throw, so it never reached the re-point hook: a device whose
+// override had been cleared could sit routeless until the next 15s tick
+// happened to resolve a link (Ludiom #74). The handler kicks route resolution
+// immediately instead. Fire-and-forget - the 503 is still thrown either way,
+// and the caller recovers on its next poll.
+let lanNoRouteHandler: (() => void) | null = null;
+export function setLanNoRouteHandler(fn: (() => void) | null): void {
+  lanNoRouteHandler = fn;
+}
+
 // Wait up to `timeoutMs` for the LAN override to be installed. Resolves
 // immediately if it's already set. On timeout it resolves anyway so a
 // genuinely-absent mother never hangs forever - the caller then fails closed
@@ -213,10 +226,12 @@ export async function apiCall<T = unknown>(
     // (not hosting, not routed). childControlLink keeps trying to discover +
     // auto-pair one, so callers (list page, nav badge) recover on a later tick.
     if (lanOverride == null) {
+      // Ask for route resolution now rather than waiting for the periodic tick.
+      lanNoRouteHandler?.();
       throw new ApiError(
         503,
         null,
-        'No mother reachable for launched_games - this device is not hosting and not routed to a mother yet.',
+        tError('motherUnreachable'),
       );
     }
   }

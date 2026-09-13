@@ -178,6 +178,7 @@
   "colPlayers": "Jugadores",
   "colSynced": "Sincronizada",
   "trackRoute_default": "Todos los checkpoints",
+  "trackRoute_reverse": "Recorrido invertido",
   "trackRoute_first_half": "Primera mitad",
   "trackRoute_last_half": "Segunda mitad",
   "trackRoute_odd": "Puntos de control impares",
@@ -185,5 +186,7 @@
   "validationsBadge_one": "{{count}} validación",
   "validationsBadge_other": "{{count}} validaciones",
   "membersHeading": "Miembros ({{count}})",
-  "noChipsBound": "Aún no hay ninguna tarjeta vinculada a este clan."
+  "noChipsBound": "Aún no hay ninguna tarjeta vinculada a este clan.",
+  "chipsInTeam": "Tarjetas en este equipo",
+  "chipsInClan": "Tarjetas en este clan"
 }

@@ -1,0 +1,15 @@
+{
+  "authPersistFailed": "Could not save the signed-in account on this device.",
+  "authPersistFailedEviction": "Could not save the signed-in account on this device after freeing a slot.",
+  "noCachedAccount": "No account is cached on this device - the PIN cannot be reset.",
+  "deviceCapReached": "Device limit reached - sign out from Settings, then sign in again.",
+  "patternNoGameType": "This file has no game type. Use a pattern exported from the studio.",
+  "patternNoRows": "No pattern rows were found in the file.",
+  "scenarioNotDownloaded": "This scenario is not downloaded yet - open the full launch screen to sync it.",
+  "noPatternAvailable": "No pattern is available for this scenario.",
+  "noMonitors": "No screen detected.",
+  "noUpdateToDownload": "There is no update to download.",
+  "noUpdateToInstall": "No downloaded update is ready to install.",
+  "motherUnreachable": "No mother reachable - this device is neither hosting nor connected to a mother yet.",
+  "pinFourDigits": "The PIN must be exactly 4 digits."
+}

@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Crown, AlertTriangle, Loader2, CheckCircle, X } from 'lucide-react';
 import { takeoverMother, type TakeoverTarget } from '../services/lanMotherBoot';
+import { failoverErrorText } from '../services/failoverErrors';
 
 type Phase = 'confirm' | 'taking' | 'success' | 'error';
 
@@ -54,7 +55,7 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
       await takeoverMother(target);
       setPhase('success');
     } catch (e) {
-      setError(String((e as { message?: string })?.message ?? e));
+      setError(failoverErrorText(e, t));
       setPhase('error');
     }
   };

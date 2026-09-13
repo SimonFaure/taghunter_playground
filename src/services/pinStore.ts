@@ -1,5 +1,6 @@
 import { getDb } from './db';
 import { pbkdf2, randomSaltB64, constantTimeEqual } from './localCrypto';
+import { tError } from '../i18n/errors';
 
 // Local PIN store. Backs the cold-start lock screen.
 //
@@ -148,6 +149,6 @@ function computeLockoutEnd(failedAttempts: number, nowSeconds: number): number {
 
 function assertPinShape(pin: string): void {
   if (!/^\d{4}$/.test(pin)) {
-    throw new Error('PIN must be exactly 4 digits');
+    throw new Error(tError('pinFourDigits'));
   }
 }

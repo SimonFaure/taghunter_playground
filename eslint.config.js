@@ -59,6 +59,18 @@ const I18N_GUARDED = [
   'src/components/CardDetectionAlert.tsx',
   'src/components/ConfirmDialog.tsx',
   'src/components/Alert.tsx',
+  // Error/alert sweep (2026-09-10): the operator wrapper around every game
+  // (controls panel, end/delete confirmations, PIN prompts, fallback rankings)
+  // and the LAN diagnostics panel, which was hardcoded French.
+  'src/components/GamePage.tsx',
+  'src/components/settings/LanDiagnostics.tsx',
+  // Clash player-facing surfaces (2026-08-05): registration, live dashboard and
+  // results all render in the LAUNCH language via the `ingame_clash` namespace,
+  // so hardcoded display text is a regression here too.
+  'src/components/ClashGamePage.tsx',
+  'src/components/ClashGameRenderer.tsx',
+  'src/components/ClashRegistrationScreen.tsx',
+  'src/components/ClashResultsScreen.tsx',
 ];
 
 export default tseslint.config(
