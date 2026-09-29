@@ -19,6 +19,7 @@ import {
   weightedScore,
 } from './tagquestScoring';
 import type { Team } from '../components/LaunchGameModal';
+import { parseDbTs } from '../utils/dbTime';
 
 interface GameQuest {
   name: string;
@@ -93,7 +94,10 @@ export interface PunchAnimationData {
   newMalus: number;
   newLateMalus: number;
   gameOver?: boolean;
-  endTimeToCommit?: number;
+  /** Unix seconds the team finished at - already written to the team row. */
+  finishedAt?: number;
+  /** Unix seconds the team started at, for the finish screen's elapsed time. */
+  startedAt?: number | null;
   teamId?: number;
 }
 
@@ -215,13 +219,15 @@ function getQuests(gdj: GameDataJson): GameQuest[] {
 
 function getLateMalusPoints(gdj: GameDataJson): number {
   const val = gdj?.game_meta?.late_malus_points ?? gdj?.game_meta?.default_time_malus ?? 0;
-  return typeof val === 'string' ? parseFloat(val) || 0 : val;
+  const n = typeof val === 'string' ? parseFloat(val) || 0 : val;
+  // The studio asks for a negative value; older scenarios hold a positive one.
+  return Math.abs(n);
 }
 
 function getMalusPoints(gdj: GameDataJson): number {
   const val = gdj?.game_meta?.malus_points ?? 0;
   const n = typeof val === 'string' ? parseFloat(val) || 0 : val;
-  // Authors type a positive penalty; be tolerant of a signed value.
+  // The studio asks for a negative value; older scenarios hold a positive one.
   return Math.abs(n);
 }
 
@@ -441,7 +447,9 @@ export async function processTagQuestPunch(
     // Card empty takes priority: an empty card (erased/blank, no punches) on bip
     // must always surface the "card empty" message - even when the chip isn't
     // tied to a team - so the player is told to go punch some stations.
-    if (card.punches.length === 0) {
+    // The FINISH punch lives in `card.end`, not in `punches`: a card carrying
+    // only the finish is a team ending its game, not an empty card (sept #56).
+    if (card.punches.length === 0 && card.end == null) {
       console.log('[TagQuest] Card empty for chip:', card.id, 'team:', teamName || '(none)');
       return {
         team_name: teamName,
@@ -788,7 +796,7 @@ export async function processTagQuestPunch(
     // Step 10: Late malus calculation (using game metadata from `state` above).
     let malusApplied = 0;
     if (state.start_time && lateMalusPoints > 0) {
-      const startMs = new Date(state.start_time).getTime();
+      const startMs = parseDbTs(state.start_time);
       const durationMs = (state.duration ?? 0) * 60 * 1000;
       const deadline = startMs + durationMs;
       const now = Date.now();
@@ -985,11 +993,15 @@ export async function processTagQuestPunch(
       // Trade-off: a team punching FINISH out in the field is timed to when they
       // reach the reader, not to the punch. That offset is roughly equal for
       // everyone, so the ranking order holds.
+      //
+      // Written NOW, with the score, not after the reveal animation: deferring
+      // it to the end of the animation + hold (+ whatever was queued ahead of
+      // it) left the finish invisible to every other device and to the
+      // rankings for over a minute on a busy kiosk. The reading device holds
+      // its own game-end until its finish screen is done (TagQuestGamePage).
       endTimeToCommit = Math.floor(Date.now() / 1000);
       gameEnded = true;
-      if (scoreNeedsWrite) {
-        await updateTeam(team.id, { score: newScore });
-      }
+      await updateTeam(team.id, { end_time: endTimeToCommit, score: newScore });
     } else if (scoreNeedsWrite) {
       await updateTeam(team.id, { score: newScore });
     }
@@ -1097,7 +1109,8 @@ export async function processTagQuestPunch(
       newMalus: stationMalus,
       newLateMalus: malusApplied,
       gameOver: gameEnded,
-      endTimeToCommit,
+      finishedAt: endTimeToCommit,
+      startedAt: team.start_time ?? null,
       teamId: team.id,
     };
 

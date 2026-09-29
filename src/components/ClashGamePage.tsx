@@ -34,6 +34,8 @@ import {
 import { ClashGameRenderer, type ClashClanVisual, type ClashSizes } from './ClashGameRenderer';
 import { ClashRegistrationScreen } from './ClashRegistrationScreen';
 import { ClashResultsScreen } from './ClashResultsScreen';
+import { renderEventSentence } from './clashEventFeed';
+import { parseDbTs } from '../utils/dbTime';
 
 interface ClashGamePageProps {
   config: GameConfig;
@@ -98,6 +100,9 @@ interface ClashGameMetaRuntime {
   event_text_attack?: Record<string, string> | string;
   event_text_neutralized?: Record<string, string> | string;
   event_text_purge?: Record<string, string> | string;
+  purge_text_already_used?: Record<string, string> | string;
+  purge_text_own_territory?: Record<string, string> | string;
+  purge_text_no_target?: Record<string, string> | string;
   ranking_title?: Record<string, string> | string;
   clans?: ClashClanMeta[];
   territories?: ClashTerritoryMeta[];
@@ -368,6 +373,17 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     [meta, lang],
   );
 
+  // Scenario-authored purge refusal messages (retours sept. #68); blank ⇒ the
+  // app's translated default.
+  const purgeTexts = useMemo(
+    () => ({
+      alreadyUsed: pickLocalized(meta?.purge_text_already_used, lang),
+      ownTerritory: pickLocalized(meta?.purge_text_own_territory, lang),
+      noTarget: pickLocalized(meta?.purge_text_no_target, lang),
+    }),
+    [meta, lang],
+  );
+
   // Optional dashboard chrome frame images (resolved; '' ⇒ default styling).
   const frames = useMemo(
     () => ({
@@ -539,7 +555,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       try {
         const st = await getLaunchedGameState(launchedGameId, 0);
         if (cancelled) return;
-        const startMs = st.start_time ? Date.parse(st.start_time) : NaN;
+        const startMs = st.start_time ? parseDbTs(st.start_time) : NaN;
         const durationSec = (st.duration ?? 0) * 60; // duration is stored in minutes
         if (!Number.isNaN(startMs) && durationSec > 0) {
           endMsRef.current = startMs + durationSec * 1000;
@@ -647,11 +663,11 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
             );
           firePurgeAnnouncement(res.team_id ?? null, res.purge.territory_index);
         } else if (res.purge.status === 'already_used') {
-          showMessage(tc('msg_purge_already_used'), 'warning');
+          showMessage(purgeTexts.alreadyUsed || tc('msg_purge_already_used'), 'warning');
         } else if (res.purge.status === 'own_territory') {
-          showMessage(tc('msg_purge_own_territory'), 'warning');
+          showMessage(purgeTexts.ownTerritory || tc('msg_purge_own_territory'), 'warning');
         } else if (res.purge.status === 'no_target') {
-          showMessage(tc('msg_purge_no_target'), 'info');
+          showMessage(purgeTexts.noTarget || tc('msg_purge_no_target'), 'info');
         }
       }
       if (res.credited.length === 0) {
@@ -674,7 +690,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
           // Absent on a pre-2026-09 mother ⇒ the bare sentence, as before.
           const missing = res.partial?.missing ?? [];
           const detail = missing.length
-            ? ` - ${tc('msg_missing_balises', { list: missing.join(', ') })}`
+            ? ` - ${tc('msg_missing_balises', { count: missing.length, list: missing.join(', ') })}`
             : '';
           showMessage(`${base}${detail}`, 'info');
         }
@@ -850,12 +866,20 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
             alt=""
             className="h-48 object-contain animate-pulse drop-shadow-2xl"
           />
+          {/* The scenario's purge sentence when authored (the same one the
+              bottom banner uses), else the app default - retours sept. #68. */}
           <div className="mt-6 text-4xl font-bold text-center px-8" style={{ fontFamily }}>
-            <span style={{ color: purgeFlash.clanColor }}>{purgeFlash.clanName}</span>
-            <span className="text-white">
-              {' '}
-              {tc('purge_announcement', { territory: purgeFlash.terrName })}
-            </span>
+            {(eventTexts.purge
+              ? renderEventSentence(eventTexts.purge, purgeFlash.clanName, purgeFlash.terrName)
+              : [
+                  { text: purgeFlash.clanName, clan: true },
+                  { text: ` ${tc('purge_announcement', { territory: purgeFlash.terrName })}`, clan: false },
+                ]
+            ).map((run, ri) => (
+              <span key={ri} style={run.clan ? { color: purgeFlash.clanColor } : undefined} className={run.clan ? undefined : 'text-white'}>
+                {run.text}
+              </span>
+            ))}
           </div>
         </div>
       )}

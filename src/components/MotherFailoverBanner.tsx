@@ -10,14 +10,17 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Crown, Link2, X } from 'lucide-react';
-import { onMotherReachability, getPromotableGameId } from '../services/motherFailover';
+import { AlertTriangle, Crown, Link2, Loader2, X } from 'lucide-react';
+import { onMotherReachState, getPromotableGameId, type ReachState } from '../services/motherFailover';
 import { rejoinCurrentMother } from '../services/childControlLink';
 import { BecomeMotherModal } from './BecomeMotherModal';
 
 export function MotherFailoverBanner() {
   const { t } = useTranslation();
-  const [unreachable, setUnreachable] = useState(false);
+  // 'reconnecting': a calm amber bar, no buttons - the device is re-attaching on
+  // its own and the operator must not start promoting things (retours sept.
+  // #22). 'lost': ~1 min without real contact - the red banner with actions.
+  const [reach, setReach] = useState<ReachState>('ok');
   const [promoteGameId, setPromoteGameId] = useState<number | null>(null);
   // "Rejoin" is offered BEFORE "become mother": after a failover the mother the
   // device needs usually exists already, and rejoining it keeps one mother for
@@ -36,18 +39,33 @@ export function MotherFailoverBanner() {
 
   useEffect(
     () =>
-      onMotherReachability((u) => {
-        setUnreachable(u);
-        if (!u) setDismissed(false); // reachable again → re-arm for next outage
+      onMotherReachState((st) => {
+        setReach(st);
+        if (st === 'ok') {
+          setDismissed(false); // reachable again → re-arm for next outage
+          setRejoinFailed(false);
+          setNoGame(false);
+        }
       }),
     []
   );
 
-  const showBanner = unreachable && !dismissed && promoteGameId == null;
-  if (!showBanner && promoteGameId == null) return null;
+  const showReconnecting = reach === 'reconnecting' && promoteGameId == null;
+  const showBanner = reach === 'lost' && !dismissed && promoteGameId == null;
+  if (!showBanner && !showReconnecting && promoteGameId == null) return null;
 
   return (
     <>
+      {showReconnecting && (
+        <div
+          className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg"
+          style={{ zIndex: 6000 }}
+          role="status"
+        >
+          <Loader2 size={16} className="shrink-0 animate-spin" />
+          <span className="text-sm font-medium">{t('failover:bannerReconnecting')}</span>
+        </div>
+      )}
       {showBanner && (
         <div
           className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-red-600/95 text-white shadow-lg"

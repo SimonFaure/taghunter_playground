@@ -169,7 +169,11 @@ export function useMotherConnection(): MotherConnectionState {
         // paired_devices as "idle mother" ONLY when we are not a satellite -
         // otherwise the ping never runs and the mother thinks we're offline.
         if (role.paired_mothers_count === 0) {
-          if (role.paired_devices_count > 0) {
+          // Leftover paired_devices rows alone do NOT make this device a mother:
+          // a device that was promoted and then demoted ("I'm not a mother")
+          // keeps them - and become_mother emptied its paired_mothers - so it
+          // kept wearing the crown with no server running. Require the server.
+          if (role.paired_devices_count > 0 && role.mother_server_running) {
             setState({ kind: 'mother_idle' });
             failuresRef.current = 0;
             return;

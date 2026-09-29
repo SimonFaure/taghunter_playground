@@ -2,11 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Search, Loader2, Trash2, Radio, X, Wifi, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
-  discoverOtherMothers, listPairedMothers, forgetPairedMother, joinMother,
-  formatLanTime,
+  discoverOtherMothers, listPairedMothers, joinMother,
   type DiscoveredMother, type PairedMotherRow, type JoinHandle, type JoinOutcome,
 } from '../../services/lanPairing';
-import { useMotherConnection } from '../../services/motherConnection';
 import { runAutoConnect, resolveConsent } from '../../services/wifiAutoConnect';
 import { isStuckOnApipa } from '../../services/wifi';
 import {
@@ -20,15 +18,19 @@ import { HelpDot } from '../../help';
 
 type Msg = { kind: 'ok' | 'err'; text: string };
 
-export function SatelliteLanSection() {
-  const { t } = useTranslation('devicesLan');
-  const conn = useMotherConnection();
+export type SatellitePart = 'wizard' | 'wifi' | 'join';
 
-  const [paired, setPaired] = useState<PairedMotherRow[]>([]);
+/** `parts`: which blocks to render (the rebuilt Network page places them in
+ *  separate rows of its Advanced section). Default: all. The "current mother"
+ *  row moved to MyMotherCard (retours sept. #7/#10). */
+export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {}) {
+  const show = (p: SatellitePart) => !parts || parts.includes(p);
+  const { t } = useTranslation('devicesLan');
+
+  const [, setPaired] = useState<PairedMotherRow[]>([]);
   const [discovered, setDiscovered] = useState<DiscoveredMother[] | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [joiningUuid, setJoiningUuid] = useState<string | null>(null);
-  const [forgettingUuid, setForgettingUuid] = useState<string | null>(null);
   const [msg, setMsg] = useState<Msg | null>(null);
   const joinRef = useRef<JoinHandle | null>(null);
   // Wi-Fi auto-connect: the first-time consent prompt + a busy flag while we
@@ -125,7 +127,7 @@ export function SatelliteLanSection() {
   async function join(m: DiscoveredMother) {
     setJoiningUuid(m.mother_uuid);
     setMsg(null);
-    const handle = joinMother(m);
+    const handle = joinMother(m, { manual: true });
     joinRef.current = handle;
     let outcome: JoinOutcome;
     try {
@@ -178,28 +180,16 @@ export function SatelliteLanSection() {
     setJoiningUuid(null);
   }
 
-  async function forget(m: PairedMotherRow) {
-    if (!window.confirm(t('forgetConfirm'))) return;
-    setForgettingUuid(m.mother_uuid);
-    try { await forgetPairedMother(m.mother_uuid); await refreshPaired(); }
-    finally { setForgettingUuid(null); }
-  }
-
-  const connText =
-    conn.kind === 'child_ok' ? t('statusConnected')
-    : conn.kind === 'child_nearby' ? t('statusNearby')
-    : t('statusOffline');
-  const connOk = conn.kind === 'child_ok';
-
   return (
     <div className="space-y-6">
       {/* ── Step-by-step manual connection (connect → search → ping). The primary,
           hand-driven path to reach a mother; nothing here fires automatically. ── */}
-      <StepByStepConnect />
+      {show('wizard') && <StepByStepConnect />}
 
       {/* ── Mother's Wi-Fi (the network this device must be ON to reach the
           mother). Studio-defined, synced to every device; read-only here so the
           operator can verify/scan it. ── */}
+      {show('wifi') && (
       <div className="pg-panel">
         <div className="flex items-center gap-2 mb-1">
           <Wifi className="w-5 h-5 text-[var(--pg-accent-bright)]" />
@@ -270,44 +260,10 @@ export function SatelliteLanSection() {
           <div className="text-[11px] text-[var(--pg-text-dim)] mt-1">{t('addNetworkHint')}</div>
         </div>
       </div>
-
-      {/* ── Currently paired mothers ── */}
-      {paired.length > 0 && (
-        <div>
-          <h3 className="pg-panel-title mb-3">{t('currentMotherTitle')}</h3>
-          <div className="space-y-2">
-            {paired.map((m) => (
-              <div key={m.mother_uuid} className="p-4 rounded-xl border bg-[var(--pg-surface)] border-[var(--pg-line)] flex items-center gap-4">
-                <Radio className={`w-6 h-6 shrink-0 ${connOk ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-text-dim)]'}`} />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[var(--pg-text)] font-medium truncate">
-                      {m.mother_label || m.mother_uuid.slice(0, 8)}
-                    </span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full border ${
-                      connOk ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
-                             : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
-                      {connText}
-                    </span>
-                  </div>
-                  {m.last_seen_at && (
-                    <div className="text-xs text-[var(--pg-text-dim)] mt-1">
-                      {t('lastSeen', { time: formatLanTime(m.last_seen_at) })}
-                    </div>
-                  )}
-                </div>
-                <button onClick={() => forget(m)} disabled={forgettingUuid === m.mother_uuid}
-                  title={t('forget')}
-                  className="p-2 rounded-lg text-[var(--pg-danger-text)] hover:bg-red-500/20 disabled:opacity-50">
-                  {forgettingUuid === m.mother_uuid ? <Loader2 className="w-5 h-5 animate-spin" /> : <Trash2 className="w-5 h-5" />}
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
       )}
 
       {/* ── Join a mother ── */}
+      {show('join') && (
       <div className="pg-panel">
         <div className="flex items-center gap-1.5">
           <h3 className="pg-panel-title">{t('satelliteTitle')}</h3>
@@ -378,7 +334,9 @@ export function SatelliteLanSection() {
         )}
       </div>
 
-      {/* Firewall panel moved into the Advanced section (see LanDevicesPanel). */}
+      )}
+
+      {/* Firewall panel lives in the Network page Advanced section (NetworkScreen). */}
 
       {consentSsid && (
         <WifiAutoConnectPrompt ssid={consentSsid} busy={autoBusy} onAnswer={answerConsent} />

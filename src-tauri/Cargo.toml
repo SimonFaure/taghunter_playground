@@ -62,14 +62,20 @@ windows = { version = "0.58", features = [
     "Networking_Connectivity",
     "Networking_NetworkOperators",
     # cp210x_driver: SetupDi* device enumeration + ShellExecuteExW UAC-elevated
-    # pnputil for the SportIdent reader driver install flow.
+    # SportIdent driver installer.
     # ShellExecuteExW lives under Win32_UI_Shell, not Win32_System_ShellAPI
-    # (the latter is not a windows-rs feature flag).
+    # (the latter is not a windows-rs feature flag), and is additionally
+    # gated on Win32_System_Registry (SHELLEXECUTEINFOW has an HKEY field).
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_UI_Shell",
+    "Win32_System_Registry",
+    # wifi_scan_fresh: WlanScan forces a real radio scan - `netsh wlan show
+    # networks` only reads Windows' cached list, which can miss a hotspot that
+    # just appeared for minutes (retours sept. #1/#19).
+    "Win32_NetworkManagement_WiFi",
 ] }
 
 # Desktop-only: app self-update + OS autostart. The Tauri updater cannot

@@ -5,7 +5,7 @@
   "finish": "Terminer la configuration",
   "lang": {
     "title": "Choisissez votre langue",
-    "subtitle": "Ceci définit la langue de l’application. Vous pourrez la modifier plus tard dans les Réglages."
+    "subtitle": "Ceci définit la langue de l’application. Vous pourrez la modifier plus tard dans les Paramètres."
   },
   "internet": {
     "title": "Connectez-vous à Internet",
@@ -32,21 +32,21 @@
     "conflictCancel": "Ne pas l’ajouter"
   },
   "mother": {
-    "title": "Serveur de jeu par défaut ?",
-    "subtitle": "Utiliser cet ordinateur comme serveur de jeu par défaut (la « mère ») qui fait tourner vos jeux sur le réseau local.",
+    "title": "Poste mère par défaut ?",
+    "subtitle": "Utiliser cet ordinateur comme poste mère par défaut : il héberge vos parties sur le réseau local.",
     "yes": "Oui, utiliser cet ordinateur comme serveur de jeu",
     "no": "Non"
   },
   "operatorOnly": {
-    "title": "Appareil opérateur uniquement ?",
+    "title": "Poste opérateur ?",
     "subtitle": "Utiliser cet ordinateur seulement pour gérer et lancer les jeux, jamais pour y jouer.",
-    "yes": "Oui, c'est un appareil opérateur uniquement",
+    "yes": "Oui, c'est un poste opérateur",
     "no": "Non, on jouera aussi sur cet appareil",
     "explainer": "Activez ceci lorsque cet ordinateur ne servira jamais à jouer - uniquement à préparer et lancer des jeux pour d'autres appareils. Il ne télécharge alors que les données et l'image de couverture de chaque jeu (pas tous les médias ni les vidéos tutoriels), ce qui économise de l'espace disque, et n'a besoin ni de lecteur de puces ni de son pilote."
   },
   "appearance": {
     "title": "Choisissez une apparence",
-    "subtitle": "Choisissez l’aspect de l’application. Vous pourrez le modifier plus tard dans les Réglages.",
+    "subtitle": "Choisissez l’aspect de l’application. Vous pourrez le modifier plus tard dans les Paramètres.",
     "red": "Rouge tactique",
     "blue": "Bleu tactique",
     "redLight": "Rouge clair",

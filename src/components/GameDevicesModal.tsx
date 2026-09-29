@@ -51,6 +51,7 @@ import {
 import { HelpDot } from '../help';
 import { GameLockGate } from './GameLockGate';
 import { getDeviceLockState, type LockReason } from '../services/deviceLock';
+import { parseDbTs } from '../utils/dbTime';
 
 interface GameDevicesModalProps {
   launchedGameId: number;
@@ -530,19 +531,20 @@ export function GameDevicesModal({
                 {playMenuOpen && (
                   <div className="absolute right-0 top-full mt-1 bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] shadow-xl z-10 min-w-[160px]">
                     <PlayMenuItem
-                      label={t('devicesModal:videoIntro')}
-                      disabled={!hasIntro}
-                      onClick={() => onPlayVideo(['intro'])}
-                    />
-                    <PlayMenuItem
                       label={t('devicesModal:videoTutorial')}
                       disabled={!hasTutorial}
                       onClick={() => onPlayVideo(['tutorial'])}
                     />
                     <PlayMenuItem
+                      label={t('devicesModal:videoIntro')}
+                      disabled={!hasIntro}
+                      onClick={() => onPlayVideo(['intro'])}
+                    />
+                    {/* Tutorial FIRST, then the scenario intro (retour 2026-09-16). */}
+                    <PlayMenuItem
                       label={t('devicesModal:videoIntroTutorial')}
                       disabled={!hasIntro || !hasTutorial}
-                      onClick={() => onPlayVideo(['intro', 'tutorial'])}
+                      onClick={() => onPlayVideo(['tutorial', 'intro'])}
                     />
                   </div>
                 )}
@@ -1000,7 +1002,7 @@ function OnlineBadge({ online }: { online: boolean }) {
 function formatStaleness(iso: string | null, t: (key: string, opts?: Record<string, unknown>) => string): string {
   if (!iso) return t('devicesModal:stalenessNever');
   // The server returns 'YYYY-MM-DD HH:MM:SS' in UTC; parse with a trailing 'Z'.
-  const parsed = Date.parse(iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
+  const parsed = parseDbTs(iso);
   if (Number.isNaN(parsed)) return t('devicesModal:stalenessNever');
   const diff = Date.now() - parsed;
   if (diff < 60_000) return t('devicesModal:stalenessJustNow');

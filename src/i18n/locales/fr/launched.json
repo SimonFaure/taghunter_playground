@@ -5,10 +5,10 @@
   "loading": "Chargement des parties lancées...",
   "loadingShort": "Chargement…",
   "noGamesYet": "Aucune partie n'a encore été lancée.",
-  "gamesOnMother": "Parties sur la mère",
+  "gamesOnMother": "Parties sur le poste mère",
   "thisDeviceSection": "Cet appareil",
   "loadMoreEnded": "Voir plus ({{count}} terminées)",
-  "motherOffline": "Mère hors ligne - parties indisponibles",
+  "motherOffline": "Poste mère hors ligne - parties indisponibles",
   "devicesInGameWarning_one": "({{count}} appareil est dans cette partie.)",
   "devicesInGameWarning_other": "({{count}} appareils sont dans cette partie.)",
   "scenarioLabel": "Scénario : {{scenario}}",
@@ -53,7 +53,7 @@
   "deleteGameConfirm": "Supprimer la partie",
   "deleteGameFailed": "Échec de la suppression de la partie",
   "archiveGameTitle": "Archiver la partie",
-  "archiveGameMessage": "L'archivage ne conserve que le résumé statistique de cette partie et supprime définitivement ses données détaillées (équipes, poinçonnages, appareils, configuration). Le résumé reste disponible dans la vue Archivées et dans Studio. Continuer ?",
+  "archiveGameMessage": "L'archivage ne conserve que le résumé statistique de cette partie et supprime définitivement ses données détaillées (équipes, bips, appareils, configuration). Le résumé reste disponible dans la vue Archivées et dans le Studio. Continuer ?",
   "archiveGameConfirm": "Archiver la partie",
   "archiveGameFailed": "Échec de l'archivage de la partie",
   "archiveAll": "Tout archiver ({{count}})",
@@ -188,5 +188,8 @@
   "membersHeading": "Membres ({{count}})",
   "noChipsBound": "Aucune puce liée à ce clan pour le moment.",
   "chipsInTeam": "Puces dans cette équipe",
-  "chipsInClan": "Puces dans ce clan"
+  "chipsInClan": "Puces dans ce clan",
+  "slowLoadTitle": "Poste mère injoignable",
+  "slowLoadHint": "La liste des parties vient du poste mère, qui ne répond pas pour l'instant. Si une reprise de partie est en cours, patientez : ce poste se reconnecte seul.",
+  "slowLoadRetry": "Réessayer"
 }

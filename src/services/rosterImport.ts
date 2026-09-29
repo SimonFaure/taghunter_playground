@@ -256,8 +256,10 @@ export async function parseRosterFile(file: File, opts: RosterImportOptions): Pr
     const nameStr = cellStr(row, cols.name);
     const groupStr = cellStr(row, cols.group);
 
-    // Fully blank row → ignore silently.
-    if (!idStr && !numStr && !nameStr && !groupStr) continue;
+    // Fully blank row → ignore silently. So is a row carrying only its chip
+    // reference: the downloaded template lists every chip of the account with
+    // empty name/team cells, and the chips left unfilled are simply unused.
+    if (!nameStr && !groupStr) continue;
 
     // Resolve the chip: prefer id, fall back to number; cross-check when both.
     const idVal = parseIntCell(idStr);
@@ -330,45 +332,49 @@ export async function parseRosterFile(file: File, opts: RosterImportOptions): Pr
 }
 
 // ---------------------------------------------------------------------------
-// Template CSV - correct headers + a couple of example rows from the roster.
+// Template - correct headers + one row per chip of the account (id and
+// printed number pre-filled, name/team left empty for the licensee to fill).
+// Licensees know their chips by number (n° 3), not by the 7-digit SportIdent id.
 // ---------------------------------------------------------------------------
 
-function csvCell(s: string): string {
-  return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-export function buildTemplateCsv(
+function buildTemplateRows(
   mode: RosterImportMode,
   chips: RosterChip[],
   clans?: ImportClanDef[],
-): string {
-  const sample = chips.slice(0, 3);
-  const rows: string[][] = [];
+): (string | number)[][] {
+  const sorted = [...chips].sort((a, b) => a.key_number - b.key_number || a.id - b.id);
+  const rows: (string | number)[][] = [];
 
-  if (mode === 'team') {
-    rows.push(['chip id', 'chip number', 'name', 'team name']);
-    sample.forEach((c, i) => {
-      rows.push([String(c.id), String(c.key_number), c.key_name || `Player ${i + 1}`, `Team ${Math.floor(i / 2) + 1}`]);
-    });
-  } else if (mode === 'clan') {
-    rows.push(['chip id', 'chip number', 'name', 'clan']);
-    sample.forEach((c, i) => {
-      const clan = clans && clans.length ? clans[i % clans.length] : { index: (i % 2) + 1, name: `Clan ${(i % 2) + 1}` };
-      rows.push([String(c.id), String(c.key_number), c.key_name || `Player ${i + 1}`, clan.name || String(clan.index)]);
-    });
-  } else {
-    rows.push(['chip id', 'chip number', 'name']);
-    sample.forEach((c, i) => {
-      rows.push([String(c.id), String(c.key_number), c.key_name || `Team ${i + 1}`]);
-    });
-  }
+  if (mode === 'team') rows.push(['chip id', 'chip number', 'name', 'team name']);
+  else if (mode === 'clan') rows.push(['chip id', 'chip number', 'name', 'clan']);
+  else rows.push(['chip id', 'chip number', 'name']);
+  const blanks = rows[0].length - 2;
+  for (const c of sorted) rows.push([c.id, c.key_number, ...Array<string>(blanks).fill('')]);
 
   // Ensure at least one example row even when the roster is empty.
   if (rows.length === 1) {
-    if (mode === 'team') rows.push(['1001', '1', 'Alice', 'Team 1']);
-    else if (mode === 'clan') rows.push(['1001', '1', 'Alice', clans?.[0]?.name || '1']);
-    else rows.push(['1001', '1', 'Red team']);
+    if (mode === 'team') rows.push([1001, 1, 'Alice', 'Team 1']);
+    else if (mode === 'clan') rows.push([1001, 1, 'Alice', clans?.[0]?.name || '1']);
+    else rows.push([1001, 1, 'Red team']);
   }
 
-  return rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
+  return rows;
+}
+
+/**
+ * The template as a real .xlsx (not CSV): French Excel opens a comma CSV as a
+ * single column, and a licensee fills this in Excel.
+ */
+export async function buildTemplateXlsx(
+  mode: RosterImportMode,
+  chips: RosterChip[],
+  clans?: ImportClanDef[],
+): Promise<Uint8Array> {
+  const XLSX = await import('xlsx');
+  const rows = buildTemplateRows(mode, chips, clans);
+  const sheet = XLSX.utils.aoa_to_sheet(rows);
+  sheet['!cols'] = rows[0].map((_, i) => ({ wch: i < 2 ? 12 : 24 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, sheet, mode === 'clan' ? 'Clans' : 'Teams');
+  return new Uint8Array(XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer);
 }

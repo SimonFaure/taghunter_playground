@@ -170,6 +170,7 @@ export function MysteryLayoutBox({
         }}
       >
         <span
+          className="vcenter-text"
           style={{
             // Applied explicitly (not just inherited) so the text renders in the
             // scenario font even outside a stage that sets it - e.g. the layout
@@ -306,6 +307,7 @@ export function MysteryIdleBox({
         }}
       >
         <span
+          className="vcenter-text"
           style={{
             fontFamily: family || undefined,
             fontWeight: 700,
@@ -615,15 +617,94 @@ export function resolveMysteryStatusFrame(
 
 export interface MysteryUnderlayMeta {
   enigma_underlay_scale?: string | number;
+  enigma_image_scale?: string | number;
+  enigma_underlay_offset_x?: string | number;
+  enigma_underlay_offset_y?: string | number;
+  enigma_image_offset_x?: string | number;
+  enigma_image_offset_y?: string | number;
 }
 
-/** % of the available square that the main-image tile occupies (10-100). */
+/** Shift of a centred box, in % of the available square (+x right, +y down). */
+export interface MysteryBoxOffset {
+  x: number;
+  y: number;
+}
+
+function clampOffset(v: unknown): number {
+  const n = gaugeNum(v as string | number | undefined);
+  return n === null ? 0 : Math.max(-50, Math.min(50, n));
+}
+
+/**
+ * Where the coloured sub-frame sits (retours sept. 2026 #38): the underlay and
+ * the image are sized separately since 2026-09-16, but both stayed centred, so
+ * the author could not place the frame behind an off-centre subject. Blank = 0,
+ * i.e. centred as before.
+ */
+export function resolveMysteryUnderlayOffset(
+  meta: MysteryUnderlayMeta | null | undefined,
+): MysteryBoxOffset {
+  const m = meta ?? {};
+  return { x: clampOffset(m.enigma_underlay_offset_x), y: clampOffset(m.enigma_underlay_offset_y) };
+}
+
+/** Where the main image sits, independently of the sub-frame (#38). */
+export function resolveMysteryEnigmaImageOffset(
+  meta: MysteryUnderlayMeta | null | undefined,
+): MysteryBoxOffset {
+  const m = meta ?? {};
+  return { x: clampOffset(m.enigma_image_offset_x), y: clampOffset(m.enigma_image_offset_y) };
+}
+
+/** % of the available square that the main-image underlay occupies (10-100). */
 export function resolveMysteryUnderlayScale(
   meta: MysteryUnderlayMeta | null | undefined,
 ): number {
   const n = gaugeNum((meta ?? {}).enigma_underlay_scale);
   if (n === null) return 100;
   return Math.max(10, Math.min(100, n));
+}
+
+/**
+ * % of the available square that the main IMAGE occupies (10-100).
+ *
+ * The image used to be drawn at 100 % of the underlay, so resizing the coloured
+ * sub-frame resized the picture with it and the frame always hugged the image
+ * (retour 2026-09-16). The two are now separate centred boxes in the same
+ * square. Blank = the underlay's size, which is exactly what a scenario authored
+ * before the split drew; the layout editor pins this value the first time the
+ * author moves the underlay, so the image stays put from then on.
+ */
+export function resolveMysteryEnigmaImageScale(
+  meta: MysteryUnderlayMeta | null | undefined,
+): number {
+  const n = gaugeNum((meta ?? {}).enigma_image_scale);
+  if (n === null) return resolveMysteryUnderlayScale(meta);
+  return Math.max(10, Math.min(100, n));
+}
+
+/**
+ * A box of `scale` % of its (square, position:relative) parent, centred in it
+ * and then shifted by `offset` (% of the parent; see resolveMysteryUnderlayOffset).
+ */
+export function mysteryCenteredBox(
+  scale: number,
+  offset: MysteryBoxOffset = { x: 0, y: 0 },
+): {
+  position: 'absolute';
+  left: string;
+  top: string;
+  width: string;
+  height: string;
+} {
+  const inset = (100 - scale) / 2;
+  return {
+    position: 'absolute',
+    left: `${inset + offset.x}%`,
+    top: `${inset + offset.y}%`,
+    width: `${scale}%`,
+    height: `${scale}%`,
+  };
 }
 
 export interface MysteryStatusPlateProps {

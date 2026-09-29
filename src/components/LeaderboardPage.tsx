@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react
 import { useTranslation } from 'react-i18next';
 import { Trophy, ArrowLeft, Clock, Zap, Star, Medal, Users, ArrowUp, ArrowDown, ArrowRight, Minus, MonitorUp, MonitorOff, X } from 'lucide-react';
 import { getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
+import { onLanOverrideChange } from '../services/api';
 import { pushOverlay, popOverlay } from '../services/screenState';
 import { GameConfig, Team as ConfigTeam } from './LaunchGameModal';
 import { getClashState, type ClashStandings } from '../services/clash';
@@ -125,6 +126,8 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
   // not finish. Without the game's own `ended` flag the board can't tell the two
   // apart, so it kept every team on "In progress" after closure.
   const [gameEnded, setGameEnded] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const failedPollsRef = useRef(0);
   // --- Clash mode ----------------------------------------------------------
   // A Clash launch has no per-team run: clans never receive a `start_time` or
   // an `end_time`, so this board read "Did not start" under every clan for the
@@ -244,8 +247,14 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
         end_time: t.end_time,
         key_id: t.key_id ?? 0,
       }));
+      failedPollsRef.current = 0;
+      setOffline(false);
     } catch (err) {
       console.error('[LeaderboardPage] fetchTeams failed:', err);
+      // Three misses in a row (~9 s): say so instead of freezing the last list
+      // as if it were live (retours sept. #18).
+      failedPollsRef.current += 1;
+      if (failedPollsRef.current >= 3) setOffline(true);
       return;
     }
 
@@ -366,8 +375,14 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
     fetchTeams(true);
 
     intervalRef.current = setInterval(() => fetchTeams(false), 3000);
+    // The route moved to another mother (failover): refetch now.
+    const offRoute = onLanOverrideChange(() => {
+      void loadMeta();
+      void fetchTeams(false);
+    });
 
     return () => {
+      offRoute();
       if (intervalRef.current) clearInterval(intervalRef.current);
       if (animationTimerRef.current) clearTimeout(animationTimerRef.current);
     };
@@ -606,6 +621,11 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
       className="fixed inset-0 z-[200] bg-[var(--pg-app-bg)] overflow-auto"
       style={projectorMode ? { zoom: 1.5 } : undefined}
     >
+      {offline && (
+        <div className="fixed bottom-3 left-3 z-[210] px-3 py-1.5 rounded-lg bg-amber-500/90 text-black text-xs font-semibold shadow">
+          {tr('offlineBadge')}
+        </div>
+      )}
       <div
         className="min-h-screen flex flex-col"
         style={{

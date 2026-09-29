@@ -17,6 +17,7 @@ import {
   type ClashStandings,
 } from '../services/clash';
 import { getLaunchedGameState } from '../services/launchedGames';
+import { formatDbTime } from '../utils/dbTime';
 
 interface ClanPunchRow {
   id: number;
@@ -323,7 +324,7 @@ export function ClashClanDetailsModal({
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
                           <span className="text-[var(--pg-text-dim)] text-xs">
-                            {new Date(rec.created_at).toLocaleTimeString()}
+                            {formatDbTime(rec.created_at)}
                           </span>
                           {isExpanded ? (
                             <ChevronUp size={14} className="text-[var(--pg-text-dim)]" />

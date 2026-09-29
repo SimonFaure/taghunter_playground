@@ -66,7 +66,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { getStoredTheme, setTheme as applyThemeChoice, type ThemeName } from '../services/theme';
 import { AccountScreen } from './settings/AccountScreen';
 import { SyncStatusScreen } from './settings/SyncStatusScreen';
-import { DevicesScreen } from './settings/DevicesScreen';
+import { NetworkScreen } from './settings/NetworkScreen';
 import { UpdatesScreen } from './settings/UpdatesScreen';
 import { UsbDriverScreen } from './settings/UsbDriverScreen';
 import { PrintingScreen } from './settings/PrintingScreen';
@@ -102,8 +102,7 @@ export type SettingsTab =
   | 'updates'
   | 'printing'
   | 'team-names'
-  | 'api-docs'
-  | 'usb-driver';
+  | 'api-docs';
 
 interface ConfigurationPageProps {
   // When the user clicks the sync pill or failure banner, App sets this to
@@ -217,7 +216,7 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
   // Operator-only hides the hardware tabs - if one is open when the mode flips
   // on, bounce back to a safe tab so the pane doesn't go blank.
   useEffect(() => {
-    if (config.operatorOnlyDevice && (activeTab === 'hardware' || activeTab === 'usb-driver')) {
+    if (config.operatorOnlyDevice && activeTab === 'hardware') {
       setActiveTab('general');
     }
   }, [config.operatorOnlyDevice, activeTab]);
@@ -629,7 +628,7 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
             )}
 
             {activeTab === 'hardware' && (
-              <HardwareTab onOpenUsbDriver={() => setActiveTab('usb-driver')} />
+              <HardwareTab />
             )}
 
             {activeTab === 'cards' && <ClientCardsPage embedded />}
@@ -637,12 +636,11 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
             {activeTab === 'images' && <ImagesTab />}
             {activeTab === 'account' && <AccountScreen />}
             {activeTab === 'sync' && <SyncStatusScreen />}
-            {activeTab === 'devices' && <DevicesScreen />}
+            {activeTab === 'devices' && <NetworkScreen />}
             {activeTab === 'updates' && <UpdatesScreen />}
             {activeTab === 'printing' && <PrintingScreen />}
             {activeTab === 'team-names' && <TeamNamesScreen />}
             {activeTab === 'api-docs' && isAdminMode && <ApiDocsPage />}
-            {activeTab === 'usb-driver' && <UsbDriverScreen />}
           </main>
         </div>
       </div>
@@ -853,13 +851,20 @@ interface CardWithReceivedAt {
   receivedAt: Date;
 }
 
-// HardwareTab - the Reader status card plus the card-reader test panel. When
-// the reader has a driver problem, the status card links over to the dedicated
-// USB driver settings tab (Developer → USB driver), which owns the full fix.
-function HardwareTab({ onOpenUsbDriver }: { onOpenUsbDriver: () => void }) {
+// HardwareTab - the Reader status card, the USB driver diagnostic and the
+// card-reader test panel. The USB driver block used to be its own tab under a
+// "Developer" nav group that licensees could see; it now lives here. When the
+// reader has a driver problem, the status card scrolls down to it.
+function HardwareTab() {
+  const usbDriverRef = useRef<HTMLDivElement>(null);
+  const scrollToUsbDriver = () =>
+    usbDriverRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   return (
     <>
-      <ReaderStatusSection onOpenUsbDriver={onOpenUsbDriver} />
+      <ReaderStatusSection onOpenUsbDriver={scrollToUsbDriver} />
+      <div ref={usbDriverRef} className="mb-6 scroll-mt-24">
+        <UsbDriverScreen />
+      </div>
       <CardReaderTestSection />
     </>
   );
@@ -1457,15 +1462,14 @@ function SettingsNav({ active, onChange, isAdminMode = false, operatorOnly = fal
       label: t('settings:navGroupDeveloper'),
       items: [
         { tab: 'api-docs', label: t('settings:navApiDocs'), icon: <BookOpen size={16} /> },
-        { tab: 'usb-driver', label: t('settings:navUsbDriver'), icon: <Usb size={16} /> },
       ],
     },
   ];
 
-  // API docs are admin-only; drop the entry (and any group it empties) when
-  // not in admin mode. Operator-only devices have no reader/driver role, so the
-  // Hardware + USB Driver tabs are hidden entirely.
-  const hiddenTabs = new Set<SettingsTab>(operatorOnly ? ['hardware', 'usb-driver'] : []);
+  // API docs are admin-only; drop the entry (and the Developer group it empties)
+  // when not in admin mode, so licensees never see that group. Operator-only
+  // devices have no reader/driver role, so the Hardware tab is hidden entirely.
+  const hiddenTabs = new Set<SettingsTab>(operatorOnly ? ['hardware'] : []);
   const visibleGroups = groups
     .map((group) => ({
       ...group,

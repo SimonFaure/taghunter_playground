@@ -70,6 +70,10 @@ export interface AppConfig {
   // Settings→Preferences or the first-launch onboarding step. See
   // services/operatorMode.ts for the toggle (reset-and-resync) flow.
   operatorOnlyDevice?: boolean;
+  // Band of this device's hotspot when it is the mother: '2.4' (default) forces
+  // 2.4 GHz, which some field PCs needed to see the AP at all (retours sept.
+  // #19); 'auto' leaves Windows' "any available". Pushed to Rust at boot.
+  hotspotBand?: '2.4' | 'auto';
 }
 
 const CONFIG_REL = 'config.json';

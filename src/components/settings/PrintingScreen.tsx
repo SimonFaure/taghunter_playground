@@ -27,7 +27,7 @@ const GAME_TYPES = Object.keys(STAT_FIELDS_BY_TYPE) as ReportGameType[];
 const GAME_TYPE_LABELS: Record<ReportGameType, string> = {
   mystery: 'Mystery',
   tracks: 'Track',
-  tagquest: 'Tagquest',
+  tagquest: 'Quest',
   clash: 'Clash',
 };
 

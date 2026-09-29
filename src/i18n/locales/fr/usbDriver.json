@@ -5,9 +5,15 @@
   },
   "detection": {
     "recheck": "Revérifier",
-    "installTitle": "Disponible dans la prochaine version",
+    "installTitle": "Lance l'installateur du pilote SportIdent fourni avec Playground (Windows demandera l'autorisation administrateur)",
     "install": "Installer le pilote signé",
-    "comingSoon": "(bientôt disponible)"
+    "installing": "Installation… confirmez la demande de Windows",
+    "preinstall": "Installer le pilote maintenant",
+    "installDone": "Pilote installé. Si le statut ci-dessus ne passe pas au vert, débranchez et rebranchez le lecteur.",
+    "errCancelled": "Installation annulée - l'autorisation administrateur est nécessaire pour installer un pilote.",
+    "errMissing": "L'installateur du pilote est absent de cette version de Playground. Utilisez plutôt le lien de téléchargement ci-dessous.",
+    "errTimeout": "L'installateur n'a pas terminé à temps. Vérifiez qu'aucune fenêtre Windows n'est en attente, puis revérifiez.",
+    "errGeneric": "Échec de l'installation du pilote ({{detail}}). Essayez le lien de téléchargement ou la solution manuelle ci-dessous."
   },
   "variant": {
     "healthy": {
@@ -24,7 +30,7 @@
     },
     "deviceAbsent": {
       "title": "Aucun lecteur SportIdent détecté",
-      "body": "Branchez votre lecteur et cette carte s'actualisera automatiquement. Si le lecteur est branché mais que le Gestionnaire de périphériques affiche un avertissement jaune, le correctif du pilote apparaîtra ici une fois détecté."
+      "body": "Branchez votre lecteur et cet encart s'actualisera automatiquement. Si le lecteur est branché mais que le Gestionnaire de périphériques affiche un avertissement jaune, le correctif du pilote apparaîtra ici une fois détecté."
     },
     "otherError": {
       "title": "Erreur de périphérique (code {{code}})",
@@ -40,7 +46,7 @@
     "subtitle": "Requis pour que le lecteur soit détecté.",
     "body": "Installez le pilote USB SportIdent signé actuel. Il remplace l'ancien pilote bloqué ou manquant par une version compatible HVCI - <1>vous n'avez pas besoin de désactiver l'Intégrité de la mémoire</1>.",
     "download": "Télécharger le pilote USB SportIdent",
-    "afterInstall": "Après l'installation, débranchez et rebranchez le lecteur, puis appuyez sur le bouton de revérification de la carte de statut ci-dessus - elle devrait passer au vert."
+    "afterInstall": "Après l'installation, débranchez et rebranchez le lecteur, puis appuyez sur Revérifier dans l'encart d'état ci-dessus : il devrait passer au vert."
   },
   "manual": {
     "title": "Solution de contournement manuelle",

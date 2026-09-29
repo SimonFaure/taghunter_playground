@@ -45,7 +45,8 @@
   "clashNoEvents": "Todavía no ha pasado nada.",
   "loadingGameData": "Cargando los datos de la partida…",
   "noLayoutTitle": "No se ha encontrado ninguna maquetación",
-  "noLayoutBody": "Para mostrar la maquetación personalizada, importa un archivo de maquetación TagQuest o sincroniza con el servidor. Mientras tanto se muestra la clasificación por defecto.",
+  "noLayoutBody": "Para mostrar la maquetación personalizada, importa un archivo de maquetación Quest o sincroniza con el servidor. Mientras tanto se muestra la clasificación por defecto.",
   "playersCount_one": "{{count}} jugador",
-  "playersCount_other": "{{count}} jugadores"
+  "playersCount_other": "{{count}} jugadores",
+  "offlineBadge": "Clasificación sin conexión, reconectando…"
 }

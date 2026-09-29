@@ -11,7 +11,8 @@ import { TimeRangeLeaderboard } from './components/TimeRangeLeaderboard';
 import { readProjectorTargetFromUrl } from './services/projectorWindow';
 import type { RankingTarget } from './services/rankingTarget';
 import { attachToRunningMotherServer } from './services/lanMotherBoot';
-import { refreshLaunchedGamesRoute } from './services/childControlLink';
+import { refreshLaunchedGamesRoute, installLanReauth } from './services/childControlLink';
+import { installMotherFailover } from './services/motherFailover';
 import './index.css';
 // Apply the saved colour theme (tactical red default / blue) synchronously,
 // before the app renders, so a blue-theme device doesn't flash red on boot.
@@ -55,12 +56,28 @@ function ProjectorRoot({ target }: { target: RankingTarget }) {
   // on a satellite we resolve the paired mother's route instead. The projector
   // must never START a server - the old unconditional ensureMotherServer could
   // mint a competing mother on a satellite when the boot fence's browse errored.
+  //
+  // Retours sept. #18: on a satellite, the projector must also FOLLOW the mother
+  // through a failover, like the main window does - it used to resolve its route
+  // once and keep showing the old mother's game. Same failover handlers, same
+  // 15 s route refresh (both idempotent, per window).
   useEffect(() => {
     if (!clientId) return;
+    let id: ReturnType<typeof setInterval> | null = null;
+    let cancelled = false;
     void (async () => {
       const attached = await attachToRunningMotherServer();
-      if (!attached) await refreshLaunchedGamesRoute().catch(() => {});
+      if (attached || cancelled) return;
+      installMotherFailover();
+      installLanReauth();
+      await refreshLaunchedGamesRoute().catch(() => {});
+      if (cancelled) return;
+      id = setInterval(() => void refreshLaunchedGamesRoute().catch(() => {}), 15_000);
     })();
+    return () => {
+      cancelled = true;
+      if (id) clearInterval(id);
+    };
   }, [clientId]);
 
   if (!auth.user) {

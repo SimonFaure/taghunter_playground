@@ -26,6 +26,7 @@
   "fieldPlayMode": "Play Mode",
   "fieldVisibilityHideDelaySec": "Keep result on screen (seconds)",
   "fieldTagquestShowQuestPreview": "Show quest images preview",
+  "fieldTagquestShowMissingStations": "Show missing stations' visuals",
   "fieldTagquestScoreWeighting": "Weight scores by number of players",
   "fieldMalusPerMinute": "Penalty per minute over time",
   "fieldTestMode": "Test mode",

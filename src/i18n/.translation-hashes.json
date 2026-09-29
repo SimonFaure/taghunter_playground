@@ -300,26 +300,6 @@
       "fr": "1ce646bb",
       "es": "1ce646bb"
     },
-    "availableForPurchase": {
-      "fr": "a85d1352",
-      "es": "a85d1352"
-    },
-    "new": {
-      "fr": "8b242db1",
-      "es": "8b242db1"
-    },
-    "availableForPurchaseSubtitle": {
-      "fr": "3bd88942",
-      "es": "3bd88942"
-    },
-    "noScenariosMatchCriteria": {
-      "fr": "6cb1ddbc",
-      "es": "6cb1ddbc"
-    },
-    "forPurchase": {
-      "fr": "94bfde6b",
-      "es": "94bfde6b"
-    },
     "untitledScenario": {
       "fr": "4a808902",
       "es": "4a808902"
@@ -359,10 +339,6 @@
     "manageConfigs": {
       "fr": "678dffb8",
       "es": "678dffb8"
-    },
-    "purchase": {
-      "fr": "3afbdb82",
-      "es": "3afbdb82"
     },
     "configSaved": {
       "fr": "db82aef0",
@@ -1252,10 +1228,6 @@
       "fr": "1316d852",
       "es": "1316d852"
     },
-    "navUsbDriver": {
-      "fr": "03618ec1",
-      "es": "03618ec1"
-    },
     "languageSpanishTitle": {
       "fr": "19f0b05e",
       "es": "19f0b05e"
@@ -1373,8 +1345,8 @@
       "es": "862a694f"
     },
     "videoIntroTutorial": {
-      "fr": "2d5a864a",
-      "es": "2d5a864a"
+      "fr": "bf793620",
+      "es": "bf793620"
     },
     "emptyInGame": {
       "fr": "5b73f468",
@@ -1611,8 +1583,8 @@
       "es": "b85aa256"
     },
     "firstBipVideosHint": {
-      "fr": "98ff778a",
-      "es": "98ff778a"
+      "fr": "7b57296b",
+      "es": "7b57296b"
     },
     "victoryType": {
       "fr": "ed705ed7",

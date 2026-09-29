@@ -80,10 +80,37 @@ export function computeScore(input: ScoreInput): number {
 }
 
 /**
- * Strict-prefix itinerary scoring. Given each route checkpoint's earliest hit
- * time (seconds-of-day, or undefined if never reached), credit the longest
- * *leading* run of checkpoints reached in non-decreasing time order. The first
- * missing or out-of-order checkpoint ends the sequence.
+ * For each route checkpoint, the slot index on the card of the FIRST punch at
+ * one of its stations (undefined = never reached). The card stores punches in
+ * the order they happened; the per-punch times come from each station's own
+ * clock, which drift apart by tens of seconds, so ordering by time judged
+ * correctly-punched courses as out of order (retours sept. #2). Times are only
+ * for durations. `numberOf` is the checkpoint's 1-based position in the full
+ * checkpoint list, the key of `stations` (patternStore.getTracksCheckpointStations).
+ */
+export function firstSlotByCheckpoint(
+  routeCheckpoints: TracksCheckpoint[],
+  numberOf: (cp: TracksCheckpoint) => number,
+  stations: Map<number, number[]>,
+  punches: ReadonlyArray<{ code: number | string; time?: string | null }>,
+): Map<string, number | undefined> {
+  const out = new Map<string, number | undefined>();
+  for (const cp of routeCheckpoints) {
+    const cpStations = stations.get(numberOf(cp)) ?? [];
+    const slot = punches.findIndex(
+      (p) => !!p.time && p.time !== '00:00:00' && cpStations.includes(Number(p.code)),
+    );
+    out.set(cp.id, slot >= 0 ? slot : undefined);
+  }
+  return out;
+}
+
+/**
+ * Strict-prefix itinerary scoring. Given each route checkpoint's first hit
+ * position on the card (slot index from firstSlotByCheckpoint, NOT a station
+ * time; undefined if never reached), credit the longest *leading* run of
+ * checkpoints reached in order. The first missing or out-of-order checkpoint
+ * ends the sequence.
  *
  * `brokeAfterId` is the last credited checkpoint id when the run deviated
  * (credited prefix shorter than the route); null on a perfect run, or when even
@@ -92,17 +119,18 @@ export function computeScore(input: ScoreInput): number {
  */
 export function orderedHitCheckpointIds(
   routeCheckpoints: TracksCheckpoint[],
-  hitTimeByCheckpointId: Map<string, number | undefined>,
+  hitOrderByCheckpointId: Map<string, number | undefined>,
 ): { hitIds: Set<string>; brokeAfterId: string | null; deviated: boolean } {
   const hitIds = new Set<string>();
-  let prevTime = Number.NEGATIVE_INFINITY;
+  let prevOrder = Number.NEGATIVE_INFINITY;
   let lastCreditedId: string | null = null;
   for (const cp of routeCheckpoints) {
-    const t = hitTimeByCheckpointId.get(cp.id);
-    if (t === undefined || t < prevTime) break; // missing or out-of-order
+    // Equal orders only when two checkpoints share a station: legitimate.
+    const o = hitOrderByCheckpointId.get(cp.id);
+    if (o === undefined || o < prevOrder) break; // missing or out-of-order
     hitIds.add(cp.id);
     lastCreditedId = cp.id;
-    prevTime = t;
+    prevOrder = o;
   }
   const deviated = hitIds.size < routeCheckpoints.length;
   return { hitIds, brokeAfterId: deviated ? lastCreditedId : null, deviated };

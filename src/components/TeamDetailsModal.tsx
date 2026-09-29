@@ -36,6 +36,7 @@ import {
   weightedScore,
   type RosterTeam,
 } from '../services/tagquestScoring';
+import { parseDbTs, formatDbTime } from '../utils/dbTime';
 
 interface Team {
   id: number;
@@ -200,7 +201,7 @@ function readLocalizedish(value: unknown, lang: string): string {
 }
 
 function rowEpochSeconds(iso: string): number {
-  const t = Date.parse(iso);
+  const t = parseDbTs(iso);
   return Number.isFinite(t) ? t / 1000 : NaN;
 }
 
@@ -259,22 +260,15 @@ function liveCodesForTeam(
   return codes;
 }
 
-// Tracks variant of liveCodesForTeam: returns the earliest live-punch time
-// (seconds-of-day) per station code, so itinerary ordering can be recomputed.
+// Tracks variant of liveCodesForTeam: returns the slot position on the card of
+// the first live punch per station code, so itinerary ordering can be
+// recomputed. Card order, not station clocks: those drift (retours sept. #2).
 // Same baseline-subtraction + per-card windowing as liveCodesForTeam.
-function liveHitTimesForTeam(
+function liveHitSlotsForTeam(
   records: RawDataRecord[],
   startTime: number | null,
   endTime: number | null,
 ): Map<string, number> {
-  const secondsOfDay = (t: string | number): number => {
-    if (typeof t === 'number') return t;
-    const parts = String(t).split(':').map(Number);
-    if (parts.length >= 2) return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
-    const n = Number(t);
-    return Number.isFinite(n) ? n : NaN;
-  };
-
   const byCard = new Map<number, RawDataRecord[]>();
   for (const r of records) {
     const cid = Number((r.raw_data as { id?: number } | null)?.id);
@@ -286,6 +280,7 @@ function liveHitTimesForTeam(
 
   const SKEW_MARGIN_SEC = 60;
   const out = new Map<string, number>();
+  let slot = 0;
   for (const allRows of byCard.values()) {
     let rows = allRows;
     if (startTime != null) {
@@ -308,11 +303,9 @@ function liveHitTimesForTeam(
     for (const p of finishRow.raw_data?.punches ?? []) {
       if (baseline.has(`${p.code}@${p.time}`)) continue;
       if (p.time == null || String(p.time) === '00:00:00') continue;
-      const ts = secondsOfDay(p.time);
-      if (!Number.isFinite(ts)) continue;
       const k = String(p.code);
-      const cur = out.get(k);
-      if (cur === undefined || ts < cur) out.set(k, ts);
+      if (!out.has(k)) out.set(k, slot);
+      slot++;
     }
   }
   return out;
@@ -371,13 +364,16 @@ function toCompletedQuest(r: {
 
 function formatTimestamp(ts: number | string | null | undefined): string {
   if (ts === null || ts === undefined) return '-';
+  // A punch time is the station's own clock as "HH:MM:SS" - already the local
+  // wall time; parseFloat("09:49:12") used to render it as 1970 + 9 s.
+  if (typeof ts === 'string' && ts.includes(':')) return ts;
   const ms = typeof ts === 'string' ? parseFloat(ts) : ts;
   const adjusted = ms > 1e10 ? ms : ms * 1000;
   return new Date(adjusted).toLocaleTimeString();
 }
 
 function formatCreatedAt(iso: string): string {
-  return new Date(iso).toLocaleTimeString();
+  return formatDbTime(iso);
 }
 
 function parseComboVal(val: string | number | undefined): number {
@@ -833,8 +829,8 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
 
   // Quests tab: list individual completions youngest (most recent) first.
   const questsNewestFirst = [...completedQuests].sort((a, b) => {
-    const at = a.completed_at ? new Date(a.completed_at).getTime() : 0;
-    const bt = b.completed_at ? new Date(b.completed_at).getTime() : 0;
+    const at = a.completed_at ? parseDbTs(a.completed_at) || 0 : 0;
+    const bt = b.completed_at ? parseDbTs(b.completed_at) || 0 : 0;
     if (at !== bt) return bt - at;
     return b.id - a.id;
   });
@@ -1034,31 +1030,31 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     t(`teamDetails:cpStatus_${status}`, { defaultValue: CP_STATUS_META[status].label });
   const tracksAllCheckpoints: TracksCheckpoint[] = gameData?.game_meta?.checkpoints ?? [];
   const tracksRouteCps = checkpointsForRoute(tracksAllCheckpoints, tracksRoute);
-  // Earliest live-punch time per station code, then per route checkpoint.
-  const cpHitTimes = liveHitTimesForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time);
+  // First card slot per station code, then per route checkpoint.
+  const cpHitSlots = liveHitSlotsForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time);
   const cpNumberOf = (cp: TracksCheckpoint) => tracksAllCheckpoints.findIndex((c) => c.id === cp.id) + 1;
-  const cpHitTimeById = new Map<string, number | undefined>();
+  const cpHitSlotById = new Map<string, number | undefined>();
   for (const cp of tracksRouteCps) {
     const codes = cpStations.get(cpNumberOf(cp)) ?? [];
-    let earliest: number | undefined;
+    let first: number | undefined;
     for (const code of codes) {
-      const ts = cpHitTimes.get(String(code));
-      if (ts !== undefined && (earliest === undefined || ts < earliest)) earliest = ts;
+      const s = cpHitSlots.get(String(code));
+      if (s !== undefined && (first === undefined || s < first)) first = s;
     }
-    cpHitTimeById.set(cp.id, earliest);
+    cpHitSlotById.set(cp.id, first);
   }
   // Itinerary = strict in-order prefix; free = any reached checkpoint.
   const tracksBaseHitIds: Set<string> =
     tracksPlayMode === 'itinerary'
-      ? orderedHitCheckpointIds(tracksRouteCps, cpHitTimeById).hitIds
+      ? orderedHitCheckpointIds(tracksRouteCps, cpHitSlotById).hitIds
       : (() => {
           const s = new Set<string>();
-          for (const cp of tracksRouteCps) if (cpHitTimeById.get(cp.id) !== undefined) s.add(cp.id);
+          for (const cp of tracksRouteCps) if (cpHitSlotById.get(cp.id) !== undefined) s.add(cp.id);
           return s;
         })();
   const detectCpStatus = (cp: TracksCheckpoint): CpStatus => {
     if (tracksBaseHitIds.has(cp.id)) return 'correct';
-    if (cpHitTimeById.get(cp.id) !== undefined) return 'wrong'; // punched, not credited
+    if (cpHitSlotById.get(cp.id) !== undefined) return 'wrong'; // punched, not credited
     return 'missing';
   };
   const resolveCheckpointThumb = (cp: TracksCheckpoint): string => {

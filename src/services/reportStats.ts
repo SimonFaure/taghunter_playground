@@ -27,7 +27,7 @@ import * as scenarioStore from './scenarioStore';
 import * as patternStore from './patternStore';
 import { normalizeGameType, resolveReportLayout, defaultReportLayout, isReportLayout, type ReportGameType, type ReportLayout } from './reportLayout';
 import { getSyncedLayout } from './reportLayoutsStore';
-import { checkpointsForRoute, orderedHitCheckpointIds, type TracksCheckpoint } from './tracksScoring';
+import { checkpointsForRoute, firstSlotByCheckpoint, orderedHitCheckpointIds, type TracksCheckpoint } from './tracksScoring';
 import { getClashState, getClashMembers } from './clash';
 import {
   MALUS_QUEST_NUMBER,
@@ -38,6 +38,7 @@ import {
   teamHeadcounts,
   weightedScore,
 } from './tagquestScoring';
+import { parseDbTs } from '../utils/dbTime';
 
 export interface ReportData {
   teamId: number;
@@ -114,7 +115,7 @@ export function rawRecordsFromState(rows: RawPunchRow[]): RawRecord[] {
 }
 
 function rowEpochSeconds(iso: string): number {
-  const t = Date.parse(iso);
+  const t = parseDbTs(iso);
   return Number.isFinite(t) ? t / 1000 : NaN;
 }
 
@@ -165,12 +166,6 @@ export function livePunchesForTeam(records: RawRecord[], startTime: number | nul
 /** The station codes a team scored on (presence only) - mystery + free tracks. */
 function liveCodesForTeam(records: RawRecord[], startTime: number | null, endTime: number | null): Set<string> {
   return new Set(livePunchesForTeam(records, startTime, endTime).map((p) => p.code));
-}
-
-/** Parse an SI clock time "HH:MM:SS" to seconds-of-day for ordering. */
-export function secondsOfDay(t: string): number {
-  const [h, m, s] = (t ?? '').split(':').map(Number);
-  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
 }
 
 // ----- per-team chip resolution (team mode: members punch with own chips) -----
@@ -329,28 +324,18 @@ async function computeStatsByTeam(
       const routeKey = meta[`route:${team.id}`] || meta.route || 'default';
       const route = checkpointsForRoute(allCheckpoints, routeKey);
 
-      // Earliest hit time per route checkpoint (undefined = never reached).
-      const hitTimeByCp = new Map<string, number | undefined>();
-      for (const cp of route) {
-        const stations = stationsByCp.get(Number(cp.id)) ?? [];
-        let earliest: number | undefined;
-        for (const p of punches) {
-          if (stations.includes(Number(p.code))) {
-            const ts = secondsOfDay(p.time);
-            if (earliest === undefined || ts < earliest) earliest = ts;
-          }
-        }
-        hitTimeByCp.set(cp.id, earliest);
-      }
+      // First card slot per route checkpoint (undefined = never reached). The
+      // checkpoint ids here ARE their 1-based numbers.
+      const hitSlotByCp = firstSlotByCheckpoint(route, (cp) => Number(cp.id), stationsByCp, punches);
 
       const hitIds = itinerary
-        ? orderedHitCheckpointIds(route, hitTimeByCp).hitIds
-        : new Set(route.filter((cp) => hitTimeByCp.get(cp.id) !== undefined).map((cp) => cp.id));
+        ? orderedHitCheckpointIds(route, hitSlotByCp).hitIds
+        : new Set(route.filter((cp) => hitSlotByCp.get(cp.id) !== undefined).map((cp) => cp.id));
 
       // statusOf (mirrors TracksGamePage): credited→correct, punched-not-credited
       // →wrong (itinerary only), never punched→missing.
       const correct = hitIds.size;
-      const missing = route.filter((cp) => hitTimeByCp.get(cp.id) === undefined).length;
+      const missing = route.filter((cp) => hitSlotByCp.get(cp.id) === undefined).length;
       const wrong = Math.max(0, route.length - correct - missing);
       const rate = route.length ? Math.round((correct / route.length) * 100) : 0;
       out.set(team.id, { score: team.score ?? 0, stats: { correct, wrong, missing, rate: `${rate}%` } });

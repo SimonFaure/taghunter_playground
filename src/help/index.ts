@@ -19,7 +19,7 @@ export async function playgroundOpenPdf(pdf: string): Promise<void> {
   // eslint-disable-next-line no-new
   new WebviewWindow(label, {
     url: `/${pdf}`,
-    title: 'Taghunter - Help (PDF)',
+    title: 'Manuel Tag Hunter (PDF)',
     width: 900,
     height: 1000,
     focus: true,

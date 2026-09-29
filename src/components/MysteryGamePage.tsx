@@ -129,10 +129,6 @@ interface GameData {
   }>;
 }
 
-/** How long a refused empty finishing bip stays "confirmable" in Départ groupé
- *  (retour #84): re-biping the same card inside this window closes the team. */
-const EMPTY_FINISH_CONFIRM_MS = 30_000;
-
 /** Read a Localized<string> map (or plain string) at the given language. Returns
  *  '' when absent so callers can `.trim()` and fall back. */
 function pickLocalized(v: unknown, lang: string): string {
@@ -194,12 +190,6 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // only: a base-station display stays open across a team's two bips, so this
   // doesn't need to survive an app reload.
   const preExistingPunchesRef = useRef<Map<number, Set<string>>>(new Map());
-  // Cards whose empty finishing bip was refused in "Départ groupé" (retour #84),
-  // keyed by card id → when the refusal happened (ms). Biping the same card again
-  // within EMPTY_FINISH_CONFIRM_MS confirms and closes the team, so an operator
-  // can still finish a team that genuinely came back with nothing; two stray bips
-  // minutes apart each get refused instead of confirming one another.
-  const emptyFinishConfirmRef = useRef<Map<number, number>>(new Map());
   // Punches read by THIS device's USB reader are processed immediately in
   // saveCardData; the 1s state poll then echoes those same raw_data rows back
   // (the server returns every row since the cursor, with no own-device filter).
@@ -936,30 +926,23 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         const baseline = preExistingPunchesRef.current.get(card.id) ?? new Set<string>();
         const livePunchCount = card.punches.filter(p => !baseline.has(`${p.code}@${p.time}`)).length;
 
-        // Retour #84 - "Départ groupé": every team is started at launch, so a card
-        // bipped by accident on the base station BEFORE the group leaves lands
-        // straight in this finishing branch. It scored an empty card, closed the
-        // run and burnt the reveal - the player's real return bip then only got
-        // the "team ended" message, the animation having been consumed. An empty
-        // card therefore doesn't close a mass-start run: the operator gets a
-        // warning instead. A team that genuinely found nothing is still closable -
-        // biping the same card a second time confirms and goes through.
-        if (config.massStart && livePunchCount === 0) {
-          const refusedAt = emptyFinishConfirmRef.current.get(card.id) ?? 0;
-          if (Date.now() - refusedAt > EMPTY_FINISH_CONFIRM_MS) {
-            emptyFinishConfirmRef.current.set(card.id, Date.now());
-            const authored = resolveMetaText('text_card_empty', finishLang, teamName);
-            const base = authored || `${teamName} : puce vide, aucune balise n'a été bipée.`;
-            showMessage(
-              `${base} Bipez à nouveau pour terminer quand même.`,
-              'warning',
-              undefined,
-              teamName,
-            );
-            return;
-          }
+        // An empty card never closes a run (retours #84 and sept #60). In "Départ
+        // groupé" a card bipped by accident before the group leaves lands straight
+        // here; in a normal start a player who rebips right after the first bip
+        // does too. Either way scoring it would burn the reveal on 12 grey
+        // enigmas. The bip only shows the warning, however many times it's
+        // repeated - a team that genuinely came back with nothing is closed by
+        // the operator (Team Details / game end), not by a bip.
+        if (livePunchCount === 0) {
+          const authored = resolveMetaText('text_card_empty', finishLang, teamName);
+          showMessage(
+            authored || `${teamName} : puce vide, aucune balise n'a été bipée.`,
+            'warning',
+            undefined,
+            teamName,
+          );
+          return;
         }
-        emptyFinishConfirmRef.current.delete(card.id);
 
         let updateOk = true;
         try {

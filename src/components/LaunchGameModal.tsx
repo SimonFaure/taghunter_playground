@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { X, ChevronRight, ChevronLeft, Usb, Save, Upload, FileDown } from 'lucide-react';
+import { X, ChevronRight, ChevronLeft, Usb, Save, Upload, FileDown, Loader2 } from 'lucide-react';
 import type { SiPuce } from '../types/database';
 import * as cardsStore from '../services/cardsStore';
 import * as cardsRepo from '../services/cardsRepo';
@@ -24,7 +24,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { RosterImportModal } from './RosterImportModal';
 import {
   parseRosterFile,
-  buildTemplateCsv,
+  buildTemplateXlsx,
   RosterImportError,
   type RosterImportResult,
   type RosterImportMode,
@@ -277,7 +277,7 @@ interface LaunchGameModalProps {
   gameTitle: string;
   gameUniqid: string;
   gameTypeName: string;
-  onLaunch: (config: GameConfig, deviceSelection: LaunchDeviceSelection) => void;
+  onLaunch: (config: GameConfig, deviceSelection: LaunchDeviceSelection) => void | Promise<void>;
   /** Seed step-1 from a saved config (Edit a config, or headless critical-fallback). */
   prefillConfig?: Partial<GameConfig>;
   /** When editing an existing config, its current name (seeds the Save field). */
@@ -430,6 +430,11 @@ export interface GameConfig {
    *  Defaults from the scenario's audience: on for mini_kids/kids, off for
    *  ado_adultes. Missing in meta ⇒ true (pre-feature games keep the ghost). */
   tagquestShowQuestPreview?: boolean;
+  /** TagQuest: on a partial combination, draw the visual of each station still
+   *  missing (dimmed, red ring). Off ⇒ a missing slot stays blank, so finding
+   *  WHICH station is missing is part of the game (retours sept #55). Missing
+   *  in meta ⇒ true (pre-feature games keep the visuals). */
+  tagquestShowMissingStations?: boolean;
   /** TagQuest (score victory + team mode only): weight each team's earned
    *  points by largest-headcount ÷ own-headcount so uneven team sizes compete
    *  fairly - the same effectif rule Clash applies. Default on. Missing in
@@ -514,6 +519,7 @@ export function LaunchGameModal({
     tagquestSelfRegister: false,
     tagquestMaxPerTeam: 0,
     tagquestShowQuestPreview: true,
+    tagquestShowMissingStations: true,
     tagquestScoreWeighting: true,
   });
   const [patternFolders, setPatternFolders] = useState<PatternOption[]>([]);
@@ -613,6 +619,11 @@ export function LaunchGameModal({
   const [savePending, setSavePending] = useState(false);
   const [overwriteConfirm, setOverwriteConfirm] = useState<string | null>(null);
   const [savedFlash, setSavedFlash] = useState<string | null>(null);
+  // Step-3 launch in flight. The ref is the real guard (a double-click fires
+  // two submits before React re-renders the disabled button); the state drives
+  // the spinner.
+  const [launching, setLaunching] = useState(false);
+  const launchingRef = useRef(false);
   // Excel/CSV roster import (step 2). The hidden file input is triggered by the
   // Import button; a successful parse opens the preview/confirm modal.
   const rosterFileInputRef = useRef<HTMLInputElement>(null);
@@ -1393,13 +1404,15 @@ export function LaunchGameModal({
     if (step === 1) setStep(2);
   };
 
-  const downloadImportTemplate = (mode: RosterImportMode) => {
-    const csv = buildTemplateCsv(mode, allChips, mode === 'clan' ? clashClanDefs : undefined);
-    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const downloadImportTemplate = async (mode: RosterImportMode) => {
+    const bytes = await buildTemplateXlsx(mode, allChips, mode === 'clan' ? clashClanDefs : undefined);
+    const blob = new Blob([bytes], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${mode === 'clan' ? 'clans' : 'teams'}-template-${gameTypeName.toLowerCase()}.csv`;
+    a.download = `${mode === 'clan' ? 'clans' : 'teams'}-template-${gameTypeName.toLowerCase()}.xlsx`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1696,7 +1709,9 @@ export function LaunchGameModal({
       return;
     }
 
-    // step === 3: actually launch.
+    // step === 3: actually launch. Ignore repeat clicks while a launch is in
+    // flight - each one used to start another game.
+    if (launchingRef.current) return;
     // Reader-not-detected is no longer a launch gate. The game pages
     // surface a banner if the dongle is missing and auto-bind via the
     // 'reader:status' event once it's plugged in.
@@ -1744,11 +1759,19 @@ export function LaunchGameModal({
         if (assigned.length > 0) reg_assignments[id] = assigned;
       }
     }
-    onLaunch(finalConfig, {
-      include_self: includeSelf,
-      satellite_targets,
-      reg_assignments,
-    });
+    launchingRef.current = true;
+    setLaunching(true);
+    try {
+      await onLaunch(finalConfig, {
+        include_self: includeSelf,
+        satellite_targets,
+        reg_assignments,
+      });
+    } finally {
+      // Re-arm in case the modal stays open (launch error) or is reopened.
+      launchingRef.current = false;
+      setLaunching(false);
+    }
   };
 
   // Persist the current step-1 settings as a named, scenario-assigned config.
@@ -2357,7 +2380,7 @@ export function LaunchGameModal({
                   </button>
                   <button
                     type="button"
-                    onClick={() => downloadImportTemplate('clan')}
+                    onClick={() => void downloadImportTemplate('clan')}
                     className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
                     title={t('launchModal:downloadTemplate')}
                   >
@@ -2915,10 +2938,11 @@ export function LaunchGameModal({
                     </div>
                   </div>
 
-                  {/* First-bip videos - moved into Advanced. */}
-                  {!isTagQuest && (hasTutorialVideo || hasIntroVideo) && (
+                  {/* First-bip videos - moved into Advanced. Quest has no per-team
+                      first bip: its videos play once, when the game starts. */}
+                  {(hasTutorialVideo || hasIntroVideo) && (
                     <div className="space-y-3 p-4 bg-[var(--pg-surface-3)] rounded-[var(--pg-radius-md)]">
-                      <div className="text-sm font-medium text-[var(--pg-text-muted)]">{t('launchModal:firstBipVideos')}</div>
+                      <div className="text-sm font-medium text-[var(--pg-text-muted)]">{t(isTagQuest ? 'launchModal:startVideos' : 'launchModal:firstBipVideos')}</div>
                       {hasTutorialVideo && (
                         <label className="flex items-center gap-3 text-sm text-[var(--pg-text-muted)]">
                           <input
@@ -2926,7 +2950,7 @@ export function LaunchGameModal({
                             checked={!!config.playTutorialOnBip}
                             onChange={(e) => setConfig({ ...config, playTutorialOnBip: e.target.checked })}
                           />
-                          {t('launchModal:playTutorialVideo')}
+                          {t(isTagQuest ? 'launchModal:playTutorialVideoAtStart' : 'launchModal:playTutorialVideo')}
                         </label>
                       )}
                       {hasIntroVideo && (
@@ -2936,11 +2960,11 @@ export function LaunchGameModal({
                             checked={!!config.playIntroOnBip}
                             onChange={(e) => setConfig({ ...config, playIntroOnBip: e.target.checked })}
                           />
-                          {t('launchModal:playIntroVideo')}
+                          {t(isTagQuest ? 'launchModal:playIntroVideoAtStart' : 'launchModal:playIntroVideo')}
                         </label>
                       )}
                       <p className="text-xs text-[var(--pg-text-dim)]">
-                        {t('launchModal:firstBipVideosHint')}
+                        {t(isTagQuest ? 'launchModal:startVideosHint' : 'launchModal:firstBipVideosHint')}
                       </p>
                     </div>
                   )}
@@ -3033,18 +3057,21 @@ export function LaunchGameModal({
                     </div>
                   ) : (
                     <>
-                      <div className="flex items-center gap-3">
-                        <input
-                          type="checkbox"
-                          id="colorblindMode"
-                          checked={config.colorblindMode}
-                          onChange={(e) => setConfig({ ...config, colorblindMode: e.target.checked })}
-                          className="w-5 h-5 accent-[var(--pg-accent)]"
-                        />
-                        <label htmlFor="colorblindMode" className="text-sm font-medium text-[var(--pg-text-muted)]">
-                          {t('launchModal:colorblindMode')}
-                        </label>
-                      </div>
+                      {/* Clash has no colourblind rendering - option hidden there. */}
+                      {!isClash && (
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id="colorblindMode"
+                            checked={config.colorblindMode}
+                            onChange={(e) => setConfig({ ...config, colorblindMode: e.target.checked })}
+                            className="w-5 h-5 accent-[var(--pg-accent)]"
+                          />
+                          <label htmlFor="colorblindMode" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                            {t('launchModal:colorblindMode')}
+                          </label>
+                        </div>
+                      )}
 
                       {isTagQuest && (
                         <div className="flex items-center gap-3">
@@ -3058,6 +3085,22 @@ export function LaunchGameModal({
                           <label htmlFor="tagquestShowQuestPreview" className="text-sm font-medium text-[var(--pg-text-muted)]">
                             {t('launchModal:showQuestPreview')}
                             <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:showQuestPreviewHint')}</span>
+                          </label>
+                        </div>
+                      )}
+
+                      {isTagQuest && (
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id="tagquestShowMissingStations"
+                            checked={config.tagquestShowMissingStations ?? true}
+                            onChange={(e) => setConfig({ ...config, tagquestShowMissingStations: e.target.checked })}
+                            className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                          />
+                          <label htmlFor="tagquestShowMissingStations" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                            {t('launchModal:showMissingStations')}
+                            <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:showMissingStationsHint')}</span>
                           </label>
                         </div>
                       )}
@@ -3264,7 +3307,7 @@ export function LaunchGameModal({
                       </button>
                       <button
                         type="button"
-                        onClick={() => downloadImportTemplate(teamImportMode)}
+                        onClick={() => void downloadImportTemplate(teamImportMode)}
                         className="pg-btn pg-btn--ghost text-sm flex items-center gap-1.5"
                         title={t('launchModal:downloadTemplate')}
                       >
@@ -3930,9 +3973,11 @@ export function LaunchGameModal({
                   </button>
                   <button
                     type="submit"
-                    disabled={!motherChecked && selectedDeviceIds.size === 0}
-                    className="px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-[var(--pg-surface-3)] disabled:text-[var(--pg-text-dim)] text-white rounded-[var(--pg-radius-md)] transition font-medium"
+                    disabled={launching || (!motherChecked && selectedDeviceIds.size === 0)}
+                    aria-busy={launching}
+                    className="inline-flex items-center gap-2 px-6 py-2 bg-green-600 hover:bg-green-500 disabled:bg-[var(--pg-surface-3)] disabled:text-[var(--pg-text-dim)] disabled:cursor-not-allowed text-white rounded-[var(--pg-radius-md)] transition font-medium"
                   >
+                    {launching && <Loader2 size={16} className="animate-spin" />}
                     {t('launchModal:launchOnDevices', { count: (motherChecked ? 1 : 0) + selectedDeviceIds.size })}
                   </button>
                 </div>

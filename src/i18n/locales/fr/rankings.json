@@ -32,8 +32,8 @@
   "rangeTrimester": "Ce trimestre",
   "rangeYear": "Cette année",
   "rangeAll": "Depuis le début",
-  "testMode": "Mode test — 5 équipes maximum",
-  "readerNotConnected": "Lecteur non connecté — en attente du dongle SportIdent. La partie s'y reliera automatiquement dès le branchement.",
+  "testMode": "Mode test : 5 équipes maximum",
+  "readerNotConnected": "Lecteur non connecté, en attente du dongle SportIdent. La partie s'y reliera automatiquement dès le branchement.",
   "liveRankings": "Classements en direct",
   "gameCount_one": "{{count}} partie",
   "gameCount_other": "{{count}} parties",
@@ -45,7 +45,8 @@
   "clashNoEvents": "Rien ne s'est encore passé.",
   "loadingGameData": "Chargement des données de la partie…",
   "noLayoutTitle": "Aucune mise en page trouvée",
-  "noLayoutBody": "Pour afficher la mise en page personnalisée, importez un fichier de mise en page TagQuest ou lancez une synchronisation. Le classement par défaut est affiché à la place.",
+  "noLayoutBody": "Pour afficher la mise en page personnalisée, importez un fichier de mise en page Quest ou lancez une synchronisation. Le classement par défaut est affiché à la place.",
   "playersCount_one": "{{count}} joueur",
-  "playersCount_other": "{{count}} joueurs"
+  "playersCount_other": "{{count}} joueurs",
+  "offlineBadge": "Classement hors ligne, reconnexion…"
 }

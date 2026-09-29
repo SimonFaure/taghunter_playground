@@ -1388,3 +1388,22 @@ body::-webkit-scrollbar-corner {
   opacity: 0.85;
   animation: logo-shimmer-sweep 3.5s ease-in-out infinite;
 }
+
+/* Text inside a positioned layout box (in-game HUD, previews, layout editors).
+   The box already centres its line with flexbox, but fonts reserve more room
+   above the capitals than below the baseline, so the glyphs still read high.
+   Trim the line to cap-height/baseline so the VISIBLE text sits in the middle.
+   Must sit on a block/inline box (a span or div), not on the flex container.
+   Browsers without text-box support keep the plain flex centring.
+   Mirrored in taghunter_playground and studio-taghunter index.css. */
+.vcenter-text {
+  text-box: trim-both cap alphabetic;
+}
+/* Tracks "background" plate: the trim removes ~0.3em of line box, give it back
+   as padding so the plate keeps the height the auto-fit math reserved. */
+@supports (text-box: trim-both cap alphabetic) {
+  .vcenter-text.vcenter-text--plate {
+    padding-top: 0.35em !important;
+    padding-bottom: 0.35em !important;
+  }
+}

@@ -50,8 +50,30 @@ let lanReadyPromise: Promise<void> = new Promise<void>((res) => {
   lanReadyResolve = res;
 });
 
+// Listeners told when the launched_games route changes target (a failover
+// re-point, a yield, a route refresh). Screens that poll a game - the rankings
+// board above all - refetch at once instead of showing the previous mother's
+// game until their next tick (retours sept. #18).
+const lanOverrideListeners = new Set<(o: LanOverride | null) => void>();
+export function onLanOverrideChange(fn: (o: LanOverride | null) => void): () => void {
+  lanOverrideListeners.add(fn);
+  return () => {
+    lanOverrideListeners.delete(fn);
+  };
+}
+
 export function setLanOverride(o: LanOverride | null): void {
+  const changed = lanOverride?.baseUrl !== o?.baseUrl || lanOverride?.token !== o?.token;
   lanOverride = o;
+  if (changed) {
+    for (const fn of lanOverrideListeners) {
+      try {
+        fn(o);
+      } catch {
+        /* a listener must never break routing */
+      }
+    }
+  }
   if (o) {
     lanReadyResolve?.();
   } else {
@@ -449,7 +471,21 @@ export type DownloadStreamOptions = Omit<ApiCallOptions, 'body' | 'method' | 'ti
   // aborted - only a genuine mid-stream stall is.
   // Default DOWNLOAD_STALL_TIMEOUT_MS. `null` disables.
   stallTimeoutMs?: number | null;
+  // Resume: ask the server for bytes from this offset on (Range: bytes=N-).
+  // A 206 streams only the tail and progress counts from the offset. A 200
+  // (server/proxy ignored the Range) throws RangeIgnoredError BEFORE any byte
+  // reaches onChunk, so the caller can truncate its partial and start over.
+  rangeStart?: number;
 };
+
+// The server answered a Range request with the full body (200). Nothing was
+// written; the caller must discard its partial and re-download from byte 0.
+export class RangeIgnoredError extends Error {
+  constructor() {
+    super('Range request ignored by server');
+    this.name = 'RangeIgnoredError';
+  }
+}
 
 // Core download driver: streams the response body, invoking `onChunk` for each
 // chunk as it arrives. Never buffers the whole body itself - buffering vs.
@@ -470,6 +506,8 @@ async function runDownload(
       throw new ApiError(401, null, 'Missing JWT');
     }
   }
+  const rangeStart = options.rangeStart && options.rangeStart > 0 ? options.rangeStart : 0;
+  if (rangeStart > 0) headers['Range'] = `bytes=${rangeStart}-`;
 
   const ttfbMs =
     options.ttfbTimeoutMs === undefined ? DOWNLOAD_TTFB_TIMEOUT_MS : options.ttfbTimeoutMs;
@@ -515,8 +553,19 @@ async function runDownload(
     throw new ApiError(res.status, body);
   }
 
+  if (rangeStart > 0 && res.status !== 206) {
+    // Full body instead of the tail: drop it unread and let the caller restart.
+    try { void res.body?.cancel(); } catch { /* ignore */ }
+    throw new RangeIgnoredError();
+  }
+
   const contentLengthHeader = res.headers.get('content-length');
-  const total = contentLengthHeader ? parseInt(contentLengthHeader, 10) : NaN;
+  let total = contentLengthHeader ? parseInt(contentLengthHeader, 10) : NaN;
+  if (rangeStart > 0) {
+    // Content-Range: bytes N-M/SIZE → progress is over the whole file.
+    const m = /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '');
+    total = m ? parseInt(m[1], 10) : Number.isFinite(total) ? total + rangeStart : NaN;
+  }
   const totalOrNull = Number.isFinite(total) && total > 0 ? total : null;
 
   // Fall back to arrayBuffer() if no readable stream is exposed. This still
@@ -525,7 +574,7 @@ async function runDownload(
   if (!res.body) {
     const buf = await res.arrayBuffer();
     const bytes = new Uint8Array(buf);
-    options.onProgress?.({ loaded: bytes.byteLength, total: totalOrNull });
+    options.onProgress?.({ loaded: rangeStart + bytes.byteLength, total: totalOrNull });
     await onChunk(bytes);
     return bytes.byteLength;
   }
@@ -535,7 +584,7 @@ async function runDownload(
 
   // Emit an initial progress so the UI shows the item immediately, even
   // before the first chunk arrives (large files can have a long TTFB).
-  options.onProgress?.({ loaded: 0, total: totalOrNull });
+  options.onProgress?.({ loaded: rangeStart, total: totalOrNull });
 
   try {
     for (;;) {
@@ -552,7 +601,7 @@ async function runDownload(
       if (value) {
         await onChunk(value);
         loaded += value.byteLength;
-        options.onProgress?.({ loaded, total: totalOrNull });
+        options.onProgress?.({ loaded: rangeStart + loaded, total: totalOrNull });
       }
     }
   } catch (err) {

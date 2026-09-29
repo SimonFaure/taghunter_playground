@@ -31,17 +31,19 @@ export async function list(): Promise<WifiNetworkRow[]> {
 }
 
 /**
- * The networks a satellite may join to reach a mother: studio-relayed hotspots
- * plus any the operator added by hand (origin='manual'). Excludes origin='paired'
- * rows (learned passively from a mother ping) - those aren't shown as pickable
- * "mother's Wi-Fi". Studio first, then manual, alphabetical within each.
+ * The networks a satellite may join to reach a mother: studio-relayed hotspots,
+ * any the operator added by hand (origin='manual'), and the creds the mother
+ * itself relayed over the LAN (origin='paired', from /ping.php). The paired rows
+ * used to be excluded, so a satellite that sat on the mother's AP - hence
+ * offline, unable to sync the studio copy - showed "No network saved for your
+ * account" while it held the right SSID (retours sept. #9). Studio first, then
+ * manual, then paired, alphabetical within each (ssid is unique, so no dupes).
  */
 export async function listJoinable(): Promise<WifiNetworkRow[]> {
   const db = await getDb();
   return db.select<WifiNetworkRow[]>(
     `SELECT * FROM wifi_networks
-     WHERE origin IN ('studio', 'manual')
-     ORDER BY CASE origin WHEN 'studio' THEN 0 ELSE 1 END, ssid`
+     ORDER BY CASE origin WHEN 'studio' THEN 0 WHEN 'manual' THEN 1 ELSE 2 END, ssid`
   );
 }
 

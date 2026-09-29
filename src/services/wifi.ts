@@ -24,6 +24,29 @@ export async function scanWifi(): Promise<string[]> {
   }
 }
 
+// Same as scanWifi, but first forces a real radio scan (WlanScan, ~4 s). The
+// cached list can miss an AP that just appeared - a freshly promoted mother's
+// hotspot (retours sept. #19) - for minutes. Use when not connected / after a
+// mother loss; the plain scan stays the cheap default.
+export async function scanWifiFresh(): Promise<string[]> {
+  try {
+    return (await invoke<string[]>('wifi_scan_fresh')) ?? [];
+  } catch {
+    return scanWifi();
+  }
+}
+
+// Drop the current Wi-Fi association. `ssid`: that profile is also switched to
+// manual connection so Windows doesn't re-join it on its own (a device that now
+// hosts that SSID itself). Best-effort, never throws.
+export async function disconnectWifi(ssid?: string): Promise<void> {
+  try {
+    await invoke('wifi_disconnect', { ssid: ssid ?? null });
+  } catch {
+    /* not connected / not Windows */
+  }
+}
+
 // Join a Wi-Fi network by SSID + WPA2 passphrase. Throws on failure (caller
 // surfaces the manual-join fallback). Not supported on mobile.
 export async function connectWifi(ssid: string, password: string): Promise<void> {

@@ -26,6 +26,7 @@
   "fieldPlayMode": "Modo de juego",
   "fieldVisibilityHideDelaySec": "Mantener el resultado en pantalla (segundos)",
   "fieldTagquestShowQuestPreview": "Mostrar la vista previa de las imágenes de misión",
+  "fieldTagquestShowMissingStations": "Mostrar la imagen de las balizas que faltan",
   "fieldTagquestScoreWeighting": "Ponderar las puntuaciones según el número de jugadores",
   "fieldMalusPerMinute": "Penalización por minuto de retraso",
   "fieldTestMode": "Modo de prueba",

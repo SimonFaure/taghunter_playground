@@ -49,6 +49,8 @@ export function gameConfigFromMeta(
     tagquestSelfRegister: metaMap.tagquestSelfRegister === 'true',
     // Missing key ⇒ true: games launched before the flag existed keep the ghost.
     tagquestShowQuestPreview: metaMap.tagquestShowQuestPreview !== 'false',
+    // Missing key ⇒ true: games launched before the flag show missing stations.
+    tagquestShowMissingStations: metaMap.tagquestShowMissingStations !== 'false',
     // Missing key ⇒ false: games launched before the option keep raw scores.
     tagquestScoreWeighting: metaMap.tagquestScoreWeighting === 'true',
     cluesPage: metaMap.cluesPage ? JSON.parse(metaMap.cluesPage) : undefined,

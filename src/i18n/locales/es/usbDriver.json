@@ -5,9 +5,15 @@
   },
   "detection": {
     "recheck": "Volver a comprobar",
-    "installTitle": "Disponible en la próxima versión",
+    "installTitle": "Ejecuta el instalador del controlador SportIdent incluido en Playground (Windows pedirá permiso de administrador)",
     "install": "Instalar controlador firmado",
-    "comingSoon": "(próximamente)"
+    "installing": "Instalando… confirme el aviso de Windows",
+    "preinstall": "Instalar el controlador ahora",
+    "installDone": "Controlador instalado. Si el estado de arriba no se pone en verde, desconecte y vuelva a conectar el lector.",
+    "errCancelled": "Instalación cancelada: se necesita permiso de administrador para instalar un controlador.",
+    "errMissing": "El instalador del controlador no está incluido en esta versión de Playground. Use el enlace de descarga de abajo.",
+    "errTimeout": "El instalador no terminó a tiempo. Compruebe si hay un aviso de Windows pendiente y vuelva a comprobar.",
+    "errGeneric": "Error al instalar el controlador ({{detail}}). Pruebe el enlace de descarga o la solución manual de abajo."
   },
   "variant": {
     "healthy": {

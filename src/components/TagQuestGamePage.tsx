@@ -10,6 +10,9 @@ import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
 import { describePunchStatus, localizedStatus, type GameMessageType } from '../services/gameMessages';
 import { PunchAnimationOverlay } from './PunchAnimationOverlay';
+import { TagQuestFinishScreen } from './TagQuestFinishScreen';
+import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
+import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
 import * as scenarioStore from '../services/scenarioStore';
 import { tIngame } from '../i18n/ingame';
 import { scenarioAssetUrl } from '../services/contentFs';
@@ -38,7 +41,6 @@ import {
   getLaunchedGameMeta,
   patchLaunchedGameMeta,
   recordPunch,
-  getRawDataForChip,
   updateTeam,
   startLaunchedGame,
 } from '../services/launchedGames';
@@ -121,6 +123,19 @@ const EXIT_MS = 600;
 // Once the animation has finished we keep the final frame on screen for this
 // long (the 'exit' phase), then reset everything to hidden. ~10s per spec.
 const POST_ANIM_HOLD_MS = 10000;
+// A finishing team goes straight to its finish screen: the long post-animation
+// hold is capped to this, otherwise the arrival read looked "stuck".
+const FINISH_HOLD_MS = 1500;
+// How long the finish screen stays up before handing the kiosk to the next
+// team (a tap dismisses it sooner). Floor under the launch's message duration.
+const FINISH_SCREEN_MIN_MS = 8000;
+
+interface FinishScreenData {
+  teamName: string;
+  score: number;
+  /** Seconds between the team's start and its arrival punch; null if unknown. */
+  elapsedSec: number | null;
+}
 
 interface TagQuestGamePageProps {
   config: GameConfig;
@@ -376,7 +391,41 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   useEffect(() => { regTeamsRef.current = regTeams; }, [regTeams]);
   useEffect(() => { assignedTeamNumbersRef.current = assignedTeamNumbers; });
   const [punchAnimation, setPunchAnimation] = useState<PunchAnimationData | null>(null);
-  const [gameOverTeamName, setGameOverTeamName] = useState<string | null>(null);
+  // Finish screen for the team that just punched the arrival station. Held
+  // inside that team's queue slot (the slot resolves when it closes), so the
+  // next team waits behind it instead of being dropped.
+  const [finishScreen, setFinishScreen] = useState<FinishScreenData | null>(null);
+  const finishResolveRef = useRef<(() => void) | null>(null);
+  const finishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Launch videos (tutorial, then scenario intro). Quest has no per-team first
+  // bip, so the launch's "play on first bip" toggles mean: play once on this
+  // screen when the game starts, and start the clock when they end.
+  const [startVideos, setStartVideos] = useState<VideoSource[] | null>(null);
+  const startVideosDoneRef = useRef<(() => void) | null>(null);
+  const playStartVideos = useCallback(async (): Promise<void> => {
+    if (!config.playTutorialOnBip && !config.playIntroOnBip) return;
+    try {
+      const raw = await scenarioStore.getGameData(gameUniqid);
+      const rawLang = (raw as { default_language?: string; game_data?: { default_language?: string } } | null);
+      const lang = config.language || rawLang?.default_language || rawLang?.game_data?.default_language || 'fr';
+      const videos = await resolveFirstBipVideos({ ...config, language: lang }, gameUniqid, 'tagquest', raw);
+      if (videos.length === 0) return;
+      await new Promise<void>((resolve) => {
+        startVideosDoneRef.current = resolve;
+        setStartVideos(videos);
+      });
+    } catch (err) {
+      console.error('[TagQuest] start videos failed:', err);
+    }
+  }, [config, gameUniqid]);
+  const playStartVideosRef = useRef(playStartVideos);
+  useEffect(() => { playStartVideosRef.current = playStartVideos; });
+  const finishStartVideos = useCallback(() => {
+    setStartVideos(null);
+    const done = startVideosDoneRef.current;
+    startVideosDoneRef.current = null;
+    done?.();
+  }, []);
 
   const [animPhase, setAnimPhase] = useState<AnimPhase>('idle');
   const [animRevealedSlots, setAnimRevealedSlots] = useState(0);
@@ -398,6 +447,21 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       pts6: parse(m?.combo_6_quests),
       pts4: parse(m?.combo_4_quests),
       pts2: parse(m?.combo_2_quests),
+    };
+  })();
+  // Points one malus occurrence costs, for the "×N" counters beside the two
+  // malus totals (N = total ÷ unit). Same reading as `getMalusPoints` /
+  // `getLateMalusPoints` in tagquestPunchLogic: the studio asks for a negative
+  // value, older scenarios hold a positive one.
+  const malusUnitPoints = (() => {
+    const m = gameData?.game_meta as Record<string, unknown> | undefined;
+    const parse = (v: unknown): number => {
+      const n = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) || 0 : 0;
+      return Math.abs(n);
+    };
+    return {
+      station: parse(m?.malus_points),
+      late: parse(m?.late_malus_points ?? m?.default_time_malus),
     };
   })();
   // Starts false (everything hidden at game start), flips to true while an
@@ -595,37 +659,35 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   useEffect(() => {
     if (animPhase === 'exit') {
       animSet(async () => {
-        if (postAnimExitDelayMs > 0) {
-          await new Promise(r => setTimeout(r, postAnimExitDelayMs));
+        const wasGameOver = punchAnimation?.gameOver ?? false;
+        const holdMs = wasGameOver ? Math.min(postAnimExitDelayMs, FINISH_HOLD_MS) : postAnimExitDelayMs;
+        if (holdMs > 0) {
+          await new Promise(r => setTimeout(r, holdMs));
         }
         clearAnimInterval();
-        const wasGameOver = punchAnimation?.gameOver ?? false;
-        const teamName = punchAnimation?.teamName ?? '';
         if (punchAnimation) {
           setLastKnownScore(punchAnimation.newScore);
           setLastKnownQuestDetails(punchAnimation.newQuestDetails);
           setLastKnownCombos(punchAnimation.newCombos);
           setLastKnownMalus(punchAnimation.newMalus ?? 0);
           setLastKnownLateMalus(punchAnimation.newLateMalus ?? 0);
-          if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-            await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
-          }
         }
         setAnimPhase('idle');
         setAnimRevealedSlots(0);
         setAnimShowUpdated(false);
         // Tear down this animation and resolve its queue slot so the queue
-        // advances to the next item (another animation or a message). On
-        // game-over we drop the rest of the queue - we're leaving the page.
+        // advances to the next item (another animation or a message). A team
+        // that just finished keeps the slot for its finish screen first.
+        const finished = punchAnimation;
         punchAnimationRef.current = null;
         setPunchAnimation(null);
-        if (wasGameOver) {
-          queue.clear();
-          setGameOverTeamName(teamName);
-        }
         const resolveSlot = animResolveRef.current;
         animResolveRef.current = null;
-        resolveSlot?.();
+        if (wasGameOver && finished) {
+          openFinishScreen(finished, resolveSlot);
+        } else {
+          resolveSlot?.();
+        }
       }, EXIT_MS);
     }
   }, [animPhase]);
@@ -640,6 +702,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       // Settle a mid-animation slot so the queue chain doesn't wedge on unmount.
       animResolveRef.current?.();
       animResolveRef.current = null;
+      if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
+      finishResolveRef.current?.();
+      finishResolveRef.current = null;
+      startVideosDoneRef.current?.();
+      startVideosDoneRef.current = null;
     };
   }, []);
 
@@ -782,6 +849,13 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           return;
         }
         if (!alreadyStarted) {
+          // Launch videos first; the clock starts when they end. Another
+          // device may have started the game meanwhile - then just follow it.
+          await playStartVideosRef.current();
+          if (cancelled) return;
+          state = await getLaunchedGameState(launchedGameId, 0);
+        }
+        if (!state.start_time) {
           // Prefer an already-running game's earliest team start (so legacy
           // games keep their real start); otherwise start now.
           const existingStarts = state.teams
@@ -875,6 +949,36 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       })();
     });
   }, [launchedGameId]);
+
+  // A device that sat on the self-register screen is moved to 'playing' by the
+  // poll when ANOTHER device pressed Start - `init` returned early on it and
+  // never read the start time / duration, so its HUD clock stayed at 0:00.
+  // Read them whenever we are playing without them (retries until the
+  // mother's start flag is visible).
+  useEffect(() => {
+    if (!launchedGameId || phase !== 'playing' || launchedGameInfo?.start_time) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const load = async () => {
+      try {
+        const state = await getLaunchedGameState(launchedGameId, 0);
+        if (cancelled) return;
+        if (state.start_time) {
+          setLaunchedGameInfo({ start_time: state.start_time, duration: state.duration });
+          loadTeams();
+          return;
+        }
+      } catch (err) {
+        console.error('[TagQuest] start-time read failed:', err);
+      }
+      if (!cancelled) timer = window.setTimeout(() => { void load(); }, 1500);
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [launchedGameId, phase, launchedGameInfo?.start_time]);
 
   // Countdown basis: the launched-game row's start_time (a persistent ISO-8601
   // UTC string set once by init/start_game). Falls back to the earliest team
@@ -1105,51 +1209,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }
   }, [launchedGameId]);
 
-  // Punches found on a chip the first time a predetermined-roster game saw it,
-  // waiting to be reported once. Consumed by `reportIgnoredPunches`, which runs
-  // in the always-fresh handleCardPunchLogic (saveCardData is a stale closure
-  // and cannot reach showMessage).
-  const pendingNotWipedRef = useRef(0);
-
-  // Predetermined rosters never bip a card before play - `init` above
-  // auto-starts the game and stamps start_time on mount - so there is NO moment
-  // at which we can honestly say "everything on this card is from a previous
-  // session". The player's first trip out and back arrives on that very first
-  // bip.
-  //
-  // So we do NOT baseline here. Baselining the first read would swallow a real
-  // trip, which is the exact failure mode of the bug this whole change exists
-  // to fix (a punch on the card that doesn't count). We warn instead: the
-  // operator is told the card wasn't wiped, on the one read where that is still
-  // worth knowing, and the punches are scored.
-  //
-  // The residual risk is a genuinely un-wiped card cashing in a previous game's
-  // punches. That is a fairness problem, and a visible one; losing a real trip
-  // is a blocker. See the memory note for the two ways to close it properly (a
-  // cross-game "last seen" baseline, or a pre-play chip check).
-  //
-  // "First time" is game-WIDE, not device-wide: `raw_data_for_chip` asks the
-  // mother. Must run BEFORE `recordPunch` writes this read's own row.
-  const noteIfCardNotWiped = useCallback(async (card: CardData): Promise<void> => {
-    if (!launchedGameId) return;
-    // Self-register games have a real registration bip and baseline there.
-    if (selfRegister) return;
-    if (card.punches.length === 0) return;
-    try {
-      const prior = await getRawDataForChip(launchedGameId, card.id, 1);
-      if (prior.length > 0) return;
-      pendingNotWipedRef.current = card.punches.length;
-      console.warn(
-        `[TagQuest] chip ${card.id} was not wiped: ${card.punches.length} punch(es) were already on it the first ` +
-          'time this game saw it. They are being COUNTED - a predetermined roster has no pre-play bip to tell them ' +
-          'apart from the player\'s first trip. Wipe cards before handing them out.',
-      );
-    } catch (err) {
-      console.error('[TagQuest] not-wiped check failed:', err);
-    }
-  }, [launchedGameId, selfRegister]);
-  const noteIfCardNotWipedRef = useRef(noteIfCardNotWiped);
-  useEffect(() => { noteIfCardNotWipedRef.current = noteIfCardNotWiped; });
+  // Predetermined rosters never bip a card before play, so the first read of a
+  // chip always carries the player's first trip: "punches on first read" is
+  // the normal case, not an un-wiped card. There is deliberately no warning
+  // here (the old one fired on every chip's first bip, retours sept. 2026 #3),
+  // and no baseline either, which would swallow that real trip.
 
   // Reader bip during registration: bind the chip to the station's selected
   // team (team mode, reuses clash_register) or enrol the chip as its own team
@@ -1211,6 +1275,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const handleRegistrationStart = useCallback(async () => {
     if (!launchedGameId) return;
     try {
+      await playStartVideos();
       const state = await getLaunchedGameState(launchedGameId, 0);
       const startMs = Date.now();
       const startIso = new Date(startMs).toISOString();
@@ -1227,7 +1292,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     } finally {
       setPhase('playing');
     }
-  }, [launchedGameId]);
+  }, [launchedGameId, playStartVideos]);
 
   // Raw-data row ids for punches THIS device physically read. The 1s state poll
   // echoes every device's punches back to every device; this set lets
@@ -1238,10 +1303,6 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const saveCardData = async (card: CardData) => {
     if (!launchedGameId) return;
     try {
-      // Before recordPunch writes this read's own raw_data row: note (do not
-      // filter) a card that arrives un-wiped the first time this game sees it.
-      // No-op for a properly wiped card and for self-register games.
-      await noteIfCardNotWipedRef.current(card);
       const rawDataJson = JSON.parse(JSON.stringify(card));
       // Server resolves device_id from the JWT (slice 1's auth_tokens.device_id);
       // no need to send it from the client.
@@ -1252,7 +1313,12 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       // TagQuest did no local processing and let the echo drive scoring, so the
       // punch animated (and re-scored) on every device in the game.
       if (typeof id === 'number') processedRawIdsRef.current.add(id);
-      await handleCardPunchLogicRef.current(card);
+      const processing = handleCardPunchLogicRef.current(card);
+      punchesInFlightRef.current = Promise.all([
+        punchesInFlightRef.current,
+        processing.catch(() => undefined),
+      ]);
+      await processing;
     } catch (error) {
       console.error('Error saving card data:', error);
     }
@@ -1296,6 +1362,50 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     }));
   }, [queue.enqueue]);
 
+  // Finish screen: shown in place of the old English "Game Over" card, closes
+  // on its own (or on a tap) and only then releases the team's queue slot.
+  const closeFinishScreen = useCallback(() => {
+    if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
+    finishTimerRef.current = null;
+    setFinishScreen(null);
+    const resolve = finishResolveRef.current;
+    finishResolveRef.current = null;
+    resolve?.();
+  }, []);
+
+  const openFinishScreen = (data: PunchAnimationData, resolveSlot: (() => void) | null) => {
+    const elapsedSec =
+      data.finishedAt != null && data.startedAt != null ? Math.max(0, data.finishedAt - data.startedAt) : null;
+    finishResolveRef.current = resolveSlot;
+    setFinishScreen({ teamName: data.teamName ?? '', score: data.newScore, elapsedSec });
+    if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
+    finishTimerRef.current = setTimeout(
+      closeFinishScreen,
+      Math.max(FINISH_SCREEN_MIN_MS, (config.messageDisplayDuration ?? 0) * 1000),
+    );
+    loadTeams();
+  };
+
+  // Every team is done. On a device with something still on screen (typically
+  // the last team's reveal + finish screen), the game ends once that is over:
+  // the end rides the presentation queue as its last slot. An idle device has
+  // an empty queue, so its slot runs at once.
+  const onGameEndRef = useRef(onGameEnd);
+  useEffect(() => { onGameEndRef.current = onGameEnd; });
+  const gameEndQueuedRef = useRef(false);
+  // Settles once every read being processed on this device has queued its
+  // presentation. The finishing read writes end_time BEFORE it queues its
+  // animation, so the poll can see "all finished" in between - the end must
+  // wait for that read, or it would jump ahead of the finish screen.
+  const punchesInFlightRef = useRef<Promise<unknown>>(Promise.resolve());
+  const endGameAfterPresentations = useCallback(() => {
+    if (gameEndQueuedRef.current) return;
+    gameEndQueuedRef.current = true;
+    void punchesInFlightRef.current.then(() =>
+      queue.enqueue(null, async () => { onGameEndRef.current?.(); }),
+    );
+  }, [queue.enqueue]);
+
   // Operator-facing note about punches this read deliberately ignored, and
   // about a card that can hold no more. Both are silent-failure modes: the
   // player sees a slot that just says "false", or punches that never landed at
@@ -1311,19 +1421,6 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     if (result.card_full) {
       showMessage(localizedStatus('card_full', lang), undefined, 'warning', result.team_name ?? null);
     }
-    // Predetermined roster, chip seen for the first time carrying punches. They
-    // ARE scored (we cannot tell them from the player's first trip) - this tells
-    // the operator to wipe cards, it does not report a rejection.
-    if (pendingNotWipedRef.current > 0) {
-      const n = pendingNotWipedRef.current;
-      pendingNotWipedRef.current = 0;
-      showMessage(
-        `${localizedStatus('card_not_wiped', lang)} (${n})`,
-        undefined,
-        'warning',
-        result.team_name ?? null,
-      );
-    }
     // When the read failed *because* of this, the status message below already
     // says so - don't say it twice.
     if (result.status === 'punches_not_wiped') return;
@@ -1334,7 +1431,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     // "balise 23" label printed on the box.
     const stations = [...new Set(notWiped.map((d) => d.code))].join(', ');
     showMessage(
-      `${localizedStatus('punches_not_wiped', lang)} — ${notWiped.length} (${stations})`,
+      `${localizedStatus('punches_not_wiped', lang)} : ${notWiped.length} (${stations})`,
       undefined,
       'warning',
       result.team_name ?? null,
@@ -1497,7 +1594,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     launchedGameId,
     numberOfTeams: config.numberOfTeams,
     onGameEnded: () => onGameEnd?.(),
-    onAllTeamsFinished: () => onGameEnd?.(),
+    onAllTeamsFinished: endGameAfterPresentations,
     onNewBip: handleNewBip,
     // A device sitting on the self-register inscription screen follows the one
     // that pressed "Start game": the mother's start flag flips, the poll sees
@@ -1673,6 +1770,78 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     return '';
   }, [gameUniqid]);
 
+  // A malus charged by this read (malus station and/or late malus) is shown in
+  // the centre zone, where the quest artwork goes - on its own it was only a
+  // number ticking up in the side strip, which nobody noticed. Alone on the
+  // read it fills the zone; with a quest it sits as a badge in the corner once
+  // the quest has been revealed.
+  const renderCenterMalus = (boxStyle: React.CSSProperties, isAnimating: boolean): JSX.Element | null => {
+    const anim = punchAnimation;
+    if (!isAnimating || !anim) return null;
+    const meta = gameData?.game_meta;
+    const hits = [
+      { key: 'station', delta: (anim.newMalus ?? 0) - (anim.prevMalus ?? 0), image: meta?.malus_image },
+      { key: 'late', delta: (anim.newLateMalus ?? 0) - (anim.prevLateMalus ?? 0), image: meta?.late_malus_image },
+    ].filter((h) => h.delta > 0);
+    if (hits.length === 0) return null;
+    const withQuest = !!anim.displayQuest;
+    if (withQuest && animPhase !== 'update' && animPhase !== 'exit') return null;
+    return (
+      <div
+        key="malus-center"
+        style={{
+          ...boxStyle,
+          display: 'flex',
+          alignItems: withQuest ? 'flex-end' : 'center',
+          justifyContent: withQuest ? 'flex-end' : 'center',
+          gap: '4%',
+          zIndex: 5,
+          pointerEvents: 'none',
+        }}
+      >
+        {hits.map((h) => (
+          <div
+            key={h.key}
+            style={{
+              position: 'relative',
+              width: withQuest ? '30%' : `${Math.floor(80 / hits.length)}%`,
+              aspectRatio: '1 / 1',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            {h.image && (
+              <img
+                src={scenarioAssetUrl(gameUniqid, String(h.image))}
+                alt=""
+                style={{ width: '100%', height: '100%', objectFit: 'contain', filter: artHalo('missed') }}
+              />
+            )}
+            <div
+              style={{
+                position: h.image ? 'absolute' : 'static',
+                bottom: h.image ? '-4%' : undefined,
+                right: h.image ? '-4%' : undefined,
+                padding: '0.1em 0.4em',
+                borderRadius: '0.3em',
+                background: 'rgba(185,28,28,0.92)',
+                color: '#fff',
+                fontWeight: 800,
+                fontSize: bgDimensions ? `${(withQuest ? 36 : 64) * (bgDimensions.width / 1920)}px` : '2rem',
+                fontFamily: scenarioFontFamily || undefined,
+                lineHeight: 1.1,
+                boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+              }}
+            >
+              -{h.delta}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   const renderLayoutElement = (element: LayoutElement, index: number): JSX.Element | JSX.Element[] => {
     if (!bgDimensions) {
       return <div key={`${element.id}-${index}`} />;
@@ -1702,14 +1871,15 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
     if (element.id === 'animation_quest_image') {
       const quests = gameData?.quests || [];
-      if (!quests.length) return <div key={`${element.id}-${index}`} style={wrapperStyle} />;
+      const malusCenter = renderCenterMalus(wrapperStyle, isAnimating);
+      if (!quests.length) return malusCenter ?? <div key={`${element.id}-${index}`} style={wrapperStyle} />;
 
       const resolveMedia = (key: string | undefined): string => {
         if (!key) return '';
         return scenarioAssetUrl(gameUniqid, key.replace(/^media\//, ''));
       };
 
-      return quests.map((quest, questIndex) => {
+      const questBoxes = quests.map((quest, questIndex) => {
         const questNum = questIndex + 1;
         const mainSrc = resolveMedia(quest.main_image);
         const isActiveQuest = isAnimating && activeQuestIndex === questIndex;
@@ -1808,6 +1978,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                   >
                   {slots.map((slot, si) => {
                     const revealed = si < animRevealedSlots;
+                    // Launch option off: a station still missing keeps its cell
+                    // blank (ghost preview included), so the screen doesn't hand
+                    // the players the answer (retours sept #55).
+                    const hideArt = !slot.matched && !(config.tagquestShowMissingStations ?? true);
                     return (
                       <div
                         key={slot.key}
@@ -1827,7 +2001,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                           transition: 'opacity 0.35s ease, transform 0.35s ease',
                         }}
                       >
-                        {slot.src ? (
+                        {slot.src && !hideArt ? (
                           <img
                             src={slot.src}
                             alt=""
@@ -1887,6 +2061,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           </div>
         );
       });
+      return malusCenter ? [...questBoxes, malusCenter] : questBoxes;
     }
 
     const elementId = element.id?.toLowerCase() ?? '';
@@ -2079,6 +2254,18 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           const count = comboTier === 6 ? combos.combos6 : comboTier === 4 ? combos.combos4 : combos.combos2;
           const pts = comboTier === 6 ? cp.pts6 : comboTier === 4 ? cp.pts4 : cp.pts2;
           displayText = `${count * pts}`;
+        } else if (isMultiplicator && elementId.includes('malus')) {
+          // malus_multiplicator / late_malus_multiplicator: how many times that
+          // malus was charged. They used to fall into the generic branch below
+          // and showed the COMBO count, so "×0" never moved on a malus (sept
+          // #57/#58). Derived from the displayed total so it ticks with it.
+          showElement = valuesShow;
+          const late = elementId.includes('late_malus');
+          const total = late
+            ? (isAnimating ? animDisplayedLateMalus : lastKnownLateMalus)
+            : (isAnimating ? animDisplayedMalus : lastKnownMalus);
+          const unit = late ? malusUnitPoints.late : malusUnitPoints.station;
+          displayText = `x${unit > 0 ? Math.round(total / unit) : 0}`;
         } else if (isMultiplicator) {
           showElement = valuesShow;
           const combos = isAnimating ? animDisplayedCombos : lastKnownCombos;
@@ -2128,7 +2315,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 whiteSpace: 'nowrap',
               }}
             >
-              {displayText}
+              <span className="vcenter-text">{displayText}</span>
             </div>
           </div>
         );
@@ -2158,6 +2345,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
   // Self-register: players bind their chip to a team before the match. Shown
   // ahead of the game-data guard so registration is available immediately.
+  const startVideoOverlay = startVideos ? (
+    <FirstBipVideoOverlay videos={startVideos} onComplete={finishStartVideos} />
+  ) : null;
+
   if (phase === 'register' && launchedGameId) {
     // Scenario background behind the registration UI (same asset the in-game
     // layout's `@background` resolves to). Empty until game-data loads - the
@@ -2166,6 +2357,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       ? scenarioAssetUrl(gameUniqid, gameData.game_meta.background_image)
       : '';
     return (
+      <>
+      {startVideoOverlay}
       <TagQuestRegistrationScreen
         playMode={playMode}
         teams={
@@ -2183,6 +2376,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         restricted={playMode === 'team' && assignedTeamNumbers != null}
         language={config.language || gameData?.default_language || 'fr'}
       />
+      </>
     );
   }
 
@@ -2190,6 +2384,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
         <div className="text-white text-xl">{tr('loadingGameData')}</div>
+        {startVideoOverlay}
       </div>
     );
   }
@@ -2260,72 +2455,29 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
             data={punchAnimation}
             colorblind={config.colorblindMode}
             onDone={async () => {
-              const wasGameOver = punchAnimation.gameOver ?? false;
-              const teamName = punchAnimation.teamName ?? '';
-              if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-                await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
-              }
+              const finished = punchAnimation;
               // Full teardown (this overlay path drives its own timeline, so the
               // phase-machine exit effect may not run): reset to idle so the next
               // queued slot can start, then resolve this slot to advance the queue.
               punchAnimationRef.current = null;
               setPunchAnimation(null);
               setAnimPhase('idle');
-              if (wasGameOver) { queue.clear(); setGameOverTeamName(teamName); }
               const resolveSlot = animResolveRef.current;
               animResolveRef.current = null;
-              resolveSlot?.();
+              if (finished.gameOver) openFinishScreen(finished, resolveSlot);
+              else resolveSlot?.();
             }}
           />
         )}
 
-        {gameOverTeamName && (
-          <div
-            style={{
-              position: 'absolute',
-              inset: 0,
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: 'rgba(0,0,0,0.82)',
-              zIndex: 2000,
-              backdropFilter: 'blur(6px)',
-            }}
-            onClick={() => setGameOverTeamName(null)}
-          >
-            <div style={{
-              textAlign: 'center',
-              padding: '48px 64px',
-              borderRadius: '20px',
-              background: 'rgba(15,23,42,0.9)',
-              border: '1px solid rgba(74,222,128,0.3)',
-              boxShadow: '0 0 60px rgba(74,222,128,0.15), 0 24px 48px rgba(0,0,0,0.6)',
-            }}>
-              <div style={{ fontSize: '4rem', marginBottom: '12px' }}>🏁</div>
-              <div style={{
-                fontSize: 'clamp(2rem, 5vw, 3.5rem)',
-                fontWeight: 800,
-                color: '#4ade80',
-                letterSpacing: '-0.02em',
-                lineHeight: 1.1,
-                marginBottom: '16px',
-              }}>
-                Game Over
-              </div>
-              <div style={{
-                fontSize: 'clamp(1.2rem, 3vw, 2rem)',
-                color: '#fff',
-                fontWeight: 600,
-                marginBottom: '8px',
-              }}>
-                Good game, {gameOverTeamName}!
-              </div>
-              <div style={{ marginTop: '32px', fontSize: '0.85rem', color: 'rgba(255,255,255,0.3)' }}>
-                Tap to dismiss
-              </div>
-            </div>
-          </div>
+        {startVideoOverlay}
+        {finishScreen && (
+          <TagQuestFinishScreen
+            {...finishScreen}
+            lang={config.language || gameData?.default_language || 'fr'}
+            fontFamily={scenarioFontFamily || undefined}
+            onClose={closeFinishScreen}
+          />
         )}
       </div>
     );
@@ -2502,38 +2654,28 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           data={punchAnimation}
           colorblind={config.colorblindMode}
           onDone={async () => {
-            const wasGameOver = punchAnimation.gameOver ?? false;
-            const teamName = punchAnimation.teamName ?? '';
-            if (punchAnimation.endTimeToCommit != null && punchAnimation.teamId != null) {
-              await updateTeam(punchAnimation.teamId, { end_time: punchAnimation.endTimeToCommit, score: punchAnimation.newScore });
-            }
+            const finished = punchAnimation;
             // Full teardown (this overlay path drives its own timeline, so the
             // phase-machine exit effect may not run): reset to idle so the next
             // queued slot can start, then resolve this slot to advance the queue.
             punchAnimationRef.current = null;
             setPunchAnimation(null);
             setAnimPhase('idle');
-            if (wasGameOver) { queue.clear(); setGameOverTeamName(teamName); }
             const resolveSlot = animResolveRef.current;
             animResolveRef.current = null;
-            resolveSlot?.();
+            if (finished.gameOver) openFinishScreen(finished, resolveSlot);
+            else resolveSlot?.();
           }}
         />
       )}
 
-      {gameOverTeamName && (
-        <div
-          className="fixed inset-0 flex items-center justify-center z-50"
-          style={{ background: 'rgba(0,0,0,0.82)', backdropFilter: 'blur(6px)' }}
-          onClick={() => setGameOverTeamName(null)}
-        >
-          <div className="text-center px-16 py-12 rounded-2xl bg-slate-900/90 border border-green-500/30 shadow-2xl">
-            <div className="text-6xl mb-3">🏁</div>
-            <div className="text-5xl font-extrabold text-green-400 mb-4 tracking-tight">Game Over</div>
-            <div className="text-2xl font-semibold text-white">Good game, {gameOverTeamName}!</div>
-            <div className="mt-8 text-sm text-white/30">Tap to dismiss</div>
-          </div>
-        </div>
+      {startVideoOverlay}
+      {finishScreen && (
+        <TagQuestFinishScreen
+          {...finishScreen}
+          lang={config.language || gameData?.default_language || 'fr'}
+          onClose={closeFinishScreen}
+        />
       )}
     </div>
   );

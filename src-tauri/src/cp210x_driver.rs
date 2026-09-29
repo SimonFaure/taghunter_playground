@@ -1,4 +1,5 @@
-// CP210x driver state detection + (Sprint 2 TODO) UAC-elevated install.
+// CP210x driver state detection + UAC-elevated install of the bundled
+// SportIdent driver.
 //
 // The SportIdent reader is built around a Silicon Labs CP210x USB-UART chip
 // (USB\VID_10C4&PID_800A). On Windows 11 24H2/25H2 the legacy CP210x driver
@@ -10,9 +11,12 @@
 //
 // This module enumerates USB devices via SetupDi*, finds the SportIdent
 // reader by VID/PID, and reads its ConfigManager problem code. The
-// frontend renders the result and (in Sprint 2) offers a one-click
-// elevated pnputil install against the driver bundle in
-// src-tauri/resources/silabser-drivers/.
+// frontend renders the result and offers a one-click install that runs
+// SportIdent's own signed installer (SPORTident.UsbDriver.Setup.exe /S, a
+// v11.x silabser.sys under their sportident.inf) bundled in
+// src-tauri/resources/sportident-driver/. Running their Setup.exe rather
+// than pnputil means the UAC prompt names "SPORTident GmbH" as publisher
+// instead of a generic Windows tool.
 //
 // Why DIGCF_ALLCLASSES (not DIGCF_DEVICEINTERFACE on the Ports class):
 // a CP210x stuck in Code 39 is NOT enumerated under "Ports (COM & LPT)" -
@@ -67,22 +71,53 @@ pub async fn check_cp210x_driver_state() -> Result<DriverState, String> {
     }
 }
 
+/// Relative to the app's resource dir. Tauri keeps the glob's directory
+/// structure ("resources/sportident-driver/**/*" in tauri.conf.json).
+#[cfg(target_os = "windows")]
+const SETUP_EXE: &str = "resources/sportident-driver/SPORTident.UsbDriver.Setup.exe";
+
+/// Runs the bundled SportIdent installer silently, elevated through UAC, and
+/// waits for it. Errors are stable codes the frontend maps to messages:
+/// "cancelled" (operator declined UAC), "missing" (installer not bundled),
+/// "timeout", "exit:<code>", or free text for anything else. The caller
+/// re-runs check_cp210x_driver_state afterwards to confirm the rebind.
 #[tauri::command]
-pub async fn install_cp210x_driver(_app: tauri::AppHandle) -> Result<(), String> {
-    // Sprint 1 stub. Sprint 2 wires:
-    //   1. resolve bundled silabser.inf via app.path().resource_dir().join(...)
-    //   2. ShellExecuteExW with lpVerb="runas", lpFile="pnputil.exe",
-    //      lpParameters="/add-driver \"<inf>\" /install", SW_HIDE
-    //   3. WaitForSingleObject on a spawn_blocking task; GetExitCodeProcess
-    //   4. caller re-runs check_cp210x_driver_state to confirm rebind
-    Err("install_cp210x_driver is a Sprint 1 stub - coming in Sprint 2".into())
+pub async fn install_cp210x_driver(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use tauri::Manager;
+        let exe = app
+            .path()
+            .resource_dir()
+            .map_err(|e| format!("resource_dir: {}", e))?
+            .join(SETUP_EXE);
+        if !exe.is_file() {
+            return Err("missing".into());
+        }
+        tokio::task::spawn_blocking(move || windows_impl::run_elevated(&exe, "/S"))
+            .await
+            .map_err(|e| format!("join error: {}", e))?
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("install_cp210x_driver is Windows-only".into())
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::DriverState;
 
-    use windows::core::PCWSTR;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Get_DevNode_Status, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
         SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS,
@@ -90,6 +125,64 @@ mod windows_impl {
         SETUP_DI_GET_CLASS_DEVS_FLAGS, SETUP_DI_REGISTRY_PROPERTY, SPDRP_HARDWAREID,
         SP_DEVINFO_DATA,
     };
+
+    /// Installer exit codes treated as success: 0, and 3010
+    /// (ERROR_SUCCESS_REBOOT_REQUIRED) - the driver is staged either way.
+    const OK_EXIT_CODES: [u32; 2] = [0, 3010];
+    /// Generous: a silent driver install is a few seconds, but a slow disk
+    /// or Defender scan of the .sys can stretch it.
+    const INSTALL_TIMEOUT_MS: u32 = 5 * 60 * 1000;
+    /// HRESULT_FROM_WIN32(ERROR_CANCELLED) - the operator said No to UAC.
+    const HRESULT_CANCELLED: i32 = 0x800704C7u32 as i32;
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// ShellExecuteExW with the "runas" verb (triggers UAC), then block until
+    /// the process exits and report its exit code.
+    pub fn run_elevated(exe: &Path, params: &str) -> Result<(), String> {
+        let file = wide(exe.as_os_str());
+        let params = wide(std::ffi::OsStr::new(params));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: w!("runas"),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            nShow: 0, // SW_HIDE
+            ..Default::default()
+        };
+
+        unsafe {
+            if let Err(e) = ShellExecuteExW(&mut info) {
+                return Err(if e.code().0 == HRESULT_CANCELLED {
+                    "cancelled".into()
+                } else {
+                    format!("ShellExecuteExW: {}", e)
+                });
+            }
+            if info.hProcess.is_invalid() {
+                return Err("no process handle".into());
+            }
+
+            let wait = WaitForSingleObject(info.hProcess, INSTALL_TIMEOUT_MS);
+            let result = if wait == WAIT_OBJECT_0 {
+                let mut code: u32 = 0;
+                match GetExitCodeProcess(info.hProcess, &mut code) {
+                    Ok(()) if OK_EXIT_CODES.contains(&code) => Ok(()),
+                    Ok(()) => Err(format!("exit:{}", code)),
+                    Err(e) => Err(format!("GetExitCodeProcess: {}", e)),
+                }
+            } else if wait == WAIT_TIMEOUT {
+                Err("timeout".into())
+            } else {
+                Err(format!("WaitForSingleObject: {:?}", wait))
+            };
+            let _ = CloseHandle(info.hProcess);
+            result
+        }
+    }
 
     pub fn enumerate() -> Result<DriverState, String> {
         unsafe {

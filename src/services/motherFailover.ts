@@ -54,9 +54,36 @@ interface DiscoveredMother {
 }
 
 // ─── "Mother unreachable" badge pub/sub ──────────────────────────────────────
+//
+// Retours sept. #22: the banner used to be a single boolean that every transport
+// error set and every cache-resolved route tick cleared, so during a takeover it
+// blinked red/normal for minutes on devices that were in fact recovering on
+// their own. It is now a small state machine with hysteresis:
+//
+//   ok ──loss──▶ reconnecting ──60 s without real contact──▶ lost
+//    ▲                │                                        │
+//    └── 2 consecutive real successes (or a verified re-point) ┘
+//
+// "reconnecting" is a calm "don't touch anything" bar; only "lost" shows the red
+// banner with its Rejoin / Become-mother actions. Any failure resets the success
+// streak, so alternating fail/succeed can no longer flap the display.
+export type ReachState = 'ok' | 'reconnecting' | 'lost';
 type ReachListener = (unreachable: boolean) => void;
+type StateListener = (state: ReachState) => void;
 const reachListeners = new Set<ReachListener>();
-let motherUnreachable = false;
+const stateListeners = new Set<StateListener>();
+let reachState: ReachState = 'ok';
+let lostTimer: ReturnType<typeof setTimeout> | null = null;
+let successStreak = 0;
+const LOST_AFTER_MS = 60_000;
+const SUCCESSES_TO_RECOVER = 2;
+
+// Hook for "we just lost the mother": the Wi-Fi layer rescans immediately
+// instead of waiting for its 20 s tick (retours sept. #19). Registered by App.
+let onLossHook: (() => void) | null = null;
+export function setMotherLossHook(fn: (() => void) | null): void {
+  onLossHook = fn;
+}
 
 // Has this device actually REACHED a remote mother at least once this session?
 // The LAN override is persisted, so on a cold boot the very first launched_games
@@ -70,22 +97,84 @@ let hadMotherContact = false;
 /** Subscribe to the "mother unreachable" flag. Fires immediately with current. */
 export function onMotherReachability(l: ReachListener): () => void {
   reachListeners.add(l);
-  l(motherUnreachable);
+  l(reachState !== 'ok');
   return () => {
     reachListeners.delete(l);
   };
 }
 
-function setMotherUnreachable(v: boolean): void {
-  if (motherUnreachable === v) return;
-  motherUnreachable = v;
-  for (const l of reachListeners) {
+/** Subscribe to the three-state reachability. Fires immediately with current. */
+export function onMotherReachState(l: StateListener): () => void {
+  stateListeners.add(l);
+  l(reachState);
+  return () => {
+    stateListeners.delete(l);
+  };
+}
+
+export function getMotherReachState(): ReachState {
+  return reachState;
+}
+
+function emitState(next: ReachState): void {
+  if (reachState === next) return;
+  const wasUnreachable = reachState !== 'ok';
+  reachState = next;
+  for (const l of stateListeners) {
     try {
-      l(v);
+      l(next);
     } catch (e) {
-      console.error('[motherFailover] reachability listener threw:', e);
+      console.error('[motherFailover] reach-state listener threw:', e);
     }
   }
+  const unreachable = next !== 'ok';
+  if (unreachable !== wasUnreachable) {
+    for (const l of reachListeners) {
+      try {
+        l(unreachable);
+      } catch (e) {
+        console.error('[motherFailover] reachability listener threw:', e);
+      }
+    }
+  }
+}
+
+/** A failure signal. Starts (or keeps) the reconnecting phase. */
+function noteMotherLoss(): void {
+  successStreak = 0;
+  if (reachState !== 'ok') return;
+  emitState('reconnecting');
+  if (lostTimer) clearTimeout(lostTimer);
+  lostTimer = setTimeout(() => {
+    lostTimer = null;
+    if (reachState === 'reconnecting') emitState('lost');
+  }, LOST_AFTER_MS);
+  try {
+    onLossHook?.();
+  } catch {
+    /* the hook is best-effort */
+  }
+}
+
+/** A success signal. `verified` (a proven re-point / promotion) recovers at once. */
+function noteMotherContact(verified: boolean): void {
+  if (reachState === 'ok') {
+    successStreak = 0;
+    return;
+  }
+  successStreak += 1;
+  if (!verified && successStreak < SUCCESSES_TO_RECOVER) return;
+  successStreak = 0;
+  if (lostTimer) {
+    clearTimeout(lostTimer);
+    lostTimer = null;
+  }
+  emitState('ok');
+}
+
+function setMotherUnreachable(v: boolean): void {
+  if (v) noteMotherLoss();
+  else noteMotherContact(true);
 }
 
 // ─── re-point ────────────────────────────────────────────────────────────────
@@ -227,8 +316,14 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
         // Match our client when both sides advertise it; tolerate older mothers
         // that don't (client_id === null) rather than excluding them.
         .filter((m) => myClientId == null || m.client_id == null || m.client_id === myClientId)
-        // Never follow the corpse back to the same machine.
-        .filter((m) => deadUuid == null || m.mother_uuid !== deadUuid)
+        // Never follow the corpse back to the same machine - but only on the
+        // degraded, unverified path. With a game to verify against, the check
+        // below proves the candidate is alive and serves us, which beats any
+        // guess about who died. The guess was wrong in the field: once this
+        // satellite cached a snapshot FROM the promoted mother, `deadUuid` named
+        // the LIVE mother, so a single slow call made us refuse it and the
+        // "lost the mother" banner kept popping up on a working connection.
+        .filter((m) => gameId != null || deadUuid == null || m.mother_uuid !== deadUuid)
         // Never our own idle server (discovery includes self).
         .filter((m) => selfUuid == null || m.mother_uuid !== selfUuid)
         // Epoch is a PREFERENCE, not a gate, whenever we can verify a candidate
@@ -259,7 +354,8 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
         // The machine that answered must be the one mDNS advertised, and must
         // not be the corpse or ourselves.
         if (check.mother_uuid !== c.mother_uuid) continue;
-        if (check.mother_uuid === deadUuid || check.mother_uuid === selfUuid) continue;
+        if (check.mother_uuid === selfUuid) continue;
+        if (gameId == null && check.mother_uuid === deadUuid) continue;
         // With a game to check against, serving it is the whole point. Without
         // one, the epoch filter above already did the (weaker) selection.
         if (gameId != null && !check.serves_game) continue;
@@ -292,6 +388,9 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
           peerSecret: token,
         });
         await invoke('client_refresh_mother_endpoints', { timeoutMs: 2500 }).catch(() => {});
+        // One mother per satellite: forget the ones we have not heard from in
+        // 10 min (retours sept. #7/#18).
+        await invoke('client_prune_paired_mothers', { keepUuid: best.uuid, staleMinutes: 10 }).catch(() => {});
       } catch (e) {
         console.warn('[motherFailover] could not register new mother as paired:', e);
       }
@@ -333,12 +432,14 @@ export function reportMotherRouteState(state: 'mother' | 'mother_offline' | 'loc
   if (state === 'mother_offline') {
     offlineTicks += 1;
     if (offlineTicks >= 2) setMotherUnreachable(true);
+    else successStreak = 0;
     return;
   }
   offlineTicks = 0;
-  // Only a resolved mother route clears it; 'local' means we're hosting or
-  // standalone, which is neither reachable nor lost.
-  if (state === 'mother') setMotherUnreachable(false);
+  // A resolved route comes from the endpoint CACHE, not a live exchange: it
+  // counts toward the success streak but can't clear the state on its own
+  // (that was the flapping). 'local' means hosting/standalone - neither.
+  if (state === 'mother') noteMotherContact(false);
 }
 
 /**
@@ -395,5 +496,7 @@ export function installMotherFailover(): void {
   setLanRepointHandler(repointToNewMother);
   setLanContactHandler(() => {
     hadMotherContact = true;
+    // A real answer from the mother over the LAN route.
+    noteMotherContact(false);
   });
 }

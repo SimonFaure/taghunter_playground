@@ -22,6 +22,7 @@ import {
   TRACKS_SCORE_TYPE_LABELS,
 } from './LaunchGameModal';
 import { HelpDot } from '../help';
+import { formatDbDateTime } from '../utils/dbTime';
 
 interface LaunchedGameConfigModalProps {
   gameId: number;
@@ -78,7 +79,7 @@ const COMMON_KEYS = [
 // route/display/play/score/malus/clues keys live in the dedicated tracks
 // section (TRACKS_SECTION_KEYS), so they're intentionally not listed here.
 const KEYS_BY_TYPE: Record<string, string[]> = {
-  tagquest: [...COMMON_KEYS, 'victoryType', 'playMode', 'visibilityHideDelaySec', 'tagquestShowQuestPreview', 'tagquestScoreWeighting'],
+  tagquest: [...COMMON_KEYS, 'victoryType', 'playMode', 'visibilityHideDelaySec', 'tagquestShowQuestPreview', 'tagquestShowMissingStations', 'tagquestScoreWeighting'],
   mystery: [
     ...COMMON_KEYS,
     'autoRegisterTeam',
@@ -99,7 +100,7 @@ const KEYS_BY_TYPE: Record<string, string[]> = {
     'reuseCards',
     'reuseDelayMinutes',
   ],
-  clash: ['pattern', 'duration', 'colorblindMode', 'testMode'],
+  clash: ['pattern', 'duration', 'testMode'],
 };
 
 // Keys rendered as bespoke card pickers (not in the generic value/toggle grids).
@@ -117,6 +118,7 @@ const EDITABLE_KEYS_BY_TYPE: Record<string, Set<string>> = {
     'visibilityHideDelaySec',     // Garder le résultat à l'écran
     'colorblindMode',             // Mode daltonien
     'tagquestShowQuestPreview',   // Aperçu des images de quête
+    'tagquestShowMissingStations', // Visuel des balises manquantes
     // Pondération par effectif - live-editable: the punch logic re-reads meta
     // on every bip, so flipping it re-scales scores from the next punch on.
     'tagquestScoreWeighting',
@@ -289,6 +291,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
       playMode: t('launchedGameConfig:fieldPlayMode'),
       visibilityHideDelaySec: t('launchedGameConfig:fieldVisibilityHideDelaySec'),
       tagquestShowQuestPreview: t('launchedGameConfig:fieldTagquestShowQuestPreview'),
+      tagquestShowMissingStations: t('launchedGameConfig:fieldTagquestShowMissingStations'),
       tagquestScoreWeighting: t('launchedGameConfig:fieldTagquestScoreWeighting'),
       malusPerMinute: t('launchedGameConfig:fieldMalusPerMinute'),
       testMode: t('launchedGameConfig:fieldTestMode'),
@@ -302,6 +305,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
         metaName === 'selfRegisterTeam' || metaName === 'enterToReset' ||
         metaName === 'showIdleLayout' || metaName === 'testMode' ||
         metaName === 'tagquestShowQuestPreview' ||
+        metaName === 'tagquestShowMissingStations' ||
         metaName === 'tagquestScoreWeighting') {
       return 'checkbox';
     }
@@ -682,7 +686,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                   </div>
                   <p className="text-[var(--pg-text-dim)] text-xs">
                     {t('launchedGameConfig:lastConnection', {
-                      date: new Date(device.last_connexion_attempt).toLocaleString(),
+                      date: formatDbDateTime(device.last_connexion_attempt),
                     })}
                   </p>
 
@@ -693,7 +697,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                         <div key={data.id} className="bg-[var(--pg-surface-3)] rounded p-3">
                           <div className="flex justify-between items-start mb-2">
                             <span className="text-xs text-[var(--pg-text-dim)]">
-                              {new Date(data.created_at).toLocaleString()}
+                              {formatDbDateTime(data.created_at)}
                             </span>
                           </div>
                           <pre className="text-xs text-[var(--pg-text-muted)] overflow-x-auto whitespace-pre-wrap">

@@ -5,9 +5,15 @@
   },
   "detection": {
     "recheck": "Re-check",
-    "installTitle": "Coming in the next build",
+    "installTitle": "Runs the SportIdent driver installer bundled with Playground (Windows will ask for administrator permission)",
     "install": "Install signed driver",
-    "comingSoon": "(coming soon)"
+    "installing": "Installing… confirm the Windows prompt",
+    "preinstall": "Install the driver now",
+    "installDone": "Driver installed. If the status above doesn't turn green, unplug and replug the reader.",
+    "errCancelled": "Installation cancelled - administrator permission is required to install a driver.",
+    "errMissing": "The driver installer is missing from this Playground build. Use the download link below instead.",
+    "errTimeout": "The installer didn't finish in time. Check whether a Windows prompt is waiting, then re-check.",
+    "errGeneric": "Driver installation failed ({{detail}}). Try the download link or the manual workaround below."
   },
   "variant": {
     "healthy": {

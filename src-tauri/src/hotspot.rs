@@ -44,6 +44,21 @@ pub struct HotspotStatus {
     pub platform: &'static str,
 }
 
+// ─── access-point band ───────────────────────────────────────────────────────
+// Retours sept. #19: with the AP left on Windows' "any available" band, some of
+// the field's heterogeneous test PCs never saw a promoted mother's Wi-Fi; forcing
+// 2.4 GHz is what made them appear. 2.4 GHz is therefore the default, with an
+// "auto" escape hatch in Settings → Network → Advanced (the renderer pushes the
+// operator's choice here at boot and on change). Process-global because the AP
+// is raised both from the renderer and from `become_mother` in Rust.
+static HOTSPOT_BAND_24: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `band`: "2.4" (default) or "auto".
+#[tauri::command]
+pub fn mother_set_hotspot_band(band: String) {
+    HOTSPOT_BAND_24.store(band != "auto", std::sync::atomic::Ordering::Relaxed);
+}
+
 // ─── tauri commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -159,7 +174,7 @@ mod windows_impl {
     use windows::Networking::Connectivity::{ConnectionProfile, NetworkInformation};
     use windows::Networking::NetworkOperators::{
         NetworkOperatorTetheringAccessPointConfiguration, NetworkOperatorTetheringManager,
-        TetheringOperationStatus, TetheringOperationalState,
+        TetheringOperationStatus, TetheringOperationalState, TetheringWiFiBand,
     };
 
     pub fn start(ssid: &str, password: &str) -> Result<(), String> {
@@ -177,6 +192,15 @@ mod windows_impl {
         config
             .SetPassphrase(&HSTRING::from(password))
             .map_err(|e| format!("SetPassphrase: {}", e.message()))?;
+        // Band (Windows 10 2004+). Unsupported API/band → leave Windows' choice.
+        let band = if super::HOTSPOT_BAND_24.load(std::sync::atomic::Ordering::Relaxed) {
+            TetheringWiFiBand::TwoPointFourGigahertz
+        } else {
+            TetheringWiFiBand::Auto
+        };
+        if config.IsBandSupported(band).unwrap_or(false) {
+            let _ = config.SetBand(band);
+        }
 
         let configure_op = manager
             .ConfigureAccessPointAsync(&config)

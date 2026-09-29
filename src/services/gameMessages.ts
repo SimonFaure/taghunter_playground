@@ -31,11 +31,6 @@ export type StatusKey =
   // honest message.
   | 'punches_already_counted'
   | 'punches_not_wiped'
-  // Advisory, NOT a rejection: a predetermined-roster chip arrived with punches
-  // already on it. They are scored - with no pre-play bip there is no way to
-  // tell them from the player's first trip - so this only asks the operator to
-  // wipe cards before handing them out.
-  | 'card_not_wiped'
   | 'card_full';
 
 const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<StatusKey>([
@@ -51,7 +46,6 @@ const KNOWN_STATUS_KEYS: ReadonlySet<string> = new Set<StatusKey>([
   'no_station_match',
   'punches_already_counted',
   'punches_not_wiped',
-  'card_not_wiped',
   'card_full',
 ]);
 
@@ -97,7 +91,6 @@ const STATUS_TYPE: Partial<Record<StatusKey, GameMessageType>> = {
   error: 'error',
   punches_already_counted: 'info',
   punches_not_wiped: 'warning',
-  card_not_wiped: 'warning',
   card_full: 'warning',
 };
 
@@ -134,7 +127,7 @@ export function describePunchStatus(
   let text = teamName && !authorPlacedName ? `${teamName} - ${base}` : base;
   const detail = fallbackMsg?.trim();
   if ((status === 'error' || status === 'no_station_match') && detail && !text.includes(detail)) {
-    text = `${text} — ${detail}`;
+    text = `${text} : ${detail}`;
   }
   return { text, type };
 }

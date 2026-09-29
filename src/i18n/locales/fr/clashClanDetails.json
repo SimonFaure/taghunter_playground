@@ -18,7 +18,7 @@
   "alreadyInClan": "Cette puce est déjà dans ce clan",
   "couldNotAdd": "Impossible d'ajouter la puce",
   "punchesHeading": "Pointages ({{count}})",
-  "noCardReads": "Aucune lecture de carte pour ce clan pour l'instant.",
+  "noCardReads": "Aucune lecture de puce pour ce clan pour l'instant.",
   "chipHolder": "{{name}} - (n°{{number}} - id {{id}})",
   "chipHolderNoNumber": "{{name}} - (id {{id}})",
   "stationCount_one": "{{count}} balise",
@@ -26,5 +26,5 @@
   "end": "Fin",
   "noStations": "Aucune balise sur cette lecture.",
   "stationCode": "Code de balise",
-  "punchTime": "Heure de pointage"
+  "punchTime": "Heure du bip"
 }

@@ -11,7 +11,7 @@
   "becomeMotherConfirm": "Take over on this device",
   "promoting": "Promoting this device…",
   "promotedBody": "This device is now the mother. The other devices will reconnect to it within a few seconds.",
-  "stickyMotherNote": "This device will keep hosting on the next start. To undo: Settings → Network → \"I am not a mother\".",
+  "stickyMotherNote": "This device will stay the mother at next start. To undo: Settings → Network → Advanced → \"I'm not a mother\" (possible once the game has ended or another device took it over).",
   "apDownBody": "This device has taken over the game, but its Wi-Fi hotspot is not up - the other devices cannot find it yet.",
   "apDownHint": "Retry below, or start the hotspot from Settings → Network. The game itself is safe on this device.",
   "retryHotspot": "Retry hotspot",
@@ -29,5 +29,18 @@
   "errSnapshotFetch": "Could not fetch the current game state from the active mother - it may have just gone offline. Try again.",
   "errNoSnapshot": "No cached snapshot for this game on this device - it can't be promoted. Pick a device that was in the game.",
   "errNotInGame": "This device was not part of any active game (no saved state, and no other host is reachable). Join the game on this device first, or take control from a device that was in it.",
-  "errTakeControl": "Could not take control: another device may already be the current mother. Try again in a few seconds."
+  "errTakeControl": "Could not take control: another device may already be the current mother. Try again in a few seconds.",
+  "errMotherUnreachable": "The current mother is not answering. Check that it is on, that Playground is open on it and that this device is on the same Wi-Fi, then retry.",
+  "errStaleSnapshot": "This device already holds a newer copy of the game and can host it directly. Use \"Take control\" in Settings → Network → Advanced.",
+  "errScenarioMissing": "This device hasn't downloaded this game's scenario. Sync it (Settings → Sync), then retry.",
+  "errAdoptFailed": "Taking over the game on this device failed and was rolled back: nothing was changed. Retry; if it happens again, take over from another device.",
+  "errPortBusy": "Another program is using Playground's network port on this device. Close other Playground windows, then retry.",
+  "errNoWifiCreds": "This device doesn't know the Tag Hunter Wi-Fi name and password, so the access point could not start. Sync the device or enter them in Settings → Network → Advanced.",
+  "errHotspot": "This device's Wi-Fi access point could not start. Retry in a few seconds; if it persists, start it from Settings → Network.",
+  "errNotAuthorized": "The current mother refused this device. Join it first (Settings → Network → Find a mother), then retry.",
+  "errGeneric": "The operation failed. Retry in a few seconds; if it happens again, send the technical details to support.",
+  "errHostingActiveGame": "This device is hosting a running game (\"{{name}}\") and no other mother serves it. End the game, or have another device take it over first (\"Make mother\" on one of its satellites).",
+  "regainNoOther": "No other mother can be reached: this device stays the mother.",
+  "promotedBodyHotspot": "This device is now the mother and broadcasts the Tag Hunter Wi-Fi. Satellites rejoin on their own within about a minute; otherwise, on the satellite: Settings → Network → Find a mother.",
+  "bannerReconnecting": "Reconnecting to the mother, please don't touch anything."
 }

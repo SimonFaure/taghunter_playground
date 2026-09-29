@@ -45,6 +45,42 @@ export async function getLanNetworks(signal?: AbortSignal): Promise<RelayedNetwo
   return res?.networks ?? [];
 }
 
+// ─── lan_networks_version cursor ─────────────────────────────────────────────
+// The version of the studio set this device last reconciled to, keyed by client
+// so an account switch never matches a stale cursor. The orchestrator pulls
+// get_lan_networks only when the manifest's lan_networks_version differs, plus
+// once per app launch (see reconciledThisSession) to drop stale local rows.
+// Before this the item was pulled on every sync and the status never read
+// "à jour" (retours sept. 2026 #28).
+const LAN_CURSOR_KEY = 'lan_networks_cursor';
+let reconciledThisSession = false;
+
+export async function getLanNetworksCursor(clientId: number): Promise<number | null> {
+  const db = await getDb();
+  const rows = await db.select<{ value: string }[]>(
+    'SELECT value FROM schema_meta WHERE key = $1',
+    [LAN_CURSOR_KEY]
+  );
+  if (!rows.length) return null;
+  const [cid, ver] = rows[0].value.split(':');
+  if (Number(cid) !== clientId) return null;
+  const v = Number(ver);
+  return Number.isFinite(v) ? v : null;
+}
+
+export async function setLanNetworksCursor(clientId: number, version: number): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    'INSERT INTO schema_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    [LAN_CURSOR_KEY, `${clientId}:${version}`]
+  );
+  reconciledThisSession = true;
+}
+
+export function lanNetworksReconciledThisSession(): boolean {
+  return reconciledThisSession;
+}
+
 // Local mirror of the "default mother" designation so the Network settings
 // toggle can render its current on/off state instantly + offline. Set alongside
 // the set_default_mother call.

@@ -32,10 +32,10 @@ import { decodeTeamSummarySnapshot, type TeamSummarySnapshot } from './services/
 import { TeamSummaryOverlay } from './components/TeamSummaryOverlay';
 import { listen } from '@tauri-apps/api/event';
 import { emitPendingJoin, emitPendingLeave, emitPendingConfigReload, emitPendingRejoin, type PendingJoinRoute } from './services/pendingJoinStore';
-import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, motherHotspotWatchdogTick, type TakeoverTarget } from './services/lanMotherBoot';
+import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, joinExistingMotherNetworkIfPresent, applyHotspotBandPreference, motherHotspotWatchdogTick, reclaimWillingMotherTick, type TakeoverTarget } from './services/lanMotherBoot';
 import { refreshLaunchedGamesRoute, installLanReauth } from './services/childControlLink';
 import { ensureFirewallRuleOnce } from './services/firewall';
-import { installMotherFailover } from './services/motherFailover';
+import { installMotherFailover, setMotherLossHook } from './services/motherFailover';
 import { reconcileSupersededGamesTick } from './services/motherStateReconcile';
 import { getPairedMother, describeLocalRole } from './services/lanPairing';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './services/device';
@@ -445,6 +445,14 @@ function App() {
   useEffect(() => {
     installMotherFailover();
     installLanReauth();
+    void applyHotspotBandPreference();
+    // Retours sept. #19: the moment contact with the mother is lost, look for its
+    // Wi-Fi again with a REAL scan (a promoted mother raises a new AP of the same
+    // name that Windows' cached list can hide for minutes) instead of waiting
+    // for the 20 s auto-connect tick.
+    setMotherLossHook(() => {
+      void runAutoConnect({ allowPrompt: false, freshScan: true }).catch(() => {});
+    });
   }, []);
 
   // Live epoch fencing: a running mother that gets superseded (another device
@@ -467,6 +475,15 @@ function App() {
         if (cancelled) return;
         if (!role?.mother_server_running) {
           await reconcileSupersededGamesTick();
+          // A willing mother that stood down behind another device takes the
+          // role back if the venue ends up with no mother at all (e.g. the
+          // device that replaced it was told "I'm not a mother").
+          if (!cancelled) {
+            const label = (await getCachedDeviceDisplayName().catch(() => null)) || undefined;
+            if (await reclaimWillingMotherTick(clientId, label)) {
+              await refreshLaunchedGamesRoute().catch(() => {});
+            }
+          }
           return;
         }
         const target = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId });
@@ -540,6 +557,14 @@ function App() {
       // Prefer the operator's custom device name (Settings → Devices) so other
       // devices see it by name over mDNS instead of a generic "Windows device".
       const label = displayName || meta?.device_label || undefined;
+      // Hotspot mode: before hosting, look for the venue's existing Tag Hunter
+      // Wi-Fi and join it if a mother is already serving behind it (retours
+      // sept. #1/#13). The boot fence below can then see that mother and stand
+      // down, and the "Take back control?" prompt is asked to re-check.
+      if (willing) {
+        await joinExistingMotherNetworkIfPresent(auth.user!.client_id);
+        if (cancelled) return;
+      }
       const motherInfo = await ensureMotherServer(auth.user!.client_id, label);
       if (cancelled) return;
 
@@ -565,7 +590,7 @@ function App() {
             console.warn('[App] stand-down re-check: no mother materialized - retrying ensureMotherServer.');
             const retry = await ensureMotherServer(auth.user!.client_id, label);
             if (cancelled || !retry) return;
-            await raiseMotherHotspotIfConfigured();
+            await raiseMotherHotspotIfConfigured({ probeExisting: true });
           })();
         }, recheckMs);
         return;

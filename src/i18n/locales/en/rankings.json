@@ -45,7 +45,8 @@
   "clashNoEvents": "Nothing has happened yet.",
   "loadingGameData": "Loading game data…",
   "noLayoutTitle": "No layout found",
-  "noLayoutBody": "To show the custom game layout, upload a TagQuest layout file or sync with the server. The default leaderboard view is being shown instead.",
+  "noLayoutBody": "To show the custom game layout, upload a Quest layout file or sync with the server. The default leaderboard view is being shown instead.",
   "playersCount_one": "{{count}} player",
-  "playersCount_other": "{{count}} players"
+  "playersCount_other": "{{count}} players",
+  "offlineBadge": "Rankings offline, reconnecting…"
 }

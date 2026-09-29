@@ -1,8 +1,8 @@
 // Shared "first-bip video" resolution, used by both MysteryGamePage and
 // TracksGamePage. Given a launch config + the scenario's raw game-data, it
 // returns the ordered list of <video> sources to play on a team's first bip
-// (intro first, then tutorial). An empty list means the caller skips the
-// overlay entirely.
+// (tutorial first, then the scenario intro - retour 2026-09-16). An empty list
+// means the caller skips the overlay entirely.
 
 import type { GameConfig } from '../components/LaunchGameModal';
 import * as scenarioStore from './scenarioStore';
@@ -27,6 +27,19 @@ export async function resolveFirstBipVideos(
   const useSubs = appCfg?.useSubtitlesByDefault !== false; // default on
   const sources: VideoSource[] = [];
 
+  // Tutorial = game-type-level video, with override-wins resolution.
+  if (config.playTutorialOnBip) {
+    const resolved = await gameTypesStore.resolveTutorialVideoUrl(gameTypeCode);
+    if (resolved) {
+      sources.push({
+        kind: 'tutorial',
+        videoUrl: resolved.videoUrl,
+        subtitles: resolved.subtitleUrls,
+        defaultSubtitleLang: pickDefaultSubtitleLang(resolved.subtitleUrls, lang, useSubs),
+      });
+    }
+  }
+
   // Intro = per-scenario scenario_video. Subtitle files live in
   // scenarios/<uniqid>/v<N>/ and are referenced from medias.sounds under
   // keys like scenario_video_subtitle_<lang>.
@@ -50,19 +63,6 @@ export async function resolveFirstBipVideos(
           defaultSubtitleLang: pickDefaultSubtitleLang(subtitles, lang, useSubs),
         });
       }
-    }
-  }
-
-  // Tutorial = game-type-level video, with override-wins resolution.
-  if (config.playTutorialOnBip) {
-    const resolved = await gameTypesStore.resolveTutorialVideoUrl(gameTypeCode);
-    if (resolved) {
-      sources.push({
-        kind: 'tutorial',
-        videoUrl: resolved.videoUrl,
-        subtitles: resolved.subtitleUrls,
-        defaultSubtitleLang: pickDefaultSubtitleLang(resolved.subtitleUrls, lang, useSubs),
-      });
     }
   }
 

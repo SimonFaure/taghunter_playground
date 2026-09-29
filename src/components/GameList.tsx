@@ -80,7 +80,6 @@ interface Scenario {
   /** Free-text univers/theme tags (game_meta.univers). Display only. */
   univers: string[];
   uniqid?: string;
-  available_for_purchase?: boolean;
 }
 
 interface ScenarioWithType extends Scenario {
@@ -310,6 +309,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       playMode: (meta.playMode as GameConfig['playMode']) ?? undefined,
       tagquestSelfRegister: meta.tagquestSelfRegister === 'true',
       tagquestShowQuestPreview: meta.tagquestShowQuestPreview !== 'false',
+      tagquestShowMissingStations: meta.tagquestShowMissingStations !== 'false',
       tagquestScoreWeighting: meta.tagquestScoreWeighting === 'true',
       teammatesPerTeam: meta.teammatesPerTeam ? parseInt(meta.teammatesPerTeam) : undefined,
       testMode: meta.testMode === 'true' ? true : undefined,
@@ -433,7 +433,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             audienceBands,
             univers,
             uniqid: row.uniqid,
-            available_for_purchase: false,
             game_type: matchedType,
           };
         })
@@ -467,8 +466,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       return 0;
     });
 
-  const purchasedScenarios = filteredScenarios.filter(s => !s.available_for_purchase);
-  const availableForPurchaseScenarios = filteredScenarios.filter(s => s.available_for_purchase);
 
   const gameTypes = [...new Set(scenarios.map((s) => s.game_type.name))];
   // Age bands actually present among loaded scenarios, in canonical young→old
@@ -574,6 +571,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       // TagQuest: low-opacity ghost preview of the quest images on each bip.
       // Audience-defaulted at launch; missing key reads as true downstream.
       tagquestShowQuestPreview: (config.tagquestShowQuestPreview ?? true) ? 'true' : 'false',
+      // TagQuest: draw the visual of a station still missing from a partial
+      // combination. Missing key reads as true downstream.
+      tagquestShowMissingStations: (config.tagquestShowMissingStations ?? true) ? 'true' : 'false',
       // TagQuest: effectif weighting of earned points (score+team mode only).
       // Default on for new launches; a MISSING key reads as off downstream so
       // games launched before the option existed keep their raw scores.
@@ -1187,7 +1187,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     setScenarioToDelete(null);
   };
 
-  // Shared action buttons (join / launch / quick launch / purchase) used by
+  // Shared action buttons (join / launch / quick launch) used by
   // both the grid card and the list row. `includeDetails` adds the inline
   // "view details" button - cards suppress it (the card has its own top-right
   // details button) while list rows keep it. Deletion now lives in the details
@@ -1197,7 +1197,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     includeDetails = true,
     layout: 'card' | 'row' = 'card'
   ) => {
-    const isAvailableForPurchase = scenario.available_for_purchase;
     const activeGame = scenario.uniqid ? activeGames.get(scenario.uniqid) : undefined;
     const configCount = scenario.uniqid ? (configCounts.get(scenario.uniqid) ?? 0) : 0;
     const launchTarget: LaunchTarget = {
@@ -1209,11 +1208,10 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     // When a card shows all three primary buttons (Join + Launch new + Quick),
     // the row gets cramped - collapse them to icon-only.
     const canPlay =
-      !isAvailableForPurchase &&
       !!scenario.uniqid &&
       (localGameIds.size === 0 || localGameIds.has(scenario.uniqid));
     const hasJoin = canPlay && !!activeGame && !operatorOnly;
-    const hasQuick = !isAvailableForPurchase && !!scenario.uniqid && configCount > 0;
+    const hasQuick = !!scenario.uniqid && configCount > 0;
     const compact = layout === 'card' && hasJoin && hasQuick;
 
     return (
@@ -1221,16 +1219,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         {/* Primary actions. When a game is already running for this scenario we
             offer BOTH "Join" (the running game) and "Launch new" - a fresh game
             can run alongside it on other (free) devices. */}
-        {isAvailableForPurchase ? (
-          <a
-            href="https://studio.taghunter.fr"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="pg-btn-play"
-          >
-            {t('home:purchase')}
-          </a>
-        ) : scenario.uniqid && (localGameIds.size === 0 || localGameIds.has(scenario.uniqid)) ? (
+        {scenario.uniqid && (localGameIds.size === 0 || localGameIds.has(scenario.uniqid)) ? (
           <>
             {activeGame && !operatorOnly && (
               <button
@@ -1256,7 +1245,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         {/* Quick Launch split button - only when this scenario has saved
             configs. Main: 1 config → headless, >1 → picker. Caret: always
             opens the picker/manage modal. */}
-        {!isAvailableForPurchase && scenario.uniqid && configCount > 0 && (
+        {scenario.uniqid && configCount > 0 && (
           <div className="pg-split">
             <button
               onClick={() => void handleQuickLaunch(launchTarget)}
@@ -1289,7 +1278,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
 
   const renderScenarioCard = (scenario: ScenarioWithType) => {
     const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
-    const isAvailableForPurchase = scenario.available_for_purchase;
 
     const difficultyLevel = coerceDifficulty(scenario.difficulty);
 
@@ -1300,18 +1288,14 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             <GameTypeIcon type={scenario.game_type.name} size={12} />
             {gameTypeLabel(scenario.game_type.name).toUpperCase()}
           </span>
-          {isAvailableForPurchase ? (
-            <span className="pg-tag">{t('home:new')}</span>
-          ) : (
-            <button
-              onClick={() => setDetailsScenario(scenario)}
-              className="pg-card-detail"
-              title={t('home:viewDetails')}
-              aria-label={t('home:viewDetails')}
-            >
-              <Eye size={15} />
-            </button>
-          )}
+          <button
+            onClick={() => setDetailsScenario(scenario)}
+            className="pg-card-detail"
+            title={t('home:viewDetails')}
+            aria-label={t('home:viewDetails')}
+          >
+            <Eye size={15} />
+          </button>
           <ScenarioThumbnail
             imageUrl={localImageUrl}
             gameTypeName={scenario.game_type.name}
@@ -1351,7 +1335,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   // horizontally so more scenarios fit on screen.
   const renderScenarioRow = (scenario: ScenarioWithType) => {
     const localImageUrl = (scenario.uniqid && localImages.get(scenario.uniqid)) || null;
-    const isAvailableForPurchase = scenario.available_for_purchase;
 
     return (
       <div key={scenario.id} className="pg-row">
@@ -1367,7 +1350,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             <h3 className="pg-card-title" style={{ marginBottom: 0 }}>
               {scenario.title || t('home:untitledScenario')}
             </h3>
-            {isAvailableForPurchase && <span className="pg-tag" style={{ position: 'static' }}>{t('home:forPurchase')}</span>}
           </div>
           <div className="pg-card-meta" style={{ marginBottom: 0, gap: 12 }}>
             <span className="inline-flex items-center gap-1.5">
@@ -1526,44 +1508,18 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           </div>
         )}
 
-        {purchasedScenarios.length > 0 && (
+        {filteredScenarios.length > 0 && (
           viewMode === 'grid' ? (
             <div className="pg-grid mb-12">
-              {purchasedScenarios.map(renderScenarioCard)}
+              {filteredScenarios.map(renderScenarioCard)}
             </div>
           ) : (
             <div className="flex flex-col gap-3 mb-12">
-              {purchasedScenarios.map(renderScenarioRow)}
+              {filteredScenarios.map(renderScenarioRow)}
             </div>
           )
         )}
 
-        {availableForPurchaseScenarios.length > 0 && (
-          <>
-            <div className="mb-6 border-t border-[var(--pg-line)] pt-10">
-              <div className="pg-section-title flex items-center gap-3">
-                {t('home:availableForPurchase')}
-                <span className="pg-tag" style={{ position: 'static' }}>{t('home:new')}</span>
-              </div>
-              <p className="pg-section-sub">{t('home:availableForPurchaseSubtitle')}</p>
-            </div>
-            {viewMode === 'grid' ? (
-              <div className="pg-grid">
-                {availableForPurchaseScenarios.map(renderScenarioCard)}
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                {availableForPurchaseScenarios.map(renderScenarioRow)}
-              </div>
-            )}
-          </>
-        )}
-
-        {purchasedScenarios.length === 0 && availableForPurchaseScenarios.length === 0 && scenarios.length > 0 && (
-          <div className="text-center py-12">
-            <p className="text-[var(--pg-text-muted)] text-lg">{t('home:noScenariosMatchCriteria')}</p>
-          </div>
-        )}
       </main>
 
       <LaunchGameModal
@@ -1651,7 +1607,6 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
           onClose={() => setDetailsScenario(null)}
           onDelete={
             detailsScenario.uniqid &&
-            !detailsScenario.available_for_purchase &&
             !activeGames.has(detailsScenario.uniqid)
               ? () => {
                   const target = {

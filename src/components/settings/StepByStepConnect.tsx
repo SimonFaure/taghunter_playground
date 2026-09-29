@@ -87,7 +87,17 @@ export function StepByStepConnect() {
   const joinRef = useRef<JoinHandle | null>(null);
 
   useEffect(() => {
-    void listConnectable().then((rows) => setCreds(rows)).catch(() => setCreds([]));
+    // Preselect the network this device is already on when it is one of the
+    // mother's: in router mode that is the router's SSID, and the wizard used to
+    // insist on the hotspot one ("connected to Tag Hunter instead of
+    // TagHunter-ae847290", retours sept. #6).
+    void Promise.all([listConnectable(), getCurrentSsid().catch(() => null)])
+      .then(([rows, current]) => {
+        setCreds(rows);
+        const i = current ? rows.findIndex((r) => r.ssid === current) : -1;
+        if (i >= 0) setSel(i);
+      })
+      .catch(() => setCreds([]));
     return () => joinRef.current?.cancel();
   }, []);
 
@@ -123,12 +133,17 @@ export function StepByStepConnect() {
       setStep1({ phase: 'ok', ip: res.ip });
     } else if (res.kind === 'apipa') {
       setStep1({ phase: 'warn', ip: res.ip });
+    } else if (res.kind === 'wrong_ssid' && res.current && creds.some((c) => c.ssid === res.current)) {
+      // Landed on ANOTHER of the mother's networks (router vs hotspot creds
+      // both known): that is a valid path to the mother, not an error.
+      await markConnected(res.current).catch(() => {});
+      setStep1({ phase: 'ok' });
     } else if (res.kind === 'wrong_ssid') {
       setStep1({ phase: 'err', detail: t('stepConnectWrongSsid', { current: res.current ?? '—', target: target.ssid }) });
     } else {
       setStep1({ phase: 'err', detail: t('stepConnectNoAssoc', { ssid: target.ssid }) });
     }
-  }, [target, t]);
+  }, [target, creds, t]);
 
   const forceStaticIp = useCallback(async () => {
     setStaticBusy(true);
@@ -173,7 +188,7 @@ export function StepByStepConnect() {
   const doJoin = useCallback(async (m: DiscoveredMother) => {
     setJoiningUuid(m.mother_uuid);
     setJoinMsg(null);
-    const handle = joinMother(m);
+    const handle = joinMother(m, { manual: true });
     joinRef.current = handle;
     let outcome: JoinOutcome;
     try {

@@ -1,4 +1,4 @@
-// Settings → Developer → USB driver. The SportIdent reader connects as a
+// Settings → Hardware → USB driver block. The SportIdent reader connects as a
 // USB-serial device and needs a vendor driver installed. Recent Windows
 // builds block outdated/unsigned serial drivers ("This driver has been
 // blocked … does not pass the Windows driver policy"), which leaves the
@@ -27,7 +27,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useTranslation, Trans } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useDriverState } from '../../services/useDriverState';
-import type { DriverState } from '../../services/cp210xDriver';
+import { installDriver, type DriverState } from '../../services/cp210xDriver';
 
 // SportIdent's own current signed driver package - the recommended first try.
 const DRIVER_URL = 'https://sportident.fr/produit/usb-driver/';
@@ -77,10 +77,11 @@ function UsbDriverExplainer() {
 // ─────────────────────────────────────────────────────────────────────────────
 // DetectionCard - auto-detects the CP210x driver state via the Rust
 // check_cp210x_driver_state command and renders the matching status. The
-// "Install signed driver" button is rendered for the two installable states
-// (blocked / not installed) but disabled - the Rust install command is a
-// Sprint 2 stub. When unknown (non-Windows or detection failed), the card
-// hides entirely and DriverFix carries the screen.
+// "Install signed driver" button runs the SportIdent installer bundled with
+// the app (UAC prompt, silent install) for the two installable states
+// (blocked / not installed), and is offered as a pre-install when no reader
+// is plugged in yet. When unknown (non-Windows or detection failed), the
+// card hides entirely and DriverFix carries the screen.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function DetectionCard({
@@ -91,11 +92,27 @@ function DetectionCard({
   recheck: () => void;
 }) {
   const { t } = useTranslation();
+  const [installing, setInstalling] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
   if (state.kind === 'unknown') return null;
 
   const v = variantFor(state, t);
   const installable =
     state.kind === 'blocked_by_policy' || state.kind === 'driver_not_installed';
+
+  const runInstall = async () => {
+    setInstalling(true);
+    setResult(null);
+    try {
+      await installDriver();
+      setResult({ ok: true, message: t('usbDriver:detection.installDone') });
+    } catch (e) {
+      setResult({ ok: false, message: installErrorMessage(String(e), t) });
+    } finally {
+      setInstalling(false);
+      recheck();
+    }
+  };
 
   return (
     <div className={`rounded-lg p-6 border-2 ${v.border} ${v.bg}`}>
@@ -114,23 +131,43 @@ function DetectionCard({
           </div>
           <p className="text-sm text-[var(--pg-text-muted)] mb-3">{v.body}</p>
 
-          {installable && (
+          {(installable || state.kind === 'device_absent') && (
             <button
-              disabled
+              onClick={runInstall}
+              disabled={installing}
               title={t('usbDriver:detection.installTitle')}
-              className="pg-btn pg-btn--primary cursor-not-allowed"
+              className={installable ? 'pg-btn pg-btn--primary' : 'pg-btn pg-btn--sm'}
             >
-              <HardDriveDownload size={16} />
-              {t('usbDriver:detection.install')}
-              <span className="text-xs uppercase tracking-wider opacity-80">
-                {t('usbDriver:detection.comingSoon')}
-              </span>
+              {installing ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <HardDriveDownload size={16} />
+              )}
+              {installing
+                ? t('usbDriver:detection.installing')
+                : installable
+                  ? t('usbDriver:detection.install')
+                  : t('usbDriver:detection.preinstall')}
             </button>
+          )}
+
+          {result && (
+            <p className={`text-sm mt-3 ${result.ok ? 'text-green-300' : 'text-red-300'}`}>
+              {result.message}
+            </p>
           )}
         </div>
       </div>
     </div>
   );
+}
+
+// install_cp210x_driver returns stable error codes (see cp210x_driver.rs).
+function installErrorMessage(err: string, t: TFunction): string {
+  if (err.includes('cancelled')) return t('usbDriver:detection.errCancelled');
+  if (err.includes('missing')) return t('usbDriver:detection.errMissing');
+  if (err.includes('timeout')) return t('usbDriver:detection.errTimeout');
+  return t('usbDriver:detection.errGeneric', { detail: err });
 }
 
 interface DetectionVariant {

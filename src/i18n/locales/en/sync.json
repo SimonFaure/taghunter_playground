@@ -93,6 +93,7 @@
   "triggerForeground": "app foreground",
   "triggerNetworkUp": "network reconnected",
   "triggerTimer": "periodic check",
+  "triggerRetry": "automatic retry",
   "triggerManual": "manual",
   "triggerUnknown": "unknown"
 }

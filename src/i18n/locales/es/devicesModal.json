@@ -18,7 +18,7 @@
   "stopTitle": "Detener el vídeo en los dispositivos seleccionados",
   "videoIntro": "Intro",
   "videoTutorial": "Tutorial",
-  "videoIntroTutorial": "Intro + Tutorial",
+  "videoIntroTutorial": "Tutorial + Intro",
   "videoChecking": "Comprobando qué vídeos están disponibles…",
   "videoNoneAvailable": "Esta partida no tiene vídeo de introducción ni de tutorial para reproducir. Añade uno en el estudio (vídeo de introducción del escenario, o el vídeo tutorial del tipo de juego) y vuelve a sincronizar.",
   "videoIntroUnavailable": "No hay vídeo de introducción para este escenario",

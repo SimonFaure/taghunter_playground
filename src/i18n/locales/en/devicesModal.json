@@ -18,7 +18,7 @@
   "stopTitle": "Stop video on selected devices",
   "videoIntro": "Intro",
   "videoTutorial": "Tutorial",
-  "videoIntroTutorial": "Intro + Tutorial",
+  "videoIntroTutorial": "Tutorial + Intro",
   "videoChecking": "Checking which videos are available…",
   "videoNoneAvailable": "This game has no intro or tutorial video to play. Add one in the studio (scenario intro video, or the game type's tutorial video) then re-sync.",
   "videoIntroUnavailable": "No intro video for this scenario",

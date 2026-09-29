@@ -11,6 +11,7 @@ import {
 } from '../services/launchedGames';
 import { buildMediaMap } from '../utils/questMedia';
 import { wrongAnswerPoints } from '../services/mysteryScoring';
+import { formatDbTime } from '../utils/dbTime';
 
 interface TeamTestModalProps {
   gameId: number;
@@ -592,7 +593,7 @@ export function TeamTestModal({ gameId, gameName, team, onClose }: TeamTestModal
                       <div className="flex-1 min-w-0">
                         <p className="text-[var(--pg-text)] text-sm font-medium truncate">{device.device_id}</p>
                         <p className="text-[var(--pg-text-dim)] text-xs">
-                          {device.connected ? 'Connected' : 'Disconnected'} · last seen {new Date(device.last_connexion_attempt).toLocaleTimeString()}
+                          {device.connected ? 'Connected' : 'Disconnected'} · last seen {formatDbTime(device.last_connexion_attempt)}
                         </p>
                       </div>
                       {testConfig.selectedDeviceId === device.device_id && (

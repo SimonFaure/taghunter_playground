@@ -79,6 +79,7 @@ import type { ScenarioOption, TimeRange, ActiveGameOption } from './RankingsModa
 import type { GameConfig, Team as ConfigTeam, Teammate } from './LaunchGameModal';
 import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
 import type { SiPuce } from '../types/database';
+import { formatDbDateTime } from '../utils/dbTime';
 
 // Tracks route keys → operator-facing labels (Add Team per-team route override).
 const TRACKS_ROUTE_LABELS: Record<string, string> = {
@@ -169,6 +170,10 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   const [teams, setTeams] = useState<Team[]>([]);
   const [refreshingTeams, setRefreshingTeams] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Retours sept. #22: during a takeover the list could spin for minutes (the
+  // launched_games call waits for a mother route that doesn't exist yet). After
+  // 10 s the spinner gives way to an explanation and a retry.
+  const [slowLoad, setSlowLoad] = useState(false);
   const [renamingTeamId, setRenamingTeamId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [gameDataMap, setGameDataMap] = useState<Record<string, GameData>>({});
@@ -502,6 +507,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
 
   const loadGames = async () => {
     setLoading(true);
+    setSlowLoad(false);
+    const slowTimer = setTimeout(() => setSlowLoad(true), 10_000);
     try {
       const rows = await listLaunchedGames();
       // Remember which server these rows came from so re-entry routes correctly.
@@ -550,6 +557,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     } catch (err) {
       console.error('Error loading launched games:', err);
     } finally {
+      clearTimeout(slowTimer);
+      setSlowLoad(false);
       setLoading(false);
     }
   };
@@ -875,10 +884,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     });
   };
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleString();
-  };
+  const formatDate = (dateString: string) => formatDbDateTime(dateString);
 
   // Team start_time / end_time are stored as unix SECONDS (see TagQuestGamePage:
   // start is `Math.floor(startMs / 1000)`, end via endTimeToCommit). The Date
@@ -1394,7 +1400,17 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <div className="text-[var(--pg-text)] text-xl">{t('launched:loading')}</div>
+        {slowLoad ? (
+          <div className="max-w-md text-center space-y-3">
+            <div className="text-[var(--pg-text)] text-xl font-semibold">{t('launched:slowLoadTitle')}</div>
+            <p className="text-sm text-[var(--pg-text-dim)]">{t('launched:slowLoadHint')}</p>
+            <button className="pg-btn pg-btn--primary" onClick={() => void loadGames()}>
+              {t('launched:slowLoadRetry')}
+            </button>
+          </div>
+        ) : (
+          <div className="text-[var(--pg-text)] text-xl">{t('launched:loading')}</div>
+        )}
       </div>
     );
   }
@@ -1744,8 +1760,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
           <div>
             {selectedGameId !== null ? (
               <div className="sticky top-24">
-                <div className="bg-[var(--pg-surface)] border-2 border-[var(--pg-line)] rounded-lg p-6">
-                  <div className="flex items-center justify-between mb-4">
+                <div className="bg-[var(--pg-surface)] border-2 border-[var(--pg-line)] rounded-lg p-6 lg:flex lg:flex-col lg:max-h-[calc(100vh-7.5rem)]">
+                  <div className="flex items-center justify-between mb-4 shrink-0">
                     <h3 className="text-xl font-bold text-[var(--pg-text)] flex items-center gap-2">
                       <Users size={20} />
                       {t('launched:teamsCount', { count: teams.length })}
@@ -1795,7 +1811,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                   </div>
 
                   {teams.length > 0 && (
-                    <div className="space-y-3 mb-4">
+                    <div className="space-y-3 mb-4 shrink-0">
                       <div className="flex gap-2">
                         <div className="relative flex-1">
                           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--pg-text-dim)] z-10" />
@@ -1828,523 +1844,528 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                     </div>
                   )}
 
-                  {teams.length === 0 ? (
-                    <p className="text-[var(--pg-text-dim)]">{t('launched:noTeamsInGame')}</p>
-                  ) : (
-                    getFilteredAndSortedTeams().length === 0 ? (
-                      <p className="text-[var(--pg-text-dim)] text-sm">{t('launched:noTeamsMatchSearch')}</p>
+                  {/* The team list scrolls on its own so an operator can reach the
+                      bottom teams without scrolling the whole page (and the games
+                      list on the left) - retours sept. 2026 #32. */}
+                  <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:-mr-3 lg:pr-3">
+                    {teams.length === 0 ? (
+                      <p className="text-[var(--pg-text-dim)]">{t('launched:noTeamsInGame')}</p>
                     ) : (
-                    <div className="space-y-3">
-                      {getFilteredAndSortedTeams().map((team, index) => {
-                        const isMinimized = minimizedTeams.has(team.id);
-                        const ranking = index + 1;
-                        const selectedGame = games.find(g => g.id === selectedGameId);
-                        // launched_games stores game_type capitalised ('TagQuest');
-                        // the scenario gameDataMap uses the lowercase slug. Lowercase
-                        // the launched value so the primary check works without
-                        // depending on the async gameDataMap fallback.
-                        const isTagQuest = selectedGame?.game_type?.toLowerCase() === 'tagquest' ||
-                          gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'tagquest';
-                        const isClash = selectedGame?.game_type?.toLowerCase() === 'clash';
-                        const isMystery = selectedGame?.game_type?.toLowerCase() === 'mystery' ||
-                          gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'mystery';
-                        // Mystery teams: the operator also wants the physical card
-                        // number (key_number) alongside the chip id (key_id).
-                        const teamCardNumber = isMystery
-                          ? (allChips.find(c => c.id === team.key_id)?.key_number ?? null)
-                          : null;
-                        const clanMemberCount = clashCounts.get(team.id) ?? 0;
-                        const showTeammates = isTagQuest && selectedGamePlayMode === 'team';
-                        const configTeam = showTeammates
-                          ? selectedGameTeamsConfig.find(t => t.chipId === team.key_id || t.name === team.team_name)
-                          : undefined;
-                        const teammates = configTeam?.teammates ?? [];
-                        // Clash: clans share one game timeline and never set per-team
-                        // start/end, so derive the live score (clan points), validation
-                        // count (activity), member chips, and an activity-based status
-                        // from the polled standings instead of the lg_teams row.
-                        const clashStanding = isClash
-                          ? clashStandings?.clans.find(c => c.team_id === team.id)
-                          : undefined;
-                        const clashPoints = clashStanding?.points ?? 0;
-                        const clashValidations = isClash
-                          ? (clashStandings?.territories ?? []).reduce(
-                              (n, terr) => n + (terr.counts[String(team.id)] ?? 0), 0)
-                          : 0;
-                        const clashMemberChips = isClash ? (clashMembers.get(team.id) ?? []) : [];
-                        // TagQuest self-register: members bound via lg_clash_members
-                        // (no teamsConfig roster). Shown whenever the config roster
-                        // has no teammates for this team.
-                        const tagquestMemberChips =
-                          isTagQuest && teammates.length === 0 ? (clashMembers.get(team.id) ?? []) : [];
-                        const displayScore = isClash ? clashPoints : team.score;
-                        // Status: ended game ⇒ done; live + scored ⇒ playing; else waiting.
-                        const clashStatus: 'ended' | 'playing' | 'waiting' = selectedGame?.ended
-                          ? 'ended'
-                          : clashValidations > 0 ? 'playing' : 'waiting';
-                        const renderStatusIcon = (size: number, extraClass = '') => {
-                          if (isClash) {
-                            if (clashStatus === 'ended') return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
-                            if (clashStatus === 'playing') return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
+                      getFilteredAndSortedTeams().length === 0 ? (
+                        <p className="text-[var(--pg-text-dim)] text-sm">{t('launched:noTeamsMatchSearch')}</p>
+                      ) : (
+                      <div className="space-y-3">
+                        {getFilteredAndSortedTeams().map((team, index) => {
+                          const isMinimized = minimizedTeams.has(team.id);
+                          const ranking = index + 1;
+                          const selectedGame = games.find(g => g.id === selectedGameId);
+                          // launched_games stores game_type capitalised ('TagQuest');
+                          // the scenario gameDataMap uses the lowercase slug. Lowercase
+                          // the launched value so the primary check works without
+                          // depending on the async gameDataMap fallback.
+                          const isTagQuest = selectedGame?.game_type?.toLowerCase() === 'tagquest' ||
+                            gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'tagquest';
+                          const isClash = selectedGame?.game_type?.toLowerCase() === 'clash';
+                          const isMystery = selectedGame?.game_type?.toLowerCase() === 'mystery' ||
+                            gameDataMap[selectedGame?.game_uniqid ?? '']?.game?.type?.toLowerCase() === 'mystery';
+                          // Mystery teams: the operator also wants the physical card
+                          // number (key_number) alongside the chip id (key_id).
+                          const teamCardNumber = isMystery
+                            ? (allChips.find(c => c.id === team.key_id)?.key_number ?? null)
+                            : null;
+                          const clanMemberCount = clashCounts.get(team.id) ?? 0;
+                          const showTeammates = isTagQuest && selectedGamePlayMode === 'team';
+                          const configTeam = showTeammates
+                            ? selectedGameTeamsConfig.find(t => t.chipId === team.key_id || t.name === team.team_name)
+                            : undefined;
+                          const teammates = configTeam?.teammates ?? [];
+                          // Clash: clans share one game timeline and never set per-team
+                          // start/end, so derive the live score (clan points), validation
+                          // count (activity), member chips, and an activity-based status
+                          // from the polled standings instead of the lg_teams row.
+                          const clashStanding = isClash
+                            ? clashStandings?.clans.find(c => c.team_id === team.id)
+                            : undefined;
+                          const clashPoints = clashStanding?.points ?? 0;
+                          const clashValidations = isClash
+                            ? (clashStandings?.territories ?? []).reduce(
+                                (n, terr) => n + (terr.counts[String(team.id)] ?? 0), 0)
+                            : 0;
+                          const clashMemberChips = isClash ? (clashMembers.get(team.id) ?? []) : [];
+                          // TagQuest self-register: members bound via lg_clash_members
+                          // (no teamsConfig roster). Shown whenever the config roster
+                          // has no teammates for this team.
+                          const tagquestMemberChips =
+                            isTagQuest && teammates.length === 0 ? (clashMembers.get(team.id) ?? []) : [];
+                          const displayScore = isClash ? clashPoints : team.score;
+                          // Status: ended game ⇒ done; live + scored ⇒ playing; else waiting.
+                          const clashStatus: 'ended' | 'playing' | 'waiting' = selectedGame?.ended
+                            ? 'ended'
+                            : clashValidations > 0 ? 'playing' : 'waiting';
+                          const renderStatusIcon = (size: number, extraClass = '') => {
+                            if (isClash) {
+                              if (clashStatus === 'ended') return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
+                              if (clashStatus === 'playing') return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
+                              return <Clock size={size} className={`text-[var(--pg-text-dim)] ${extraClass}`} />;
+                            }
+                            if (team.end_time) return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
+                            if (team.start_time) return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
                             return <Clock size={size} className={`text-[var(--pg-text-dim)] ${extraClass}`} />;
-                          }
-                          if (team.end_time) return <CheckCircle size={size} className={`text-green-500 ${extraClass}`} />;
-                          if (team.start_time) return <Play size={size} className={`text-[var(--pg-accent-bright)] ${extraClass}`} />;
-                          return <Clock size={size} className={`text-[var(--pg-text-dim)] ${extraClass}`} />;
-                        };
-                        const clanChipLabel = (chipId: number) => {
-                          const c = allChips.find(x => x.id === chipId);
-                          return c ? { number: c.key_number, name: c.key_name } : { number: chipId, name: '' };
-                        };
+                          };
+                          const clanChipLabel = (chipId: number) => {
+                            const c = allChips.find(x => x.id === chipId);
+                            return c ? { number: c.key_number, name: c.key_name } : { number: chipId, name: '' };
+                          };
 
-                        return (
-                        <div
-                          key={team.id}
-                          className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-lg overflow-hidden"
-                        >
-                          {isMinimized ? (
-                            <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-[var(--pg-surface-3)] transition" onClick={() => toggleMinimizeTeam(team.id)}>
-                              <div className="flex items-center gap-3 flex-1 min-w-0">
-                                <span className="text-[var(--pg-text-dim)] text-sm font-medium">#{ranking}</span>
-                                <div className="flex items-center gap-2 min-w-0">
-                                  {renderStatusIcon(16, 'shrink-0')}
-                                  <span className="text-[var(--pg-text)] font-semibold truncate">{team.team_name}</span>
-                                </div>
-                                {showTeammates && teammates.length > 1 && (
-                                  <span className="flex items-center gap-1 text-teal-400 text-xs shrink-0">
-                                    <Users size={12} />
-                                    {teammates.length}
-                                  </span>
-                                )}
-                                {(isClash || tagquestMemberChips.length > 0) && (
-                                  <span className="flex items-center gap-1 text-blue-400 text-xs shrink-0" title={t('launched:chipsInTeam')}>
-                                    <Users size={12} />
-                                    {clanMemberCount}
-                                  </span>
-                                )}
-                                <span className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm ml-auto mr-4 shrink-0">
-                                  {t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span>
-                                  {team.weight != null && (
-                                    <span
-                                      title={t('launched:effectifWeightTitle')}
-                                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
-                                    >
+                          return (
+                          <div
+                            key={team.id}
+                            className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-lg overflow-hidden"
+                          >
+                            {isMinimized ? (
+                              <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-[var(--pg-surface-3)] transition" onClick={() => toggleMinimizeTeam(team.id)}>
+                                <div className="flex items-center gap-3 flex-1 min-w-0">
+                                  <span className="text-[var(--pg-text-dim)] text-sm font-medium">#{ranking}</span>
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    {renderStatusIcon(16, 'shrink-0')}
+                                    <span className="text-[var(--pg-text)] font-semibold truncate">{team.team_name}</span>
+                                  </div>
+                                  {showTeammates && teammates.length > 1 && (
+                                    <span className="flex items-center gap-1 text-teal-400 text-xs shrink-0">
                                       <Users size={12} />
-                                      {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
+                                      {teammates.length}
                                     </span>
                                   )}
-                                  {team.currentLevel && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
-                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
-                                      {team.currentLevel.name}
+                                  {(isClash || tagquestMemberChips.length > 0) && (
+                                    <span className="flex items-center gap-1 text-blue-400 text-xs shrink-0" title={t('launched:chipsInTeam')}>
+                                      <Users size={12} />
+                                      {clanMemberCount}
                                     </span>
                                   )}
-                                </span>
-                                {!showTeammates && !isClash && (
-                                  <span className="text-[var(--pg-text-dim)] text-sm shrink-0 flex items-center gap-2">
-                                    <span>{t('launched:chipLabel', { id: team.key_id })}</span>
-                                    {isMystery && teamCardNumber != null && (
-                                      <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
+                                  <span className="flex items-center gap-2 text-[var(--pg-text-dim)] text-sm ml-auto mr-4 shrink-0">
+                                    {t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span>
+                                    {team.weight != null && (
+                                      <span
+                                        title={t('launched:effectifWeightTitle')}
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
+                                      >
+                                        <Users size={12} />
+                                        {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
+                                      </span>
+                                    )}
+                                    {team.currentLevel && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                                        {team.currentLevel.name}
+                                      </span>
                                     )}
                                   </span>
-                                )}
-                              </div>
-                              <button className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition ml-2 shrink-0" title={t('launched:expandTeamDetails')}>
-                                <Maximize2 size={16} className="text-[var(--pg-text-dim)]" />
-                              </button>
-                            </div>
-                          ) : (
-                          <div className="p-4">
-                            <div className="flex items-center justify-between mb-3">
-                              <div className="flex items-center gap-3">
-                                <div className="flex items-center gap-2">
-                                  {renderStatusIcon(18)}
-                                  {renamingTeamId === team.id ? (
-                                    <input
-                                      autoFocus
-                                      value={renameValue}
-                                      onChange={e => setRenameValue(e.target.value)}
-                                      onBlur={() => handleRenameTeam(team.id)}
-                                      onKeyDown={e => {
-                                        if (e.key === 'Enter') handleRenameTeam(team.id);
-                                        if (e.key === 'Escape') { setRenamingTeamId(null); setRenameValue(''); }
-                                      }}
-                                      className="bg-[var(--pg-surface-3)] border border-[var(--pg-accent-line)] rounded px-2 py-0.5 text-[var(--pg-text)] font-semibold text-sm focus:outline-none w-36"
-                                    />
-                                  ) : (
-                                    <span
-                                      className="text-[var(--pg-text)] font-semibold cursor-pointer hover:text-[var(--pg-accent-bright)] transition-colors"
-                                      title={t('launched:doubleClickToRename')}
-                                      onDoubleClick={() => { setRenamingTeamId(team.id); setRenameValue(team.team_name); }}
-                                    >
-                                      {team.team_name}
+                                  {!showTeammates && !isClash && (
+                                    <span className="text-[var(--pg-text-dim)] text-sm shrink-0 flex items-center gap-2">
+                                      <span>{t('launched:chipLabel', { id: team.key_id })}</span>
+                                      {isMystery && teamCardNumber != null && (
+                                        <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
+                                      )}
                                     </span>
                                   )}
-                                  <span className="text-[var(--pg-text-dim)] text-xs font-mono">#{team.team_number}</span>
                                 </div>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                {!showTeammates && !isClash && (
-                                  <span className="text-[var(--pg-text-dim)] text-sm flex items-center gap-2">
-                                    <span>{t('launched:chipLabel', { id: team.key_id })}</span>
-                                    {isMystery && teamCardNumber != null && (
-                                      <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
-                                    )}
-                                  </span>
-                                )}
-                                {isClash && (
-                                  <span className="flex items-center gap-1 text-blue-400 text-sm" title={t('launched:chipsInClan')}>
-                                    <Users size={13} />
-                                    {clanMemberCount}
-                                  </span>
-                                )}
-                                <button
-                                  onClick={() => toggleMinimizeTeam(team.id)}
-                                  className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition"
-                                  title={t('launched:minimizeTeamDetails')}
-                                >
-                                  <Minimize2 size={16} className="text-[var(--pg-text-dim)]" />
+                                <button className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition ml-2 shrink-0" title={t('launched:expandTeamDetails')}>
+                                  <Maximize2 size={16} className="text-[var(--pg-text-dim)]" />
                                 </button>
                               </div>
-                            </div>
-
-                          <>
-                              <div className="text-sm text-[var(--pg-text-dim)] space-y-1 mb-3">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span>{t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span></span>
-                                  {team.weight != null && (
-                                    <span
-                                      title={t('launched:effectifWeightTitle')}
-                                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
-                                    >
-                                      <Users size={12} />
-                                      {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
-                                    </span>
-                                  )}
-                                  {team.currentLevel && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
-                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
-                                      {team.currentLevel.name}
+                            ) : (
+                            <div className="p-4">
+                              <div className="flex items-center justify-between mb-3">
+                                <div className="flex items-center gap-3">
+                                  <div className="flex items-center gap-2">
+                                    {renderStatusIcon(18)}
+                                    {renamingTeamId === team.id ? (
+                                      <input
+                                        autoFocus
+                                        value={renameValue}
+                                        onChange={e => setRenameValue(e.target.value)}
+                                        onBlur={() => handleRenameTeam(team.id)}
+                                        onKeyDown={e => {
+                                          if (e.key === 'Enter') handleRenameTeam(team.id);
+                                          if (e.key === 'Escape') { setRenamingTeamId(null); setRenameValue(''); }
+                                        }}
+                                        className="bg-[var(--pg-surface-3)] border border-[var(--pg-accent-line)] rounded px-2 py-0.5 text-[var(--pg-text)] font-semibold text-sm focus:outline-none w-36"
+                                      />
+                                    ) : (
+                                      <span
+                                        className="text-[var(--pg-text)] font-semibold cursor-pointer hover:text-[var(--pg-accent-bright)] transition-colors"
+                                        title={t('launched:doubleClickToRename')}
+                                        onDoubleClick={() => { setRenamingTeamId(team.id); setRenameValue(team.team_name); }}
+                                      >
+                                        {team.team_name}
+                                      </span>
+                                    )}
+                                    <span className="text-[var(--pg-text-dim)] text-xs font-mono">#{team.team_number}</span>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  {!showTeammates && !isClash && (
+                                    <span className="text-[var(--pg-text-dim)] text-sm flex items-center gap-2">
+                                      <span>{t('launched:chipLabel', { id: team.key_id })}</span>
+                                      {isMystery && teamCardNumber != null && (
+                                        <span>{t('launched:cardNumberLabel', { number: teamCardNumber })}</span>
+                                      )}
                                     </span>
                                   )}
                                   {isClash && (
-                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-500/15 border border-blue-500/30 rounded-full text-blue-300 text-xs font-semibold">
-                                      <Flag size={11} />
-                                      {t('launched:validationsBadge', { count: clashValidations })}
+                                    <span className="flex items-center gap-1 text-blue-400 text-sm" title={t('launched:chipsInClan')}>
+                                      <Users size={13} />
+                                      {clanMemberCount}
                                     </span>
                                   )}
+                                  <button
+                                    onClick={() => toggleMinimizeTeam(team.id)}
+                                    className="p-1 hover:bg-[var(--pg-surface-3)] rounded transition"
+                                    title={t('launched:minimizeTeamDetails')}
+                                  >
+                                    <Minimize2 size={16} className="text-[var(--pg-text-dim)]" />
+                                  </button>
                                 </div>
-                                {!isClash && (
-                                  <>
-                                    <div>{t('launched:startLabel')} <span className="text-[var(--pg-text)]">{formatTime(team.start_time)}</span></div>
-                                    <div>{t('launched:endLabel')} <span className="text-[var(--pg-text)]">{team.end_time ? formatTime(team.end_time) : t('launched:notEnded')}</span></div>
-                                  </>
-                                )}
                               </div>
-                              {(isClash || tagquestMemberChips.length > 0) && (
-                                <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
-                                  <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)] mb-2">
-                                    <Users size={12} />
-                                    <span className="font-medium uppercase tracking-wide">
-                                      {t('launched:membersHeading', { count: (isClash ? clashMemberChips : tagquestMemberChips).length })}
-                                    </span>
-                                  </div>
-                                  {(isClash ? clashMemberChips : tagquestMemberChips).length === 0 ? (
-                                    <p className="text-xs text-[var(--pg-text-dim)]">{t('launched:noChipsBound')}</p>
-                                  ) : (
-                                    <div className="flex flex-wrap gap-2">
-                                      {(isClash ? clashMemberChips : tagquestMemberChips).map((chipId) => {
-                                        const label = clanChipLabel(chipId);
-                                        return (
-                                          <span key={chipId} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
-                                            {label.name || `Chip ${chipId}`}
-                                            <span className="text-[var(--pg-text-dim)] font-mono">#{label.number}</span>
-                                          </span>
-                                        );
-                                      })}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                              {showTeammates && (
-                                <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
-                                  <div className="flex items-center justify-between mb-2">
-                                    <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)]">
-                                      <Users size={12} />
-                                      <span className="font-medium uppercase tracking-wide">{t('launched:teammates')}</span>
-                                    </div>
-                                    {addTeammateState?.teamId !== team.id && (
-                                      <button
-                                        onClick={() => openAddTeammate(team.id)}
-                                        className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300 transition"
+
+                            <>
+                                <div className="text-sm text-[var(--pg-text-dim)] space-y-1 mb-3">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span>{t('launched:scoreLabel')} <span className="text-[var(--pg-text)] font-medium">{displayScore}</span></span>
+                                    {team.weight != null && (
+                                      <span
+                                        title={t('launched:effectifWeightTitle')}
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 bg-sky-500/20 border border-sky-500/40 rounded-full text-sky-400 text-xs font-semibold"
                                       >
-                                        <UserPlus size={12} />
-                                        {t('launched:add')}
-                                      </button>
+                                        <Users size={12} />
+                                        {t('launched:effectifWeightBadge', { count: team.headcount ?? 1, weight: formatWeight(team.weight) })}
+                                      </span>
+                                    )}
+                                    {team.currentLevel && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-500/20 border border-amber-500/40 rounded-full text-amber-400 text-xs font-semibold">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                                        {team.currentLevel.name}
+                                      </span>
+                                    )}
+                                    {isClash && (
+                                      <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-500/15 border border-blue-500/30 rounded-full text-blue-300 text-xs font-semibold">
+                                        <Flag size={11} />
+                                        {t('launched:validationsBadge', { count: clashValidations })}
+                                      </span>
                                     )}
                                   </div>
-                                  <div className="flex flex-wrap gap-2">
-                                    {teammates.map((mate, mi) => (
-                                      <span key={mi} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-teal-400 shrink-0" />
-                                        {mate.name}
-                                        <span className="text-[var(--pg-text-dim)] font-mono">#{mate.chipNumber}</span>
-                                        <span className="text-[var(--pg-text-dim)] font-mono text-[10px]">{mate.chipId}</span>
-                                        {mate.chipId !== team.key_id && (
-                                          <button
-                                            onClick={() => handleRemoveTeammate(team.id, mate.chipId, mate.name)}
-                                            className="ml-0.5 -mr-0.5 text-[var(--pg-text-dim)] hover:text-red-400 transition"
-                                            title={t('launched:removeTeammateTitle')}
-                                          >
-                                            <X size={12} />
-                                          </button>
-                                        )}
-                                      </span>
-                                    ))}
-                                  </div>
-                                  {addTeammateState?.teamId === team.id && (
-                                    <div className="mt-2 p-2 bg-[var(--pg-bg)] rounded-lg space-y-2">
-                                      <input
-                                        type="text"
-                                        placeholder={t('launched:teammateNamePlaceholder')}
-                                        value={addTeammateState.name}
-                                        onChange={e => setAddTeammateState({ ...addTeammateState, name: e.target.value })}
-                                        className="pg-input !text-xs !py-1.5"
-                                      />
-                                      <select
-                                        value={addTeammateState.chipId ?? ''}
-                                        onChange={e => {
-                                          const id = Number(e.target.value) || null;
-                                          const chip = allChips.find(c => c.id === id);
-                                          setAddTeammateState({ ...addTeammateState, chipId: id, name: chip ? chip.key_name : addTeammateState.name });
-                                        }}
-                                        className="pg-select !text-xs !py-1.5"
-                                      >
-                                        <option value="">{t('launched:selectChip')}</option>
-                                        {allChips
-                                          .filter(c => !getUsedChipIds().has(c.id))
-                                          .map(c => (
-                                            <option key={c.id} value={c.id}>
-                                              {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
-                                            </option>
-                                          ))}
-                                      </select>
-                                      <div className="flex gap-1.5">
-                                        <button
-                                          onClick={handleAddTeammate}
-                                          disabled={savingTeammate || !addTeammateState.name.trim() || addTeammateState.chipId === null}
-                                          className="flex-1 px-2 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center justify-center gap-1"
-                                        >
-                                          <Save size={11} />
-                                          {savingTeammate ? t('launched:saving') : t('launched:save')}
-                                        </button>
-                                        <button
-                                          onClick={() => {
-                                            const name = pickRandomName();
-                                            if (name) setAddTeammateState(s => (s ? { ...s, name } : s));
-                                          }}
-                                          disabled={namePoolNames.length === 0}
-                                          className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-xs flex items-center gap-1"
-                                          title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
-                                        >
-                                          <Dices size={11} />
-                                        </button>
-                                        <button
-                                          onClick={() => setAddTeammateState(null)}
-                                          className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-xs"
-                                        >
-                                          <X size={11} />
-                                        </button>
-                                      </div>
-                                    </div>
+                                  {!isClash && (
+                                    <>
+                                      <div>{t('launched:startLabel')} <span className="text-[var(--pg-text)]">{formatTime(team.start_time)}</span></div>
+                                      <div>{t('launched:endLabel')} <span className="text-[var(--pg-text)]">{team.end_time ? formatTime(team.end_time) : t('launched:notEnded')}</span></div>
+                                    </>
                                   )}
                                 </div>
-                              )}
-                              <div className="flex gap-2">
-                                <button
-                                  onClick={() => {
-                                    const game = games.find(g => g.id === selectedGameId);
-                                    if (!game) return;
-                                    if ((game.game_type || '').toLowerCase() === 'clash') {
-                                      // Clash: clan-management modal (chips + territories) instead
-                                      // of the quest/enigma TeamDetailsModal.
-                                      setClashClan({ id: team.id, team_number: team.team_number, team_name: team.team_name });
-                                    } else {
-                                      setTeamDetails({ team, gameUniqid: game.game_uniqid, gameType: game.game_type });
-                                    }
-                                  }}
-                                  className="flex-1 px-3 py-2 bg-[var(--pg-accent)] hover:bg-[var(--pg-accent-hover)] text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
-                                  title={t('launched:viewTeamDetails')}
-                                >
-                                  <Eye size={15} />
-                                  {t('launched:details')}
-                                </button>
-                                <button
-                                  onClick={() => handleEndTeam(team)}
-                                  disabled={!!team.end_time}
-                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-orange-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] disabled:hover:text-[var(--pg-text-muted)]"
-                                  title={team.end_time ? t('launched:teamAlreadyEnded') : t('launched:endTeamTitle')}
-                                >
-                                  <StopCircle size={14} />
-                                </button>
-                                {isAdminMode && (
+                                {(isClash || tagquestMemberChips.length > 0) && (
+                                  <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
+                                    <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)] mb-2">
+                                      <Users size={12} />
+                                      <span className="font-medium uppercase tracking-wide">
+                                        {t('launched:membersHeading', { count: (isClash ? clashMemberChips : tagquestMemberChips).length })}
+                                      </span>
+                                    </div>
+                                    {(isClash ? clashMemberChips : tagquestMemberChips).length === 0 ? (
+                                      <p className="text-xs text-[var(--pg-text-dim)]">{t('launched:noChipsBound')}</p>
+                                    ) : (
+                                      <div className="flex flex-wrap gap-2">
+                                        {(isClash ? clashMemberChips : tagquestMemberChips).map((chipId) => {
+                                          const label = clanChipLabel(chipId);
+                                          return (
+                                            <span key={chipId} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
+                                              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 shrink-0" />
+                                              {label.name || `Chip ${chipId}`}
+                                              <span className="text-[var(--pg-text-dim)] font-mono">#{label.number}</span>
+                                            </span>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                                {showTeammates && (
+                                  <div className="mb-3 pt-2 border-t border-[var(--pg-line)]">
+                                    <div className="flex items-center justify-between mb-2">
+                                      <div className="flex items-center gap-1.5 text-xs text-[var(--pg-text-dim)]">
+                                        <Users size={12} />
+                                        <span className="font-medium uppercase tracking-wide">{t('launched:teammates')}</span>
+                                      </div>
+                                      {addTeammateState?.teamId !== team.id && (
+                                        <button
+                                          onClick={() => openAddTeammate(team.id)}
+                                          className="flex items-center gap-1 text-xs text-teal-400 hover:text-teal-300 transition"
+                                        >
+                                          <UserPlus size={12} />
+                                          {t('launched:add')}
+                                        </button>
+                                      )}
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                      {teammates.map((mate, mi) => (
+                                        <span key={mi} className="flex items-center gap-1.5 px-2.5 py-1 bg-[var(--pg-surface-3)] rounded-full text-xs text-[var(--pg-text-muted)]">
+                                          <span className="w-1.5 h-1.5 rounded-full bg-teal-400 shrink-0" />
+                                          {mate.name}
+                                          <span className="text-[var(--pg-text-dim)] font-mono">#{mate.chipNumber}</span>
+                                          <span className="text-[var(--pg-text-dim)] font-mono text-[10px]">{mate.chipId}</span>
+                                          {mate.chipId !== team.key_id && (
+                                            <button
+                                              onClick={() => handleRemoveTeammate(team.id, mate.chipId, mate.name)}
+                                              className="ml-0.5 -mr-0.5 text-[var(--pg-text-dim)] hover:text-red-400 transition"
+                                              title={t('launched:removeTeammateTitle')}
+                                            >
+                                              <X size={12} />
+                                            </button>
+                                          )}
+                                        </span>
+                                      ))}
+                                    </div>
+                                    {addTeammateState?.teamId === team.id && (
+                                      <div className="mt-2 p-2 bg-[var(--pg-bg)] rounded-lg space-y-2">
+                                        <input
+                                          type="text"
+                                          placeholder={t('launched:teammateNamePlaceholder')}
+                                          value={addTeammateState.name}
+                                          onChange={e => setAddTeammateState({ ...addTeammateState, name: e.target.value })}
+                                          className="pg-input !text-xs !py-1.5"
+                                        />
+                                        <select
+                                          value={addTeammateState.chipId ?? ''}
+                                          onChange={e => {
+                                            const id = Number(e.target.value) || null;
+                                            const chip = allChips.find(c => c.id === id);
+                                            setAddTeammateState({ ...addTeammateState, chipId: id, name: chip ? chip.key_name : addTeammateState.name });
+                                          }}
+                                          className="pg-select !text-xs !py-1.5"
+                                        >
+                                          <option value="">{t('launched:selectChip')}</option>
+                                          {allChips
+                                            .filter(c => !getUsedChipIds().has(c.id))
+                                            .map(c => (
+                                              <option key={c.id} value={c.id}>
+                                                {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
+                                              </option>
+                                            ))}
+                                        </select>
+                                        <div className="flex gap-1.5">
+                                          <button
+                                            onClick={handleAddTeammate}
+                                            disabled={savingTeammate || !addTeammateState.name.trim() || addTeammateState.chipId === null}
+                                            className="flex-1 px-2 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center justify-center gap-1"
+                                          >
+                                            <Save size={11} />
+                                            {savingTeammate ? t('launched:saving') : t('launched:save')}
+                                          </button>
+                                          <button
+                                            onClick={() => {
+                                              const name = pickRandomName();
+                                              if (name) setAddTeammateState(s => (s ? { ...s, name } : s));
+                                            }}
+                                            disabled={namePoolNames.length === 0}
+                                            className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-xs flex items-center gap-1"
+                                            title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
+                                          >
+                                            <Dices size={11} />
+                                          </button>
+                                          <button
+                                            onClick={() => setAddTeammateState(null)}
+                                            className="px-2 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-xs"
+                                          >
+                                            <X size={11} />
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                                <div className="flex gap-2">
                                   <button
                                     onClick={() => {
                                       const game = games.find(g => g.id === selectedGameId);
-                                      if (game) {
-                                        setTestTeam({ gameId: game.id, gameName: game.name, team });
+                                      if (!game) return;
+                                      if ((game.game_type || '').toLowerCase() === 'clash') {
+                                        // Clash: clan-management modal (chips + territories) instead
+                                        // of the quest/enigma TeamDetailsModal.
+                                        setClashClan({ id: team.id, team_number: team.team_number, team_name: team.team_name });
+                                      } else {
+                                        setTeamDetails({ team, gameUniqid: game.game_uniqid, gameType: game.game_type });
                                       }
                                     }}
-                                    className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-sm font-medium flex items-center gap-1.5"
-                                    title={t('launched:testThisTeam')}
+                                    className="flex-1 px-3 py-2 bg-[var(--pg-accent)] hover:bg-[var(--pg-accent-hover)] text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
+                                    title={t('launched:viewTeamDetails')}
                                   >
-                                    <FlaskConical size={14} />
-                                    {t('launched:test')}
+                                    <Eye size={15} />
+                                    {t('launched:details')}
                                   </button>
-                                )}
-                                <button
-                                  onClick={() => {
-                                    const game = games.find(g => g.id === selectedGameId);
-                                    if (game) setPrintTarget({ game, teamId: team.id, subject: `${game.name} - ${team.team_name}` });
-                                  }}
-                                  disabled={printing}
-                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] rounded text-sm font-medium flex items-center disabled:opacity-50"
-                                  title={t('launched:printTeam')}
-                                >
-                                  <Printer size={14} />
-                                </button>
-                                {(() => {
-                                  const game = games.find(g => g.id === selectedGameId);
-                                  if (!game || !gameTypeHasTeamSummary(game.game_type) || !team.end_time) return null;
-                                  return (
+                                  <button
+                                    onClick={() => handleEndTeam(team)}
+                                    disabled={!!team.end_time}
+                                    className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-orange-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] disabled:hover:text-[var(--pg-text-muted)]"
+                                    title={team.end_time ? t('launched:teamAlreadyEnded') : t('launched:endTeamTitle')}
+                                  >
+                                    <StopCircle size={14} />
+                                  </button>
+                                  {isAdminMode && (
                                     <button
-                                      onClick={() => setSummaryDeviceTarget({ game, teamId: team.id })}
-                                      className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-indigo-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
-                                      title={t('launched:showSummaryOnDevice')}
+                                      onClick={() => {
+                                        const game = games.find(g => g.id === selectedGameId);
+                                        if (game) {
+                                          setTestTeam({ gameId: game.id, gameName: game.name, team });
+                                        }
+                                      }}
+                                      className="px-3 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded text-sm font-medium flex items-center gap-1.5"
+                                      title={t('launched:testThisTeam')}
                                     >
-                                      <MonitorPlay size={14} />
+                                      <FlaskConical size={14} />
+                                      {t('launched:test')}
                                     </button>
-                                  );
-                                })()}
-                                <button
-                                  onClick={() => handleRemoveTeam(team)}
-                                  className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-red-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
-                                  title={t('launched:removeTeamTitle')}
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              </div>
-                            </>
+                                  )}
+                                  <button
+                                    onClick={() => {
+                                      const game = games.find(g => g.id === selectedGameId);
+                                      if (game) setPrintTarget({ game, teamId: team.id, subject: `${game.name} - ${team.team_name}` });
+                                    }}
+                                    disabled={printing}
+                                    className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text-muted)] rounded text-sm font-medium flex items-center disabled:opacity-50"
+                                    title={t('launched:printTeam')}
+                                  >
+                                    <Printer size={14} />
+                                  </button>
+                                  {(() => {
+                                    const game = games.find(g => g.id === selectedGameId);
+                                    if (!game || !gameTypeHasTeamSummary(game.game_type) || !team.end_time) return null;
+                                    return (
+                                      <button
+                                        onClick={() => setSummaryDeviceTarget({ game, teamId: team.id })}
+                                        className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-indigo-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
+                                        title={t('launched:showSummaryOnDevice')}
+                                      >
+                                        <MonitorPlay size={14} />
+                                      </button>
+                                    );
+                                  })()}
+                                  <button
+                                    onClick={() => handleRemoveTeam(team)}
+                                    className="px-3 py-2 bg-[var(--pg-surface-3)] hover:bg-red-600 text-[var(--pg-text-muted)] hover:text-white rounded text-sm font-medium flex items-center"
+                                    title={t('launched:removeTeamTitle')}
+                                  >
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              </>
+                            </div>
+                            )}
                           </div>
-                          )}
-                        </div>
-                        );
-                      })}
-                    </div>
-                    )
-                  )}
-                  {selectedGamePlayMode === 'team' && (
-                    <div className="mt-4">
-                      {addTeamState === null ? (
-                        <button
-                          onClick={openAddTeam}
-                          className="w-full flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-[var(--pg-line-strong)] hover:border-teal-500 text-[var(--pg-text-dim)] hover:text-teal-400 rounded-lg text-sm transition"
-                        >
-                          <PlusCircle size={15} />
-                          {t('launched:addTeam')}
-                        </button>
-                      ) : (
-                        <div className="p-3 bg-[var(--pg-surface-2)] border border-[var(--pg-line-strong)] rounded-lg space-y-2">
-                          <div className="text-xs text-[var(--pg-text-dim)] font-medium uppercase tracking-wide mb-1">{t('launched:newTeam')}</div>
-                          <input
-                            type="text"
-                            placeholder={t('launched:teamNamePlaceholder')}
-                            value={addTeamState.name}
-                            onChange={e => setAddTeamState({ ...addTeamState, name: e.target.value })}
-                            className="pg-input !py-1.5"
-                          />
-                          <select
-                            value={addTeamState.chipId ?? ''}
-                            onChange={e => {
-                              const id = Number(e.target.value) || null;
-                              const chip = allChips.find(c => c.id === id);
-                              setAddTeamState({ ...addTeamState, chipId: id, name: chip ? chip.key_name : addTeamState.name });
-                            }}
-                            className="pg-select !py-1.5"
+                          );
+                        })}
+                      </div>
+                      )
+                    )}
+                    {selectedGamePlayMode === 'team' && (
+                      <div className="mt-4">
+                        {addTeamState === null ? (
+                          <button
+                            onClick={openAddTeam}
+                            className="w-full flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-[var(--pg-line-strong)] hover:border-teal-500 text-[var(--pg-text-dim)] hover:text-teal-400 rounded-lg text-sm transition"
                           >
-                            <option value="">{t('launched:selectChip')}</option>
-                            {allChips
-                              .filter(c => !getUsedChipIds().has(c.id))
-                              .map(c => (
-                                <option key={c.id} value={c.id}>
-                                  {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
-                                </option>
-                              ))}
-                          </select>
-                          {tracksRouteOptions.length > 1 && (
+                            <PlusCircle size={15} />
+                            {t('launched:addTeam')}
+                          </button>
+                        ) : (
+                          <div className="p-3 bg-[var(--pg-surface-2)] border border-[var(--pg-line-strong)] rounded-lg space-y-2">
+                            <div className="text-xs text-[var(--pg-text-dim)] font-medium uppercase tracking-wide mb-1">{t('launched:newTeam')}</div>
+                            <input
+                              type="text"
+                              placeholder={t('launched:teamNamePlaceholder')}
+                              value={addTeamState.name}
+                              onChange={e => setAddTeamState({ ...addTeamState, name: e.target.value })}
+                              className="pg-input !py-1.5"
+                            />
                             <select
-                              value={addTeamState.route ?? tracksDefaultRoute}
-                              onChange={e => setAddTeamState({ ...addTeamState, route: e.target.value })}
+                              value={addTeamState.chipId ?? ''}
+                              onChange={e => {
+                                const id = Number(e.target.value) || null;
+                                const chip = allChips.find(c => c.id === id);
+                                setAddTeamState({ ...addTeamState, chipId: id, name: chip ? chip.key_name : addTeamState.name });
+                              }}
                               className="pg-select !py-1.5"
-                              title={t('launched:routeSelectTitle')}
                             >
-                              {tracksRouteOptions.map(r => (
-                                <option key={r} value={r}>
-                                  {t(`launched:trackRoute_${r}`, { defaultValue: TRACKS_ROUTE_LABELS[r] ?? r })}
-                                </option>
-                              ))}
+                              <option value="">{t('launched:selectChip')}</option>
+                              {allChips
+                                .filter(c => !getUsedChipIds().has(c.id))
+                                .map(c => (
+                                  <option key={c.id} value={c.id}>
+                                    {t('launched:chipOption', { number: c.key_number, name: c.key_name, id: c.id })}
+                                  </option>
+                                ))}
                             </select>
-                          )}
-                          {selectedGameLanguages.length >= 2 && (
-                            <div className="flex items-center gap-2">
+                            {tracksRouteOptions.length > 1 && (
                               <select
-                                value={addTeamState.language ?? nameDrawLang}
-                                onChange={e => setAddTeamState({ ...addTeamState, language: e.target.value })}
-                                className="pg-select flex-1 min-w-0 !py-1.5"
-                                title={t('launched:languageSelectTitle')}
+                                value={addTeamState.route ?? tracksDefaultRoute}
+                                onChange={e => setAddTeamState({ ...addTeamState, route: e.target.value })}
+                                className="pg-select !py-1.5"
+                                title={t('launched:routeSelectTitle')}
                               >
-                                {selectedGameLanguages.map(l => (
-                                  <option key={l} value={l}>
-                                    {LANG_NAMES[l] ?? l}
+                                {tracksRouteOptions.map(r => (
+                                  <option key={r} value={r}>
+                                    {t(`launched:trackRoute_${r}`, { defaultValue: TRACKS_ROUTE_LABELS[r] ?? r })}
                                   </option>
                                 ))}
                               </select>
-                              <HelpDot topic="team.language" align="right" />
+                            )}
+                            {selectedGameLanguages.length >= 2 && (
+                              <div className="flex items-center gap-2">
+                                <select
+                                  value={addTeamState.language ?? nameDrawLang}
+                                  onChange={e => setAddTeamState({ ...addTeamState, language: e.target.value })}
+                                  className="pg-select flex-1 min-w-0 !py-1.5"
+                                  title={t('launched:languageSelectTitle')}
+                                >
+                                  {selectedGameLanguages.map(l => (
+                                    <option key={l} value={l}>
+                                      {LANG_NAMES[l] ?? l}
+                                    </option>
+                                  ))}
+                                </select>
+                                <HelpDot topic="team.language" align="right" />
+                              </div>
+                            )}
+                            <div className="flex gap-2">
+                              <button
+                                onClick={handleAddTeam}
+                                disabled={savingTeam || !addTeamState.name.trim() || addTeamState.chipId === null}
+                                className="flex-1 px-3 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
+                              >
+                                <Save size={13} />
+                                {savingTeam ? t('launched:saving') : t('launched:saveTeam')}
+                              </button>
+                              <button
+                                onClick={() => {
+                                  const name = pickRandomName();
+                                  if (name) setAddTeamState(s => (s ? { ...s, name } : s));
+                                }}
+                                disabled={namePoolNames.length === 0}
+                                className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-sm flex items-center gap-1.5"
+                                title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
+                              >
+                                <Dices size={13} />
+                                {t('launched:randomName')}
+                              </button>
+                              <button
+                                onClick={() => setAddTeamState(null)}
+                                className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-sm"
+                              >
+                                <X size={13} />
+                              </button>
                             </div>
-                          )}
-                          <div className="flex gap-2">
-                            <button
-                              onClick={handleAddTeam}
-                              disabled={savingTeam || !addTeamState.name.trim() || addTeamState.chipId === null}
-                              className="flex-1 px-3 py-1.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white rounded text-sm font-medium flex items-center justify-center gap-1.5"
-                            >
-                              <Save size={13} />
-                              {savingTeam ? t('launched:saving') : t('launched:saveTeam')}
-                            </button>
-                            <button
-                              onClick={() => {
-                                const name = pickRandomName();
-                                if (name) setAddTeamState(s => (s ? { ...s, name } : s));
-                              }}
-                              disabled={namePoolNames.length === 0}
-                              className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-indigo-600 disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] rounded text-sm flex items-center gap-1.5"
-                              title={namePoolNames.length === 0 ? t('launched:noPooledNames') : t('launched:randomName')}
-                            >
-                              <Dices size={13} />
-                              {t('launched:randomName')}
-                            </button>
-                            <button
-                              onClick={() => setAddTeamState(null)}
-                              className="px-3 py-1.5 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-sm"
-                            >
-                              <X size={13} />
-                            </button>
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             ) : (

@@ -57,6 +57,7 @@
     "fs:allow-read-dir",
     "fs:allow-exists",
     "fs:allow-rename",
+    "fs:allow-stat",
     {
       "identifier": "fs:scope",
       "allow": [

@@ -2,7 +2,7 @@
   "authPersistFailed": "Impossible d'enregistrer le compte connecté sur cet appareil.",
   "authPersistFailedEviction": "Impossible d'enregistrer le compte connecté sur cet appareil après avoir libéré une place.",
   "noCachedAccount": "Aucun compte n'est enregistré sur cet appareil : le code PIN ne peut pas être réinitialisé.",
-  "deviceCapReached": "Nombre maximal d'appareils atteint : déconnectez-vous depuis les Réglages, puis reconnectez-vous.",
+  "deviceCapReached": "Nombre maximal d'appareils atteint : déconnectez-vous depuis les Paramètres, puis reconnectez-vous.",
   "patternNoGameType": "Ce fichier n'indique aucun type de jeu. Utilisez un modèle exporté depuis le studio.",
   "patternNoRows": "Aucune ligne de modèle n'a été trouvée dans le fichier.",
   "scenarioNotDownloaded": "Ce scénario n'est pas encore téléchargé : ouvrez l'écran de lancement complet pour le synchroniser.",
@@ -10,6 +10,6 @@
   "noMonitors": "Aucun écran détecté.",
   "noUpdateToDownload": "Aucune mise à jour à télécharger.",
   "noUpdateToInstall": "Aucune mise à jour téléchargée n'est prête à être installée.",
-  "motherUnreachable": "Aucune mère joignable : cet appareil n'héberge pas la partie et n'est pas encore relié à une mère.",
+  "motherUnreachable": "Aucun poste mère joignable : cet appareil n'héberge pas la partie et n'est pas encore relié à un poste mère.",
   "pinFourDigits": "Le code PIN doit comporter exactement 4 chiffres."
 }

@@ -285,16 +285,19 @@ function PositionedHudBox({
           : { background: 'rgba(0,0,0,0.45)', borderRadius: 8 }),
       }}
     >
-      {label && (
-        <div
-          className="uppercase tracking-wider opacity-70 leading-none"
-          style={{ fontSize: `${labelFontSize}px` }}
-        >
-          {label}
+      {/* One trimmed block: label top + value baseline centre as a pair. */}
+      <div className="vcenter-text">
+        {label && (
+          <div
+            className="uppercase tracking-wider opacity-70 leading-none"
+            style={{ fontSize: `${labelFontSize}px` }}
+          >
+            {label}
+          </div>
+        )}
+        <div className="font-bold leading-tight" style={{ fontSize: `${valueFontSize}px` }}>
+          {value}
         </div>
-      )}
-      <div className="font-bold leading-tight" style={{ fontSize: `${valueFontSize}px` }}>
-        {value}
       </div>
     </div>
   );
@@ -487,13 +490,13 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
 
       {/* Author-defined text overlays on the map. Sits ABOVE reveal markers
           (DOM order: rendered after) and BELOW the HUD (rendered before), per
-          the design's z-order. Same visibility rule as the HUD via `!isClues`;
+          the design's z-order. Shown on the reveal and the clues map alike;
           background + topreveal + simple already early-returned above. Each
           element's `position` is `% of map image`, identical to the
           checkpoint-marker referential - same math here as for markers. The
           inner TracksTextFit needs pixel dimensions, so we multiply by the
           live window size (kiosk renderer fills the viewport). */}
-      {!isClues && Array.isArray(textElements) && textElements.length > 0 && (
+      {Array.isArray(textElements) && textElements.length > 0 && (
         <>
           {textElements.map((te) => {
             if (!te.position) return null;
@@ -557,12 +560,12 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         </>
       )}
 
-      {/* HUD - hidden on the clues page. When the studio LayoutEditor has
+      {/* HUD - reveal and clues map. When the studio LayoutEditor has
           saved per-frame positions, each box renders absolutely inside the
           map referential (matching the editor preview exactly). Otherwise we
           fall back to the legacy top strip so scenarios that never opened
           the layout editor still get a usable HUD. */}
-      {!isClues && (
+      {(
         (() => {
           const placedTeam = hudLayout?.team_name_background_image;
           const placedTimer = hudLayout?.timer_background_image;
@@ -632,83 +635,46 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         </div>
       )}
 
-      {/* Clues page - every checkpoint, constrained to the viewport with no
-          overflow (kiosk display has no scroll). A top strip shows the team
-          name, score and time; the grid below fits all checkpoints by computing
-          a near-square column count and dividing the remaining height evenly. A
-          checkpoint the team found shows its own image; an unfound one shows the
-          "not found" image instead. */}
-      {isClues && clues.enabled && (() => {
-        const n = routeCheckpoints.length || 1;
-        // Bias toward more columns than rows for landscape kiosks.
-        const cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.7)));
-        const rows = Math.max(1, Math.ceil(n / cols));
-        return (
-          <div className="absolute inset-0 bg-black/70 flex flex-col overflow-hidden">
-            {/* Top HUD: team name, score, time */}
-            <div className="shrink-0 flex items-center justify-between gap-4 px-8 py-3 border-b border-white/15">
-              <div className="text-2xl font-bold truncate">{teamName}</div>
-              <div className="flex items-center gap-6">
-                {showScore && (
-                  <div className="text-right">
-                    <div className="text-[10px] uppercase tracking-wider opacity-60">{scoreLabel}</div>
-                    <div className="text-2xl font-bold leading-none">{scoreText}</div>
-                  </div>
-                )}
-                {timerText && (
-                  <div className="text-right">
-                    <div className="text-[10px] uppercase tracking-wider opacity-60">{timeLabel}</div>
-                    <div className="text-2xl font-bold leading-none">{timerText}</div>
-                  </div>
-                )}
-              </div>
+      {/* Clues page - the MAP with every route checkpoint drawn at its own
+          position: a found checkpoint shows its own image, an unfound one the
+          "not found" image, each optionally captioned with its title/text. The
+          HUD above stays up (team, time, score). It used to be a black overlay
+          with one dark tile per checkpoint, which hid the map - the numbered
+          crosses the players need to read the clues (retours sept. #64). */}
+      {isClues && clues.enabled &&
+        routeCheckpoints.map((cp, i) => {
+          const found = !!foundCheckpointIds?.has(cp.id);
+          const imgUrl = clues.show_image
+            ? (found ? resolveCheckpointImage(cp) : (missingCheckpointUrl || ''))
+            : '';
+          const title = clues.show_title
+            ? readLocalized(cp.title as Localizedish, language) || `#${i + 1}`
+            : '';
+          const text = clues.show_text ? readLocalized(cp.description as Localizedish, language) : '';
+          if (!imgUrl && !title && !text) return null;
+          const pos = cp.position ?? { top: 50, left: 50 };
+          const left = imgBounds.x + (Number(pos.left) / 100) * imgBounds.width;
+          const top = imgBounds.y + (Number(pos.top) / 100) * imgBounds.height;
+          const w = (iconSizePercent / 100) * imgBounds.width;
+          return (
+            <div
+              key={cp.id}
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center text-center pointer-events-none tracks-fade-in"
+              style={{ top: `${top}%`, left: `${left}%`, width: `${w}%` }}
+            >
+              {imgUrl && <img src={imgUrl} alt="" className="w-full h-auto" />}
+              {(title || text) && (
+                <div
+                  className="mt-1 px-1.5 py-0.5 rounded bg-black/60 leading-tight"
+                  style={{ width: 'max-content', maxWidth: '12rem' }}
+                >
+                  {title && <div className="font-bold text-sm truncate">{title}</div>}
+                  {text && <div className="text-xs opacity-85 line-clamp-2">{text}</div>}
+                </div>
+              )}
             </div>
-            {/* Checkpoint grid - fills the remaining height, no overflow */}
-            <div className="flex-1 min-h-0 p-4">
-              <div
-                className="h-full w-full"
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-                  gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
-                  gap: '0.6rem',
-                }}
-              >
-                {routeCheckpoints.map((cp, i) => {
-                  const found = !!foundCheckpointIds?.has(cp.id);
-                  const imgUrl = found
-                    ? resolveCheckpointImage(cp)
-                    : (missingCheckpointUrl || '');
-                  return (
-                    <div
-                      key={cp.id}
-                      className="min-h-0 min-w-0 bg-black/50 rounded-lg p-2 flex flex-col items-center justify-center text-center overflow-hidden"
-                    >
-                      {clues.show_image && imgUrl && (
-                        <img
-                          src={imgUrl}
-                          alt=""
-                          className="flex-1 min-h-0 max-w-full object-contain"
-                        />
-                      )}
-                      {clues.show_title && (
-                        <div className="shrink-0 mt-1 font-bold text-sm leading-tight truncate w-full">
-                          {readLocalized(cp.title as Localizedish, language) || `#${i + 1}`}
-                        </div>
-                      )}
-                      {clues.show_text && (
-                        <div className="shrink-0 text-xs opacity-80 leading-tight line-clamp-2 w-full">
-                          {readLocalized(cp.description as Localizedish, language)}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        );
-      })()}
+          );
+        })}
     </div>
   );
 }

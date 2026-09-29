@@ -7,14 +7,19 @@ import {
   formatLanTime, isRecent, displayDeviceLabel,
   type PairedDeviceRow,
 } from '../../services/lanPairing';
+import { ErrorDetails } from '../ErrorDetails';
 
 const POLL_MS = 4000;
 
 // The mother-side "Paired devices" list: every device paired to this one, with
 // per-device revoke and the planned-handover "Make mother" button. Lives at the
 // very top of the Network tab so the operator sees the fleet at a glance.
+// On the rebuilt Network page this is the mother's "Mes satellites" card: the
+// device itself is not listed (it is the mother), removal is sticky (retours
+// sept. #8) and errors render in plain language instead of window.alert.
 export function PairedDevicesPanel() {
   const { t } = useTranslation('devicesLan');
+  const [makeMotherErr, setMakeMotherErr] = useState<unknown>(null);
 
   const [paired, setPaired] = useState<PairedDeviceRow[]>([]);
   const [revokingId, setRevokingId] = useState<number | null>(null);
@@ -55,26 +60,28 @@ export function PairedDevicesPanel() {
         'Hand the game over to this device? It becomes the mother and the other devices reconnect to it.',
     }))) return;
     setMakingMotherId(d.id);
+    setMakeMotherErr(null);
     try {
       await queueBecomeMotherCommand(d.id, activeGameId);
     } catch (e) {
-      window.alert(t('makeMotherError', {
-        defaultValue: 'Could not hand over: {{message}}',
-        message: (e as Error).message,
-      }));
+      setMakeMotherErr(e);
     } finally {
       setMakingMotherId(null);
     }
   }
 
+  const satellites = paired.filter((d) => !d.is_self);
+
   return (
-    <div className="mb-6">
-      <h3 className="pg-panel-title mb-3">{t('pairedTitle')}</h3>
-      {paired.length === 0 ? (
+    <div className="pg-panel">
+      <h3 className="pg-panel-title">{t('mySatellitesTitle')}</h3>
+      <p className="text-sm text-[var(--pg-text-dim)] mt-1 mb-3">{t('mySatellitesHint')}</p>
+      {makeMotherErr != null && <ErrorDetails error={makeMotherErr} className="mb-3" />}
+      {satellites.length === 0 ? (
         <div className="text-[var(--pg-text-dim)] text-sm py-4">{t('pairedEmpty')}</div>
       ) : (
         <div className="space-y-2">
-          {paired.map((d) => {
+          {satellites.map((d) => {
             const Icon = osIcon(d.peer_os);
             const online = d.is_self || isRecent(d.last_seen_at);
             return (

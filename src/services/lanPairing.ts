@@ -11,6 +11,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './device';
 import { getAuthUser } from './authStore';
 import { saveHotspotCreds } from './lanCredentials';
+import { parseDbTs, formatDbDateTime } from '../utils/dbTime';
 
 // The Rust side seeds a device's self row with this placeholder before the
 // operator's device name is known (ensure_self_pair replaces it with the real
@@ -218,7 +219,9 @@ export interface JoinHandle {
  */
 export function joinMother(
   mother: DiscoveredMother,
-  opts?: { timeoutMs?: number },
+  // `manual`: the operator pressed "Join" on this device - lifts a sticky
+  // removal on the mother (retours sept. #8). Automatic re-pairs leave it off.
+  opts?: { timeoutMs?: number; manual?: boolean },
 ): JoinHandle {
   const timeoutMs = opts?.timeoutMs ?? 120_000;
   let onCancel: ((o: JoinOutcome) => void) | null = null;
@@ -241,6 +244,7 @@ export function joinMother(
       // Sent so a same-client mother auto-approves us on the LAN (E1).
       clientId: me?.client_id ?? null,
       timeoutMs,
+      manual: opts?.manual ?? false,
     }).catch((e): JoinOutcome => ({
       kind: 'unreachable',
       message: (e as Error).message || String(e),
@@ -255,24 +259,15 @@ export function joinMother(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-/** Parse an SQLite UTC timestamp ("YYYY-MM-DD HH:MM:SS") to epoch ms, or NaN. */
-function parseLanTs(ts: string): number {
-  // Already has a timezone marker (cloud ISO) - parse as-is.
-  if (/[zZ]|[+-]\d\d:?\d\d$/.test(ts)) return Date.parse(ts);
-  return Date.parse(ts.replace(' ', 'T') + 'Z');
-}
-
 /** True if an SQLite UTC timestamp is within `withinSec` of now. */
 export function isRecent(lastSeenAt: string | null, withinSec = 25): boolean {
   if (!lastSeenAt) return false;
-  const t = parseLanTs(lastSeenAt);
+  const t = parseDbTs(lastSeenAt);
   if (Number.isNaN(t)) return false;
   return Date.now() - t < withinSec * 1000;
 }
 
 /** Locale-formatted local time for an SQLite UTC timestamp. */
 export function formatLanTime(ts: string | null): string {
-  if (!ts) return '';
-  const t = parseLanTs(ts);
-  return Number.isNaN(t) ? ts : new Date(t).toLocaleString();
+  return formatDbDateTime(ts);
 }

@@ -30,7 +30,7 @@ export type WorkItemKind =
   | 'game_type_override_video';
 
 export interface CycleStartedPayload {
-  trigger: 'startup' | 'foreground' | 'network_up' | 'timer' | 'manual';
+  trigger: 'startup' | 'foreground' | 'network_up' | 'timer' | 'retry' | 'manual';
   startedAt: string;
 }
 

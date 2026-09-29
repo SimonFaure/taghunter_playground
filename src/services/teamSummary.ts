@@ -13,13 +13,12 @@
 import { getLaunchedGameState, getLaunchedGameMeta, type RawPunchRow, type TeamRow } from './launchedGames';
 import * as scenarioStore from './scenarioStore';
 import * as patternStore from './patternStore';
-import { checkpointsForRoute, orderedHitCheckpointIds, type TracksCheckpoint } from './tracksScoring';
+import { checkpointsForRoute, firstSlotByCheckpoint, orderedHitCheckpointIds, type TracksCheckpoint } from './tracksScoring';
 import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
 import {
   livePunchesForTeam,
   chipIdsForTeam,
   parseTeamsConfig,
-  secondsOfDay,
   rawRecordsFromState,
 } from './reportStats';
 import type { TeamSummarySnapshot, TeamSummaryCheckpoint } from './teamSummaryTarget';
@@ -215,22 +214,11 @@ async function buildTracks(
     );
     const punches = livePunchesForTeam(records, team.start_time, team.end_time);
     const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
-    const hitTimeByCp = new Map<string, number | undefined>();
-    for (const cp of routeCps) {
-      const cpStations = stations.get(numberOf(cp)) ?? [];
-      let earliest: number | undefined;
-      for (const p of punches) {
-        if (p.time && p.time !== '00:00:00' && cpStations.includes(Number(p.code))) {
-          const ts = secondsOfDay(p.time);
-          if (earliest === undefined || ts < earliest) earliest = ts;
-        }
-      }
-      hitTimeByCp.set(cp.id, earliest);
-    }
+    const hitSlotByCp = firstSlotByCheckpoint(routeCps, numberOf, stations, punches);
     if (trackPlayMode === 'itinerary') {
-      for (const id of orderedHitCheckpointIds(routeCps, hitTimeByCp).hitIds) found.add(id);
+      for (const id of orderedHitCheckpointIds(routeCps, hitSlotByCp).hitIds) found.add(id);
     } else {
-      for (const cp of routeCps) if (hitTimeByCp.get(cp.id) !== undefined) found.add(cp.id);
+      for (const cp of routeCps) if (hitSlotByCp.get(cp.id) !== undefined) found.add(cp.id);
     }
   } catch (err) {
     console.error('[teamSummary] tracks found-set error:', err);

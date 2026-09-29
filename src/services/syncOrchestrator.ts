@@ -20,7 +20,7 @@
 // Q9 escape hatch: if mobile profiling shows JS-heap pressure on big media
 // downloads, lift this whole orchestrator into Rust.
 
-import { ApiError, apiCall, apiDownloadBytesStream, apiDownloadStreamed } from './api';
+import { ApiError, RangeIgnoredError, apiCall, apiDownloadBytesStream, apiDownloadStreamed } from './api';
 import { withRetry } from './apiRetry';
 import { AuthUser } from './authStore';
 import {
@@ -30,6 +30,8 @@ import {
   writeJson,
   writeBinary,
   streamBinary,
+  streamBinaryAppend,
+  fileSize,
   writeText,
   blobExists,
   blobPathRel,
@@ -75,21 +77,29 @@ import { getDb } from './db';
 
 const DEBOUNCE_MS = 60_000;
 const TIMER_MS = 30 * 60 * 1000;
+// After a cycle that left items behind (failed downloads, idle-cap abort), a
+// follow-up cycle is scheduled on this backoff instead of waiting for the next
+// 30-min tick or for the operator to press "Tout réessayer". With resumable
+// media each follow-up continues where the last one stopped. Reset by a
+// complete cycle. Retours sept. 2026 #27.
+const RETRY_BACKOFF_MS = [2 * 60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
 const FOREGROUND_THRESHOLD_MS = 5 * 60 * 1000;
-const POOL_SIZE = 3;
+// 5 parallel downloads: first sync of a full catalogue (30+ scenarios, heavy
+// videos) was taking 5-6 h at 3. Retours sept. 2026 #26.
+const POOL_SIZE = 5;
 // Defense-in-depth cap on a single cycle. Per-request timeouts in api.ts should
 // already bound every call; this is the backstop guaranteeing runCycle() always
 // terminates even if a future path forgets a timeout.
 //
 // It is deliberately an IDLE cap, not a wall-clock one. A flat wall-clock cap
 // (it used to be 10 minutes) killed cycles that were downloading perfectly
-// well: a scenario carrying a few 100-200 MB videos, split three ways by the
-// worker pool, simply needs longer than that. Because there is no resume
-// (streamBinary truncates, and the studio's get_media ignores Range), the next
-// cycle restarted those videos from byte 0 and was cut off at the same point -
-// a livelock in which heavy videos could never land and their scenario was
-// never committed. Mirrors DOWNLOAD_STALL_TIMEOUT_MS in api.ts: what matters is
-// that progress is being made, not how long the whole job takes.
+// well: a scenario carrying a few 100-200 MB videos, split across the worker
+// pool, simply needs longer than that. Back then there was no resume, so the
+// next cycle restarted those videos from byte 0 and was cut off at the same
+// point - a livelock in which heavy videos could never land. Scenario media now
+// resume from their `.part` (Range request, see downloadScenarioMedia), but the
+// idle cap stays the right shape. Mirrors DOWNLOAD_STALL_TIMEOUT_MS in api.ts:
+// what matters is that progress is being made, not how long the job takes.
 const CYCLE_IDLE_CAP_MS = 5 * 60 * 1000; // no progress of any kind
 const CYCLE_ABSOLUTE_CAP_MS = 4 * 60 * 60 * 1000; // runaway guard only
 const CYCLE_CAP_CHECK_MS = 15 * 1000;
@@ -109,7 +119,7 @@ function isVideoFile(relPath: string): boolean {
 
 // ---------- types ----------
 
-export type Trigger = 'startup' | 'foreground' | 'network_up' | 'timer' | 'manual';
+export type Trigger = 'startup' | 'foreground' | 'network_up' | 'timer' | 'retry' | 'manual';
 
 interface ManifestResponse {
   custom_scenarios: Array<{ uniqid: string; title: string; version: number; game_type: string; content_hash?: string | null }>;
@@ -172,6 +182,8 @@ let lastCycleStats: { total: number; completed: number; failed: number } | null 
 let cycleAbort: AbortController | null = null;
 let disposers: Array<() => void> = [];
 let timerHandle: ReturnType<typeof setInterval> | null = null;
+let retryHandle: ReturnType<typeof setTimeout> | null = null;
+let retryStep = 0;
 let lastVisibleAtMs = Date.now();
 
 // Wall-clock of the last observable forward step in the running cycle: a phase
@@ -211,11 +223,11 @@ interface ScenarioProgress {
 }
 const scenarioProgress = new Map<string, ScenarioProgress>();
 
-// Monotonic disambiguator for in-flight blob temp filenames, so two workers
-// fetching the same missing blob (e.g. a file shared by two scenarios) don't
-// collide on one temp path before the verify+rename. Module-lived; the value
-// is irrelevant, only its uniqueness within a run.
-let blobTmpSeq = 0;
+// In-flight scenario-media downloads by blob hash. The temp path is stable per
+// hash (`{hash}.part`, so an interrupted download can be RESUMED next time), so
+// two workers fetching the same blob (a file shared by two scenarios) must not
+// both append to it: the second one joins the first one's promise instead.
+const inflightBlobs = new Map<string, Promise<number>>();
 
 // ---------- public API ----------
 
@@ -297,6 +309,8 @@ export function stop(): void {
     clearInterval(timerHandle);
     timerHandle = null;
   }
+  clearRetry();
+  retryStep = 0;
   if (cycleAbort) {
     cycleAbort.abort();
     cycleAbort = null;
@@ -307,6 +321,30 @@ export function stop(): void {
 
 export async function runCycleNow(trigger: Trigger = 'manual'): Promise<void> {
   await fireTrigger(trigger, { force: trigger === 'manual' });
+}
+
+function clearRetry(): void {
+  if (retryHandle) {
+    clearTimeout(retryHandle);
+    retryHandle = null;
+  }
+}
+
+// Called once per finished cycle. `incomplete` = items were left behind for a
+// reason worth retrying (not auth). Past the last backoff step the regular
+// 30-min timer takes over.
+function scheduleRetry(incomplete: boolean): void {
+  clearRetry();
+  if (!incomplete) {
+    retryStep = 0;
+    return;
+  }
+  if (!started || retryStep >= RETRY_BACKOFF_MS.length) return;
+  const delay = RETRY_BACKOFF_MS[retryStep++];
+  retryHandle = setTimeout(() => {
+    retryHandle = null;
+    void fireTrigger('retry');
+  }, delay);
 }
 
 // ---------- trigger gate (debounce) ----------
@@ -392,6 +430,8 @@ async function runCycle(trigger: Trigger): Promise<void> {
   // already idle. Emitting it inline (while still inside this try) left
   // cycleInFlight=true at notification time, which froze the UI's "Syncing…".
   let emitTerminal: (() => void) | null = null;
+  // Whether this cycle left work behind that a quick follow-up should pick up.
+  let retryWorthy = false;
 
   try {
     // Phase 1: push pending local mutations (uploads).
@@ -446,6 +486,8 @@ async function runCycle(trigger: Trigger): Promise<void> {
     }
 
     lastCycleStats = { total, completed, failed };
+    // Failed items, or items never reached because the idle cap aborted the pool.
+    retryWorthy = failed > 0 || completed < total;
     const finishedAt = new Date().toISOString();
     lastCycleFinishedAtIso = finishedAt;
     emitTerminal = () =>
@@ -462,6 +504,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
       emitTerminal = () => emit('cycle:failed', { reason: 'auth_invalid', recoverable: false });
     } else {
+      retryWorthy = true;
       const detail = buildFailureDetail(err);
       // Log full raw err to console so a developer with devtools open can
       // inspect even non-serializable values (DOMException, Error subclasses,
@@ -497,6 +540,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     cycleAbort = null;
     currentPhase = null;
     currentTrigger = null;
+    scheduleRetry(retryWorthy);
     // Orchestrator is idle again - now fire the terminal event so any
     // getState() call inside a listener observes the consistent idle state.
     emitTerminal?.();
@@ -722,24 +766,27 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     }
   }
 
-  // Relayed default-hotspot networks (Feature B download side). A simple
-  // version-compare against the schema_meta-stored local version - when studio's
-  // advances, re-pull get_lan_networks and upsert into wifi_networks. Siblings
-  // that never paired thus learn the SSID/password to auto-join.
+  // Relayed default-hotspot networks (Feature B download side). Pulled when the
+  // studio's lan_networks_version differs from the local cursor, and once per
+  // app launch regardless, so the local mirror is reconciled to studio's
+  // authoritative set: that drops stale rows (e.g. an old auto-generated hotspot
+  // SSID a device learned via a past ping) even when the version hasn't moved.
+  // An unchanged set is NOT re-pulled on every sync any more, so a sync with
+  // nothing new reads "à jour". When studio has nothing (remoteVersion 0 /
+  // table not migrated) we skip and leave the mirror alone.
   {
     const remoteVersion = manifest.lan_networks_version ?? 0;
-    // Pull EVERY sync whenever studio has networks (version-INDEPENDENT), so the
-    // local mirror is reconciled to studio's authoritative set each time - this
-    // drops stale rows (e.g. an old auto-generated hotspot SSID a device learned
-    // via a past ping) even when the version hasn't advanced. The payload is a
-    // tiny GET; studio is the source of truth. When studio has nothing
-    // (remoteVersion 0 / table not migrated) we skip and leave the mirror alone.
-    if (remoteVersion > 0) {
+    const clientId = currentUser?.client_id ?? 0;
+    const localVersion = await lanNetworks.getLanNetworksCursor(clientId).catch(() => null);
+    if (
+      remoteVersion > 0 &&
+      (remoteVersion !== localVersion || !lanNetworks.lanNetworksReconciledThisSession())
+    ) {
       work.push({
         kind: 'lan_networks',
         priority: 1,
         remoteVersion,
-        label: `LAN networks v${remoteVersion}`,
+        label: 'Wi-Fi networks',
       });
     }
   }
@@ -1234,7 +1281,7 @@ async function downloadReportLayouts(
 }
 
 async function downloadLanNetworks(
-  _item: Extract<WorkItem, { kind: 'lan_networks' }>,
+  item: Extract<WorkItem, { kind: 'lan_networks' }>,
   signal: AbortSignal
 ): Promise<DownloadOutcome> {
   const networks = await withRetry(() => lanNetworks.getLanNetworks(signal));
@@ -1256,6 +1303,7 @@ async function downloadLanNetworks(
   // rows (renamed hotspot) AND stale paired rows (e.g. an old auto-generated
   // hotspot SSID from a past ping that nothing refreshes). Runs every sync.
   await wifiNetworksStore.reconcileToStudioSet(networks.map((n) => n.ssid));
+  await lanNetworks.setLanNetworksCursor(currentUser?.client_id ?? 0, item.remoteVersion);
   return { enqueued: null, bytes: jsonByteLength(networks) };
 }
 
@@ -1396,29 +1444,27 @@ async function downloadScenarioMedia(
   item: Extract<WorkItem, { kind: 'scenario_media' }>,
   signal: AbortSignal
 ): Promise<DownloadOutcome> {
-  // Download to a unique temp, verify its SHA-256 against the studio hash, then
+  // Download to a temp, verify its SHA-256 against the studio hash, then
   // atomically move it into the pool under that hash. Stream straight to disk -
   // a scenario video can be hundreds of MB and buffering it OOMs the Android
   // WebView heap; the native sha256_file command hashes on disk for the same
-  // reason. The whole download+verify+commit is one retryable unit: a corrupt
-  // body fails the check and retries from a freshly-truncated temp.
-  const tmpRel = blobTmpPathRel(`${item.hash}.${blobTmpSeq++}`);
-  const tmpAbs = await join(await appDataDir(), tmpRel);
-
-  // Any exit that did not commit the blob must drop its partial. pruneOrphanBlobs
-  // wipes media/blobs/.tmp, but only at app boot - without this a long-running
-  // session leaks one partial per aborted attempt, which for videos is hundreds
-  // of MB an hour.
-  const total = await withRetry(async () => {
-    let committed = false;
-    try {
-      return await runScenarioMediaAttempt(item, tmpRel, tmpAbs, signal, () => {
-        committed = true;
-      });
-    } finally {
-      if (!committed) await removeRecursive(tmpRel).catch(() => {});
-    }
-  });
+  // reason.
+  //
+  // The temp is STABLE per hash (`{hash}.part`) and survives a failed attempt:
+  // the next attempt (or the next cycle, or the next app launch - see
+  // pruneOrphanBlobs) resumes it with an HTTP Range request instead of
+  // restarting a 200 MB video from byte 0 every time the connection drops.
+  // Only a hash mismatch discards it.
+  let job = inflightBlobs.get(item.hash);
+  if (!job) {
+    const tmpRel = blobTmpPathRel(`${item.hash}.part`);
+    job = (async () => {
+      const tmpAbs = await join(await appDataDir(), tmpRel);
+      return withRetry(() => runScenarioMediaAttempt(item, tmpRel, tmpAbs, signal));
+    })().finally(() => inflightBlobs.delete(item.hash));
+    inflightBlobs.set(item.hash, job);
+  }
+  const total = await job;
   emitItemProgress(item.label, item.kind, total, total, true);
 
   // Bookkeeping: drop from remaining set; the post-pool sweep commits the
@@ -1428,16 +1474,15 @@ async function downloadScenarioMedia(
   return { enqueued: null, bytes: total };
 }
 
-// One download+verify+commit attempt. Split out of downloadScenarioMedia so the
-// temp-file cleanup above can wrap it without nesting three levels of try.
+// One download+verify+commit attempt, resuming any partial already on disk.
+// Returns the full file size.
 async function runScenarioMediaAttempt(
   item: Extract<WorkItem, { kind: 'scenario_media' }>,
   tmpRel: string,
   tmpAbs: string,
-  signal: AbortSignal,
-  markCommitted: () => void
+  signal: AbortSignal
 ): Promise<number> {
-  const n = await streamBinary(tmpRel, (write) =>
+  const fetchInto = (sink: (chunk: Uint8Array) => Promise<void>, rangeStart: number) =>
     apiDownloadStreamed(
       'playground',
       'get_media',
@@ -1445,20 +1490,44 @@ async function runScenarioMediaAttempt(
         bearer: true,
         query: { uniqid: item.uniqid, filename: item.filename },
         signal,
+        rangeStart,
         onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
       },
-      write
-    )
-  );
+      sink
+    );
+
+  let have = await fileSize(tmpRel);
+  let size = 0;
+  if (have > 0) {
+    try {
+      size = have + (await streamBinaryAppend(tmpRel, (write) => fetchInto(write, have)));
+    } catch (err) {
+      if (err instanceof RangeIgnoredError) {
+        // Server without Range support: nothing was appended, start over below.
+        have = 0;
+      } else if (err instanceof ApiError && err.status === 416) {
+        // Nothing left to fetch: the partial is (claims to be) the whole file,
+        // e.g. the app closed between the last byte and the commit. Verify it.
+        size = have;
+      } else {
+        throw err;
+      }
+    }
+  }
+  if (have === 0) {
+    size = await streamBinary(tmpRel, (write) => fetchInto(write, 0));
+  }
+
   const got = await invoke<string>('sha256_file', { path: tmpAbs });
   if (got !== item.hash) {
+    // Corrupt or stale partial: drop it so the retry starts from byte 0.
+    await removeRecursive(tmpRel).catch(() => {});
     throw new Error(
       `hash mismatch for ${item.uniqid}/${item.filename}: expected ${item.hash}, got ${got}`
     );
   }
   await commitBlobFromTemp(tmpRel, item.hash);
-  markCommitted();
-  return n;
+  return size;
 }
 
 async function downloadGameTypeAdminVideo(

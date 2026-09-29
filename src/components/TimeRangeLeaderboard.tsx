@@ -9,6 +9,8 @@ import {
 import type { TimeRange, ScenarioOption } from './RankingsModal';
 import { closeSelfProjectorWindow } from '../services/projectorWindow';
 import { pushOverlay, popOverlay } from '../services/screenState';
+import { dbDate, parseDbTs } from '../utils/dbTime';
+import { onLanOverrideChange } from '../services/api';
 
 interface TimeRangeLeaderboardProps {
   scenario: ScenarioOption;
@@ -60,7 +62,7 @@ function formatDuration(seconds: number): string {
 }
 
 function formatDate(iso: string): string {
-  const d = new Date(iso);
+  const d = dbDate(iso) ?? new Date(iso);
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
@@ -102,6 +104,10 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
   const [playMode, setPlayMode] = useState<'solo' | 'team'>('solo');
   const [loading, setLoading] = useState(true);
   const [visible, setVisible] = useState(false);
+  // Bumped when the launched_games route moves to another mother (failover), so
+  // the aggregation reloads from the new one (retours sept. #18).
+  const [routeTick, setRouteTick] = useState(0);
+  useEffect(() => onLanOverrideChange(() => setRouteTick((n) => n + 1)), []);
 
   // Report "showing a ranking" to paired mothers while this page is mounted
   // (mirrors LeaderboardPage - same overlay, scenario time-range variant).
@@ -148,7 +154,7 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
       const launchedGames = allGames.filter((g) => {
         if (g.game_uniqid !== scenario.uniqid) return false;
         if (cutoffMs > 0 && g.created_at) {
-          if (new Date(g.created_at).getTime() < cutoffMs) return false;
+          if (parseDbTs(g.created_at) < cutoffMs) return false;
         }
         return true;
       });
@@ -209,7 +215,7 @@ export function TimeRangeLeaderboard({ scenario, timeRange, onBack, projectorMod
     };
 
     load();
-  }, [scenario.uniqid, timeRange]);
+  }, [scenario.uniqid, timeRange, routeTick]);
 
   return (
     <div

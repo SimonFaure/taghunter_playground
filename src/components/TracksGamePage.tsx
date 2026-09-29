@@ -40,6 +40,7 @@ import {
 import {
   checkpointsForRoute,
   computeScore,
+  firstSlotByCheckpoint,
   orderedHitCheckpointIds,
   sortTracksTeams,
   rankTier,
@@ -588,27 +589,12 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 const routeCps = checkpointsForRoute(allCps, cluesRoute);
                 const stations = await patternStore.getTracksCheckpointStations(config.pattern);
                 const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
-                const secondsOfDay = (t: string) => {
-                  const [h, m, s] = (t ?? '').split(':').map(Number);
-                  return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
-                };
-                const hitTimeByCp = new Map<string, number | undefined>();
-                for (const cp of routeCps) {
-                  const cpStations = stations.get(numberOf(cp)) ?? [];
-                  let earliest: number | undefined;
-                  for (const p of card.punches ?? []) {
-                    if (p.time && p.time !== '00:00:00' && cpStations.includes(p.code)) {
-                      const ts = secondsOfDay(p.time);
-                      if (earliest === undefined || ts < earliest) earliest = ts;
-                    }
-                  }
-                  hitTimeByCp.set(cp.id, earliest);
-                }
+                const hitSlotByCp = firstSlotByCheckpoint(routeCps, numberOf, stations, card.punches ?? []);
                 if (trackPlayMode === 'itinerary') {
-                  cluesFound = orderedHitCheckpointIds(routeCps, hitTimeByCp).hitIds;
+                  cluesFound = orderedHitCheckpointIds(routeCps, hitSlotByCp).hitIds;
                 } else {
                   for (const cp of routeCps) {
-                    if (hitTimeByCp.get(cp.id) !== undefined) cluesFound.add(cp.id);
+                    if (hitSlotByCp.get(cp.id) !== undefined) cluesFound.add(cp.id);
                   }
                 }
               } catch (err) {
@@ -844,43 +830,42 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           (p) => !baseline.has(`${p.code}@${p.time}`),
         );
 
-        // Empty card on the closing bip (no new punches since start) - surface
-        // the authored "card empty" message ahead of the all-missing reveal.
+        // Empty card on the closing bip (no new punches since start): say so
+        // and stop - no scoring, no reveal, the run stays open. With a mass
+        // start every team already has a start_time, so an unused card bipped
+        // at the desk landed here and played the full score animation
+        // (retours sept. #63). Same rule as Mystery #60: an empty card never
+        // finishes a run.
         if (livePunches.length === 0) {
-          const emptyMsg = resolveTracksText(gd.texts, 'text_card_empty', team.language || language, {
-            team: teamName,
-          });
-          if (emptyMsg) showMessage(emptyMsg, 'warning', teamName);
+          const emptyLang = team.language || language;
+          showMessage(
+            resolveTracksText(gd.texts, 'text_card_empty', emptyLang, { team: teamName }) ||
+              localizedStatus('card_empty', emptyLang),
+            'warning',
+            teamName,
+          );
+          return;
         }
 
         const numberOf = (cp: TracksCheckpoint) => allCps.findIndex((c) => c.id === cp.id) + 1;
-        // Earliest live-punch time at which each route checkpoint was reached
-        // (undefined = never reached).
-        const hitTimeByCp = new Map<string, number | undefined>();
+        // Card slot of the first live punch at each route checkpoint (undefined =
+        // never reached). Slot order, not station time: see firstSlotByCheckpoint.
         let unboundCheckpoints = 0;
         for (const cp of routeCps) {
-          const cpStations = stations.get(numberOf(cp)) ?? [];
-          if (cpStations.length === 0) {
+          if ((stations.get(numberOf(cp)) ?? []).length === 0) {
             unboundCheckpoints++;
             console.warn(
               `[TracksGamePage] checkpoint #${numberOf(cp)} resolves to NO pattern station - it can never be scored as hit. Check that the pattern has one row per checkpoint.`,
             );
           }
-          let earliest: number | undefined;
-          for (const p of livePunches) {
-            if (cpStations.includes(p.code)) {
-              const ts = secondsOfDay(p.time);
-              if (earliest === undefined || ts < earliest) earliest = ts;
-            }
-          }
-          hitTimeByCp.set(cp.id, earliest);
         }
+        const hitSlotByCp = firstSlotByCheckpoint(routeCps, numberOf, stations, livePunches);
 
         // Punch-vs-course diagnostic. A run that scores nothing looks exactly
         // like "the software reports punch errors" (retours #87/#89), so make
         // the two causes distinguishable: a wrong/absent pattern binding leaves
         // EVERY checkpoint unreached while the card is full of punches.
-        const matchedAnyStation = routeCps.some((cp) => hitTimeByCp.get(cp.id) !== undefined);
+        const matchedAnyStation = routeCps.some((cp) => hitSlotByCp.get(cp.id) !== undefined);
         console.info(
           '[TracksGamePage] scoring',
           {
@@ -892,6 +877,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             unboundCheckpoints,
             punchCodes: livePunches.map((p) => `${p.code}@${p.time}`),
             expectedStations: routeCps.map((cp) => `#${numberOf(cp)}→${(stations.get(numberOf(cp)) ?? []).join('/') || '—'}`),
+            // Card slot each route checkpoint was first reached at (the order
+            // itinerary scoring judges); '—' = never reached.
+            slotOrder: routeCps.map((cp) => `#${numberOf(cp)}@${hitSlotByCp.get(cp.id) ?? '—'}`),
           },
         );
         if (livePunches.length > 0 && !matchedAnyStation) {
@@ -905,11 +893,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         // Itinerary = strict in-order prefix; free = any reached checkpoint.
         let hitIds: Set<string>;
         if (trackPlayMode === 'itinerary') {
-          hitIds = orderedHitCheckpointIds(routeCps, hitTimeByCp).hitIds;
+          hitIds = orderedHitCheckpointIds(routeCps, hitSlotByCp).hitIds;
         } else {
           hitIds = new Set<string>();
           for (const cp of routeCps) {
-            if (hitTimeByCp.get(cp.id) !== undefined) hitIds.add(cp.id);
+            if (hitSlotByCp.get(cp.id) !== undefined) hitIds.add(cp.id);
           }
         }
 
@@ -952,7 +940,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
         const statusOf = (cp: TracksCheckpoint): 'correct' | 'wrong' | 'missing' => {
           if (hitIds.has(cp.id)) return 'correct';
-          if (hitTimeByCp.get(cp.id) !== undefined) return 'wrong'; // punched, not credited
+          if (hitSlotByCp.get(cp.id) !== undefined) return 'wrong'; // punched, not credited
           return 'missing';
         };
         const correctImage = (cp: TracksCheckpoint) =>
@@ -1074,8 +1062,18 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
           setGameMessage('');
         }
+        // "Scenario ended" only when the roster is closed and complete. With
+        // auto/self-register or card reuse, teams join and leave one at a time,
+        // so "every registered team has finished" is true after nearly every
+        // return and the end-of-game message followed each team's results
+        // (retours sept. #62). Those sessions only end on the operator's "End
+        // game" (retours #88).
+        const rosterClosed =
+          !config.autoRegisterTeam && !config.selfRegisterTeam && !config.reuseCards;
         const allFinished =
-          refreshed.teams.length > 0 && refreshed.teams.every((t) => t.end_time);
+          rosterClosed &&
+          refreshed.teams.length >= Math.max(1, config.numberOfTeams || 1) &&
+          refreshed.teams.every((t) => t.end_time);
         if (allFinished) {
           const scenarioEndedMsg = resolveTracksText(gd.texts, 'text_scenario_ended', endLang);
           if (scenarioEndedMsg) {
@@ -1106,7 +1104,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.messageDisplayDuration, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.playTutorialOnBip, config.playIntroOnBip, gameUniqid, playSound, scoreText, showMessage, language],
+    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.messageDisplayDuration, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.numberOfTeams, config.playTutorialOnBip, config.playIntroOnBip, gameUniqid, playSound, scoreText, showMessage, language],
   );
 
   const resetDisplay = () => {

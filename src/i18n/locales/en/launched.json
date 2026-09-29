@@ -188,5 +188,8 @@
   "membersHeading": "Members ({{count}})",
   "noChipsBound": "No chips bound to this clan yet.",
   "chipsInTeam": "Chips in this team",
-  "chipsInClan": "Chips in this clan"
+  "chipsInClan": "Chips in this clan",
+  "slowLoadTitle": "Mother unreachable",
+  "slowLoadHint": "The games list comes from the mother, which isn't answering right now. If a takeover is in progress, wait: this device reconnects on its own.",
+  "slowLoadRetry": "Retry"
 }

@@ -7,18 +7,21 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Satellite } from 'lucide-react';
-import { demoteFromMother } from '../../services/lanMotherBoot';
+import { demoteFromMother, HostingActiveGameError } from '../../services/lanMotherBoot';
+import { relaunchToApply } from '../../services/appRelaunch';
 import { refreshLaunchedGamesRoute } from '../../services/childControlLink';
 import { describeLocalRole } from '../../services/lanPairing';
 import { CONFIG_CHANGED_EVENT } from '../../utils/config';
-import { failoverErrorText } from '../../services/failoverErrors';
+import { ErrorDetails } from '../ErrorDetails';
+import { useAuth } from '../auth/AuthProvider';
 
 export function NotMotherPanel() {
   const { t } = useTranslation('devicesLan');
+  const auth = useAuth();
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [hostingWarn, setHostingWarn] = useState(false);
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [msg, setMsg] = useState<{ kind: 'ok'; text: string } | { kind: 'err'; error: unknown } | null>(null);
 
   const askConfirm = async () => {
     setMsg(null);
@@ -33,7 +36,7 @@ export function NotMotherPanel() {
     setBusy(true);
     setMsg(null);
     try {
-      await demoteFromMother();
+      await demoteFromMother(auth.user?.client_id);
       // Converge on the venue's mother right away (auto-join + route install)
       // instead of waiting for the periodic tick. With no mother nearby the
       // device simply stays a satellite-in-waiting - still a success.
@@ -43,7 +46,7 @@ export function NotMotherPanel() {
       setMsg({
         kind: 'ok',
         text:
-          route === 'mother'
+          (route === 'mother'
             ? t('notMotherDoneJoined', {
                 defaultValue:
                   'Done. This device is now a satellite, connected to the mother on this network.',
@@ -51,10 +54,18 @@ export function NotMotherPanel() {
             : t('notMotherDone', {
                 defaultValue:
                   'Done. This device is now a satellite - it will follow a mother as soon as one is available on the network.',
-              }),
+              })) + ' ' + t('relaunchingToApply'),
       });
+      // Apply the new role through a clean start (retours sept. #16).
+      void relaunchToApply(2500);
     } catch (e) {
-      setMsg({ kind: 'err', text: failoverErrorText(e, t) });
+      setMsg({
+        kind: 'err',
+        error:
+          e instanceof HostingActiveGameError
+            ? { message: t('failover:errHostingActiveGame', { name: e.gameName }), detail: null }
+            : e,
+      });
     } finally {
       setBusy(false);
       setConfirming(false);
@@ -94,6 +105,7 @@ export function NotMotherPanel() {
                   })}
                 </p>
               )}
+              <p className="text-xs text-[var(--pg-text-dim)] leading-relaxed mb-2">{t('relaunchNote')}</p>
               <div className="flex gap-2">
                 <button onClick={() => setConfirming(false)} className="pg-btn" disabled={busy}>
                   {t('notMotherCancel', { defaultValue: 'Cancel' })}
@@ -106,11 +118,8 @@ export function NotMotherPanel() {
               </div>
             </div>
           )}
-          {msg && (
-            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-danger-icon)]'}`}>
-              {msg.text}
-            </p>
-          )}
+          {msg?.kind === 'ok' && <p className="text-xs mt-3 text-[var(--pg-ok-icon)]">{msg.text}</p>}
+          {msg?.kind === 'err' && <ErrorDetails error={msg.error} className="mt-3" />}
         </div>
       </div>
     </div>

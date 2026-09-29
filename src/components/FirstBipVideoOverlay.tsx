@@ -5,8 +5,8 @@ import { LANG_NAMES } from '../services/langFlags';
 import type { VideoSource } from '../services/videoResolution';
 
 // Fullscreen overlay shown when a team scans their first tag. Plays the
-// scenario intro video first (if enabled and present), then the game-type
-// tutorial video (if enabled and present). Players cannot skip - only
+// game-type tutorial video first (if enabled and present), then the
+// scenario intro video (if enabled and present). Players cannot skip - only
 // the operator can, via a hidden 4-tap gesture in the top-right corner
 // followed by a confirm prompt.
 //

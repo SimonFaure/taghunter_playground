@@ -19,6 +19,7 @@ import {
   readDir,
   remove,
   rename,
+  stat,
   writeFile,
   writeTextFile,
   BaseDirectory,
@@ -137,10 +138,10 @@ export async function blobExists(hash: string): Promise<boolean> {
   return exists(blobPathRel(hash), { baseDir: APP });
 }
 
-// A unique temp path for an in-flight blob download. `token` must be unique
-// per concurrent download (the orchestrator uses hash + a monotonic counter)
-// so two workers fetching the same missing blob don't clobber each other's
-// partial file before the verify+rename step.
+// Temp path for an in-flight blob download. The orchestrator uses a stable
+// `{hash}.part` token so an interrupted download can be resumed, and makes sure
+// only one download per hash runs at a time (two workers must never append to
+// the same partial).
 export function blobTmpPathRel(token: string): string {
   return `${BLOBS_TMP_REL}/${token}`;
 }
@@ -210,6 +211,42 @@ export async function streamBinary<T>(
     });
   } finally {
     await file.close();
+  }
+}
+
+// Resume variant of streamBinary: appends to whatever is already in the file
+// (a partial left by an interrupted download) instead of truncating it.
+export async function streamBinaryAppend<T>(
+  relPath: string,
+  pump: (write: (chunk: Uint8Array) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  const lastSlash = relPath.lastIndexOf('/');
+  if (lastSlash > 0) await ensureDir(relPath.slice(0, lastSlash));
+  const file = await open(relPath, {
+    write: true,
+    append: true,
+    create: true,
+    baseDir: APP,
+  });
+  try {
+    return await pump(async (chunk) => {
+      let off = 0;
+      while (off < chunk.byteLength) {
+        off += await file.write(chunk.subarray(off));
+      }
+    });
+  } finally {
+    await file.close();
+  }
+}
+
+// Size in bytes of a file under appData, or 0 when it doesn't exist.
+export async function fileSize(relPath: string): Promise<number> {
+  try {
+    if (!(await exists(relPath, { baseDir: APP }))) return 0;
+    return (await stat(relPath, { baseDir: APP })).size;
+  } catch {
+    return 0;
   }
 }
 
@@ -315,8 +352,11 @@ export async function pruneOrphanBlobs(): Promise<number> {
 
   if (!(await exists(BLOBS_REL, { baseDir: APP }))) return 0;
 
-  // Interrupted-download temp files are never referenced - always clear them.
-  await removeRecursive(BLOBS_TMP_REL);
+  // Interrupted-download temp files are never referenced. Resumable partials
+  // (`{hash}.part`, see syncOrchestrator.downloadScenarioMedia) are kept for a
+  // week so the next sync continues them instead of restarting a big video
+  // from byte 0; anything else, or an older partial, is cleared.
+  await pruneBlobTmp();
 
   let pruned = 0;
   const shards = await readDir(BLOBS_REL, { baseDir: APP });
@@ -340,6 +380,32 @@ export async function pruneOrphanBlobs(): Promise<number> {
     }
   }
   return pruned;
+}
+
+const PARTIAL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function pruneBlobTmp(): Promise<void> {
+  if (!(await exists(BLOBS_TMP_REL, { baseDir: APP }))) return;
+  const now = Date.now();
+  let entries;
+  try {
+    entries = await readDir(BLOBS_TMP_REL, { baseDir: APP });
+  } catch {
+    await removeRecursive(BLOBS_TMP_REL);
+    return;
+  }
+  for (const e of entries) {
+    const rel = `${BLOBS_TMP_REL}/${e.name}`;
+    try {
+      if (e.isFile && e.name.endsWith('.part')) {
+        const mtime = (await stat(rel, { baseDir: APP })).mtime?.getTime() ?? 0;
+        if (now - mtime < PARTIAL_MAX_AGE_MS) continue;
+      }
+      await removeRecursive(rel);
+    } catch (err) {
+      console.warn(`[contentFs] prune: skipped temp ${rel}:`, err);
+    }
+  }
 }
 
 // One-shot cleanup: remove any media/cards/v*.csv files left over from

@@ -15,7 +15,7 @@ import { platform } from '@tauri-apps/plugin-os';
 import { describeLocalRole, discoverOtherMothers, type DiscoveredMother } from './lanPairing';
 import { refreshMotherEndpoints } from './lanPairing';
 import {
-  getCurrentSsid, scanWifi, connectWifi, maybeRenewDhcpIfStuck,
+  getCurrentSsid, scanWifi, scanWifiFresh, connectWifi, maybeRenewDhcpIfStuck,
   isStuckOnApipa, assignStaticIp,
 } from './wifi';
 import * as wifiNetworksStore from './wifiNetworksStore';
@@ -32,6 +32,8 @@ export interface AutoConnectOpts {
   /** join-context passes true (may return `needs_consent`); launch passes false
    *  (silently joins only already-consented networks, never prompts). */
   allowPrompt: boolean;
+  /** Force a real radio scan even while associated (mother just lost). */
+  freshScan?: boolean;
 }
 
 // After landing on the AP, re-establish reachability to the mother: warm a fresh
@@ -125,7 +127,10 @@ export async function runAutoConnect(opts: AutoConnectOpts): Promise<AutoConnect
     return { kind: 'noop', reason: 'already-on-known' };
   }
 
-  const visible = new Set(await scanWifi());
+  // Not associated to anything (the mother's AP just vanished, or a new one is
+  // coming up): the cached netsh list can hide the new AP for minutes, so force
+  // a real scan. Associated elsewhere: the cheap cached list is enough.
+  const visible = new Set(current && !opts.freshScan ? await scanWifi() : await scanWifiFresh());
 
   // Consented + in range + not the current network, in MRU/paired-first order.
   const consentedTarget = networks.find(

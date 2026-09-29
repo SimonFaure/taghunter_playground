@@ -11,7 +11,7 @@
   "becomeMotherConfirm": "Retomar la partida en este dispositivo",
   "promoting": "Promoviendo este dispositivo…",
   "promotedBody": "Este dispositivo es ahora la madre. Los demás dispositivos se reconectarán en unos segundos.",
-  "stickyMotherNote": "Este dispositivo seguirá siendo la madre en el próximo inicio. Para deshacerlo: Ajustes → Red → «No soy una madre».",
+  "stickyMotherNote": "Este equipo seguirá siendo el puesto madre en el próximo inicio. Para anularlo: Ajustes → Red → Avanzado → «No soy un puesto madre» (posible una vez terminada la partida o recuperada por otro equipo).",
   "apDownBody": "Este dispositivo ha retomado la partida, pero su punto de acceso Wi-Fi no está activo: los demás dispositivos aún no pueden encontrarlo.",
   "apDownHint": "Vuelva a intentarlo abajo o inicie el punto de acceso desde Ajustes → Red. La partida está a salvo en este dispositivo.",
   "retryHotspot": "Reintentar el punto de acceso",
@@ -29,5 +29,18 @@
   "errSnapshotFetch": "No se ha podido obtener el estado actual de la partida de la madre activa: puede que acabe de desconectarse. Vuelva a intentarlo.",
   "errNoSnapshot": "No hay ninguna copia guardada de esta partida en este dispositivo: no puede promoverse. Elija un dispositivo que estuviera en la partida.",
   "errNotInGame": "Este dispositivo no formaba parte de ninguna partida activa (sin estado guardado y sin ningún otro anfitrión accesible). Únase primero a la partida en este dispositivo, o tome el control desde un dispositivo que estuviera en ella.",
-  "errTakeControl": "No se ha podido tomar el control: puede que otro dispositivo ya sea la madre actual. Inténtelo de nuevo en unos segundos."
+  "errTakeControl": "No se ha podido tomar el control: puede que otro dispositivo ya sea la madre actual. Inténtelo de nuevo en unos segundos.",
+  "errMotherUnreachable": "El puesto madre actual no responde. Compruebe que está encendido, que Playground está abierto y que este equipo está en la misma Wi-Fi, y vuelva a intentarlo.",
+  "errStaleSnapshot": "Este equipo ya tiene una copia más reciente de la partida y puede alojarla directamente. Use «Tomar el control» en Ajustes → Red → Avanzado.",
+  "errScenarioMissing": "Este equipo no ha descargado el escenario de esta partida. Sincronícelo (Ajustes → Sincronización) y vuelva a intentarlo.",
+  "errAdoptFailed": "La recuperación de la partida en este equipo falló y se anuló: no se modificó nada. Vuelva a intentarlo; si se repite, recupere la partida desde otro equipo.",
+  "errPortBusy": "Otro programa usa el puerto de red de Playground en este equipo. Cierre las demás ventanas de Playground y vuelva a intentarlo.",
+  "errNoWifiCreds": "Este equipo no conoce el nombre y la contraseña de la Wi-Fi Tag Hunter: no se pudo iniciar el punto de acceso. Sincronice el equipo o introdúzcalos en Ajustes → Red → Avanzado.",
+  "errHotspot": "No se pudo iniciar el punto de acceso Wi-Fi de este equipo. Vuelva a intentarlo en unos segundos; si persiste, inícielo desde Ajustes → Red.",
+  "errNotAuthorized": "El puesto madre actual rechazó este equipo. Únase primero (Ajustes → Red → Buscar un puesto madre) y vuelva a intentarlo.",
+  "errGeneric": "La operación falló. Vuelva a intentarlo en unos segundos; si se repite, envíe los detalles técnicos al soporte.",
+  "errHostingActiveGame": "Este equipo aloja una partida en curso («{{name}}») y ningún otro puesto madre la sirve. Termine la partida, o haga primero que otro equipo la recupere («Hacer puesto madre» en uno de sus satélites).",
+  "regainNoOther": "No se puede contactar con ningún otro puesto madre: este equipo sigue siendo el puesto madre.",
+  "promotedBodyHotspot": "Este equipo es ahora el puesto madre y emite la Wi-Fi Tag Hunter. Los satélites se reconectan solos en aproximadamente un minuto; si no, en el satélite: Ajustes → Red → Buscar un puesto madre.",
+  "bannerReconnecting": "Reconectando con el puesto madre, no toque nada."
 }

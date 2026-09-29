@@ -13,6 +13,7 @@ import { checkpointsForRoute, computeScore, type TracksScoreType } from '../serv
 import { processTagQuestPunch } from '../services/tagquestPunchLogic';
 import { buildMediaMap } from '../utils/questMedia';
 import { wrongAnswerPoints } from '../services/mysteryScoring';
+import { formatDbTime } from '../utils/dbTime';
 
 interface GameTestModalProps {
   gameId: number;
@@ -496,13 +497,21 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
           const punches: Array<{ code: number; time: string }> = [];
           const hitIds = new Set<string>();
           let t = startTime + 60;
+          // Real SI station clocks drift by tens of seconds, so card times are NOT
+          // in punch order; itinerary order must come from the card slot order
+          // (retours sept. #2). Give each station a stable ±60 s offset.
+          const clockOffset = new Map<number, number>();
+          const stationClock = (code: number, sec: number) => {
+            if (!clockOffset.has(code)) clockOffset.set(code, Math.round(Math.random() * 120 - 60));
+            return toClock(sec + clockOffset.get(code)!);
+          };
           for (let i = 0; i < checkpoints.length; i++) {
             const cp = checkpoints[i];
             if (!routeCps.some((c) => c.id === cp.id)) continue;
             const cpStations = trStations.get(i + 1) ?? [];
             if (cpStations.length === 0) continue;
             if (Math.random() * 100 < testConfig.goodAnswerPercent) {
-              punches.push({ code: cpStations[0], time: toClock(t) });
+              punches.push({ code: cpStations[0], time: stationClock(cpStations[0], t) });
               hitIds.add(cp.id);
               t += 90;
             }
@@ -692,7 +701,7 @@ export function GameTestModal({ gameId, gameName, onClose, postAnimExitDelayMs =
                       <div className="flex-1 min-w-0">
                         <p className="text-[var(--pg-text)] text-sm font-medium truncate">{device.device_id}</p>
                         <p className="text-[var(--pg-text-dim)] text-xs">
-                          {device.connected ? 'Connected' : 'Disconnected'} · last seen {new Date(device.last_connexion_attempt).toLocaleTimeString()}
+                          {device.connected ? 'Connected' : 'Disconnected'} · last seen {formatDbTime(device.last_connexion_attempt)}
                         </p>
                       </div>
                       {testConfig.selectedDeviceId === device.device_id && (

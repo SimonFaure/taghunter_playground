@@ -16,6 +16,7 @@ mod lan_server;
 mod scenario_protocol;
 mod sportident;
 mod telemetry;
+mod win_health;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -89,6 +90,8 @@ pub fn run() {
             get_wifi_ssid,
             sha256_file,
             scan_wifi,
+            wifi_scan_fresh,
+            wifi_disconnect,
             connect_wifi,
             telemetry::take_pending_panic,
             lan_server::mother_start_local_server,
@@ -115,6 +118,7 @@ pub fn run() {
             lan_server::client_list_paired_mothers,
             lan_server::client_get_paired_mother,
             lan_server::client_forget_paired_mother,
+            lan_server::client_prune_paired_mothers,
             lan_server::client_get_device_identity,
             lan_server::client_discover_mothers,
             lan_server::client_probe_mother,
@@ -127,6 +131,9 @@ pub fn run() {
             lan_server::client_set_screen_state,
             lan_server::client_describe_local_role,
             hotspot::mother_start_hotspot,
+            hotspot::mother_set_hotspot_band,
+            win_health::mother_windows_health,
+            win_health::mother_fix_windows_health,
             hotspot::mother_stop_hotspot,
             hotspot::mother_hotspot_status,
             sportident::si_list_ports,
@@ -1181,6 +1188,27 @@ fn playground_migrations() -> Vec<Migration> {
             "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 34,
+            description: "mother: sticky device revocation",
+            sql: r#"
+                -- A device the operator removed on the mother. The same-client
+                -- auto-approve used to re-pair it silently at its next ping, so
+                -- a removal never stuck (retours sept. #8). While its uuid is
+                -- here the mother refuses to auto-approve it; a pairing the
+                -- operator starts by hand from that device clears the row. The
+                -- table travels in the failover snapshot, so a promoted mother
+                -- inherits the removals.
+                CREATE TABLE IF NOT EXISTS revoked_devices (
+                    peer_uuid  TEXT PRIMARY KEY,
+                    peer_label TEXT NULL,
+                    revoked_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                );
+
+                UPDATE schema_meta SET value = '34' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -1290,6 +1318,119 @@ async fn connect_wifi(ssid: String, password: String) -> Result<(), String> {
     connect_wifi_platform(&ssid, &password).await
 }
 
+/// Like `scan_wifi`, but first asks every Wi-Fi adapter for a REAL radio scan
+/// (WlanScan) and waits for it to settle. `netsh wlan show networks` only reads
+/// Windows' cached list, which can miss a hotspot that appeared a minute ago -
+/// exactly the "the satellites don't see the new mother's Wi-Fi" case (retours
+/// sept. #19), and the returning mother that must look for the network before
+/// raising its own (#1/#13). Falls back to the cached list on any error.
+#[tauri::command]
+async fn wifi_scan_fresh() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let requested = tauri::async_runtime::spawn_blocking(request_wlan_scan)
+            .await
+            .unwrap_or(false);
+        if requested {
+            // Windows drivers must finish a scan within 4 s.
+            tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+        }
+    }
+    scan_wifi_platform().await
+}
+
+#[cfg(target_os = "windows")]
+fn request_wlan_scan() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::WiFi::{
+        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanScan,
+        WLAN_INTERFACE_INFO_LIST,
+    };
+    unsafe {
+        let mut negotiated = 0u32;
+        let mut handle = HANDLE::default();
+        if WlanOpenHandle(2, None, &mut negotiated, &mut handle) != 0 {
+            return false;
+        }
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        let mut any = false;
+        if WlanEnumInterfaces(handle, None, &mut list) == 0 && !list.is_null() {
+            let count = (*list).dwNumberOfItems as usize;
+            let first = (*list).InterfaceInfo.as_ptr();
+            for i in 0..count {
+                let info = &*first.add(i);
+                if WlanScan(handle, &info.InterfaceGuid, None, None, None) == 0 {
+                    any = true;
+                }
+            }
+            WlanFreeMemory(list as *const std::ffi::c_void);
+        }
+        let _ = WlanCloseHandle(handle, None);
+        any
+    }
+}
+
+/// Drop the current Wi-Fi client association. Used by a device that becomes the
+/// mother in hotspot mode while still connected to the old mother's same-SSID
+/// AP: it otherwise keeps a 192.168.137.x lease next to its own 192.168.137.1
+/// (retours sept. #21), and by a returning mother that probed for an existing
+/// Tag Hunter network and found no mother behind it.
+///
+/// `ssid`: the profile to switch to MANUAL connection first. Satellite profiles
+/// are written as auto-connect (so Windows rejoins a returning AP by itself);
+/// a device that now owns that SSID as a mother must not have Windows re-join
+/// the old AP behind its back.
+#[tauri::command]
+async fn wifi_disconnect(ssid: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if let Some(name) = ssid.filter(|s| !s.is_empty()) {
+            let _ = tokio::process::Command::new("netsh")
+                .args(["wlan", "set", "profileparameter"])
+                .arg(format!("name={name}"))
+                .arg("connectionmode=manual")
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .await;
+        }
+        let out = tokio::process::Command::new("netsh")
+            .args(["wlan", "disconnect"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ssid;
+        Err("wifi_disconnect is only implemented on Windows".into())
+    }
+}
+
+/// If this device is currently a Wi-Fi CLIENT of `ssid`, disconnect and make
+/// that profile manual-connect, so a device about to host `ssid` itself does not
+/// keep (or regain) a lease on another AP of the same name. Best-effort.
+pub(crate) async fn leave_ssid_as_client(ssid: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(Some(current)) = parse_ssid_from_platform().await {
+            if current == ssid {
+                let _ = wifi_disconnect(Some(ssid.to_string())).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ssid;
+    }
+}
+
 #[cfg(target_os = "windows")]
 async fn scan_wifi_platform() -> Result<Vec<String>, String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1331,7 +1472,7 @@ async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String>
   <name>{ssid}</name>
   <SSIDConfig><SSID><name>{ssid}</name></SSID></SSIDConfig>
   <connectionType>ESS</connectionType>
-  <connectionMode>manual</connectionMode>
+  <connectionMode>auto</connectionMode>
   <MSM><security>
     <authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption>
     <sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>{pw}</keyMaterial></sharedKey>

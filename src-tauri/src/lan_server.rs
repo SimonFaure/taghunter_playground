@@ -837,6 +837,122 @@ fn parse_snapshot_rows(snap: &Value) -> Result<SnapshotRows, String> {
     })
 }
 
+/// Row ids are allocated per DEVICE (AUTOINCREMENT), but a snapshot carries the
+/// mother's ids verbatim. A device that hosted or mirrored OTHER games can
+/// therefore already hold a row with one of the snapshot's ids under a different
+/// `launched_game_id` - the adopt then died on "UNIQUE constraint failed:
+/// lg_launched_game_raw_data.id" and every retry hit the same wall (retours
+/// sept. #15). The snapshot's ids must be preserved (satellites address the game
+/// by them), so it is the LOCAL, unrelated rows that move to fresh ids.
+///
+/// Same `lg_launched_games.id` with a different `summary_uuid` is an unrelated
+/// game that happens to share the number: it used to be silently deleted by the
+/// wholesale replace; it is now moved aside with its children instead.
+///
+/// FK checks are deferred to commit so a parent id and its children can be
+/// renumbered in either order.
+fn rekey_conflicting_local_rows(tx: &rusqlite::Transaction, rows: &SnapshotRows) -> rusqlite::Result<()> {
+    tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+    let game_id = rows.game.id;
+
+    // Tables whose children point at a launched game.
+    const GAME_CHILDREN: [&str; 9] = [
+        "lg_launched_game_meta",
+        "lg_launched_game_devices",
+        "lg_launched_game_raw_data",
+        "lg_teams",
+        "lg_team_completed_quests",
+        "lg_clash_members",
+        "lg_clash_validations",
+        "lg_clash_consumed",
+        "lg_clash_effectif",
+    ];
+    fn next_id(tx: &rusqlite::Transaction, table: &str) -> rusqlite::Result<i64> {
+        let max_row: i64 = tx.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {table}"), [], |r| r.get(0))?;
+        let seq: i64 = tx
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = ?", params![table], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(max_row.max(seq) + 1)
+    }
+
+    // 1. The game row itself.
+    let local_uuid: Option<String> = tx
+        .query_row("SELECT summary_uuid FROM lg_launched_games WHERE id = ?", params![game_id], |r| r.get(0))
+        .optional()?;
+    if let Some(u) = local_uuid {
+        if u != rows.game.summary_uuid {
+            let new_gid = next_id(tx, "lg_launched_games")?;
+            tx.execute("UPDATE lg_launched_games SET id = ?1 WHERE id = ?2", params![new_gid, game_id])?;
+            for t in GAME_CHILDREN.iter().chain(["lg_clash_purges"].iter()) {
+                tx.execute(
+                    &format!("UPDATE {t} SET launched_game_id = ?1 WHERE launched_game_id = ?2"),
+                    params![new_gid, game_id],
+                )?;
+            }
+            // Summaries carry no FK; follow the moved game by its uuid only.
+            tx.execute(
+                "UPDATE lg_game_summaries SET launched_game_id = ?1
+                  WHERE launched_game_id = ?2 AND summary_uuid = ?3",
+                params![new_gid, game_id, u],
+            )?;
+        }
+    }
+
+    // 2. Teams (parent of completed quests + clash rows) of OTHER games.
+    for t in &rows.teams {
+        let other: Option<i64> = tx
+            .query_row(
+                "SELECT launched_game_id FROM lg_teams WHERE id = ?1 AND launched_game_id <> ?2",
+                params![t.id, game_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if other.is_some() {
+            let new_id = next_id(tx, "lg_teams")?;
+            tx.execute("UPDATE lg_teams SET id = ?1 WHERE id = ?2", params![new_id, t.id])?;
+            for child in [
+                "lg_team_completed_quests",
+                "lg_clash_members",
+                "lg_clash_validations",
+                "lg_clash_effectif",
+                "lg_clash_purges",
+            ] {
+                tx.execute(
+                    &format!("UPDATE {child} SET team_id = ?1 WHERE team_id = ?2 AND launched_game_id <> ?3"),
+                    params![new_id, t.id, game_id],
+                )?;
+            }
+        }
+    }
+
+    // 3. Leaf rows: nothing references their ids.
+    let leaf = |table: &str, ids: Vec<i64>| -> rusqlite::Result<()> {
+        for id in ids {
+            let clash: bool = tx
+                .query_row(
+                    &format!("SELECT 1 FROM {table} WHERE id = ?1 AND launched_game_id <> ?2"),
+                    params![id, game_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if clash {
+                let new_id = next_id(tx, table)?;
+                tx.execute(&format!("UPDATE {table} SET id = ?1 WHERE id = ?2"), params![new_id, id])?;
+            }
+        }
+        Ok(())
+    };
+    leaf("lg_launched_game_raw_data", rows.raw_data.iter().map(|r| r.id).collect())?;
+    leaf("lg_team_completed_quests", rows.cqs.iter().map(|r| r.id).collect())?;
+    leaf("lg_clash_members", rows.clash_members.iter().map(|r| r.id).collect())?;
+    leaf("lg_clash_validations", rows.clash_validations.iter().map(|r| r.id).collect())?;
+    leaf("lg_clash_consumed", rows.clash_consumed.iter().map(|r| r.id).collect())?;
+    leaf("lg_clash_purges", rows.clash_purges.iter().map(|r| r.id).collect())?;
+    Ok(())
+}
+
 /// Replace one launched game's rows with the snapshot's, inside the caller's
 /// transaction. The DELETE cascades the children, so this is a wholesale
 /// replacement, not a merge: the mother is the truth.
@@ -874,6 +990,7 @@ fn apply_game_rows(
         0
     };
 
+    rekey_conflicting_local_rows(tx, rows)?;
     tx.execute("DELETE FROM lg_launched_games WHERE id = ?", params![game_id])?;
     tx.execute(
         "INSERT INTO lg_launched_games
@@ -1001,20 +1118,11 @@ pub async fn become_mother(
     port: u16,
     mdns_label: Option<String>,
 ) -> Result<BecomeMotherInfo, String> {
-    // Every device runs its OWN idle local server from boot (ensureMotherServer),
-    // so "already running" is the normal case, not an error - stop it before we
-    // adopt the game and start the replacement. Take it out under the lock, then
-    // shut it down without holding the lock (the join await would otherwise
-    // block other server-state callers).
-    let existing = { state.inner.lock().await.take() };
-    if let Some(running) = existing {
-        if let Some(m) = running.mdns {
-            let _ = m.daemon.unregister(&m.full_name);
-            let _ = m.daemon.shutdown();
-        }
-        let _ = running.shutdown.send(());
-        let _ = running.join.await;
-    }
+    // NOTE: a server already running on this device is stopped only once every
+    // guard below has passed and the snapshot is adopted (step 5-ter). Stopping
+    // it up front meant any refusal - no snapshot, scenario not synced, stale
+    // snapshot - left a serving mother with NO server at all, and the venue with
+    // no mother to find.
 
     let db_path = resolve_db_path(&app)?;
     let conn = DbConnection::open(db_path.clone())
@@ -1055,6 +1163,31 @@ pub async fn become_mother(
     let old_epoch = rows.mother_epoch;
     let new_epoch = old_epoch + 1;
     let snap_state_version = rows.state_version;
+
+    // 2-bis. Staleness guard. Our own rows for this game may be NEWER than the
+    // cached snapshot - typically on the device that was promoted earlier: its
+    // cache still holds the dead mother's copy (epoch N) while it has been
+    // serving at N+1 ever since. Adopting would silently roll the game back to
+    // the moment of the failover. The `stale_snapshot` marker lets the caller
+    // fall back to simply (re)starting its own server.
+    let local_epoch: Option<i64> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+            Ok(c.query_row(
+                "SELECT mother_epoch FROM lg_launched_games WHERE id = ?",
+                params![launched_game_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(le) = local_epoch {
+        if le > old_epoch {
+            return Err(format!(
+                "stale_snapshot: this device already holds a newer copy of the game (epoch {le} > cached {old_epoch})"
+            ));
+        }
+    }
 
     // 3. Content guard - refuse if this device hasn't synced the scenario.
     let game_uniqid_for_guard = game_uniqid.clone();
@@ -1120,6 +1253,10 @@ pub async fn become_mother(
             _ => None,
         }
     });
+    // None = an older snapshot without the field: keep our own list.
+    let snap_revoked: Option<Vec<String>> = snap.get("revoked_devices").and_then(|v| v.as_array()).map(|a| {
+        a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+    });
     let (self_peer_id, self_peer_secret) = conn
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(i64, String)> {
             let tx = c.transaction()?;
@@ -1156,6 +1293,18 @@ pub async fn become_mother(
                     (tx.last_insert_rowid(), new_self_secret.clone())
                 }
             };
+
+            // 5a-bis. Inherit the dead mother's sticky removals (retours sept. #8).
+            if let Some(list) = snap_revoked.as_ref() {
+                if tx.execute("DELETE FROM revoked_devices", []).is_ok() {
+                    for u in list {
+                        let _ = tx.execute(
+                            "INSERT OR IGNORE INTO revoked_devices (peer_uuid) VALUES (?)",
+                            params![u],
+                        );
+                    }
+                }
+            }
 
             // 5b. Replace this game's rows at our NEW epoch. `preserve` is false:
             // taking ownership doesn't make us the device that launched the game,
@@ -1222,6 +1371,21 @@ pub async fn become_mother(
     // for the rest of the session.
     cache.inner.lock().await.clear();
     cache.fails.lock().await.clear();
+
+    // 5-ter. Every device may run its OWN local server (ensureMotherServer), so
+    // "already running" is the normal case, not an error - stop it now that the
+    // adoption is committed, then start the replacement. Take it out under the
+    // lock, then shut it down without holding the lock (the join await would
+    // otherwise block other server-state callers).
+    let existing = { state.inner.lock().await.take() };
+    if let Some(running) = existing {
+        if let Some(m) = running.mdns {
+            let _ = m.daemon.unregister(&m.full_name);
+            let _ = m.daemon.shutdown();
+        }
+        let _ = running.shutdown.send(());
+        let _ = running.join.await;
+    }
 
     // 6. Build state + serve + mDNS (epoch bumped so fencing prefers us).
     let app_state = AppState {
@@ -1314,7 +1478,14 @@ pub async fn become_mother(
                         .into(),
                 );
             }
-            Some((ssid, password)) => match crate::hotspot::mother_start_hotspot(ssid, password).await {
+            Some((ssid, password)) => match {
+                // Retours sept. #21: still associated to the OLD mother's
+                // same-SSID AP (it may well still be on the air) - leave it
+                // first, or we end up with its 192.168.137.x lease next to our
+                // own .1 and advertise both.
+                crate::leave_ssid_as_client(&ssid).await;
+                crate::hotspot::mother_start_hotspot(ssid, password).await
+            } {
                 Ok(info) => {
                     hotspot_started = true;
                     // Re-register mDNS with the AP IPv4s so clients resolve us.
@@ -1495,33 +1666,51 @@ pub struct TakeoverTarget {
     pub epoch: i64,
 }
 
-/// The secret this device should present when talking to the CURRENT mother of
-/// its game. Prefers a pairing secret from `paired_mothers` (the mother adopted
-/// our row, so it honours this) and falls back to our own `is_self` secret
-/// (honoured when WE were the mother the live one was promoted from). None if
-/// neither exists.
-async fn best_outbound_secret(conn: &DbConnection) -> Option<String> {
-    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
-        let paired: Option<String> = c
+/// Every secret this device could present to the CURRENT mother of its game,
+/// best first: all `paired_mothers` secrets (the mother adopted our row, so it
+/// honours one of them; most recently seen first, never-seen rows last), then
+/// our own `is_self` secret (honoured when WE were the mother the live one was
+/// promoted from). Callers that get a 401/403 try the next one.
+///
+/// Trying only the first used to strand the "take back control" path after a
+/// failover: the freshest `paired_mothers` row is not necessarily the one the
+/// live mother honours (a satellite that followed several mothers holds a row
+/// per mother), and a single refusal ended the takeover with an error.
+async fn outbound_secrets(conn: &DbConnection) -> Vec<String> {
+    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut stmt = c.prepare(
+            "SELECT peer_secret FROM paired_mothers
+             ORDER BY last_seen_at IS NULL, last_seen_at DESC, paired_at DESC",
+        )?;
+        for s in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let s = s?;
+            if !s.is_empty() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        let own: Option<String> = c
             .query_row(
-                "SELECT peer_secret FROM paired_mothers ORDER BY last_seen_at DESC LIMIT 1",
+                "SELECT peer_secret FROM paired_devices WHERE is_self = 1 LIMIT 1",
                 [],
                 |r| r.get(0),
             )
             .optional()?;
-        if paired.is_some() {
-            return Ok(paired);
+        if let Some(s) = own.filter(|s| !s.is_empty()) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
         }
-        Ok(c.query_row(
-            "SELECT peer_secret FROM paired_devices WHERE is_self = 1 LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?)
+        Ok(out)
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_default()
+}
+
+/// Whether a `pull_snapshot_over_http` error is the mother refusing our token
+/// (worth retrying with another secret) rather than a transport failure.
+fn is_auth_refusal(err: &str) -> bool {
+    err.contains("HTTP 401") || err.contains("HTTP 403")
 }
 
 /// "Regain control" detection. Returns the live mother to take over from, if
@@ -1565,46 +1754,108 @@ pub async fn get_takeover_target(
         .ok()
         .flatten();
 
-    let mothers = run_mdns_discovery(Duration::from_millis(2000)).await.unwrap_or_default();
-    let best = mothers
+    let mut mothers: Vec<DiscoveredMother> = run_mdns_discovery(Duration::from_millis(2000))
+        .await
+        .unwrap_or_default()
         .into_iter()
         .filter(|m| m.client_id == Some(client_id))
         .filter(|m| self_uuid.as_deref() != Some(m.mother_uuid.as_str()))
         .filter(|m| m.epoch.map_or(false, |e| e > my_epoch))
-        .max_by_key(|m| m.epoch.unwrap_or(0));
-    let Some(m) = best else { return Ok(None) };
-    let Some(addr) = select_address(&m.addresses) else { return Ok(None) };
+        .collect();
+    mothers.sort_by_key(|m| std::cmp::Reverse(m.epoch.unwrap_or(0)));
 
-    // Game id+name: our local row (same id, preserved through adoption) if we
-    // have one, else ask the live mother.
-    let (gid, name) = match local {
-        Some((id, nm, _)) => (id, nm),
-        None => {
-            let Some(secret) = best_outbound_secret(&conn).await else { return Ok(None) };
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .connect_timeout(Duration::from_millis(1500))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let resp = client
-                .get(format!("http://{addr}:{}/launched_games.php?action=list_active", m.port))
-                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Ok(None);
+    // Game id+name. Ask the live mother which games it is ACTUALLY serving and
+    // prefer one we also hold locally (ids are preserved through adoption).
+    // Picking our local row blind - "highest epoch among our unfinished games" -
+    // could land on a leftover unfinished game from an earlier session that the
+    // live mother knows nothing about; the snapshot fetch then came back empty
+    // and "take back control" failed with an error (Ludiom field test).
+    let local_ids: Vec<(i64, String)> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String)>> {
+            let mut stmt = c.prepare(
+                "SELECT id, name FROM lg_launched_games WHERE client_id = ? AND ended = 0",
+            )?;
+            let rows = stmt.query_map(params![client_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(1500))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let secrets = outbound_secrets(&conn).await;
+
+    // Retours sept. #14: the target used to be "first matching address of the
+    // highest-epoch advertisement", unverified - a mother advertising a stale
+    // client lease (192.168.137.138) sent the regain button at an address that
+    // no longer existed, while the "someone took over" state never cleared.
+    // Now every advertised address of every candidate is tried, best epoch
+    // first, and only an address that ANSWERS becomes the target. A candidate
+    // nobody can reach is no target at all: this device simply stays mother.
+    let mut chosen: Option<(DiscoveredMother, String, Option<Vec<(i64, String)>>)> = None;
+    'candidates: for m in mothers {
+        let mut addrs = m.addresses.clone();
+        if let Some(first) = select_address(&m.addresses) {
+            addrs.retain(|a| a != &first);
+            addrs.insert(0, first);
+        }
+        for addr in addrs.into_iter().filter(|a| a.parse::<Ipv4Addr>().is_ok()) {
+            // None = could not authenticate; Some(list) = the mother answered.
+            let mut reached = false;
+            let mut served: Option<Vec<(i64, String)>> = None;
+            for secret in &secrets {
+                let Ok(resp) = client
+                    .get(format!("http://{addr}:{}/launched_games.php?action=list_active", m.port))
+                    .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                    .send()
+                    .await
+                else {
+                    break; // transport failure: try the next address
+                };
+                reached = true;
+                if !resp.status().is_success() {
+                    continue;
+                }
+                let Ok(body) = resp.json::<Value>().await else { break };
+                let games = body
+                    .get("games")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|g| {
+                                let id = g.get("id").and_then(|v| v.as_i64())?;
+                                let nm = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                Some((id, nm))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                served = Some(games);
+                break;
             }
-            let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-            let g = body.get("games").and_then(|v| v.as_array()).and_then(|a| a.first());
-            match g {
-                Some(g) => (
-                    g.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                    g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                ),
+            if reached {
+                chosen = Some((m, addr, served));
+                break 'candidates;
+            }
+        }
+    }
+    let Some((m, addr, served)) = chosen else { return Ok(None) };
+    let (gid, name) = match served {
+        Some(games) => {
+            let shared = games.iter().find(|(id, _)| local_ids.iter().any(|(l, _)| l == id));
+            match shared.or(games.first()) {
+                Some((id, nm)) => (*id, nm.clone()),
+                // The live mother serves nothing: there is no game to take over.
                 None => return Ok(None),
             }
         }
+        // Couldn't ask: fall back to our own best guess, as before.
+        None => match local {
+            Some((id, nm, _)) => (id, nm),
+            None => return Ok(None),
+        },
     };
     if gid == 0 {
         return Ok(None);
@@ -1688,12 +1939,28 @@ pub async fn fetch_snapshot_from_mother(
     port: u16,
 ) -> Result<bool, String> {
     let conn = open_db_for_command(&app).await?;
-    let Some(secret) = best_outbound_secret(&conn).await else {
+    let secrets = outbound_secrets(&conn).await;
+    if secrets.is_empty() {
         return Err("this device has no credentials to authenticate with the current mother".into());
-    };
+    }
 
-    let Some(snap) = pull_snapshot_over_http(&format!("{addr}:{port}"), &secret, launched_game_id).await?
-    else {
+    // Try each secret we hold until the mother accepts one; only a refusal
+    // (401/403) moves on - a transport error is final.
+    let addr_port = format!("{addr}:{port}");
+    let mut pulled: Option<Option<Value>> = None;
+    let mut last_err = String::new();
+    for secret in &secrets {
+        match pull_snapshot_over_http(&addr_port, secret, launched_game_id).await {
+            Ok(v) => {
+                pulled = Some(v);
+                break;
+            }
+            Err(e) if is_auth_refusal(&e) => last_err = e,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some(pulled) = pulled else { return Err(last_err) };
+    let Some(snap) = pulled else {
         return Ok(false);
     };
     let gid = snap.get("game").and_then(|g| g.get("id")).and_then(|v| v.as_i64());
@@ -1970,10 +2237,14 @@ async fn ensure_self_pair(
 ) -> tokio_rusqlite::Result<SelfPair> {
     conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<SelfPair> {
         let tx = c.transaction()?;
-        // Read or initialize mother_device_uuid in schema_meta.
-        let mother_uuid: String = match tx
+        // A device has ONE identity, whatever its role: the mother uuid IS the
+        // `client_device_uuid` it pairs to other mothers with. `become_mother`
+        // always advertised that one, while a plain boot used to mint a random
+        // `mother_device_uuid` - so the same PC showed up on satellites under a
+        // fresh hex id every time it changed role (retours sept. #7).
+        let client_uuid: String = match tx
             .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'mother_device_uuid'",
+                "SELECT value FROM schema_meta WHERE key = 'client_device_uuid'",
                 [],
                 |r| r.get::<_, String>(0),
             )
@@ -1983,15 +2254,24 @@ async fn ensure_self_pair(
             None => {
                 let new = uuid::Uuid::new_v4().to_string();
                 tx.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('mother_device_uuid', ?)",
+                    "INSERT INTO schema_meta(key, value) VALUES ('client_device_uuid', ?)",
                     params![new],
                 )?;
                 new
             }
         };
+        let legacy_uuid: Option<String> = tx
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'mother_device_uuid'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let mother_uuid = client_uuid.clone();
 
-        // Find or create the self paired_devices entry.
-        let existing: Option<(i64, String)> = tx
+        // Find the self row: under the current identity, else under the legacy
+        // random one (one-time migration below).
+        let mut existing: Option<(i64, String)> = tx
             .query_row(
                 "SELECT id, peer_secret FROM paired_devices
                  WHERE peer_uuid = ? AND is_self = 1",
@@ -1999,6 +2279,34 @@ async fn ensure_self_pair(
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
+        if existing.is_none() {
+            if let Some(old) = legacy_uuid.as_deref().filter(|o| *o != mother_uuid) {
+                let legacy_row: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT id, peer_secret FROM paired_devices WHERE peer_uuid = ? AND is_self = 1",
+                        params![old],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((id, secret)) = legacy_row {
+                    // Free the uuid (a non-self row for our own identity is a
+                    // ghost anyway - heal merges it into the self row), then
+                    // re-key the self row. Its id and secret are kept, so game
+                    // participation and our own client stack stay valid.
+                    heal_self_identity(&tx, id)?;
+                    tx.execute(
+                        "UPDATE paired_devices SET peer_uuid = ?1 WHERE id = ?2",
+                        params![mother_uuid, id],
+                    )?;
+                    existing = Some((id, secret));
+                }
+            }
+        }
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('mother_device_uuid', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![mother_uuid],
+        )?;
 
         let (peer_id, peer_secret) = match existing {
             Some(t) => t,
@@ -2657,6 +2965,16 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Sticky removals travel too, so a promoted mother keeps refusing
+            // the devices the operator removed (retours sept. #8). Empty when
+            // the table doesn't exist yet.
+            let revoked_devices: Vec<String> = c
+                .prepare("SELECT peer_uuid FROM revoked_devices")
+                .and_then(|mut st| {
+                    st.query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap_or_default();
 
             Ok(Some(json!({
                 "schema": 1,
@@ -2671,6 +2989,7 @@ async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> O
                 "teams": teams,
                 "completed_quests": completed_quests,
                 "paired_devices": paired_devices,
+                "revoked_devices": revoked_devices,
                 "clash_members": clash_members,
                 "clash_validations": clash_validations,
                 "clash_consumed": clash_consumed,
@@ -6153,6 +6472,35 @@ async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, Ap
         }));
     }
 
+    // Sticky removal (retours sept. #8): a device the operator removed is not
+    // auto-approved again. Only a pairing started by hand from that device
+    // (`manual: true`) lifts it. Tolerates a DB without migration 34.
+    let manual = body.get("manual").and_then(|v| v.as_bool()).unwrap_or(false);
+    let revoked: bool = state
+        .db
+        .call({
+            let peer_uuid = peer_uuid.clone();
+            move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+                if manual {
+                    let _ = c.execute("DELETE FROM revoked_devices WHERE peer_uuid = ?", params![peer_uuid]);
+                    return Ok(false);
+                }
+                Ok(c
+                    .query_row("SELECT 1 FROM revoked_devices WHERE peer_uuid = ?", params![peer_uuid], |_| Ok(true))
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false))
+            }
+        })
+        .await?;
+    if revoked {
+        return Ok(json!({
+            "status": "denied",
+            "message": "This device was removed from the mother. Join again by hand from this device to re-pair it."
+        }));
+    }
+
     // Auto-pair fast path: trusted same-client joiner. Create the paired_devices
     // row now and hand the secret back immediately (no pair_requests row, no
     // polling - the joiner reads "approved" straight from this response).
@@ -6263,15 +6611,36 @@ pub async fn mother_revoke_paired_device(
 ) -> Result<(), String> {
     let conn = open_db_for_command(&app).await?;
     conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-        let n = c.execute(
-            "DELETE FROM paired_devices WHERE id = ? AND is_self = 0",
-            params![peer_id],
-        )?;
-        if n == 0 {
+        let tx = c.transaction()?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT peer_uuid, peer_label FROM paired_devices WHERE id = ? AND is_self = 0",
+                params![peer_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((peer_uuid, peer_label)) = row else {
             return Err(tokio_rusqlite::Error::Other(
                 format!("no non-self paired_devices row id={peer_id}").into(),
             ));
-        }
+        };
+        tx.execute("DELETE FROM paired_devices WHERE id = ?", params![peer_id])?;
+        // Sticky removal (retours sept. #8): remember it, so the same-client
+        // auto-approve can't silently re-pair the device at its next ping.
+        // Tolerates a DB whose migration 34 hasn't run yet.
+        let _ = tx.execute(
+            "INSERT INTO revoked_devices (peer_uuid, peer_label) VALUES (?1, ?2)
+             ON CONFLICT(peer_uuid) DO UPDATE SET revoked_at = CURRENT_TIMESTAMP, peer_label = excluded.peer_label",
+            params![peer_uuid, peer_label],
+        );
+        // Let satellites' cached snapshots (and a future promoted mother) see
+        // the new pairing table without waiting for the next game action.
+        tx.execute(
+            "INSERT INTO schema_meta(key, value) VALUES('lg_state_version', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            [],
+        )?;
+        tx.commit()?;
         Ok(())
     })
     .await
@@ -6316,7 +6685,7 @@ pub async fn client_save_paired_mother(
             "INSERT INTO paired_mothers (mother_uuid, mother_label, peer_secret, last_seen_at)
              VALUES (?, ?, ?, CURRENT_TIMESTAMP)
              ON CONFLICT(mother_uuid) DO UPDATE SET
-               mother_label = excluded.mother_label,
+               mother_label = COALESCE(excluded.mother_label, paired_mothers.mother_label),
                peer_secret = excluded.peer_secret,
                last_seen_at = CURRENT_TIMESTAMP",
             params![mother_uuid, mother_label, peer_secret],
@@ -6399,6 +6768,50 @@ pub async fn client_forget_paired_mother(
     let mut guard = cache.inner.lock().await;
     guard.remove(&mother_uuid);
     Ok(())
+}
+
+/// After a verified switch to `keep_uuid` (failover re-point, yield), drop the
+/// other paired mothers not heard from for `stale_minutes`. A satellite has ONE
+/// mother: the leftovers were shown as extra "connected" mothers (retours sept.
+/// #7) and, while their endpoint stayed warm, the 15 s route tick could drag the
+/// games route back to the old machine (#18). Recently seen rows are kept - a
+/// planned handover may still be settling. Returns how many rows were removed.
+#[tauri::command]
+pub async fn client_prune_paired_mothers(
+    app: AppHandle,
+    cache: tauri::State<'_, MotherEndpointCache>,
+    keep_uuid: String,
+    stale_minutes: i64,
+) -> Result<Vec<String>, String> {
+    let conn = open_db_for_command(&app).await?;
+    let window = format!("-{} minutes", stale_minutes.max(0));
+    let removed: Vec<String> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<String>> {
+            let tx = c.transaction()?;
+            let uuids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT mother_uuid FROM paired_mothers
+                      WHERE mother_uuid <> ?1
+                        AND (last_seen_at IS NULL OR last_seen_at < datetime('now', ?2))",
+                )?;
+                let rows = stmt.query_map(params![keep_uuid, window], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for u in &uuids {
+                tx.execute("DELETE FROM paired_mothers WHERE mother_uuid = ?", params![u])?;
+            }
+            tx.commit()?;
+            Ok(uuids)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    if !removed.is_empty() {
+        let mut guard = cache.inner.lock().await;
+        for u in &removed {
+            guard.remove(u);
+        }
+    }
+    Ok(removed)
 }
 
 // Also expose a "get-or-create" for the client's own device identity, so the
@@ -6509,6 +6922,9 @@ pub async fn client_pair_with_mother(
     // caller doesn't know it (falls back to manual approval).
     client_id: Option<i64>,
     timeout_ms: Option<u64>,
+    // True when the operator started this pairing by hand ("Join" button): it
+    // lifts a sticky removal on the mother. Automatic re-pairs pass None/false.
+    manual: Option<bool>,
 ) -> Result<JoinOutcome, String> {
     // Stable per-device peer uuid (same source as client_get_device_identity).
     let conn = open_db_for_command(&app).await?;
@@ -6579,6 +6995,7 @@ pub async fn client_pair_with_mother(
         "peer_os": peer_os,
         "peer_app_version": peer_app_version,
         "client_id": client_id,
+        "manual": manual.unwrap_or(false),
     });
     let mut chosen: Option<String> = None;
     let mut request_id: Option<i64> = None;
@@ -6611,7 +7028,7 @@ pub async fn client_pair_with_mother(
                                     "INSERT INTO paired_mothers (mother_uuid, mother_label, peer_secret, last_seen_at)
                                      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                                      ON CONFLICT(mother_uuid) DO UPDATE SET
-                                       mother_label = excluded.mother_label,
+                                       mother_label = COALESCE(excluded.mother_label, paired_mothers.mother_label),
                                        peer_secret = excluded.peer_secret,
                                        last_seen_at = CURRENT_TIMESTAMP",
                                     params![uuid_db, label_db, secret_db],
@@ -6667,7 +7084,7 @@ pub async fn client_pair_with_mother(
                                     "INSERT INTO paired_mothers (mother_uuid, mother_label, peer_secret, last_seen_at)
                                      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                                      ON CONFLICT(mother_uuid) DO UPDATE SET
-                                       mother_label = excluded.mother_label,
+                                       mother_label = COALESCE(excluded.mother_label, paired_mothers.mother_label),
                                        peer_secret = excluded.peer_secret,
                                        last_seen_at = CURRENT_TIMESTAMP",
                                     params![uuid_db, label_db, secret_db],
@@ -6762,8 +7179,15 @@ fn start_mdns(
     props.insert("uuid".into(), mother_uuid.to_string());
     props.insert("client_id".into(), client_id.to_string());
     props.insert("epoch".into(), epoch.to_string());
-    if let Some(l) = label {
-        props.insert("label".into(), l.to_string());
+    // Never advertise without a name: satellites fall back to the uuid prefix
+    // ("3ea399e5"), which nobody on the field can map to a PC (retours sept. #7).
+    // Promotion paths used to pass no label at all.
+    let fallback_label = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if let Some(l) = label.filter(|l| !l.trim().is_empty()).map(str::to_string).or(fallback_label) {
+        props.insert("label".into(), l);
     }
     let ip_arg = advertised.join(",");
     let svc = ServiceInfo::new(
@@ -7138,7 +7562,7 @@ pub async fn client_verify_mother_candidate(
     if let Some(t) = token.filter(|t| !t.is_empty()) {
         secrets.push(t);
     }
-    if let Some(s) = best_outbound_secret(&conn).await {
+    for s in outbound_secrets(&conn).await {
         if !secrets.contains(&s) {
             secrets.push(s);
         }
@@ -7213,7 +7637,7 @@ pub async fn get_local_ipv4s() -> Result<Vec<String>, String> {
 // and launches it with `Start-Process -Verb RunAs`. Used for the static-IP
 // fallback below - changing a NIC's IP config requires admin.
 #[cfg(target_os = "windows")]
-fn run_elevated_powershell(script: &str) -> Result<i32, String> {
+pub(crate) fn run_elevated_powershell(script: &str) -> Result<i32, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut path = std::env::temp_dir();
@@ -7446,11 +7870,21 @@ fn designated_lan_addrs(source: &str, candidates: &[String]) -> Vec<String> {
         // "hotspot" and any unknown/legacy value default to hotspot semantics: the
         // AP is EITHER the ICS subnet (192.168.137.*) OR a link-local (169.254.*)
         // address. Both are AP-local; the routable office/upstream IP is excluded.
-        _ => candidates
-            .iter()
-            .filter(|a| is_ics(a) || is_link_local(a))
-            .cloned()
-            .collect(),
+        _ => {
+            // Windows ICS always gives its own soft-AP 192.168.137.1. When we
+            // hold it, any OTHER 192.168.137.x is a client lease on somebody
+            // else's same-SSID AP (the old mother's, still on the air) - an
+            // address satellites and regain prompts then picked and never
+            // reached (retours sept. #14/#21). Advertise the AP address alone.
+            if candidates.iter().any(|a| a == "192.168.137.1") {
+                return vec!["192.168.137.1".to_string()];
+            }
+            candidates
+                .iter()
+                .filter(|a| is_ics(a) || is_link_local(a))
+                .cloned()
+                .collect()
+        }
     }
 }
 
@@ -7829,6 +8263,22 @@ pub async fn client_ping_mother(
         return Err(PingErr::WrongUuid { got });
     }
 
+    // A real, authenticated exchange: this is what "Connecté · vu à HH:MM" on the
+    // satellite's Network page reflects. last_seen_at used to be written only at
+    // pairing, so a dead mother kept "Connecté" for hours (retours sept. #7).
+    if let Ok(conn) = open_db_for_command(&app).await {
+        let uuid_for_q = mother_uuid.clone();
+        let _ = conn
+            .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE paired_mothers SET last_seen_at = CURRENT_TIMESTAMP WHERE mother_uuid = ?",
+                    params![uuid_for_q],
+                )?;
+                Ok(())
+            })
+            .await;
+    }
+
     // Feature A: remember the mother's Wi-Fi creds for auto-rejoin. Upsert into
     // wifi_networks (origin='paired'); NEVER touch auto_connect, so the operator's
     // consent choice survives a refreshed password.
@@ -8013,4 +8463,161 @@ pub async fn client_describe_local_role(
         paired_devices_count,
         paired_mothers_count,
     })
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+
+    const SCHEMA: &str = r#"
+        CREATE TABLE lg_launched_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, summary_uuid TEXT NOT NULL UNIQUE,
+            client_id INTEGER NOT NULL, game_uniqid TEXT NOT NULL, name TEXT NOT NULL,
+            number_of_teams INTEGER NOT NULL, game_type TEXT NOT NULL, duration INTEGER NOT NULL,
+            start_time TEXT NULL, started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), mother_epoch INTEGER NOT NULL DEFAULT 1,
+            ended_at INTEGER NULL, launched_by_self INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE lg_launched_game_meta (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            meta_name TEXT NOT NULL, meta_value TEXT NULL,
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
+        CREATE TABLE lg_launched_game_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            device_id INTEGER NOT NULL, device_label TEXT NULL, os TEXT NULL, os_version TEXT NULL,
+            connected INTEGER NOT NULL DEFAULT 1, UNIQUE(launched_game_id, device_id),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
+        CREATE TABLE lg_launched_game_raw_data (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            device_id INTEGER NOT NULL, raw_data TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
+        CREATE TABLE lg_teams (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_number INTEGER NOT NULL, team_name TEXT NULL, pattern INTEGER NOT NULL, score INTEGER NOT NULL DEFAULT 0,
+            key_id INTEGER NULL, start_time INTEGER NULL, end_time INTEGER NULL, language TEXT NULL,
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
+        CREATE TABLE lg_team_completed_quests (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL, teammate_chip_id INTEGER NULL, quest_id INTEGER NULL, quest_number TEXT NOT NULL,
+            points_awarded INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE,
+            FOREIGN KEY (team_id) REFERENCES lg_teams(id) ON DELETE CASCADE);
+        CREATE TABLE lg_clash_members (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL, chip_id INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE,
+            FOREIGN KEY (team_id) REFERENCES lg_teams(id) ON DELETE CASCADE);
+        CREATE TABLE lg_clash_validations (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL, chip_id INTEGER NOT NULL, combo_index INTEGER NOT NULL,
+            territory_index INTEGER NOT NULL, seq INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE,
+            FOREIGN KEY (team_id) REFERENCES lg_teams(id) ON DELETE CASCADE);
+        CREATE TABLE lg_clash_consumed (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            chip_id INTEGER NOT NULL, punch_key TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
+        CREATE TABLE lg_clash_effectif (launched_game_id INTEGER NOT NULL, team_id INTEGER NOT NULL, size INTEGER NOT NULL,
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE,
+            FOREIGN KEY (team_id) REFERENCES lg_teams(id) ON DELETE CASCADE);
+        CREATE TABLE lg_clash_purges (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL, chip_id INTEGER NOT NULL, territory_index INTEGER NOT NULL, seq INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE,
+            FOREIGN KEY (team_id) REFERENCES lg_teams(id) ON DELETE CASCADE);
+        CREATE TABLE lg_game_summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, summary_uuid TEXT NOT NULL UNIQUE,
+            launched_game_id INTEGER NULL);
+    "#;
+
+    fn db() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.pragma_update(None, "foreign_keys", "ON").unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c
+    }
+
+    /// Local, unrelated game 7 owns raw 5, team 3 (+ quest 9 on it) and a
+    /// summary; the snapshot adopts a game also numbered 7, another summary_uuid.
+    fn seed_local(c: &rusqlite::Connection) {
+        c.execute_batch(
+            "INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration, ended)
+               VALUES (7, 'local-uuid', 1, 'g', 'local', 1, 'quest', 0, 1);
+             INSERT INTO lg_launched_game_raw_data (id, launched_game_id, device_id, raw_data) VALUES (5, 7, 1, 'local-raw');
+             INSERT INTO lg_teams (id, launched_game_id, team_number, pattern) VALUES (3, 7, 1, 0);
+             INSERT INTO lg_team_completed_quests (id, launched_game_id, team_id, quest_number) VALUES (9, 7, 3, 'q');
+             INSERT INTO lg_game_summaries (summary_uuid, launched_game_id) VALUES ('local-uuid', 7);",
+        )
+        .unwrap();
+    }
+
+    fn snapshot() -> SnapshotRows {
+        parse_snapshot_rows(&json!({
+            "mother_epoch": 2, "state_version": 4,
+            "game": {"id": 7, "summary_uuid": "adopted-uuid", "client_id": 1, "game_uniqid": "g",
+                     "name": "adopted", "game_type": "quest"},
+            "raw_data": [{"id": 5, "device_id": 2, "raw_data": "adopted-raw"}],
+            "teams": [{"id": 3, "team_number": 1}],
+            "completed_quests": [{"id": 9, "team_id": 3, "quest_number": "q"}],
+        }))
+        .unwrap()
+    }
+
+    fn adopt(c: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+        let rows = snapshot();
+        let tx = c.transaction()?;
+        apply_game_rows(&tx, &rows, 3, false)?;
+        tx.commit()
+    }
+
+    fn one<T: rusqlite::types::FromSql>(c: &rusqlite::Connection, sql: &str) -> T {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn adopt_moves_colliding_local_rows_aside() {
+        let mut c = db();
+        seed_local(&c);
+        adopt(&mut c).expect("adopt must not hit UNIQUE");
+
+        assert_eq!(one::<String>(&c, "SELECT raw_data FROM lg_launched_game_raw_data WHERE id = 5"), "adopted-raw");
+        assert_eq!(one::<String>(&c, "SELECT name FROM lg_launched_games WHERE id = 7"), "adopted");
+
+        // The unrelated local game survived under a new id, children intact.
+        let local_gid: i64 = one(&c, "SELECT id FROM lg_launched_games WHERE summary_uuid = 'local-uuid'");
+        assert_ne!(local_gid, 7);
+        let raw: String = c
+            .query_row("SELECT raw_data FROM lg_launched_game_raw_data WHERE launched_game_id = ?", [local_gid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, "local-raw");
+        let (team_id, cq_team): (i64, i64) = c
+            .query_row(
+                "SELECT t.id, q.team_id FROM lg_teams t JOIN lg_team_completed_quests q ON q.team_id = t.id
+                  WHERE t.launched_game_id = ?",
+                [local_gid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(team_id, cq_team);
+        assert_ne!(team_id, 3);
+        assert_eq!(one::<i64>(&c, "SELECT launched_game_id FROM lg_game_summaries WHERE summary_uuid = 'local-uuid'"), local_gid);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    #[test]
+    fn adopt_is_repeatable() {
+        let mut c = db();
+        seed_local(&c);
+        adopt(&mut c).unwrap();
+        adopt(&mut c).expect("second adopt of the same snapshot must succeed");
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_launched_games"), 2);
+    }
+
+    #[test]
+    fn leaf_collision_only_moves_the_leaf() {
+        let mut c = db();
+        c.execute_batch(
+            "INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration)
+               VALUES (1, 'other', 1, 'g', 'other', 1, 'quest', 0);
+             INSERT INTO lg_launched_game_raw_data (id, launched_game_id, device_id, raw_data) VALUES (5, 1, 1, 'other-raw');",
+        )
+        .unwrap();
+        adopt(&mut c).unwrap();
+        let moved: i64 = one(&c, "SELECT id FROM lg_launched_game_raw_data WHERE raw_data = 'other-raw'");
+        assert_ne!(moved, 5);
+        let gid: i64 = c
+            .query_row("SELECT launched_game_id FROM lg_launched_game_raw_data WHERE id = ?", [moved], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gid, 1);
+    }
 }

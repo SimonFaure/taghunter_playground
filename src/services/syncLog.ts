@@ -240,6 +240,8 @@ export function triggerLabel(trigger: CycleStartedPayload['trigger'] | null): st
       return 'sync:triggerNetworkUp';
     case 'timer':
       return 'sync:triggerTimer';
+    case 'retry':
+      return 'sync:triggerRetry';
     case 'manual':
       return 'sync:triggerManual';
     default:

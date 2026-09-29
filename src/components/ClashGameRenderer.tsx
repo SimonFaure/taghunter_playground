@@ -380,14 +380,18 @@ export function ClashGameRenderer({
                   style={{
                     // An unboxed plate has no height of its own: keep the old
                     // padding so it still hugs the digits.
-                    ...(boxed ? { width: '100%', height: '100%' } : { padding: '0.375rem 1.25rem' }),
+                    // The digits are cap-trimmed (vcenter-text), so an unboxed
+                    // plate pins its old 1em line height back explicitly.
+                    ...(boxed
+                      ? { width: '100%', height: '100%' }
+                      : { padding: '0.375rem 1.25rem', height: 'calc(1em + 0.75rem)' }),
                     transform: `translate(${off.x}%, ${off.y}%)`,
                     fontSize: `${timerPx}px`,
                     lineHeight: 1,
                     color: inkTimer,
                   }}
                 >
-                  {formatClock(remainingSec)}
+                  <span className="vcenter-text">{formatClock(remainingSec)}</span>
                 </div>
               </div>
             );
@@ -429,19 +433,23 @@ export function ClashGameRenderer({
                   style={{ left: `${a.labelLeftPct}%`, top: `${a.labelTopPct}%` }}
                 >
                   <span
-                    className={`font-bold px-2.5 py-0.5 rounded whitespace-nowrap${
+                    className={`flex items-center font-bold px-2.5 py-0.5 rounded whitespace-nowrap${
                       frames?.territoryName ? '' : ' bg-black/60 border border-white/15'
                     }`}
                     style={{
                       fontSize: `${territoryNamePx}px`,
                       lineHeight: 1.35,
+                      // Border-box: the 1.35em line plus the py-0.5 padding.
+                      height: 'calc(1.35em + 0.25rem)',
                       color: inkTerritory,
                       ...(frames?.territoryName
                         ? { backgroundImage: `url(${frames.territoryName})`, backgroundSize: '100% 100%' }
                         : {}),
                     }}
                   >
-                    {territoryNames[t.index] || tc('territory_fallback', { n: i + 1 })}
+                    <span className="vcenter-text">
+                      {territoryNames[t.index] || tc('territory_fallback', { n: i + 1 })}
+                    </span>
                   </span>
                   <TerritoryGauge
                     t={t}
@@ -479,7 +487,7 @@ export function ClashGameRenderer({
                 overflow: 'hidden',
               }}
             >
-              {te.text}
+              <span className="vcenter-text">{te.text}</span>
             </div>
           ))}
 
@@ -614,7 +622,11 @@ export function ClashGameRenderer({
                       <span className="w-3 h-3 rounded-full" style={{ backgroundColor: v?.color ?? '#888' }} />
                     )}
                   </div>
-                  <div className="leading-tight max-w-[150px]">
+                  {/* 300px (was 150): authors reword the sentences to fit
+                      singular AND plural clan names ("Le clan %CLAN% a
+                      conquis…"), which no longer fit - retours sept. #67.
+                      Keep in step with the studio LayoutEditor mock. */}
+                  <div className="leading-tight max-w-[300px]">
                     <div className="text-xs font-semibold" style={{ color: inkEvent }}>
                       {runs.map((run, ri) => (
                         <span key={ri} style={run.clan ? { color: v?.color } : undefined}>

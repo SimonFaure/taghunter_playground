@@ -93,6 +93,7 @@
   "triggerForeground": "app en primer plano",
   "triggerNetworkUp": "reconexión de red",
   "triggerTimer": "comprobación periódica",
+  "triggerRetry": "reintento automático",
   "triggerManual": "manual",
   "triggerUnknown": "desconocido"
 }

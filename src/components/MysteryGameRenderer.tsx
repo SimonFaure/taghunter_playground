@@ -30,6 +30,10 @@ import {
   resolveMysteryGaugeGeometry,
   resolveMysteryStatusFrame,
   resolveMysteryUnderlayScale,
+  resolveMysteryEnigmaImageScale,
+  resolveMysteryUnderlayOffset,
+  resolveMysteryEnigmaImageOffset,
+  mysteryCenteredBox,
   type IdleLayout,
   type IngameFrames,
   type IngameLayout,
@@ -89,6 +93,13 @@ export interface MysteryRendererGameMeta {
   status_frame_over_image?: string;
   /** Size of the main-image underlay (see resolveMysteryUnderlayScale). */
   enigma_underlay_scale?: string;
+  /** Size of the main image itself (see resolveMysteryEnigmaImageScale). */
+  enigma_image_scale?: string;
+  /** Positions of the underlay / image (see resolveMysteryUnderlayOffset). */
+  enigma_underlay_offset_x?: string;
+  enigma_underlay_offset_y?: string;
+  enigma_image_offset_x?: string;
+  enigma_image_offset_y?: string;
 }
 
 export interface MysteryRendererEnigma {
@@ -414,6 +425,12 @@ export function MysteryGameRenderer({
   // paints the neutral, verdict-less layer: a white slab behind the artwork is
   // not wanted in-game, so `MYSTERY_STATUS_NEUTRAL` is no longer used here.
   const underlayScale = resolveMysteryUnderlayScale(gameMeta);
+  // The main image's own size. It used to be the underlay's (the image filled
+  // the tile), so resizing the sub-frame resized the picture (retour 2026-09-16).
+  const imageScale = resolveMysteryEnigmaImageScale(gameMeta);
+  // Their positions (retours sept. #38): each box can be moved off-centre.
+  const underlayOffset = resolveMysteryUnderlayOffset(gameMeta);
+  const imageOffset = resolveMysteryEnigmaImageOffset(gameMeta);
 
   const reachedBonuses = reachedMysteryBonuses(bonuses ?? [], score);
   const activeBonus = reachedBonuses.length > 0 ? reachedBonuses[reachedBonuses.length - 1] : null;
@@ -738,12 +755,16 @@ export function MysteryGameRenderer({
                             justifyContent: 'center',
                           }}
                         >
+                          {/* The full square available to the main image.
+                              The underlay (sub-frame) and the image are two
+                              SEPARATE centred boxes inside it, each with its
+                              own scale (retour 2026-09-16). */}
                           <div
                             style={{
                               position: 'relative',
-                              height: `${underlayScale}%`,
+                              height: '100%',
                               aspectRatio: '1 / 1',
-                              maxWidth: `${underlayScale}%`,
+                              maxWidth: '100%',
                               overflow: 'hidden',
                             }}
                           >
@@ -752,28 +773,36 @@ export function MysteryGameRenderer({
                                 plate behind every un-answered image - a white
                                 slab under the artwork is never wanted in-game. */}
                             {featuredOverlay && (
-                              <MysteryStatusPlate
-                                color={featuredOverlay}
-                                frame={statusFrame}
-                                legacyRadius={12}
-                              />
+                              <div style={mysteryCenteredBox(underlayScale, underlayOffset)}>
+                                <MysteryStatusPlate
+                                  color={featuredOverlay}
+                                  frame={statusFrame}
+                                  legacyRadius={12}
+                                />
+                              </div>
                             )}
                             {imgSrc && (
-                              <CenterEnigmaImage src={imgSrc} blurred={!revealed} alt={text} />
+                              <div style={mysteryCenteredBox(imageScale, imageOffset)}>
+                                <CenterEnigmaImage src={imgSrc} blurred={!revealed} alt={text} />
+                              </div>
                             )}
                             {/* Same tint repeated over the artwork so a picture
                                 exported on an opaque background still shows its
                                 verdict colour (retour #83). */}
                             {featuredOverlay && (
-                              <MysteryStatusPlate
-                                color={featuredOverlay}
-                                frame={statusFrame}
-                                legacyRadius={12}
-                                over
-                              />
+                              <div style={mysteryCenteredBox(underlayScale, underlayOffset)}>
+                                <MysteryStatusPlate
+                                  color={featuredOverlay}
+                                  frame={statusFrame}
+                                  legacyRadius={12}
+                                  over
+                                />
+                              </div>
                             )}
                             {colorblind && featuredKind && (
-                              <StatusMark kind={featuredKind} size={stage.height * 0.075} />
+                              <div style={mysteryCenteredBox(underlayScale, underlayOffset)}>
+                                <StatusMark kind={featuredKind} size={stage.height * 0.075} />
+                              </div>
                             )}
                           </div>
                         </div>
@@ -861,10 +890,11 @@ export function MysteryGameRenderer({
 
               {/* The bonus ("overscore") plate, placed by the author
                   (ingame_frames.bonus, default = the board's left cell). The
-                  "empty bonus" image is on screen for the whole run; the highest
-                  tier a team has unlocked by scoring ABOVE score_full_game is
-                  drawn on top of it, REPLACING whatever tier was showing before
-                  (retour #35). Absolutely positioned over the stage, so moving
+                  "empty bonus" image shows until a tier is reached; the highest
+                  tier a team has unlocked by scoring ABOVE score_full_game then
+                  takes its PLACE at the plate's full size - not inside it
+                  (retour 2026-09-16) - replacing whatever tier was showing
+                  before (retour #35). Absolutely positioned over the stage, so moving
                   or resizing it never disturbs the board columns. */}
               {(emptyBonusUrl || activeBonus) && (
                 <div
@@ -880,7 +910,7 @@ export function MysteryGameRenderer({
                     pointerEvents: 'none',
                   }}
                 >
-                  {emptyBonusUrl && (
+                  {emptyBonusUrl && !activeBonus?.image && (
                     <img
                       src={emptyBonusUrl}
                       alt=""
@@ -915,21 +945,21 @@ export function MysteryGameRenderer({
                         <img
                           src={resolveMediaUrl(activeBonus.image)}
                           alt=""
+                          // Same box as the empty plate it replaces - legacy
+                          // `.team_bonus_container img { width: 100% }` stacked
+                          // over `.team_bonus_container_empty`.
                           style={{
-                            maxWidth: '100%',
-                            // 37 % of the plate, which is what the old fixed
-                            // 24 %-of-stage cap came to inside the old fixed
-                            // 65 %-tall cell: the tier art keeps its size on an
-                            // untouched scenario and now scales WITH the plate
-                            // instead of ignoring it.
-                            maxHeight: '37%',
-                            width: 'auto',
-                            height: 'auto',
+                            position: 'absolute',
+                            inset: 0,
+                            width: '100%',
+                            height: '100%',
                             objectFit: 'contain',
                           }}
                         />
                       )}
-                      {activeBonus.name && (
+                      {/* The tier artwork carries its own wording, so the name
+                          is only drawn for a tier authored without an image. */}
+                      {activeBonus.name && !activeBonus.image && (
                         <div
                           style={{
                             fontSize: `${stage.height * 0.018}px`,
@@ -941,19 +971,17 @@ export function MysteryGameRenderer({
                             maxWidth: '100%',
                             textShadow: '0 1px 4px rgba(0,0,0,0.8)',
                             color: gameMeta.level_font_color || '#ffffff',
-                            // Name-only tiers (no authored image) still read
-                            // as a badge rather than floating text.
-                            ...(activeBonus.image
-                              ? {}
-                              : {
-                                  padding: `${stage.height * 0.008}px ${stage.width * 0.008}px`,
-                                  border: '2px solid rgba(255,255,255,0.65)',
-                                  borderRadius: 8,
-                                  background: 'rgba(0,0,0,0.35)',
-                                }),
+                            // Name-only tiers still read as a badge rather than
+                            // floating text.
+                            // +0.15em top/bottom gives back the line room the
+                            // cap trim (vcenter-text) takes off the name.
+                            padding: `calc(${stage.height * 0.008}px + 0.15em) ${stage.width * 0.008}px`,
+                            border: '2px solid rgba(255,255,255,0.65)',
+                            borderRadius: 8,
+                            background: 'rgba(0,0,0,0.35)',
                           }}
                         >
-                          {activeBonus.name}
+                          <div className="vcenter-text">{activeBonus.name}</div>
                         </div>
                       )}
                     </div>

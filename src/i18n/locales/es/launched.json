@@ -188,5 +188,8 @@
   "membersHeading": "Miembros ({{count}})",
   "noChipsBound": "Aún no hay ninguna tarjeta vinculada a este clan.",
   "chipsInTeam": "Tarjetas en este equipo",
-  "chipsInClan": "Tarjetas en este clan"
+  "chipsInClan": "Tarjetas en este clan",
+  "slowLoadTitle": "Puesto madre inaccesible",
+  "slowLoadHint": "La lista de partidas viene del puesto madre, que no responde por ahora. Si hay una recuperación en curso, espere: este equipo se reconecta solo.",
+  "slowLoadRetry": "Reintentar"
 }

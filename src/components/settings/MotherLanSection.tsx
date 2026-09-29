@@ -14,6 +14,10 @@ import {
 } from '../../services/lanCredentials';
 import { WifiQr } from './WifiQr';
 import { HelpDot } from '../../help';
+import { relaunchToApply } from '../../services/appRelaunch';
+import { applyHotspotBandPreference } from '../../services/lanMotherBoot';
+import { loadConfig, saveConfig } from '../../utils/config';
+import { ErrorDetails } from '../ErrorDetails';
 
 const POLL_MS = 4000;
 
@@ -30,13 +34,28 @@ export function MotherLanSection() {
   const [preferredSsid, setPreferredSsidState] = useState('');
   const [status, setStatus] = useState<HotspotStatus | null>(null);
   const [busyHotspot, setBusyHotspot] = useState(false);
-  const [hotspotErr, setHotspotErr] = useState<string | null>(null);
+  const [hotspotErr, setHotspotErr] = useState<unknown>(null);
   const [copied, setCopied] = useState<'ssid' | 'password' | null>(null);
 
   // Network source: create the LAN with this device's hotspot, or ride on an
   // external router. Only drives which host UI is shown - the pairing/discovery
   // stack works identically either way.
   const [networkSource, setNetworkSourceState] = useState<NetworkSource>('hotspot');
+  // A source switch is applied through a relaunch (retours sept. #5: it used to
+  // silently wait for the next manual restart - an hour lost on the field).
+  const [pendingSource, setPendingSource] = useState<NetworkSource | null>(null);
+  const [relaunching, setRelaunching] = useState(false);
+  const [band24, setBand24] = useState(true);
+  useEffect(() => {
+    void loadConfig().then((c) => setBand24((c.hotspotBand ?? '2.4') === '2.4')).catch(() => {});
+  }, []);
+  async function toggleBand(on: boolean) {
+    setBand24(on);
+    const band = on ? '2.4' : 'auto';
+    const cfg = await loadConfig().catch(() => null);
+    if (cfg) await saveConfig({ ...cfg, hotspotBand: band }).catch(() => {});
+    await applyHotspotBandPreference(band);
+  }
   const [routerSsid, setRouterSsid] = useState('');
   const [routerPassword, setRouterPassword] = useState('');
 
@@ -104,18 +123,20 @@ export function MotherLanSection() {
   const routableAddrs = allAddrs.filter((a) => !a.startsWith('169.254.'));
   const motherAddrs = routableAddrs.length > 0 ? routableAddrs : allAddrs;
 
-  async function selectSource(src: NetworkSource) {
-    if (src === networkSource) return;
+  function selectSource(src: NetworkSource) {
+    setPendingSource(src === networkSource ? null : src);
+  }
+
+  async function applySource(src: NetworkSource) {
+    setRelaunching(true);
     setNetworkSourceState(src);
     await setNetworkSource(src).catch(() => { /* best-effort */ });
     // Switching to router mode: this device shouldn't be an access point and a
     // router client at once - stop a running hotspot.
     if (src === 'router' && running) {
-      setBusyHotspot(true);
-      try { await stopHotspot(); await refresh(); }
-      catch { /* best-effort */ }
-      finally { setBusyHotspot(false); }
+      try { await stopHotspot(); } catch { /* best-effort */ }
     }
+    await relaunchToApply(800);
   }
 
   function onRouterSsidChange(v: string) {
@@ -136,7 +157,7 @@ export function MotherLanSection() {
       } else {
         const creds = await getPreferredHotspotCreds();
         if (!creds) {
-          setHotspotErr(t('noStudioHotspot'));
+          setHotspotErr({ message: t('noStudioHotspot'), detail: null });
           setBusyHotspot(false);
           return;
         }
@@ -151,7 +172,7 @@ export function MotherLanSection() {
       }
       await refresh();
     } catch (e) {
-      setHotspotErr((e as Error).message);
+      setHotspotErr(e);
     } finally {
       setBusyHotspot(false);
     }
@@ -181,7 +202,7 @@ export function MotherLanSection() {
               <button
                 key={src}
                 type="button"
-                onClick={() => void selectSource(src)}
+                onClick={() => selectSource(src)}
                 disabled={busyHotspot}
                 className={`flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border text-sm font-medium disabled:opacity-50 ${
                   active ? 'bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)] border-[var(--pg-accent-line)]'
@@ -196,6 +217,38 @@ export function MotherLanSection() {
         <p className="text-xs text-[var(--pg-text-dim)] mt-3">
           {networkSource === 'router' ? t('sourceRouterHint') : t('sourceHotspotHint')}
         </p>
+        {networkSource === 'hotspot' && (
+          <label className="mt-3 flex items-start gap-2 text-xs text-[var(--pg-text-muted)] cursor-pointer">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={band24}
+              onChange={(e) => void toggleBand(e.target.checked)}
+            />
+            <span>
+              {t('hotspotBand24')}
+              <span className="block text-[var(--pg-text-dim)]">{t('hotspotBand24Hint')}</span>
+            </span>
+          </label>
+        )}
+        {pendingSource && (
+          <div className="mt-3 p-3 rounded-lg border border-[var(--pg-warn-line,var(--pg-line))] bg-[var(--pg-surface-2)]">
+            <p className="text-xs text-[var(--pg-text)] mb-2">{t('relaunchNote')}</p>
+            <div className="flex gap-2">
+              <button className="pg-btn" disabled={relaunching} onClick={() => setPendingSource(null)}>
+                {t('notMotherCancel')}
+              </button>
+              <button
+                className="pg-btn pg-btn--primary"
+                disabled={relaunching}
+                onClick={() => void applySource(pendingSource)}
+              >
+                {relaunching ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                {relaunching ? t('relaunchingToApply') : t('relaunchConfirm')}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {networkSource === 'router' ? (
@@ -315,11 +368,7 @@ export function MotherLanSection() {
             {t('hotspotWindowsOnly')}
           </div>
         )}
-        {hotspotErr && (
-          <div className="mt-3 text-xs text-[var(--pg-danger-text)] bg-[var(--pg-danger-bg)] border border-[var(--pg-danger-line)] rounded-lg p-2">
-            {t('hotspotError', { message: hotspotErr })}
-          </div>
-        )}
+        {hotspotErr != null && <ErrorDetails error={hotspotErr} className="mt-3" />}
 
         <button
           type="button"

@@ -11,7 +11,7 @@ import { useTranslation } from 'react-i18next';
 import { Crown } from 'lucide-react';
 import { useAuth } from '../auth/AuthProvider';
 import { forceBecomeMother } from '../../services/lanMotherBoot';
-import { failoverErrorText } from '../../services/failoverErrors';
+import { ErrorDetails } from '../ErrorDetails';
 
 export function ForceMotherPanel() {
   const { t } = useTranslation('devicesLan');
@@ -19,7 +19,7 @@ export function ForceMotherPanel() {
   const clientId = auth.user?.client_id ?? null;
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [msg, setMsg] = useState<{ kind: 'ok'; text: string } | { kind: 'err'; error: unknown } | null>(null);
 
   const run = async () => {
     if (clientId == null) return;
@@ -41,7 +41,7 @@ export function ForceMotherPanel() {
               }),
       });
     } catch (e) {
-      setMsg({ kind: 'err', text: failoverErrorText(e, t) });
+      setMsg({ kind: 'err', error: e });
     } finally {
       setBusy(false);
       setConfirming(false);
@@ -86,11 +86,8 @@ export function ForceMotherPanel() {
               </button>
             </div>
           )}
-          {msg && (
-            <p className={`text-xs mt-3 ${msg.kind === 'ok' ? 'text-[var(--pg-ok-icon)]' : 'text-[var(--pg-danger-icon)]'}`}>
-              {msg.text}
-            </p>
-          )}
+          {msg?.kind === 'ok' && <p className="text-xs mt-3 text-[var(--pg-ok-icon)]">{msg.text}</p>}
+          {msg?.kind === 'err' && <ErrorDetails error={msg.error} className="mt-3" />}
         </div>
       </div>
     </div>

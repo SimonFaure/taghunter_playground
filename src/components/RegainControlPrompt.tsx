@@ -11,51 +11,71 @@
 // mother's CURRENT state first, then promotes - so no data is lost. It's a
 // deliberate operator choice, never automatic.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Crown, AlertTriangle, Loader2, CheckCircle, X } from 'lucide-react';
-import { takeoverMother, type TakeoverTarget } from '../services/lanMotherBoot';
-import { failoverErrorText } from '../services/failoverErrors';
+import { takeoverMother, onRegainCheckRequested, type TakeoverTarget } from '../services/lanMotherBoot';
+import { ErrorDetails } from './ErrorDetails';
 
-type Phase = 'confirm' | 'taking' | 'success' | 'error';
+type Phase = 'confirm' | 'taking' | 'success' | 'error' | 'no_other';
 
 export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
   const { t } = useTranslation();
   const [target, setTarget] = useState<TakeoverTarget | null>(null);
   const [phase, setPhase] = useState<Phase>('confirm');
-  const [error, setError] = useState('');
+  const [error, setError] = useState<unknown>(null);
+
+  const check = useCallback(async () => {
+    if (clientId == null) return;
+    try {
+      const tgt = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId });
+      if (tgt) {
+        setPhase('confirm');
+        setTarget(tgt);
+      }
+    } catch {
+      /* no target / browse failed - nothing to prompt */
+    }
+  }, [clientId]);
 
   useEffect(() => {
     if (clientId == null) return;
-    let cancelled = false;
     // One-shot check a few seconds after boot, once ensureMotherServer has had a
     // chance to start/stand-down. get_takeover_target only returns a target when
-    // this device has an active LOCAL game AND a higher-epoch mother is live.
-    const id = setTimeout(async () => {
-      try {
-        const tgt = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId });
-        if (!cancelled && tgt) setTarget(tgt);
-      } catch {
-        /* no target / browse failed - nothing to prompt */
-      }
-    }, 2500);
+    // a higher-epoch mother of this client is live AND answers.
+    const id = setTimeout(() => void check(), 2500);
+    // A returning mother in hotspot mode only sees the live mother after it has
+    // found and joined the venue's Wi-Fi (~15 s later): it asks us to look again.
+    const off = onRegainCheckRequested(() => void check());
     return () => {
-      cancelled = true;
       clearTimeout(id);
+      off();
     };
-  }, [clientId]);
+  }, [clientId, check]);
 
   if (!target) return null;
 
   const takeover = async () => {
     setPhase('taking');
-    setError('');
+    setError(null);
     try {
-      await takeoverMother(target);
+      // Never act on the target found at boot: its address may be long gone
+      // (retours sept. #14 - "error sending request for url
+      // (http://192.168.137.138:47800/ping.php)"). Resolve it again, verified.
+      const fresh = clientId == null
+        ? null
+        : await invoke<TakeoverTarget | null>('get_takeover_target', { clientId }).catch(() => null);
+      if (!fresh) {
+        // Nobody else is serving any more: this device simply stays the mother.
+        setPhase('no_other');
+        return;
+      }
+      setTarget(fresh);
+      await takeoverMother(fresh);
       setPhase('success');
     } catch (e) {
-      setError(failoverErrorText(e, t));
+      setError(e);
       setPhase('error');
     }
   };
@@ -145,12 +165,21 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
             </div>
           )}
 
+          {phase === 'no_other' && (
+            <div className="space-y-5">
+              <div className="flex flex-col items-center gap-3 py-2 text-center">
+                <CheckCircle size={28} className="text-green-400" />
+                <p className="text-sm text-[var(--pg-text)]">{t('failover:regainNoOther')}</p>
+              </div>
+              <button onClick={close} className="pg-btn pg-btn--primary w-full justify-center">
+                {t('failover:done')}
+              </button>
+            </div>
+          )}
+
           {phase === 'error' && (
             <div className="space-y-5">
-              <div className="flex items-start gap-2.5">
-                <AlertTriangle size={18} className="text-red-400 shrink-0 mt-0.5" />
-                <p className="text-sm text-[var(--pg-text)]">{error}</p>
-              </div>
+              <ErrorDetails error={error} />
               <div className="flex gap-2.5">
                 <button onClick={close} className="pg-btn flex-1 justify-center">
                   {t('failover:close', { defaultValue: 'Close' })}

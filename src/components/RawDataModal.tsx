@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { Database, RefreshCw, Loader2, X, Check, Copy, AlertTriangle, ChevronRight } from 'lucide-react';
 import { getLaunchedGameState, type RawPunchRow } from '../services/launchedGames';
+import { formatDbDateTime } from '../utils/dbTime';
 
 interface RawDataModalProps {
   launchedGameId: number;
@@ -72,10 +73,7 @@ export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModal
     }
   };
 
-  const formatTs = (iso: string): string => {
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-  };
+  const formatTs = (iso: string): string => formatDbDateTime(iso);
 
   const summarize = (raw: unknown): { chipId: string; punchCount: number; codes: string; card: CardLike | null } => {
     if (!raw || typeof raw !== 'object') return { chipId: '-', punchCount: 0, codes: '', card: null };

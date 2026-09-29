@@ -82,7 +82,7 @@ export function GameVideoModal({
       try {
         const state = await getLaunchedGameState(launchedGameId, 0);
         const vids = await resolveVideosByKind(
-          ['intro', 'tutorial'],
+          ['tutorial', 'intro'],
           state.game_uniqid,
           state.game_type,
           gameLanguage || 'fr',
@@ -355,28 +355,29 @@ export function GameVideoModal({
               {playMenuOpen && (
                 <div className="absolute right-0 top-full mt-1 bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] shadow-xl z-10 min-w-[160px]">
                   <PlayMenuItem
-                    label={t('devicesModal:videoIntro')}
-                    disabled={!hasIntro}
-                    title={!hasIntro ? t('devicesModal:videoIntroUnavailable') : undefined}
-                    onClick={() => onPlayVideo(['intro'])}
-                  />
-                  <PlayMenuItem
                     label={t('devicesModal:videoTutorial')}
                     disabled={!hasTutorial}
                     title={!hasTutorial ? t('devicesModal:videoTutorialUnavailable') : undefined}
                     onClick={() => onPlayVideo(['tutorial'])}
                   />
                   <PlayMenuItem
+                    label={t('devicesModal:videoIntro')}
+                    disabled={!hasIntro}
+                    title={!hasIntro ? t('devicesModal:videoIntroUnavailable') : undefined}
+                    onClick={() => onPlayVideo(['intro'])}
+                  />
+                  {/* Tutorial FIRST, then the scenario intro (retour 2026-09-16). */}
+                  <PlayMenuItem
                     label={t('devicesModal:videoIntroTutorial')}
                     disabled={!hasIntro || !hasTutorial}
                     title={
-                      !hasIntro
-                        ? t('devicesModal:videoIntroUnavailable')
-                        : !hasTutorial
-                          ? t('devicesModal:videoTutorialUnavailable')
+                      !hasTutorial
+                        ? t('devicesModal:videoTutorialUnavailable')
+                        : !hasIntro
+                          ? t('devicesModal:videoIntroUnavailable')
                           : undefined
                     }
-                    onClick={() => onPlayVideo(['intro', 'tutorial'])}
+                    onClick={() => onPlayVideo(['tutorial', 'intro'])}
                   />
                 </div>
               )}
