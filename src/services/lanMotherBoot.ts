@@ -20,7 +20,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { platform } from '@tauri-apps/plugin-os';
 import { setLanOverride, getLanOverride, setLocalLaunchedGamesRoute, LOCAL_ONLY_ENDPOINTS } from './api';
-import { notifyPromotedToMother, getPromotableGameId } from './motherFailover';
+import {
+  notifyPromotedToMother, getPromotableGameId, findTakeoverMother, noteMotherTakeover, rejoinMotherNow,
+  type TakeoverMother,
+} from './motherFailover';
 import { discoverOtherMothers, joinMother, hotspotStatus, startHotspot, stopHotspot, refreshMdns, getLastHotspotStopAt } from './lanPairing';
 import { getNetworkSource, getPreferredHotspotCreds, saveHotspotCreds } from './lanCredentials';
 import { ensureFirewallRuleOnce } from './firewall';
@@ -188,8 +191,40 @@ export async function becomeMother(
     if (st?.running) effective = { ...info, hotspot_started: true, hotspot_error: null };
   }
   // We're the mother now - clear the "unreachable" banner.
+  lastPromotedAt = Date.now();
   notifyPromotedToMother();
   return effective;
+}
+
+// When this device last promoted itself. For two minutes after, the App's
+// superseded-mother check runs every 5 s instead of 20 s, so two satellites
+// promoted in the same second converge fast (retours sept. #10).
+let lastPromotedAt = 0;
+export function msSincePromotion(): number {
+  return lastPromotedAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastPromotedAt;
+}
+
+export type PromoteOutcome =
+  | { kind: 'promoted'; info: BecomeMotherInfo }
+  | { kind: 'joined'; taker: TakeoverMother };
+
+/**
+ * "Reprendre la partie" with first-click-wins (retours sept. #10): if another
+ * satellite already took over (a same-client mother above our cached epoch),
+ * join it instead of promoting a second mother. Only otherwise becomeMother.
+ * Two clicks in the very same second both promote; the equal-epoch tie-break
+ * in `get_takeover_target` then makes the higher uuid yield.
+ */
+export async function promoteUnlessTakenOver(launchedGameId: number, clientId?: number): Promise<PromoteOutcome> {
+  const taker = await findTakeoverMother();
+  if (taker) {
+    noteMotherTakeover(taker);
+    if (!(await rejoinMotherNow().catch(() => false)) && clientId != null) {
+      await autoJoinSameClientMother(clientId).catch(() => false);
+    }
+    return { kind: 'joined', taker };
+  }
+  return { kind: 'promoted', info: await becomeMother(launchedGameId) };
 }
 
 export interface TakeoverTarget {

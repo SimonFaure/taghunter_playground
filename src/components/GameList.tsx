@@ -39,7 +39,7 @@ import {
   listActiveLaunchedGames,
   getLaunchedGameMeta,
   getLaunchedGameState,
-  listPairedDevicesForLaunch,
+  listLaunchDevices,
   mergeLaunchedGameMeta,
   queueJoinGameCommandBulk,
   updateTeam,
@@ -833,15 +833,14 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       let regMap = deviceSelection.reg_assignments;
       if (regMap === undefined) {
         try {
-          const rows = await listPairedDevicesForLaunch();
+          const { devices: rows, selfId } = await listLaunchDevices();
           const targets = new Set(deviceSelection.satellite_targets);
-          // Every participating device is dealt teams - the mother first when
+          // Every participating device is dealt teams - this device first when
           // it takes part, then the selected satellites. Mirrors the wizard's
           // deal (no reader filter: the flag is only meaningful while online).
-          const selfRow = rows.find((r) => r.is_self);
           const eligibleIds = [
-            ...(deviceSelection.include_self && selfRow ? [selfRow.id] : []),
-            ...rows.filter((r) => !r.is_self && targets.has(r.id)).map((r) => r.id),
+            ...(deviceSelection.include_self && selfId !== null ? [selfId] : []),
+            ...rows.filter((r) => r.id !== selfId && targets.has(r.id)).map((r) => r.id),
           ];
           regMap = computeAutoRegAssignments(eligibleIds, finalNumberOfTeams);
         } catch (err) {

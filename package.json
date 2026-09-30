@@ -22,6 +22,7 @@
     "tauri:build:test": "set VITE_QA_HARNESS=1&& tauri build --features devtools",
     "android:dev": "tauri android dev",
     "android:build": "tauri android build",
+    "android:release": "node scripts/android-release.mjs",
     "ios:dev": "tauri ios dev",
     "ios:build": "tauri ios build"
   },

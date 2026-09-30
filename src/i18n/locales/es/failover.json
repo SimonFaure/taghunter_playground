@@ -42,5 +42,8 @@
   "errHostingActiveGame": "Este equipo aloja una partida en curso («{{name}}») y ningún otro puesto madre la sirve. Termine la partida, o haga primero que otro equipo la recupere («Hacer puesto madre» en uno de sus satélites).",
   "regainNoOther": "No se puede contactar con ningún otro puesto madre: este equipo sigue siendo el puesto madre.",
   "promotedBodyHotspot": "Este equipo es ahora el puesto madre y emite la Wi-Fi Tag Hunter. Los satélites se reconectan solos en aproximadamente un minuto; si no, en el satélite: Ajustes → Red → Buscar un puesto madre.",
-  "bannerReconnecting": "Reconectando con el puesto madre, no toque nada."
+  "bannerReconnecting": "Reconectando con el puesto madre, no toque nada.",
+  "takingOverBy": "{{name}} toma el relevo, reconectando, no toques nada.",
+  "anotherDevice": "Otro equipo",
+  "alreadyTakenOver": "{{name}} ya ha tomado el relevo: este equipo se ha unido, no hay nada más que hacer."
 }

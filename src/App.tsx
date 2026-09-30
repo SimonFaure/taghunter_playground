@@ -32,7 +32,7 @@ import { decodeTeamSummarySnapshot, type TeamSummarySnapshot } from './services/
 import { TeamSummaryOverlay } from './components/TeamSummaryOverlay';
 import { listen } from '@tauri-apps/api/event';
 import { emitPendingJoin, emitPendingLeave, emitPendingConfigReload, emitPendingRejoin, type PendingJoinRoute } from './services/pendingJoinStore';
-import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, joinExistingMotherNetworkIfPresent, applyHotspotBandPreference, motherHotspotWatchdogTick, reclaimWillingMotherTick, type TakeoverTarget } from './services/lanMotherBoot';
+import { ensureMotherServer, pointLaunchedGamesAtMother, yieldToMother, becomeMother, deviceHasLocalActiveGame, autoJoinSameClientMother, raiseMotherHotspotIfConfigured, joinExistingMotherNetworkIfPresent, applyHotspotBandPreference, motherHotspotWatchdogTick, reclaimWillingMotherTick, msSincePromotion, type TakeoverTarget } from './services/lanMotherBoot';
 import { refreshLaunchedGamesRoute, installLanReauth } from './services/childControlLink';
 import { ensureFirewallRuleOnce } from './services/firewall';
 import { installMotherFailover, setMotherLossHook } from './services/motherFailover';
@@ -68,6 +68,7 @@ import {
 import { startSummarySync, stopSummarySync, listLaunchedGames } from './services/launchedGames';
 import { loadConfig } from './utils/config';
 import { onPinReset } from './services/pinResetSignal';
+import { getLocalLaunchedGamesRoute } from './services/api';
 
 type Page =
   | 'scenarios'
@@ -168,6 +169,10 @@ function App() {
         payload: Record<string, unknown> & { launched_game_id?: number };
         mother_uuid?: string;
         mother_addr?: string;
+        // Set when OUR OWN server dispatched the command in-process (a child
+        // targeted this device while it hosts the game) - there's no remote
+        // mother to repoint at.
+        local?: boolean;
       }>('taghunter://lan-command', (event) => {
         if (cancelled) return;
         const cmd = event.payload;
@@ -175,7 +180,18 @@ function App() {
           const gid = cmd.payload.launched_game_id;
           if (typeof gid !== 'number') return;
           void (async () => {
-            const joinRoute = await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+            // Self-targeted join (a child launched the game onto this mother):
+            // the game lives in our own db, so enter it via our local server.
+            let joinRoute: PendingJoinRoute | undefined;
+            if (cmd.local) {
+              const local = getLocalLaunchedGamesRoute();
+              if (local) {
+                joinRoute = { baseUrl: local.baseUrl, token: local.token };
+                pointLaunchedGamesAtMother(joinRoute.baseUrl, joinRoute.token);
+              }
+            } else {
+              joinRoute = await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+            }
             if (cancelled) return;
             // Dismiss any pushed overlay first - they render on top of the page
             // tree, so leaving one up would hide the game page we're about to
@@ -469,11 +485,21 @@ function App() {
     const clientId = auth.user?.client_id;
     if (clientId == null) return;
     let cancelled = false;
+    // Every 20 s - but every 5 s during the 2 min after this device promoted
+    // itself, so two satellites promoted in the same second (equal epochs, see
+    // `outranks_local_mother`) converge on one mother fast (retours sept. #10).
+    // Only the superseded-mother check speeds up: the reclaim path below counts
+    // ~20 s ticks ("three empty ticks = 1 min") and must keep its pace.
+    let lastFull = 0;
     const id = setInterval(async () => {
+      const full = Date.now() - lastFull >= 20_000;
+      if (!full && msSincePromotion() > 120_000) return;
+      if (full) lastFull = Date.now();
       try {
         const role = await invoke<{ mother_server_running: boolean }>('client_describe_local_role');
         if (cancelled) return;
         if (!role?.mother_server_running) {
+          if (!full) return;
           await reconcileSupersededGamesTick();
           // A willing mother that stood down behind another device takes the
           // role back if the venue ends up with no mother at all (e.g. the
@@ -497,7 +523,7 @@ function App() {
       } catch {
         /* best-effort */
       }
-    }, 20_000);
+    }, 5_000);
     return () => {
       cancelled = true;
       clearInterval(id);

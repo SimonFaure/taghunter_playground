@@ -1,8 +1,10 @@
 // App self-update service.
 //
 // Desktop (Windows/macOS/Linux): downloads + installs a new app build via
-// tauri-plugin-updater. Mobile (Android/iOS): cannot self-install, so the
-// same version check applies but the action deep-links to the app store.
+// tauri-plugin-updater. Android (sideloaded, no Play Store): downloads the APK
+// Studio publishes, checks its SHA-256 and hands it to the system installer,
+// where the operator confirms (design: project_android_operator_tablet).
+// iOS: no in-app install, so the action deep-links to the app store.
 //
 // The version check + hard-floor logic runs on ALL platforms -- it is just a
 // semver comparison. Only the delivery differs.
@@ -18,6 +20,10 @@ import { platform, arch } from '@tauri-apps/plugin-os';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { invoke } from '@tauri-apps/api/core';
+import { appDataDir, join } from '@tauri-apps/api/path';
+import { apiDownloadStreamed } from './api';
+import { streamBinary, removeRecursive } from './contentFs';
 import { getAuthUser } from './authStore';
 import { tError } from '../i18n/errors';
 
@@ -36,8 +42,9 @@ export interface UpdateStatus {
   minSupportedVersion: string | null;
   /** App-store URL for the current platform (mobile), if published. */
   storeUrl: string | null;
-  /** True on desktop, where the in-app updater can download + install. */
-  isDesktop: boolean;
+  /** True where the app can download + install the update itself: desktop,
+   *  and Android when Studio has an APK for it. False -> store link. */
+  canSelfUpdate: boolean;
 }
 
 export interface DownloadProgress {
@@ -53,6 +60,8 @@ interface ManifestResponse {
     pub_date?: string;
     min_supported_version?: string;
     store_urls?: Record<string, string>;
+    /** Android only: the sideload APK to download and verify. */
+    apk?: { id: number; sha256: string; size: number | null };
   } | null;
 }
 
@@ -116,9 +125,21 @@ function compareSemver(a: string, b: string): number {
  * Check the studio for a newer app version and evaluate the hard floor.
  * Network failure resolves to `state: 'error'` (the caller proceeds silently).
  */
+async function fetchManifest(currentVersion: string): Promise<ManifestResponse | null> {
+  const channel = await resolveUpdateChannel();
+  const url =
+    `${API_BASE}/playground_update.php?action=check` +
+    `&target=${encodeURIComponent(currentTarget())}` +
+    `&arch=${encodeURIComponent(currentArch())}` +
+    `&current_version=${encodeURIComponent(currentVersion)}` +
+    `&channel=${encodeURIComponent(channel)}`;
+  const res = await tauriFetch(url, { method: 'GET' });
+  if (!res.ok) return null;
+  return (await res.json()) as ManifestResponse;
+}
+
 export async function checkForUpdate(): Promise<UpdateStatus> {
   const currentVersion = await getVersion().catch(() => '0.0.0');
-  const isDesktop = isDesktopPlatform();
   const target = currentTarget();
   const base: Omit<UpdateStatus, 'state'> = {
     currentVersion,
@@ -126,22 +147,12 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
     notes: '',
     minSupportedVersion: null,
     storeUrl: null,
-    isDesktop,
+    canSelfUpdate: isDesktopPlatform(),
   };
 
   try {
-    const channel = await resolveUpdateChannel();
-    const url =
-      `${API_BASE}/playground_update.php?action=check` +
-      `&target=${encodeURIComponent(target)}` +
-      `&arch=${encodeURIComponent(currentArch())}` +
-      `&current_version=${encodeURIComponent(currentVersion)}` +
-      `&channel=${encodeURIComponent(channel)}`;
-
-    const res = await tauriFetch(url, { method: 'GET' });
-    if (!res.ok) return { ...base, state: 'error' };
-
-    const json = (await res.json()) as ManifestResponse;
+    const json = await fetchManifest(currentVersion);
+    if (!json) return { ...base, state: 'error' };
     const m = json.manifest;
     if (!json.available || !m) {
       return { ...base, state: 'up-to-date' };
@@ -155,6 +166,7 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
       notes: m.notes ?? '',
       minSupportedVersion: floor,
       storeUrl,
+      canSelfUpdate: base.canSelfUpdate || (target === 'android' && !!m.apk),
     };
 
     if (compareSemver(currentVersion, floor) < 0) {
@@ -182,6 +194,10 @@ let pendingUpdate: Update | null = null;
 export async function downloadUpdate(
   onProgress: (p: DownloadProgress) => void
 ): Promise<void> {
+  if (currentTarget() === 'android') {
+    await downloadApk(onProgress);
+    return;
+  }
   // Route the plugin's own manifest request to the resolved channel. The plugin
   // builds its URL from the tauri.conf template (no query string), so the only
   // channel hook is a request header the server also reads.
@@ -211,7 +227,7 @@ export async function downloadUpdate(
 
 /** True once downloadUpdate() has completed and an install is staged. */
 export function hasPendingUpdate(): boolean {
-  return pendingUpdate !== null;
+  return pendingUpdate !== null || pendingApkPath !== null;
 }
 
 /**
@@ -219,9 +235,51 @@ export function hasPendingUpdate(): boolean {
  * On Windows the installer (passive mode) takes over and the process exits.
  */
 export async function installAndRelaunch(): Promise<void> {
+  if (pendingApkPath) {
+    // Opens Android's "update this app?" screen. Once the operator confirms,
+    // Android replaces the app and it restarts on the new version by itself.
+    await invoke('android_install_apk', { path: pendingApkPath });
+    return;
+  }
   if (!pendingUpdate) throw new Error(tError('noUpdateToInstall'));
   await pendingUpdate.install();
   await relaunch();
+}
+
+// ── android: sideload APK ────────────────────────────────────────────────────
+
+const APK_REL = 'updates/playground-update.apk';
+let pendingApkPath: string | null = null;
+
+// Download the latest APK for this device's channel into app data, then verify
+// it against the SHA-256 Studio recorded at upload. A mismatch (corrupt or
+// tampered download) is deleted and never reaches the installer.
+async function downloadApk(onProgress: (p: DownloadProgress) => void): Promise<void> {
+  pendingApkPath = null;
+  const currentVersion = await getVersion().catch(() => '0.0.0');
+  const apk = (await fetchManifest(currentVersion))?.manifest?.apk;
+  if (!apk) throw new Error(tError('noUpdateToDownload'));
+
+  await streamBinary(APK_REL, (write) =>
+    apiDownloadStreamed(
+      'playground_update',
+      'download',
+      {
+        bearer: false,
+        query: { id: apk.id },
+        onProgress: (p) => onProgress({ downloaded: p.loaded, total: p.total ?? apk.size }),
+      },
+      write,
+    ),
+  );
+
+  const abs = await join(await appDataDir(), APK_REL);
+  const got = await invoke<string>('sha256_file', { path: abs });
+  if (got !== apk.sha256) {
+    await removeRecursive(APK_REL).catch(() => {});
+    throw new Error(`APK hash mismatch: expected ${apk.sha256}, got ${got}`);
+  }
+  pendingApkPath = abs;
 }
 
 // ── mobile: store deep link ──────────────────────────────────────────────────

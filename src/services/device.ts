@@ -1,4 +1,5 @@
 import { getVersion } from '@tauri-apps/api/app';
+import { invoke } from '@tauri-apps/api/core';
 import { platform, version as osVersion, hostname } from '@tauri-apps/plugin-os';
 import type Database from '@tauri-apps/plugin-sql';
 import { getDb } from './db';
@@ -28,7 +29,11 @@ export async function getDeviceMetadata(): Promise<DeviceMetadata> {
   let v = 'unknown';
   try { p = platform(); } catch { /* keep default */ }
   try { v = osVersion(); } catch { /* keep default */ }
-  const h = await hostname().catch(() => null);
+  // Android's hostname is just "localhost": label tablets by make + model.
+  const model = p === 'android'
+    ? await invoke<string | null>('android_device_model').catch(() => null)
+    : null;
+  const h = model || await hostname().catch(() => null);
   const appVersion = await getVersion().catch(() => 'unknown');
 
   cachedMetadata = {

@@ -90,7 +90,7 @@ export function NotMotherPanel() {
             <button
               onClick={() => void askConfirm()}
               disabled={busy}
-              className="pg-btn"
+              className="pg-btn pg-btn--danger"
             >
               <Satellite size={15} />
               {t('notMotherBtn', { defaultValue: "I'm not a mother" })}
@@ -110,7 +110,7 @@ export function NotMotherPanel() {
                 <button onClick={() => setConfirming(false)} className="pg-btn" disabled={busy}>
                   {t('notMotherCancel', { defaultValue: 'Cancel' })}
                 </button>
-                <button onClick={run} className="pg-btn pg-btn--primary" disabled={busy}>
+                <button onClick={run} className="pg-btn pg-btn--danger" disabled={busy}>
                   {busy
                     ? t('notMotherWorking', { defaultValue: 'Working…' })
                     : t('notMotherConfirm', { defaultValue: 'Confirm - step down' })}

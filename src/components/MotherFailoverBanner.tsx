@@ -11,7 +11,9 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Crown, Link2, Loader2, X } from 'lucide-react';
-import { onMotherReachState, getPromotableGameId, type ReachState } from '../services/motherFailover';
+import {
+  onMotherReachState, onMotherTakeover, getPromotableGameId, type ReachState, type TakeoverMother,
+} from '../services/motherFailover';
 import { rejoinCurrentMother } from '../services/childControlLink';
 import { BecomeMotherModal } from './BecomeMotherModal';
 
@@ -36,6 +38,10 @@ export function MotherFailoverBanner() {
   // NOT auto-clear on its own - only a successful promotion / re-point or this
   // dismiss hides it.
   const [dismissed, setDismissed] = useState(false);
+  // Another satellite already took over (retours sept. #10, first click wins):
+  // no promote button any more - this device is joining it.
+  const [taker, setTaker] = useState<TakeoverMother | null>(null);
+  useEffect(() => onMotherTakeover(setTaker), []);
 
   useEffect(
     () =>
@@ -50,12 +56,25 @@ export function MotherFailoverBanner() {
     []
   );
 
-  const showReconnecting = reach === 'reconnecting' && promoteGameId == null;
-  const showBanner = reach === 'lost' && !dismissed && promoteGameId == null;
-  if (!showBanner && !showReconnecting && promoteGameId == null) return null;
+  const showTakeover = taker != null && reach !== 'ok' && promoteGameId == null;
+  const showReconnecting = reach === 'reconnecting' && promoteGameId == null && !showTakeover;
+  const showBanner = reach === 'lost' && !dismissed && promoteGameId == null && !showTakeover;
+  if (!showBanner && !showReconnecting && !showTakeover && promoteGameId == null) return null;
 
   return (
     <>
+      {showTakeover && (
+        <div
+          className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg"
+          style={{ zIndex: 6000 }}
+          role="status"
+        >
+          <Loader2 size={16} className="shrink-0 animate-spin" />
+          <span className="text-sm font-medium">
+            {t('failover:takingOverBy', { name: taker?.label || t('failover:anotherDevice') })}
+          </span>
+        </div>
+      )}
       {showReconnecting && (
         <div
           className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg"

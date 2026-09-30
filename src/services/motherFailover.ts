@@ -120,6 +120,8 @@ function emitState(next: ReachState): void {
   if (reachState === next) return;
   const wasUnreachable = reachState !== 'ok';
   reachState = next;
+  // Back in contact: whoever took over is now simply "our mother".
+  if (next === 'ok') noteMotherTakeover(null);
   for (const l of stateListeners) {
     try {
       l(next);
@@ -484,6 +486,70 @@ export async function getPromotableGameId(): Promise<number | null> {
     return null;
   } catch {
     return null;
+  }
+}
+
+// ─── "someone already took over" (retours sept. #10: first click wins) ───────
+//
+// Every satellite gets "Reprendre la partie" once the mother is lost, so two
+// operators can race. Two guards make the FIRST click win:
+//  - a promotion first looks for a mother that already took over (below) and
+//    joins it instead (lanMotherBoot.promoteUnlessTakenOver);
+//  - while 'lost', the satellites keep looking for that mother, announce it
+//    ("PC2 prend le relais") and join it - the promote button disappears.
+// A newly promoted mother is recognisable by its epoch: becomeMother bumps it
+// above the one in the snapshot every satellite cached from the dead mother.
+
+export interface TakeoverMother {
+  mother_uuid: string;
+  label: string | null;
+  epoch: number;
+}
+
+/** A same-client mother whose epoch beats our cached snapshot - i.e. one that took over. */
+export async function findTakeoverMother(timeoutMs = 2000): Promise<TakeoverMother | null> {
+  try {
+    const [mothers, me, cached, selfUuid] = await Promise.all([
+      invoke<DiscoveredMother[]>('client_discover_mothers', { timeoutMs }),
+      getAuthUser().catch(() => null),
+      getCachedMotherIdentity(),
+      getSelfUuid(),
+    ]);
+    const myClientId = me?.client_id ?? null;
+    const hit = mothers
+      .filter((m) => m.addresses.length > 0 && m.port > 0)
+      .filter((m) => myClientId == null || m.client_id == null || m.client_id === myClientId)
+      .filter((m) => selfUuid == null || m.mother_uuid !== selfUuid)
+      .filter((m) => (m.epoch ?? 0) > cached.epoch)
+      .sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0))[0];
+    return hit ? { mother_uuid: hit.mother_uuid, label: hit.label, epoch: hit.epoch ?? 0 } : null;
+  } catch {
+    return null;
+  }
+}
+
+type TakeoverListener = (taker: TakeoverMother | null) => void;
+const takeoverListeners = new Set<TakeoverListener>();
+let currentTaker: TakeoverMother | null = null;
+
+/** Subscribe to "another device took over the game". Fires immediately with current. */
+export function onMotherTakeover(l: TakeoverListener): () => void {
+  takeoverListeners.add(l);
+  l(currentTaker);
+  return () => {
+    takeoverListeners.delete(l);
+  };
+}
+
+export function noteMotherTakeover(taker: TakeoverMother | null): void {
+  if (currentTaker?.mother_uuid === taker?.mother_uuid) return;
+  currentTaker = taker;
+  for (const l of takeoverListeners) {
+    try {
+      l(taker);
+    } catch (e) {
+      console.error('[motherFailover] takeover listener threw:', e);
+    }
   }
 }
 

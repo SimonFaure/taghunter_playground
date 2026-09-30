@@ -68,7 +68,7 @@ export function UpdateRequiredOverlay({ status }: UpdateRequiredOverlayProps) {
           </div>
         )}
 
-        {status.isDesktop ? (
+        {status.canSelfUpdate ? (
           <DesktopUpdateInstaller version={status.latestVersion} />
         ) : status.storeUrl ? (
           <button

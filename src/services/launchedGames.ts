@@ -9,7 +9,7 @@
 // is sourced from the authenticated token on the server, never trusted from
 // the client.
 
-import { apiCall } from './api';
+import { apiCall, getLanOverride, getLocalLaunchedGamesRoute } from './api';
 import { withRetry } from './apiRetry';
 import { captureGameSummary, type GameSummaryPayload } from './telemetry';
 import type { ScreenState } from './screenState';
@@ -565,6 +565,42 @@ export async function listPairedDevicesForLaunch(): Promise<PairedDeviceStatusRo
     )
   );
   return res.devices;
+}
+
+/**
+ * The launch device list plus THIS device's row id. The rows come from the
+ * mother's db, so `is_self` marks the MOTHER - on a child (e.g. an operator-only
+ * tablet) that is not us. `selfId` uses the server-reported caller id.
+ *
+ * An older mother build doesn't report it. Falling back to `is_self` is only
+ * right when we ARE the mother (routed at our own server); on a child it made
+ * the mother's row pose as "this device" - and on an operator-only tablet,
+ * greyed out as "opérateur uniquement". On a child we can't tell which row is
+ * ours, so selfId is null and `motherOutdated` is set: an old mother also
+ * refuses a join_game aimed at itself, so it can't be a launch target anyway.
+ */
+export async function listLaunchDevices(): Promise<{
+  devices: PairedDeviceStatusRow[];
+  selfId: number | null;
+  motherOutdated: boolean;
+}> {
+  const res = await withRetry(() =>
+    apiCall<{ devices: PairedDeviceStatusRow[]; caller_device_id?: number }>(
+      'launched_games',
+      'list_paired_for_launch',
+      { method: 'GET', bearer: true }
+    )
+  );
+  if (typeof res.caller_device_id === 'number') {
+    return { devices: res.devices, selfId: res.caller_device_id, motherOutdated: false };
+  }
+  const override = getLanOverride();
+  const remote = !!override && override.baseUrl !== getLocalLaunchedGamesRoute()?.baseUrl;
+  return {
+    devices: res.devices,
+    selfId: remote ? null : res.devices.find((d) => d.is_self)?.id ?? null,
+    motherOutdated: remote,
+  };
 }
 
 export interface QueueCommandResult {

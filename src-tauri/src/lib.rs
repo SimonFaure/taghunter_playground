@@ -88,6 +88,8 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_wifi_ssid,
+            android_device_model,
+            android_install_apk,
             sha256_file,
             scan_wifi,
             wifi_scan_fresh,
@@ -132,6 +134,7 @@ pub fn run() {
             lan_server::client_describe_local_role,
             hotspot::mother_start_hotspot,
             hotspot::mother_set_hotspot_band,
+            hotspot::open_windows_hotspot_settings,
             win_health::mother_windows_health,
             win_health::mother_fix_windows_health,
             hotspot::mother_stop_hotspot,
@@ -1223,6 +1226,115 @@ async fn get_wifi_ssid() -> Result<Option<String>, String> {
     // \bSSID\b avoids matching BSSID lines that appear later in netsh/airport
     // output (B-S has no word boundary, so \b prevents the false match).
     parse_ssid_from_platform().await
+}
+
+// Human label for an Android tablet ("samsung SM-X210") from android.os.Build,
+// since hostname() is just "localhost" there. None on every other platform
+// (device.ts keeps using the hostname). Design: project_android_operator_tablet.
+#[tauri::command]
+async fn android_device_model() -> Option<String> {
+    #[cfg(target_os = "android")]
+    {
+        tauri::async_runtime::spawn_blocking(android_build_label)
+            .await
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_build_label() -> Option<String> {
+    use jni::objects::JString;
+    let ctx = ndk_context::android_context();
+    // Safety: ndk-context holds a valid JavaVM* once the app has started.
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let mut field = |name: &str| -> Option<String> {
+        let obj = env
+            .get_static_field("android/os/Build", name, "Ljava/lang/String;")
+            .ok()?
+            .l()
+            .ok()?;
+        let s: String = env.get_string(&JString::from(obj)).ok()?.into();
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let manufacturer = field("MANUFACTURER");
+    let model = field("MODEL")?;
+    // Many OEMs already prefix MODEL with the brand ("Lenovo TB-X606F").
+    Some(match manufacturer {
+        Some(m) if !model.to_lowercase().starts_with(&m.to_lowercase()) => format!("{m} {model}"),
+        _ => model,
+    })
+}
+
+// Android self-update: hand an already-downloaded, hash-checked APK (absolute
+// path under app data) to the system installer via ApkInstaller.kt. Resolves
+// once the installer screen is launched; the operator confirms there.
+#[tauri::command]
+async fn android_install_apk(path: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        tauri::async_runtime::spawn_blocking(move || android_start_apk_install(&path))
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))?
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = path;
+        Err("android_install_apk is Android-only".into())
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_start_apk_install(path: &str) -> Result<(), String> {
+    use jni::objects::{JObject, JString, JValue};
+    let ctx = ndk_context::android_context();
+    // Safety: ndk-context holds a valid JavaVM* once the app has started.
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm() as *mut jni::sys::JavaVM) }
+        .map_err(|e| format!("attach jvm: {e}"))?;
+    let mut env = vm.attach_current_thread().map_err(|e| format!("attach thread: {e}"))?;
+    let context = unsafe { JObject::from_raw(ctx.context() as jni::sys::jobject) };
+
+    let result = (|| -> jni::errors::Result<Option<String>> {
+        // App classes are only visible through the app's class loader from a
+        // native thread (see sportident/transport/android.rs load_app_class).
+        let loader = env
+            .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let name = env.new_string("com.taghunter.playground.ApkInstaller")?;
+        let class: jni::objects::JClass = env
+            .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?
+            .l()?
+            .into();
+        let jpath = env.new_string(path)?;
+        let err = env
+            .call_static_method(
+                &class,
+                "install",
+                "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&context), JValue::Object(&jpath)],
+            )?
+            .l()?;
+        if err.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(env.get_string(&JString::from(err))?.into()))
+    })();
+
+    match result {
+        Ok(None) => Ok(()),
+        Ok(Some(msg)) => Err(msg),
+        Err(e) => {
+            // Clear any pending Java exception so detaching the thread can't abort.
+            let _ = env.exception_clear();
+            Err(format!("ApkInstaller.install: {e}"))
+        }
+    }
 }
 
 // Streaming SHA-256 of a file, used to verify a downloaded scenario media blob

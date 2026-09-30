@@ -6,6 +6,7 @@ import { OnboardingShell } from './OnboardingShell';
 import { renameDevice } from '../../../services/auth';
 import { setCachedDeviceDisplayName, getDeviceMetadata } from '../../../services/device';
 import { loadConfig, saveConfig } from '../../../utils/config';
+import { isAndroid } from '../../../utils/platform';
 import { setTheme, getStoredTheme, type ThemeName } from '../../../services/theme';
 import {
   setDefaultMother,
@@ -55,7 +56,7 @@ export function PostPinOnboarding({ user, onComplete }: Props) {
         user={user}
         busy={busy}
         setBusy={setBusy}
-        onDone={() => setStep('hotspot')}
+        onDone={() => setStep(isAndroid() ? 'appearance' : 'hotspot')}
       />
     );
   }
@@ -93,7 +94,7 @@ export function PostPinOnboarding({ user, onComplete }: Props) {
     <AppearanceStep
       busy={busy}
       setBusy={setBusy}
-      onBack={() => setStep('operatorOnly')}
+      onBack={() => setStep(isAndroid() ? 'name' : 'operatorOnly')}
       onDone={async () => {
         await markOnboardingComplete();
         onComplete();
@@ -363,7 +364,7 @@ function AppearanceStep({
 
   return (
     <OnboardingShell
-      stepNumber={9}
+      stepNumber={isAndroid() ? 6 : 9}
       title={t('appearance.title')}
       subtitle={t('appearance.subtitle')}
       onPrimary={handleFinish}

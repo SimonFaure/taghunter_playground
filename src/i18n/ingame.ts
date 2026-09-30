@@ -766,8 +766,8 @@ const CLASH_BASELINE: Catalog = {
 
 /**
  * ingame_tracks - the player-facing Track text the app owns: the two HUD frame
- * captions, the simple-mode summary line, and the not-empty-card dialogue at
- * the start reader. Resolves against the team language like every bucket-2
+ * captions, the simple-mode summary line, the feedback-image legend rows, and
+ * the not-empty-card dialogue at the start reader. Resolves against the team language like every bucket-2
  * string. Checkpoint names/descriptions come from the scenario (bucket 3).
  */
 const TRACKS_BASELINE: Catalog = {
@@ -780,6 +780,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: "Aucun poinçon de la puce ne correspond aux points de contrôle - vérifiez le modèle associé au scénario.",
     player_starts: "C'est parti ! {{team}}",
     card_not_empty_warn: "⚠️ Votre puce n'est pas vide, effacez votre puce",
+    legend_wrong_order: 'Mauvais ordre',
+    legend_missing_checkpoint: 'Point de contrôle manquant',
   },
   en: {
     hud_time: 'Time',
@@ -790,6 +792,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: 'None of the card punches match a checkpoint - check the pattern bound to this scenario.',
     player_starts: "Here we go! {{team}}",
     card_not_empty_warn: "⚠️ Your card is not empty, wipe it",
+    legend_wrong_order: 'Wrong order',
+    legend_missing_checkpoint: 'Missing checkpoint',
   },
   es: {
     hud_time: 'Tiempo',
@@ -800,6 +804,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: 'Ningún marcaje de la tarjeta coincide con un punto de control: revisa el modelo asociado al escenario.',
     player_starts: "¡Empezamos! {{team}}",
     card_not_empty_warn: "⚠️ Tu tarjeta no está vacía, bórrala",
+    legend_wrong_order: 'Orden incorrecto',
+    legend_missing_checkpoint: 'Punto de control faltante',
   },
   de: {
     hud_time: 'Zeit',
@@ -810,6 +816,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: 'Kein Stempel der Karte passt zu einem Posten - prüfe das Muster dieses Szenarios.',
     player_starts: "Los geht's! {{team}}",
     card_not_empty_warn: "⚠️ Deine Karte ist nicht leer, bitte löschen",
+    legend_wrong_order: 'Falsche Reihenfolge',
+    legend_missing_checkpoint: 'Fehlender Posten',
   },
   it: {
     hud_time: 'Tempo',
@@ -820,6 +828,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: 'Nessuna punzonatura della tessera corrisponde a un punto di controllo: controlla il modello associato allo scenario.',
     player_starts: "Si parte! {{team}}",
     card_not_empty_warn: "⚠️ La tua tessera non è vuota, cancellala",
+    legend_wrong_order: 'Ordine errato',
+    legend_missing_checkpoint: 'Punto di controllo mancante',
   },
   pt: {
     hud_time: 'Tempo',
@@ -830,6 +840,8 @@ const TRACKS_BASELINE: Catalog = {
     no_station_match: 'Nenhuma picagem do cartão corresponde a um ponto de controlo - verifique o modelo associado ao cenário.',
     player_starts: "Vamos lá! {{team}}",
     card_not_empty_warn: "⚠️ O seu cartão não está vazio, apague-o",
+    legend_wrong_order: 'Ordem errada',
+    legend_missing_checkpoint: 'Ponto de controlo em falta',
   },
 };
 

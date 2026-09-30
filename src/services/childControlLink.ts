@@ -16,7 +16,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { pointLaunchedGamesAtMother, restoreLocalLaunchedGames, autoJoinSameClientMother } from './lanMotherBoot';
 import { setLanReauthHandler, setLanNoRouteHandler } from './api';
-import { reportMotherRouteState, rejoinMotherNow } from './motherFailover';
+import {
+  reportMotherRouteState, rejoinMotherNow, onMotherReachState, findTakeoverMother, noteMotherTakeover,
+} from './motherFailover';
 import { getAuthUser } from './authStore';
 
 interface MotherLink {
@@ -224,4 +226,39 @@ export function installLanReauth(): void {
   reauthInstalled = true;
   setLanReauthHandler(reauthPairedMother);
   setLanNoRouteHandler(kickRouteResolution);
+  installTakeoverWatcher();
+}
+
+// Retours sept. #10, "first click wins": once the mother is lost, look every
+// 5 s for a device that already took over. Found → announce it (the failover
+// banner and the Network page drop the promote button and say "PC2 prend le
+// relais") and join it, so no second satellite promotes itself. Only runs in
+// the 'lost' state: during 'reconnecting' the normal re-point is still at work.
+const TAKEOVER_POLL_MS = 5000;
+function installTakeoverWatcher(): void {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let busy = false;
+  const tick = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const taker = await findTakeoverMother();
+      if (!taker) return;
+      noteMotherTakeover(taker);
+      await rejoinCurrentMother().catch(() => 'not_found' as const);
+    } finally {
+      busy = false;
+    }
+  };
+  onMotherReachState((st) => {
+    if (st === 'lost') {
+      if (!timer) {
+        void tick();
+        timer = setInterval(() => void tick(), TAKEOVER_POLL_MS);
+      }
+    } else if (st === 'ok' && timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  });
 }

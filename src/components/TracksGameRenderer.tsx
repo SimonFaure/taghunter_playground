@@ -21,6 +21,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import type { TracksCheckpoint } from '../services/tracksScoring';
 import { resolveFontFamily } from '../fonts/resolveFontFamily';
 import { TracksTextFit } from './TracksTextFit';
+import { TracksLegend, type TracksLegendRow } from './TracksLegend';
 import { TEXT_ELEMENT_DEFAULT_ALIGN } from './trackTextElementStyle';
 import {
   resolveTypography,
@@ -125,6 +126,10 @@ export interface TracksGameRendererProps {
   /** "Not found" image URL (already resolved) shown on the clues page for
    *  checkpoints the team didn't reach; '' falls back to no image. */
   missingCheckpointUrl?: string;
+  /** Clues page: checkpoints punched out of itinerary order (not credited);
+   *  drawn with `wrongOrderUrl`, exactly like the reveal. */
+  wrongCheckpointIds?: Set<string>;
+  wrongOrderUrl?: string;
   /** Marker size as a % of map width. */
   iconSizePercent: number;
   /** HUD frame backgrounds (already resolved URLs; '' if none). */
@@ -137,6 +142,17 @@ export interface TracksGameRendererProps {
   timerText: string;
   scoreText: string;
   showScore: boolean;
+  /**
+   * Feedback-image legend (scenario option), or null. Rows are pre-filtered by
+   * the page (missing image / free mode → null). Drawn over the map on the
+   * reveal (full/map) and on the clues page, where only the "missing" row
+   * applies (and only when the clues page shows images).
+   */
+  legend?: {
+    box: HudBoxPos;
+    wrongOrder: TracksLegendRow | null;
+    missing: TracksLegendRow | null;
+  } | null;
   /** Localized caption drawn over the timer frame (`ingame_tracks:hud_time`). */
   timeLabel: string;
   /** Localized caption drawn over the score frame (`ingame_tracks:hud_score`). */
@@ -315,12 +331,15 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     resolveCheckpointImage,
     foundCheckpointIds,
     missingCheckpointUrl,
+    wrongCheckpointIds,
+    wrongOrderUrl,
     iconSizePercent,
     hud,
     teamName,
     timerText,
     scoreText,
     showScore,
+    legend,
     timeLabel,
     scoreLabel,
     checkpointsSummary,
@@ -613,6 +632,42 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         })()
       )}
 
+      {/* Feedback-image legend - under the big reveal (z-40) in full mode. */}
+      {legend && (() => {
+        // Clues page draws the same status images as the reveal, but only
+        // when it shows images at all.
+        const rows = (
+          isClues && !(clues.enabled && clues.show_image)
+            ? []
+            : [legend.wrongOrder, legend.missing]
+        ).filter((r): r is TracksLegendRow => !!r);
+        if (rows.length === 0) return null;
+        const { box } = legend;
+        const widthPct = (box.width / 100) * imgBounds.width;
+        const heightPct = (box.height / 100) * imgBounds.height;
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 0;
+        const vh = typeof window !== 'undefined' ? window.innerHeight : 0;
+        return (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: `${imgBounds.x + (box.x / 100) * imgBounds.width}%`,
+              top: `${imgBounds.y + (box.y / 100) * imgBounds.height}%`,
+              width: `${widthPct}%`,
+              height: `${heightPct}%`,
+            }}
+          >
+            <TracksLegend
+              rows={rows}
+              boxWidthPx={(widthPct / 100) * vw}
+              boxHeightPx={(heightPct / 100) * vh}
+              fontFamily={fontFamily || ''}
+              textScale={box.textScale}
+            />
+          </div>
+        );
+      })()}
+
       {/* Full-mode big-center reveal for the current checkpoint */}
       {screen === 'reveal' && bigReveal && (
         <div className="absolute inset-0 z-40 flex flex-col items-center justify-center px-10 pointer-events-none" style={{ background: 'rgba(0,0,0,0.45)' }}>
@@ -645,7 +700,11 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
         routeCheckpoints.map((cp, i) => {
           const found = !!foundCheckpointIds?.has(cp.id);
           const imgUrl = clues.show_image
-            ? (found ? resolveCheckpointImage(cp) : (missingCheckpointUrl || ''))
+            ? (found
+                ? resolveCheckpointImage(cp)
+                : wrongCheckpointIds?.has(cp.id)
+                  ? (wrongOrderUrl || '')
+                  : (missingCheckpointUrl || ''))
             : '';
           const title = clues.show_title
             ? readLocalized(cp.title as Localizedish, language) || `#${i + 1}`

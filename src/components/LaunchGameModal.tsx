@@ -34,7 +34,7 @@ import { DEFAULT_CLASH_PURGE_STATION } from '../services/clash';
 import {
   listActiveLaunchedGames,
   getLaunchedGameState,
-  listPairedDevicesForLaunch,
+  listLaunchDevices,
   listBusyDeviceIds,
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
@@ -529,6 +529,13 @@ export function LaunchGameModal({
   // advances to step 3; reset on modal close so a fresh open doesn't show
   // stale online indicators.
   const [pairedDevices, setPairedDevices] = useState<PairedDeviceStatusRow[]>([]);
+  // THIS device's row in pairedDevices. Not the `is_self` row: the list comes
+  // from the mother's db, where `is_self` is the MOTHER - on a child (e.g. an
+  // operator-only tablet) the mother is just another launch target.
+  const [selfDeviceId, setSelfDeviceId] = useState<number | null>(null);
+  // Child talking to an older mother build: it can't say which row is us, and
+  // it refuses a join_game aimed at itself - so its row is not a launch target.
+  const [motherOutdated, setMotherOutdated] = useState(false);
   const [pairedLoading, setPairedLoading] = useState(false);
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<Set<number>>(new Set());
   const [motherChecked, setMotherChecked] = useState(true);
@@ -1023,13 +1030,13 @@ export function LaunchGameModal({
   // only knowable while a device is online, so filtering on it used to leave
   // the whole list unassigned. Rows stay individually editable either way.
   const autoRegDeviceIds: number[] = (() => {
-    const selfRow = pairedDevices.find((d) => d.is_self);
+    const selfRow = pairedDevices.find((d) => d.id === selfDeviceId);
     const ids: number[] = [];
     if (selfRow && motherChecked && !busyDeviceIds.has(selfRow.id) && !operatorOnly) {
       ids.push(selfRow.id);
     }
     for (const d of pairedDevices) {
-      if (d.is_self) continue;
+      if (d.id === selfDeviceId) continue;
       if (!selectedDeviceIds.has(d.id) || busyDeviceIds.has(d.id)) continue;
       ids.push(d.id);
     }
@@ -1601,14 +1608,17 @@ export function LaunchGameModal({
     setStep(3);
     setPairedLoading(true);
     try {
-      const [rows, busy] = await Promise.all([listPairedDevicesForLaunch(), listBusyDeviceIds()]);
+      const [{ devices: rows, selfId, motherOutdated: outdated }, busy] = await Promise.all([listLaunchDevices(), listBusyDeviceIds()]);
       setPairedDevices(rows);
+      setSelfDeviceId(selfId);
+      setMotherOutdated(outdated);
       setBusyDeviceIds(busy);
-      // Pre-check only online, non-self peers that aren't already in a game.
-      setSelectedDeviceIds(new Set(rows.filter(r => !r.is_self && r.online && !busy.has(r.id)).map(r => r.id)));
+      // Pre-check only online, non-self peers that aren't already in a game
+      // (on a child this includes the mother, unless it's an older build).
+      setSelectedDeviceIds(new Set(rows.filter(r => r.id !== selfId && r.online && !busy.has(r.id) && !(outdated && r.is_self)).map(r => r.id)));
       // This device participates by default unless it's already running a game.
       // Operator-only devices never participate.
-      const selfRow = rows.find(r => r.is_self);
+      const selfRow = rows.find(r => r.id === selfId);
       setMotherChecked(operatorOnly ? false : !(selfRow && busy.has(selfRow.id)));
     } catch (err) {
       console.error('[LaunchGameModal] failed to load paired devices:', err);
@@ -1738,9 +1748,12 @@ export function LaunchGameModal({
     // Never dispatch to a device already in another game, even if a stale id
     // lingered in the selection. Likewise, don't let this device participate
     // if it's busy (one game per device - it can still host/dispatch).
-    const selfRow = pairedDevices.find((r) => r.is_self);
+    const selfRow = pairedDevices.find((r) => r.id === selfDeviceId);
     const selfBusy = !!(selfRow && busyDeviceIds.has(selfRow.id));
-    const satellite_targets = Array.from(selectedDeviceIds).filter((id) => !busyDeviceIds.has(id));
+    const outdatedMotherId = motherOutdated ? pairedDevices.find((r) => r.is_self)?.id : undefined;
+    const satellite_targets = Array.from(selectedDeviceIds).filter(
+      (id) => !busyDeviceIds.has(id) && id !== outdatedMotherId
+    );
     const includeSelf = motherChecked && !selfBusy && !operatorOnly;
     // Station-based self-register: resolve the auto/manual per-device teams
     // into the final map persisted as meta.regAssignments. Devices with no
@@ -3814,8 +3827,11 @@ export function LaunchGameModal({
                   <p className="text-[var(--pg-text-dim)] text-sm">{t('launchModal:loadingPairedDevices')}</p>
                 ) : (
                   <div className="space-y-2">
+                    {motherOutdated && (
+                      <p className="text-sm text-amber-400 px-1">{t('launchModal:motherOutdatedHint')}</p>
+                    )}
                     {(() => {
-                      const selfRow = pairedDevices.find((r) => r.is_self);
+                      const selfRow = pairedDevices.find((r) => r.id === selfDeviceId);
                       const selfBusy = !!(selfRow && busyDeviceIds.has(selfRow.id));
                       return (
                     /* Mother row - defaults checked so this device participates,
@@ -3833,7 +3849,10 @@ export function LaunchGameModal({
                         className="w-4 h-4 accent-[var(--pg-accent)] disabled:opacity-50"
                       />
                       <span className="flex-1 text-[var(--pg-text)] font-medium">
-                        {t('launchModal:thisDevice')} <span className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:motherTag')}</span>
+                        {(selfRow && displayDeviceLabel(selfRow.device_label)) || t('launchModal:thisDevice')}{' '}
+                        <span className="text-xs text-[var(--pg-text-dim)]">
+                          {selfRow?.is_self ? t('launchModal:motherTag') : t('launchModal:thisDeviceTag')}
+                        </span>
                       </span>
                       {operatorOnly ? (
                         <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-blue-500/10 text-blue-300">
@@ -3866,32 +3885,33 @@ export function LaunchGameModal({
                     })()}
 
                     {/* Paired (non-self) devices */}
-                    {pairedDevices.filter(d => !d.is_self).length === 0 ? (
+                    {pairedDevices.filter(d => d.id !== selfDeviceId).length === 0 ? (
                       <p className="text-sm text-[var(--pg-text-dim)] italic px-1 mt-2">
                         {t('launchModal:noOtherPairedDevices')}
                       </p>
                     ) : (
                       pairedDevices
-                        .filter(d => !d.is_self)
+                        .filter(d => d.id !== selfDeviceId)
                         .map(device => {
                           const busy = busyDeviceIds.has(device.id);
-                          const checked = selectedDeviceIds.has(device.id) && !busy;
+                          const outdated = motherOutdated && device.is_self;
+                          const checked = selectedDeviceIds.has(device.id) && !busy && !outdated;
                           return (
                             <div
                               key={device.id}
                               className={`bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] ${
-                                busy || !device.online ? 'opacity-70' : ''
+                                busy || outdated || !device.online ? 'opacity-70' : ''
                               }`}
                             >
                             <label
                               className={`flex items-center gap-3 p-3 ${
-                                busy ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'
+                                busy || outdated ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'
                               }`}
                             >
                               <input
                                 type="checkbox"
                                 checked={checked}
-                                disabled={busy}
+                                disabled={busy || outdated}
                                 onChange={(e) => {
                                   setSelectedDeviceIds(prev => {
                                     const next = new Set(prev);
@@ -3905,6 +3925,11 @@ export function LaunchGameModal({
                               <div className="flex-1 min-w-0">
                                 <div className="text-[var(--pg-text)] font-medium truncate">
                                   {displayDeviceLabel(device.device_label) || t('devicesModal:unknownDevice')}
+                                  {/* Only reachable on a child: the mother's row is
+                                      a regular launch target there. */}
+                                  {device.is_self && (
+                                    <span className="ml-1.5 text-xs font-normal text-[var(--pg-text-dim)]">{t('launchModal:motherTag')}</span>
+                                  )}
                                 </div>
                                 {device.peer_os && (
                                   <div className="text-xs text-[var(--pg-text-dim)] truncate">{device.peer_os}</div>
@@ -3913,6 +3938,14 @@ export function LaunchGameModal({
                               {busy && (
                                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-amber-500/10 text-amber-400">
                                   {t('launchModal:deviceBusy')}
+                                </span>
+                              )}
+                              {outdated && (
+                                <span
+                                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-amber-500/10 text-amber-400"
+                                  title={t('launchModal:motherOutdatedHint')}
+                                >
+                                  {t('launchModal:motherOutdated')}
                                 </span>
                               )}
                               {/* Reader state is only knowable while the device

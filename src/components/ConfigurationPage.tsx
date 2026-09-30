@@ -29,7 +29,7 @@ import {
   ServerCog,
   Tags,
 } from 'lucide-react';
-import { enable as enableAutostart, disable as disableAutostart } from '@tauri-apps/plugin-autostart';
+import { syncAutostart } from '../utils/autostart';
 import { useTranslation } from 'react-i18next';
 import {
   sportidentService,
@@ -43,6 +43,7 @@ import ClientCardsPage from './ClientCardsPage';
 import { VideosTab, ImagesTab } from './MediaTabs';
 import { setUiLanguage } from '../i18n';
 import { loadConfig, saveConfig, AppConfig } from '../utils/config';
+import { isAndroid } from '../utils/platform';
 import {
   extForFile,
   isSupportedLogoExt,
@@ -253,16 +254,10 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
 
       await saveConfig(finalConfig);
 
-      // Sync the OS autostart registration if the toggle changed. There is
-      // no "next launch" for an OS registration, so this applies on Save.
-      if (Boolean(finalConfig.autoLaunch) !== Boolean(savedConfig.autoLaunch)) {
-        try {
-          if (finalConfig.autoLaunch) await enableAutostart();
-          else await disableAutostart();
-        } catch (e) {
-          console.error('Error updating autostart registration:', e);
-        }
-      }
+      // Reconcile the OS autostart registration on every Save, not only when
+      // the toggle changed: the registration can vanish behind our back (a
+      // reinstall's uninstaller deletes it) while config.json keeps "on".
+      await syncAutostart(Boolean(finalConfig.autoLaunch));
 
       setConfig(finalConfig);
       setSavedConfig(finalConfig);
@@ -413,6 +408,9 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
                   </div>
                 </Section>
 
+                {/* Android tablets: no window fullscreen/autostart, and the role is
+                    locked operator-only (utils/platform.ts). */}
+                {!isAndroid() && (<>
                 <Section icon={<Monitor className="text-[var(--pg-accent-bright)]" size={24} />} title={t('settings:sectionDisplay')}>
                   <Toggle
                     label={t('settings:fullscreenOnLaunchLabel')}
@@ -443,6 +441,7 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
                     {t('settings:operatorOnlyExplainer')}
                   </p>
                 </Section>
+                </>)}
 
                 <Section
                   icon={<ShieldCheck className="text-[var(--pg-accent-bright)]" size={24} />}
@@ -1469,7 +1468,12 @@ function SettingsNav({ active, onChange, isAdminMode = false, operatorOnly = fal
   // API docs are admin-only; drop the entry (and the Developer group it empties)
   // when not in admin mode, so licensees never see that group. Operator-only
   // devices have no reader/driver role, so the Hardware tab is hidden entirely.
-  const hiddenTabs = new Set<SettingsTab>(operatorOnly ? ['hardware'] : []);
+  // Android tablets never play games, so they have no tutorial videos or game
+  // images to manage either.
+  const hiddenTabs = new Set<SettingsTab>([
+    ...(operatorOnly ? (['hardware'] as SettingsTab[]) : []),
+    ...(isAndroid() ? (['videos', 'images'] as SettingsTab[]) : []),
+  ]);
   const visibleGroups = groups
     .map((group) => ({
       ...group,

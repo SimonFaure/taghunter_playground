@@ -106,34 +106,31 @@ export function firstSlotByCheckpoint(
 }
 
 /**
- * Strict-prefix itinerary scoring. Given each route checkpoint's first hit
+ * "Walk the route" itinerary scoring. Given each route checkpoint's first hit
  * position on the card (slot index from firstSlotByCheckpoint, NOT a station
- * time; undefined if never reached), credit the longest *leading* run of
- * checkpoints reached in order. The first missing or out-of-order checkpoint
- * ends the sequence.
+ * time; undefined if never reached), walk the route in order: a missing
+ * checkpoint is skipped (it does NOT end the sequence), a punched checkpoint is
+ * credited when its slot is at/after the last credited one, otherwise it stays
+ * uncredited (shown as "wrong"). E.g. punches cp1, cp14, cp19, cp4 → 1 and 4
+ * found, 14 and 19 wrong, the rest missing.
  *
- * `brokeAfterId` is the last credited checkpoint id when the run deviated
- * (credited prefix shorter than the route); null on a perfect run, or when even
- * the first checkpoint failed (then `hitIds` is empty). Free mode does NOT use
- * this - it counts any reached checkpoint regardless of order.
+ * Free mode does NOT use this - it counts any reached checkpoint regardless of order.
  */
 export function orderedHitCheckpointIds(
   routeCheckpoints: TracksCheckpoint[],
   hitOrderByCheckpointId: Map<string, number | undefined>,
-): { hitIds: Set<string>; brokeAfterId: string | null; deviated: boolean } {
+): { hitIds: Set<string>; deviated: boolean } {
   const hitIds = new Set<string>();
   let prevOrder = Number.NEGATIVE_INFINITY;
-  let lastCreditedId: string | null = null;
   for (const cp of routeCheckpoints) {
-    // Equal orders only when two checkpoints share a station: legitimate.
     const o = hitOrderByCheckpointId.get(cp.id);
-    if (o === undefined || o < prevOrder) break; // missing or out-of-order
+    if (o === undefined) continue; // missing: skip, the walk goes on
+    // Equal orders only when two checkpoints share a station: legitimate.
+    if (o < prevOrder) continue; // punched out of order: not credited
     hitIds.add(cp.id);
-    lastCreditedId = cp.id;
     prevOrder = o;
   }
-  const deviated = hitIds.size < routeCheckpoints.length;
-  return { hitIds, brokeAfterId: deviated ? lastCreditedId : null, deviated };
+  return { hitIds, deviated: hitIds.size < routeCheckpoints.length };
 }
 
 export interface RankableTeam {

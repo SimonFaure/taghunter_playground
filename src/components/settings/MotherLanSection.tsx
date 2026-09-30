@@ -21,8 +21,18 @@ import { ErrorDetails } from '../ErrorDetails';
 
 const POLL_MS = 4000;
 
-export function MotherLanSection() {
+/**
+ * The mother's Wi-Fi, in three views (retours sept. #10):
+ *  - `summary`: mother main page - mode tiles + network name/password, nothing else;
+ *  - `details`: mother, under Avancé - band, venue, IPs, router editor/QR/checklist,
+ *    start/stop (stop is red and confirmed);
+ *  - `mode`: satellite, under Avancé - the mode tiles only, no hotspot control.
+ */
+export type MotherLanView = 'summary' | 'details' | 'mode';
+
+export function MotherLanSection({ view }: { view: MotherLanView }) {
   const { t } = useTranslation('devicesLan');
+  const [confirmStop, setConfirmStop] = useState(false);
 
   // Hotspot creds are now authored in studio and pushed down on sync (the local
   // mirror). This section is READ-ONLY: it shows the active hotspot + a picker
@@ -154,6 +164,7 @@ export function MotherLanSection() {
     try {
       if (running) {
         await stopHotspot();
+        setConfirmStop(false);
       } else {
         const creds = await getPreferredHotspotCreds();
         if (!creds) {
@@ -186,78 +197,101 @@ export function MotherLanSection() {
     } catch { /* clipboard may be unavailable */ }
   }
 
-  return (
-    <div className="space-y-6">
-      {/* ── Network source selector ── */}
+  const modeTiles = (
+    <>
+      <div className="grid sm:grid-cols-2 gap-3">
+        {(['hotspot', 'router'] as const).map((src) => {
+          const active = (pendingSource ?? networkSource) === src;
+          const Icon = src === 'hotspot' ? Wifi : Router;
+          return (
+            <button
+              key={src}
+              type="button"
+              onClick={() => selectSource(src)}
+              disabled={busyHotspot || relaunching}
+              className={`flex items-start gap-3 p-4 rounded-lg border-2 text-left disabled:opacity-50 ${
+                active ? 'border-[var(--pg-accent)] bg-[var(--pg-surface)]'
+                       : 'border-[var(--pg-line)] bg-[var(--pg-surface)] hover:bg-[var(--pg-surface-3)]'}`}
+            >
+              <Icon className={`w-5 h-5 shrink-0 mt-0.5 ${active ? 'text-[var(--pg-accent-bright)]' : 'text-[var(--pg-text-dim)]'}`} />
+              <span className="min-w-0">
+                <span className={`block font-semibold ${active ? 'text-[var(--pg-text)]' : 'text-[var(--pg-text-muted)]'}`}>
+                  {src === 'hotspot' ? t('tileHotspotTitle') : t('tileRouterTitle')}
+                </span>
+                <span className="block text-sm text-[var(--pg-text-dim)]">
+                  {src === 'hotspot' ? t('tileHotspotSub') : t('tileRouterSub')}
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {pendingSource && (
+        <div className="mt-3 p-3 rounded-lg border border-[var(--pg-warn-line,var(--pg-line))] bg-[var(--pg-surface-2)]">
+          <p className="text-xs text-[var(--pg-text)] mb-2">{t('relaunchNote')}</p>
+          <div className="flex gap-2">
+            <button className="pg-btn" disabled={relaunching} onClick={() => setPendingSource(null)}>
+              {t('notMotherCancel')}
+            </button>
+            <button
+              className="pg-btn pg-btn--primary"
+              disabled={relaunching}
+              onClick={() => void applySource(pendingSource)}
+            >
+              {relaunching ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              {relaunching ? t('relaunchingToApply') : t('relaunchConfirm')}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  // Satellite, Avancé → Mode réseau: the choice only. No hotspot control at all
+  // (retours sept. #10: a satellite must never be one click away from raising a
+  // second Tag Hunter Wi-Fi).
+  if (view === 'mode') return <div>{modeTiles}</div>;
+
+  // Mother, main page (mockup 3): the mode, the network name and password.
+  // Everything technical lives in view="details" under Avancé.
+  if (view === 'summary') {
+    const shownSsid = networkSource === 'router' ? routerSsid : ssid;
+    const shownPassword = networkSource === 'router' ? routerPassword : password;
+    const missing = networkSource === 'hotspot' ? studioHotspots.length === 0 : !routerSsid;
+    return (
       <div className="pg-panel">
-        <div className="flex items-center gap-1.5 mb-3">
-          <h3 className="pg-panel-title">{t('networkSourceTitle')}</h3>
+        <div className="flex items-center gap-1.5">
+          <h3 className="pg-panel-title">{t('wifiCardTitle')}</h3>
           <HelpDot topic="devices.router-pairing" />
         </div>
-        <div className="grid grid-cols-2 gap-2">
-          {(['hotspot', 'router'] as const).map((src) => {
-            const active = networkSource === src;
-            const Icon = src === 'hotspot' ? Wifi : Router;
-            return (
-              <button
-                key={src}
-                type="button"
-                onClick={() => selectSource(src)}
-                disabled={busyHotspot}
-                className={`flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border text-sm font-medium disabled:opacity-50 ${
-                  active ? 'bg-[var(--pg-accent-tint)] text-[var(--pg-accent-bright)] border-[var(--pg-accent-line)]'
-                         : 'bg-[var(--pg-bg)] text-[var(--pg-text-muted)] border-[var(--pg-line)] hover:bg-[var(--pg-surface-3)]'}`}
-              >
-                <Icon className="w-4 h-4" />
-                {src === 'hotspot' ? t('sourceHotspot') : t('sourceRouter')}
-              </button>
-            );
-          })}
-        </div>
-        <p className="text-xs text-[var(--pg-text-dim)] mt-3">
-          {networkSource === 'router' ? t('sourceRouterHint') : t('sourceHotspotHint')}
-        </p>
-        {networkSource === 'hotspot' && (
-          <label className="mt-3 flex items-start gap-2 text-xs text-[var(--pg-text-muted)] cursor-pointer">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={band24}
-              onChange={(e) => void toggleBand(e.target.checked)}
+        <p className="text-sm text-[var(--pg-text-dim)] mb-4">{t('wifiCardSub')}</p>
+        {modeTiles}
+        {missing ? (
+          <p className="mt-4 text-xs text-[var(--pg-text-dim)]">
+            {networkSource === 'hotspot' ? t('noStudioHotspot') : t('wifiCardRouterMissing')}
+          </p>
+        ) : (
+          <div className="mt-5 flex flex-wrap gap-x-10 gap-y-3">
+            <ReadOnlyCred
+              label={t('wifiCardName')} value={shownSsid}
+              onCopy={() => copy('ssid', shownSsid)} copied={copied === 'ssid'} copyLabel={t('copy')}
             />
-            <span>
-              {t('hotspotBand24')}
-              <span className="block text-[var(--pg-text-dim)]">{t('hotspotBand24Hint')}</span>
-            </span>
-          </label>
-        )}
-        {pendingSource && (
-          <div className="mt-3 p-3 rounded-lg border border-[var(--pg-warn-line,var(--pg-line))] bg-[var(--pg-surface-2)]">
-            <p className="text-xs text-[var(--pg-text)] mb-2">{t('relaunchNote')}</p>
-            <div className="flex gap-2">
-              <button className="pg-btn" disabled={relaunching} onClick={() => setPendingSource(null)}>
-                {t('notMotherCancel')}
-              </button>
-              <button
-                className="pg-btn pg-btn--primary"
-                disabled={relaunching}
-                onClick={() => void applySource(pendingSource)}
-              >
-                {relaunching ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                {relaunching ? t('relaunchingToApply') : t('relaunchConfirm')}
-              </button>
-            </div>
+            <ReadOnlyCred
+              label={t('wifiCardPassword')} value={shownPassword}
+              onCopy={() => copy('password', shownPassword)} copied={copied === 'password'} copyLabel={t('copy')}
+            />
           </div>
         )}
       </div>
+    );
+  }
 
+  // Mother, Avancé → "Wi-Fi : réglages avancés".
+  return (
+    <div className="space-y-5">
       {networkSource === 'router' ? (
         /* ── External router ── */
-        <div className="pg-panel space-y-4">
-          <div className="flex items-center gap-2">
-            <Router className="w-5 h-5 text-[var(--pg-accent-bright)]" />
-            <h3 className="pg-panel-title">{t('routerTitle')}</h3>
-          </div>
+        <div className="space-y-4">
           <p className="text-sm text-[var(--pg-text-muted)]">{t('routerIntro')}</p>
 
           {motherAddrs.length > 0 && (
@@ -294,63 +328,53 @@ export function MotherLanSection() {
           </div>
         </div>
       ) : (
-      /* ── Hotspot control ── */
-      <div className="pg-panel">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            {running ? <Wifi className="w-5 h-5 text-[var(--pg-ok-icon)]" /> : <WifiOff className="w-5 h-5 text-[var(--pg-text-dim)]" />}
-            <h3 className="pg-panel-title">{t('hotspotTitle')}</h3>
-            <span className={`text-xs px-2 py-0.5 rounded-full border ${
-              running ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
-                      : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
-              {running ? t('hotspotRunning') : t('hotspotStopped')}
-            </span>
-          </div>
+      /* ── Hotspot details ── */
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          {running ? <Wifi className="w-5 h-5 text-[var(--pg-ok-icon)]" /> : <WifiOff className="w-5 h-5 text-[var(--pg-text-dim)]" />}
+          <span className="font-semibold text-[var(--pg-text)]">{t('hotspotTitle')}</span>
+          <span className={`text-xs px-2 py-0.5 rounded-full border ${
+            running ? 'bg-[var(--pg-ok-bg)] text-[var(--pg-ok-text)] border-[var(--pg-ok-line)]'
+                    : 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)] border-[var(--pg-line-strong)]'}`}>
+            {running ? t('hotspotRunning') : t('hotspotStopped')}
+          </span>
         </div>
 
-        {studioHotspots.length === 0 ? (
-          <div className="text-xs text-[var(--pg-text-dim)] bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-lg p-3">
-            {t('noStudioHotspot')}
-          </div>
-        ) : (
-          <>
-            {/* Multi-venue: pick which of the client's hotspots this device raises. */}
-            {studioHotspots.length > 1 && (
-              <div className="mb-3">
-                <label className="pg-label">{t('preferredHotspotLabel')}</label>
-                <select
-                  value={preferredSsid || (studioHotspots[0]?.ssid ?? '')}
-                  onChange={(e) => void selectPreferred(e.target.value)}
-                  disabled={running || busyHotspot}
-                  className="pg-input w-full font-mono disabled:opacity-70"
-                >
-                  {studioHotspots.map((h) => (
-                    <option key={h.ssid} value={h.ssid}>{h.ssid}</option>
-                  ))}
-                </select>
-              </div>
-            )}
+        <label className="flex items-start gap-2 text-sm text-[var(--pg-text-muted)] cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={band24}
+            onChange={(e) => void toggleBand(e.target.checked)}
+          />
+          <span>
+            {t('hotspotBand24')}
+            <span className="block text-xs text-[var(--pg-text-dim)]">{t('hotspotBand24Hint')}</span>
+          </span>
+        </label>
 
-            <div className="grid sm:grid-cols-2 gap-3">
-              <CredField
-                label={t('ssidLabel')} value={ssid} onChange={setSsid}
-                disabled
-                onCopy={() => copy('ssid', ssid)} copied={copied === 'ssid'}
-                copyLabel={t('copy')} copiedLabel={t('copied')}
-              />
-              <CredField
-                label={t('passwordLabel')} value={password} onChange={setPassword}
-                disabled
-                onCopy={() => copy('password', password)} copied={copied === 'password'}
-                copyLabel={t('copy')} copiedLabel={t('copied')}
-              />
-            </div>
-            <p className="text-[11px] text-[var(--pg-text-dim)] mt-2">{t('studioManagedHint')}</p>
-          </>
+        {/* Multi-venue: pick which of the client's hotspots this device raises. */}
+        {studioHotspots.length > 1 && (
+          <div>
+            <label className="pg-label">{t('preferredHotspotLabel')}</label>
+            <select
+              value={preferredSsid || (studioHotspots[0]?.ssid ?? '')}
+              onChange={(e) => void selectPreferred(e.target.value)}
+              disabled={running || busyHotspot}
+              className="pg-input w-full font-mono disabled:opacity-70"
+            >
+              {studioHotspots.map((h) => (
+                <option key={h.ssid} value={h.ssid}>{h.ssid}</option>
+              ))}
+            </select>
+          </div>
+        )}
+        {studioHotspots.length > 0 && (
+          <p className="text-[11px] text-[var(--pg-text-dim)]">{t('studioManagedHint')}</p>
         )}
 
         {running && status && status.ipv4_addresses.length > 0 && (
-          <div className="text-xs text-[var(--pg-text-dim)] mt-3">
+          <div className="text-xs text-[var(--pg-text-dim)]">
             {t('ipAddresses', { addrs: status.ipv4_addresses.join(', ') })}
           </div>
         )}
@@ -358,39 +382,67 @@ export function MotherLanSection() {
         {/* The live AP is broadcasting a different SSID than the configured one
             (creds changed in studio since it was raised). Cold-start to apply. */}
         {running && status?.ssid && ssid && status.ssid !== ssid && (
-          <div className="mt-3 text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
+          <div className="text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
             {t('hotspotBroadcastMismatch', { current: status.ssid })}
           </div>
         )}
 
         {windowsOnly && (
-          <div className="mt-3 text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
+          <div className="text-xs text-[var(--pg-warn-text)] bg-[var(--pg-warn-bg)] border border-[var(--pg-warn-line)] rounded-lg p-2">
             {t('hotspotWindowsOnly')}
           </div>
         )}
-        {hotspotErr != null && <ErrorDetails error={hotspotErr} className="mt-3" />}
+        {hotspotErr != null && <ErrorDetails error={hotspotErr} />}
 
-        <button
-          type="button"
-          onClick={toggleHotspot}
-          disabled={busyHotspot || windowsOnly}
-          className={`mt-4 px-4 py-2 rounded-lg font-medium flex items-center gap-2 disabled:opacity-50 ${
-            running ? 'bg-red-500/20 text-red-200 hover:bg-red-500/30'
-                    : 'bg-green-600 text-white hover:bg-green-500'}`}
-        >
-          {busyHotspot ? <Loader2 className="w-4 h-4 animate-spin" />
-                       : running ? <WifiOff className="w-4 h-4" /> : <Wifi className="w-4 h-4" />}
-          {running ? t('stopHotspot') : t('startHotspot')}
-        </button>
+        {/* Stopping the AP drops every satellite: red, and confirmed. */}
+        {running && confirmStop ? (
+          <div className="p-3 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] space-y-2">
+            <p className="text-sm text-[var(--pg-text)]">{t('stopHotspotConfirm')}</p>
+            <div className="flex gap-2">
+              <button className="pg-btn" disabled={busyHotspot} onClick={() => setConfirmStop(false)}>
+                {t('notMotherCancel')}
+              </button>
+              <button className="pg-btn pg-btn--danger" disabled={busyHotspot} onClick={() => void toggleHotspot()}>
+                {busyHotspot ? <Loader2 className="w-4 h-4 animate-spin" /> : <WifiOff className="w-4 h-4" />}
+                {t('stopHotspot')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => (running ? setConfirmStop(true) : void toggleHotspot())}
+            disabled={busyHotspot || windowsOnly}
+            className={`pg-btn ${running ? 'pg-btn--danger' : 'pg-btn--primary'}`}
+          >
+            {busyHotspot ? <Loader2 className="w-4 h-4 animate-spin" />
+                         : running ? <WifiOff className="w-4 h-4" /> : <Wifi className="w-4 h-4" />}
+            {running ? t('stopHotspot') : t('startHotspot')}
+          </button>
+        )}
       </div>
       )}
+    </div>
+  );
+}
 
-      {/* Pending-requests panel retired: same-client devices auto-pair with no
-          operator tap, and cross-client devices are flat-denied by the mother
-          (move them between clients in studio instead). */}
-
-      {/* Paired-devices list moved to PairedDevicesPanel (top of the Network
-          tab); the firewall panel moved into the Advanced section below. */}
+function ReadOnlyCred({
+  label, value, onCopy, copied, copyLabel,
+}: {
+  label: string; value: string; onCopy: () => void; copied: boolean; copyLabel: string;
+}) {
+  return (
+    <div>
+      <div className="text-xs font-semibold uppercase tracking-wide text-[var(--pg-text-dim)]">{label}</div>
+      <div className="flex items-center gap-1">
+        <span className="font-mono text-lg text-[var(--pg-text)]">{value || '-'}</span>
+        {value && (
+          <button type="button" onClick={onCopy} title={copyLabel}
+            className="p-1.5 rounded-lg text-[var(--pg-text-muted)] hover:bg-[var(--pg-surface-3)]">
+            {copied ? <Check className="w-4 h-4 text-[var(--pg-ok-icon)]" /> : <Copy className="w-4 h-4" />}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

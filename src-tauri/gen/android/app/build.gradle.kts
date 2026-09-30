@@ -13,6 +13,20 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Release signing (design: project_android_operator_tablet). keystore.properties
+// sits next to this project's settings.gradle, is gitignored, and points at the
+// release keystore kept OUTSIDE the repo. Every APK ever shipped must be signed
+// with that same key or tablets refuse the update - back it up.
+//   storeFile=C:/taghunter-keys/playground-release.jks
+//   password=...
+//   keyAlias=playground
+val keystoreProperties = Properties().apply {
+    val propFile = rootProject.file("keystore.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 36
     namespace = "com.taghunter.playground"
@@ -23,6 +37,16 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (keystoreProperties.containsKey("storeFile")) {
+            create("release") {
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["password"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["password"] as String
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -37,6 +61,12 @@ android {
             }
         }
         getByName("release") {
+            signingConfig = signingConfigs.findByName("release")
+            // Compress the native libs: the APK is sideloaded/downloaded by the
+            // app itself, so download size (~halved) beats install-time extraction.
+            packaging {
+                jniLibs.useLegacyPackaging = true
+            }
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }

@@ -11,9 +11,14 @@ import { useTranslation } from 'react-i18next';
 import { Crown } from 'lucide-react';
 import { useAuth } from '../auth/AuthProvider';
 import { forceBecomeMother } from '../../services/lanMotherBoot';
+import { findTakeoverMother, noteMotherTakeover } from '../../services/motherFailover';
+import { rejoinCurrentMother } from '../../services/childControlLink';
 import { ErrorDetails } from '../ErrorDetails';
 
-export function ForceMotherPanel() {
+// `firstClickWins`: the "Reprendre une partie" use after the mother was lost
+// (retours sept. #10). If another satellite already took over, join it instead
+// of taking the game away from it.
+export function ForceMotherPanel({ firstClickWins = false }: { firstClickWins?: boolean }) {
   const { t } = useTranslation('devicesLan');
   const auth = useAuth();
   const clientId = auth.user?.client_id ?? null;
@@ -26,6 +31,18 @@ export function ForceMotherPanel() {
     setBusy(true);
     setMsg(null);
     try {
+      if (firstClickWins) {
+        const taker = await findTakeoverMother();
+        if (taker) {
+          noteMotherTakeover(taker);
+          await rejoinCurrentMother().catch(() => null);
+          setMsg({
+            kind: 'ok',
+            text: t('failover:alreadyTakenOver', { name: taker.label || t('failover:anotherDevice') }),
+          });
+          return;
+        }
+      }
       const outcome = await forceBecomeMother(clientId);
       setMsg({
         kind: 'ok',
@@ -51,7 +68,7 @@ export function ForceMotherPanel() {
   return (
     <div className="pg-panel">
       <div className="flex items-start gap-3">
-        <Crown className="w-5 h-5 mt-0.5 shrink-0 text-[var(--pg-warn-icon)]" />
+        <Crown className="w-5 h-5 mt-0.5 shrink-0 text-[var(--pg-danger-text)]" />
         <div className="flex-1">
           <div className="text-sm font-semibold text-[var(--pg-text)] mb-0.5">
             {t('forceMotherTitle', { defaultValue: 'Take control as mother' })}
@@ -69,7 +86,7 @@ export function ForceMotherPanel() {
                 setConfirming(true);
               }}
               disabled={busy || clientId == null}
-              className="pg-btn pg-btn--primary"
+              className="pg-btn pg-btn--danger"
             >
               <Crown size={15} />
               {t('forceMotherBtn', { defaultValue: 'Take control' })}
@@ -79,7 +96,7 @@ export function ForceMotherPanel() {
               <button onClick={() => setConfirming(false)} className="pg-btn" disabled={busy}>
                 {t('forceMotherCancel', { defaultValue: 'Cancel' })}
               </button>
-              <button onClick={run} className="pg-btn pg-btn--primary" disabled={busy}>
+              <button onClick={run} className="pg-btn pg-btn--danger" disabled={busy}>
                 {busy
                   ? t('forceMotherWorking', { defaultValue: 'Working…' })
                   : t('forceMotherConfirm', { defaultValue: 'Confirm - take control' })}

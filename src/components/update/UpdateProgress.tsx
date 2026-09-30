@@ -11,6 +11,7 @@ import { Download, RotateCw, Loader2, AlertTriangle, CheckCircle2 } from 'lucide
 import { invoke } from '@tauri-apps/api/core';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { isGameActive } from '../../services/activeSession';
+import { listLaunchedGames } from '../../services/launchedGames';
 import {
   downloadUpdate,
   installAndRelaunch,
@@ -24,14 +25,18 @@ function formatBytes(n: number): string {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(n / 1024).toFixed(0)} KB`;
 }
 
-// Returns true if a launched game or a LAN mother session is currently live.
+// Returns true if a launched game is open on this device, or this device is a
+// mother hosting at least one un-ended game. The mother server alone is NOT a
+// signal: it stays up on any mother device even with no game running.
 async function aGameIsRunning(): Promise<boolean> {
   if (isGameActive()) return true;
   try {
     const role = await invoke<{ mother_server_running?: boolean }>(
       'client_describe_local_role'
     );
-    return !!role?.mother_server_running;
+    if (!role?.mother_server_running) return false;
+    const hosted = await listLaunchedGames({ ended: false, forceLocal: true });
+    return hosted.length > 0;
   } catch {
     return false;
   }
@@ -63,8 +68,12 @@ export function DesktopUpdateInstaller({ version }: { version?: string | null })
     setConfirmOpen(false);
     setPhase('installing');
     try {
-      // Relaunches the app; this call does not return on success.
+      // Desktop: relaunches the app, so this call does not return on success.
+      // Android: returns once the system install screen is up. If the operator
+      // cancels it, offer the install button again (a confirmed install
+      // replaces and restarts the app on its own).
       await installAndRelaunch();
+      setPhase('downloaded');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase('error');

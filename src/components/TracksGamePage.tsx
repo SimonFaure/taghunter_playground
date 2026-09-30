@@ -37,6 +37,7 @@ import {
   type SceneTextElement,
   type SceneTextCategory,
 } from './TracksGameRenderer';
+import { TRACKS_LEGEND_ID, TRACKS_LEGEND_DEFAULT_BOX } from './TracksLegend';
 import {
   checkpointsForRoute,
   computeScore,
@@ -104,6 +105,9 @@ interface TracksGameData {
   /** Saved positions for the 4 HUD frames (team_name, timer, score, time),
    *  keyed by element id; empty map → renderer uses its default top strip. */
   hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>>;
+  /** Feedback-image legend box (`game_meta.show_legend`); null when the option
+   *  is off or the author hid the box. No saved box → the studio default. */
+  legendBox: HudFrameBox | null;
   /** Author-editable run messages (text_* UI strings), each a
    *  Localized<string> | string. Surfaced by the runtime only when the author
    *  filled the field in; an empty/missing key keeps the built-in behaviour. */
@@ -257,7 +261,23 @@ function normalizeTracksGameData(raw: any): TracksGameData {
           ? raw.game_data.scenario_layout.elements
           : [];
   const hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>> = {};
+  let legendBox: HudFrameBox | null = gm.show_legend === true ? { ...TRACKS_LEGEND_DEFAULT_BOX } : null;
   for (const el of layoutElements) {
+    const le = el as Record<string, unknown> | null;
+    if (legendBox && le && le.id === TRACKS_LEGEND_ID) {
+      if (le.hidden === true) {
+        legendBox = null;
+      } else if (
+        typeof le.x === 'number' && typeof le.y === 'number' &&
+        typeof le.width === 'number' && typeof le.height === 'number'
+      ) {
+        legendBox = {
+          x: le.x, y: le.y, width: le.width, height: le.height,
+          ...(typeof le.textScale === 'number' && le.textScale > 0 ? { textScale: le.textScale } : {}),
+        };
+      }
+      continue;
+    }
     if (
       el &&
       typeof el === 'object' &&
@@ -299,6 +319,7 @@ function normalizeTracksGameData(raw: any): TracksGameData {
     textElements,
     textCategories,
     hudLayout,
+    legendBox,
     texts: (() => {
       const t: Record<string, unknown> = {};
       for (const k of TRACKS_TEXT_KEYS) if (gm[k] != null) t[k] = gm[k];
@@ -382,6 +403,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // Checkpoints the focused team reached, used by the clues page to show each
   // checkpoint's own image (found) vs the "not found" image (unfound).
   const [cluesFoundIds, setCluesFoundIds] = useState<Set<string>>(new Set());
+  // Clues page: checkpoints punched but not credited (itinerary wrong order) -
+  // drawn with the wrong-order image, like the reveal, not as "missing".
+  const [cluesWrongIds, setCluesWrongIds] = useState<Set<string>>(new Set());
   // The focused team's resolved route (per-team meta override else launch
   // default) - drives which markers render and which checkpoints score.
   const [focusRoute, setFocusRoute] = useState(config.route ?? 'default');
@@ -566,7 +590,15 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                     'warning',
                   );
                 } else {
-                  showMessage(localizedStatus('team_already_finished', language), 'warning');
+                  // The scenario's "équipe terminée" text belongs HERE (a finished
+                  // team bipping again), not on the run's end. Built-in fallback.
+                  const lastTeam = teamsForCard[teamsForCard.length - 1];
+                  const ended = dataRef.current
+                    ? resolveTracksText(dataRef.current.texts, 'text_team_ended', lastTeam?.language || language, {
+                        team: lastTeam?.team_name ?? '',
+                      })
+                    : '';
+                  showMessage(ended || localizedStatus('team_already_finished', language), 'warning');
                 }
                 return;
               }
@@ -584,6 +616,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
               // "not found" image for the ones they missed. Best-effort - on any
               // failure we fall back to an empty found-set (all shown as missing).
               let cluesFound = new Set<string>();
+              const cluesWrong = new Set<string>();
               try {
                 const allCps = gd.checkpoints;
                 const routeCps = checkpointsForRoute(allCps, cluesRoute);
@@ -592,6 +625,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 const hitSlotByCp = firstSlotByCheckpoint(routeCps, numberOf, stations, card.punches ?? []);
                 if (trackPlayMode === 'itinerary') {
                   cluesFound = orderedHitCheckpointIds(routeCps, hitSlotByCp).hitIds;
+                  for (const cp of routeCps) {
+                    if (!cluesFound.has(cp.id) && hitSlotByCp.get(cp.id) !== undefined) cluesWrong.add(cp.id);
+                  }
                 } else {
                   for (const cp of routeCps) {
                     if (hitSlotByCp.get(cp.id) !== undefined) cluesFound.add(cp.id);
@@ -610,6 +646,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 setFocusTeamName(finishedTeam.team_name ?? '');
                 setFocusLanguage(finishedTeam.language ?? '');
                 setCluesFoundIds(cluesFound);
+                setCluesWrongIds(cluesWrong);
                 setFocusScoreText(scoreText(finishedTeam.score ?? 0));
                 setFocusFrozenSec(cluesFrozenSec);
                 setScreen('clues');
@@ -890,7 +927,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           );
         }
 
-        // Itinerary = strict in-order prefix; free = any reached checkpoint.
+        // Itinerary = walk the route in card-slot order (see orderedHitCheckpointIds); free = any reached checkpoint.
         let hitIds: Set<string>;
         if (trackPlayMode === 'itinerary') {
           hitIds = orderedHitCheckpointIds(routeCps, hitSlotByCp).hitIds;
@@ -1040,28 +1077,27 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         const ranked = sortTracksTeams(refreshed.teams.filter((t) => t.end_time));
         const rank = ranked.findIndex((t) => t.id === team.id) + 1;
         const tier = rank > 0 ? rankTier(rank) : null;
-        if (tier) {
-          const url = getImageUrl(gd.images[`${tier}_image`]);
-          setTopRevealUrl(url);
+        // Only with an uploaded reward image: without one the top-X screen was
+        // a bare black page (score text in the scenario colour, often dark).
+        const tierUrl = tier ? getImageUrl(gd.images[`${tier}_image`]) : '';
+        if (tier && tierUrl) {
+          setTopRevealUrl(tierUrl);
           setGameMessage(''); // clear any lingering warning before the celebration
           setScreen('topreveal');
           playSound(`${tier}_sound`);
           // eslint-disable-next-line no-await-in-loop
           await new Promise((r) => setTimeout(r, 4000));
+          // Back to the revealed map for the closing hold, not the reward page.
+          setTopRevealUrl('');
+          setScreen('reveal');
         }
 
-        // --- Closing messages: team ended, then scenario ended ----------------
+        // --- Closing message: scenario ended --------------------------------
         // Already inside the reveal slot, so drive the overlay directly: routing
         // through showMessage would enqueue a nested slot and deadlock the queue.
+        // No "équipe terminée" here - that text is for a finished team bipping
+        // AGAIN without the clues page (see the finished-card branch above).
         const endLang = team.language || language;
-        const teamEndedMsg = resolveTracksText(gd.texts, 'text_team_ended', endLang, { team: teamName });
-        if (teamEndedMsg) {
-          setGameMessageType('info');
-          setGameMessage(teamEndedMsg);
-          // eslint-disable-next-line no-await-in-loop
-          await new Promise((r) => setTimeout(r, Math.max(1, config.messageDisplayDuration) * 1000));
-          setGameMessage('');
-        }
         // "Scenario ended" only when the roster is closed and complete. With
         // auto/self-register or card reuse, teams join and leave one at a time,
         // so "every registered team has finished" is true after nearly every
@@ -1113,6 +1149,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     setPlacedCheckpoints(new Map());
     setBigReveal(null);
     setCluesFoundIds(new Set());
+    setCluesWrongIds(new Set());
     setTopRevealUrl('');
     setGameMessage('');
     setFocusFrozenSec(null);
@@ -1318,6 +1355,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         bigReveal={bigReveal}
         resolveCheckpointImage={resolveCheckpointImage}
         foundCheckpointIds={cluesFoundIds}
+        wrongCheckpointIds={cluesWrongIds}
+        wrongOrderUrl={getImageUrl(data.images.wrong_order_image)}
         missingCheckpointUrl={getImageUrl(data.images.missing_checkpoint_image)}
         iconSizePercent={data.iconSizePercent}
         hud={{
@@ -1329,6 +1368,28 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         timerText={timerDisplay}
         scoreText={focusScoreText || (scoreType === 'percentage' ? '0%' : '0 pts')}
         showScore={data.showScore}
+        legend={
+          data.legendBox
+            ? {
+                box: data.legendBox,
+                // Wrong order only exists in itinerary mode (free mode credits
+                // every punched checkpoint), so free mode drops that row.
+                wrongOrder:
+                  trackPlayMode === 'itinerary' && data.images.wrong_order_image
+                    ? {
+                        imageUrl: getImageUrl(data.images.wrong_order_image),
+                        label: tIngame('ingame_tracks', 'legend_wrong_order', hudLangCode),
+                      }
+                    : null,
+                missing: data.images.missing_checkpoint_image
+                  ? {
+                      imageUrl: getImageUrl(data.images.missing_checkpoint_image),
+                      label: tIngame('ingame_tracks', 'legend_missing_checkpoint', hudLangCode),
+                    }
+                  : null,
+              }
+            : null
+        }
         timeLabel={hudLang.time}
         scoreLabel={hudLang.score}
         checkpointsSummary={hudLang.summary}

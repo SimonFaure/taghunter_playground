@@ -10,6 +10,7 @@
 // (pinStore) respectively, which the auth gate already inspects.
 
 import { getDb } from './db';
+import { isAndroid } from '../utils/platform';
 
 // schema_meta keys. `onboarding_completed` is the single commit flag set only
 // when the final step (Appearance → Finish) lands.
@@ -89,6 +90,9 @@ export type PostPinStep = 'name' | 'hotspot' | 'mother' | 'operatorOnly' | 'appe
 
 export async function firstUnansweredPostPinStep(): Promise<PostPinStep> {
   if (!(await isStepAnswered(NAMED_KEY))) return 'name';
+  // Android tablets are locked operator-only and never host: no hotspot,
+  // mother or operator-only question to ask.
+  if (isAndroid()) return 'appearance';
   if (!(await isStepAnswered(HOTSPOT_KEY))) return 'hotspot';
   if (!(await isStepAnswered(MOTHER_KEY))) return 'mother';
   if (!(await isStepAnswered(OPERATOR_KEY))) return 'operatorOnly';

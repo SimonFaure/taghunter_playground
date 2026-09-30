@@ -8,7 +8,7 @@
 // even though the modal imports functions from here.
 
 import type { GameConfig, Team, Teammate, LaunchDeviceSelection } from '../components/LaunchGameModal';
-import { listPairedDevicesForLaunch, listBusyDeviceIds } from './launchedGames';
+import { listLaunchDevices, listBusyDeviceIds } from './launchedGames';
 import { isOperatorOnly } from './operatorMode';
 import { tError } from '../i18n/errors';
 
@@ -235,20 +235,20 @@ export function buildClashContiguousAssignments(
  */
 export async function resolveDefaultDeviceSelection(): Promise<LaunchDeviceSelection> {
   try {
-    const [rows, busy, operatorOnly] = await Promise.all([
-      listPairedDevicesForLaunch(),
+    const [{ devices: rows, selfId, motherOutdated }, busy, operatorOnly] = await Promise.all([
+      listLaunchDevices(),
       listBusyDeviceIds(),
       isOperatorOnly(),
     ]);
-    const selfRow = rows.find((r) => r.is_self);
     return {
       // This device only joins the new game if it isn't already running one -
       // and never on an operator-only device (it manages games but never plays).
-      include_self: operatorOnly ? false : selfRow ? !busy.has(selfRow.id) : true,
+      include_self: operatorOnly ? false : selfId !== null ? !busy.has(selfId) : true,
       // Skip peers already participating in another active game (a device runs
-      // at most one game at a time).
+      // at most one game at a time). On a child this includes the mother -
+      // unless it runs an older build, which refuses a join_game to itself.
       satellite_targets: rows
-        .filter((r) => !r.is_self && r.online && !busy.has(r.id))
+        .filter((r) => r.id !== selfId && r.online && !busy.has(r.id) && !(motherOutdated && r.is_self))
         .map((r) => r.id),
     };
   } catch (err) {

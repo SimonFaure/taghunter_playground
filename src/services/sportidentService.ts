@@ -29,6 +29,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { isAndroid } from '../utils/platform';
 
 // ─── Public types (single source of truth post-step-7) ──────────────
 
@@ -199,9 +200,10 @@ class SportIdentService {
   /** True while a reconnect attempt is in flight, so retries don't overlap. */
   private reconnecting = false;
 
-  /** True when running inside the Tauri shell (desktop or mobile). */
+  /** True when running inside the Tauri shell. Never on Android: the tablet is
+   *  a locked operator-only device with no SI reader (utils/platform.ts). */
   isAvailable(): boolean {
-    return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+    return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window && !isAndroid();
   }
 
   async getAvailablePorts(): Promise<USBPort[]> {

@@ -16,6 +16,7 @@
 // real error ("open sqlite (C:\...): disk full") be parsed as a namespace.
 
 import type { TFunction } from 'i18next';
+import { describeHotspotError } from './hotspotErrors';
 
 const CODE_RE = /^failover:[A-Za-z][A-Za-z0-9_]*$/;
 
@@ -48,6 +49,8 @@ function rawMessage(err: unknown): string {
 export function describeFailoverError(err: unknown, t: TFunction): DescribedError {
   const raw = rawMessage(err);
   if (CODE_RE.test(raw)) return { message: t(raw), detail: null };
+  const hotspot = describeHotspotError(raw, t);
+  if (hotspot) return { message: hotspot.message, detail: hotspot.detail };
   const hit = PATTERNS.find(([re]) => re.test(raw));
   return { message: t(hit ? hit[1] : 'failover:errGeneric'), detail: raw || null };
 }

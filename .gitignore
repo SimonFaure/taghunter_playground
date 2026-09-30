@@ -27,3 +27,6 @@ dist-ssr
 src/help/_generated/
 public/help-assets/
 public/playground-help.pdf
+
+# Signed Android APKs (scripts/android-release.mjs)
+release-android/

@@ -24,7 +24,7 @@ export function UpdateAvailableNotice({
   const [opening, setOpening] = useState(false);
 
   const handleUpdate = async () => {
-    if (status.isDesktop) {
+    if (status.canSelfUpdate) {
       onOpenUpdates();
       return;
     }
@@ -42,7 +42,7 @@ export function UpdateAvailableNotice({
       <div className="flex items-center gap-2 text-[var(--pg-accent-bright)]">
         <ArrowUpCircle className="w-4 h-4" />
         <span>
-          {status.isDesktop
+          {status.canSelfUpdate
             ? t('update:availableDesktop', { version: status.latestVersion })
             : t('update:availableStore', { version: status.latestVersion })}
         </span>
@@ -53,8 +53,8 @@ export function UpdateAvailableNotice({
           disabled={opening}
           className="text-[var(--pg-accent-bright)] hover:text-[var(--pg-text)] underline inline-flex items-center gap-1 disabled:opacity-50"
         >
-          {status.isDesktop ? t('update:updateButton') : t('update:openStoreButton')}
-          {!status.isDesktop && <ExternalLink className="w-3 h-3" />}
+          {status.canSelfUpdate ? t('update:updateButton') : t('update:openStoreButton')}
+          {!status.canSelfUpdate && <ExternalLink className="w-3 h-3" />}
         </button>
         <button
           onClick={onDismiss}

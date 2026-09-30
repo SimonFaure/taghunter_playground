@@ -42,5 +42,8 @@
   "errHostingActiveGame": "Ce poste héberge une partie en cours (« {{name}} ») et aucun autre poste mère ne la sert. Arrêtez la partie, ou faites d'abord reprendre la partie par un autre poste (« Faire poste mère » sur ses satellites).",
   "regainNoOther": "Aucun autre poste mère n'est joignable : ce poste reste le poste mère.",
   "promotedBodyHotspot": "Cet appareil est maintenant le poste mère et diffuse le Wi-Fi Tag Hunter. Les satellites le rejoignent d'eux-mêmes en une minute environ ; sinon, sur le satellite : Paramètres → Réseau → Rechercher un poste mère.",
-  "bannerReconnecting": "Reconnexion au poste mère en cours, ne touchez à rien."
+  "bannerReconnecting": "Reconnexion au poste mère en cours, ne touchez à rien.",
+  "takingOverBy": "{{name}} prend le relais, reconnexion en cours, ne touchez à rien.",
+  "anotherDevice": "Un autre poste",
+  "alreadyTakenOver": "{{name}} a déjà pris le relais : ce poste l'a rejoint, rien d'autre à faire."
 }

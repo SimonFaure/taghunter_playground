@@ -10,6 +10,7 @@ import {
   BaseDirectory,
 } from '@tauri-apps/plugin-fs';
 import type { LogoAnimation } from './logoEffect';
+import { isAndroid } from './platform';
 
 export interface AppConfig {
   language: 'english' | 'french' | 'spanish';
@@ -96,7 +97,23 @@ const DEFAULT_CONFIG: AppConfig = {
   operatorOnlyDevice: false,
 };
 
-export const loadConfig = async (): Promise<AppConfig> => {
+// Android tablets are locked operator-only and can never host (see
+// utils/platform.ts), whatever config.json says.
+const applyPlatformLocks = (config: AppConfig): AppConfig => {
+  if (!isAndroid()) return config;
+  return {
+    ...config,
+    operatorOnlyDevice: true,
+    beMotherWhenAvailable: false,
+    startHotspotOnLaunch: false,
+    autoLaunch: false,
+  };
+};
+
+export const loadConfig = async (): Promise<AppConfig> =>
+  applyPlatformLocks(await loadConfigRaw());
+
+const loadConfigRaw = async (): Promise<AppConfig> => {
   try {
     if (!(await exists(CONFIG_REL, { baseDir: BaseDirectory.AppData }))) {
       return { ...DEFAULT_CONFIG };

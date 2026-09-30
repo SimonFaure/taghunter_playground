@@ -1043,7 +1043,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     }
     cpHitSlotById.set(cp.id, first);
   }
-  // Itinerary = strict in-order prefix; free = any reached checkpoint.
+  // Itinerary = walk the route in card-slot order (see orderedHitCheckpointIds); free = any reached checkpoint.
   const tracksBaseHitIds: Set<string> =
     tracksPlayMode === 'itinerary'
       ? orderedHitCheckpointIds(tracksRouteCps, cpHitSlotById).hitIds

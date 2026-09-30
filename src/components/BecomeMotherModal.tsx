@@ -11,10 +11,12 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Crown, X, AlertTriangle, Loader2, CheckCircle, Wifi } from 'lucide-react';
 import {
-  becomeMother,
+  promoteUnlessTakenOver,
   raiseMotherHotspotIfConfigured,
   type BecomeMotherInfo,
 } from '../services/lanMotherBoot';
+import { refreshLaunchedGamesRoute } from '../services/childControlLink';
+import { useAuth } from './auth/AuthProvider';
 import { hotspotStatus } from '../services/lanPairing';
 import { getNetworkSource } from '../services/lanCredentials';
 import { ErrorDetails } from './ErrorDetails';
@@ -25,7 +27,9 @@ import { ErrorDetails } from './ErrorDetails';
 // used to render as the plain green success panel (the yellow note required a
 // non-null hotspot_error, which the missing-creds path never set), which is
 // exactly why an operator saw "success" and nothing happened.
-type Phase = 'confirm' | 'promoting' | 'success' | 'partial' | 'error';
+// 'joined' = another satellite had already taken over: this one joined it
+// instead of becoming a second mother (retours sept. #10, first click wins).
+type Phase = 'confirm' | 'promoting' | 'success' | 'partial' | 'joined' | 'error';
 
 export function BecomeMotherModal({
   launchedGameId,
@@ -35,7 +39,9 @@ export function BecomeMotherModal({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const auth = useAuth();
   const [phase, setPhase] = useState<Phase>('confirm');
+  const [takerLabel, setTakerLabel] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [source, setSource] = useState<string>('hotspot');
   const [info, setInfo] = useState<BecomeMotherInfo | null>(null);
@@ -58,7 +64,14 @@ export function BecomeMotherModal({
     setPhase('promoting');
     setError(null);
     try {
-      await settle(await becomeMother(launchedGameId));
+      const outcome = await promoteUnlessTakenOver(launchedGameId, auth.user?.client_id);
+      if (outcome.kind === 'joined') {
+        setTakerLabel(outcome.taker.label);
+        await refreshLaunchedGamesRoute().catch(() => {});
+        setPhase('joined');
+        return;
+      }
+      await settle(outcome.info);
     } catch (e) {
       setError(e);
       setPhase('error');
@@ -165,6 +178,20 @@ export function BecomeMotherModal({
                     defaultValue:
                       'This device will keep hosting on the next start. To undo: Settings → Network → "I am not a mother".',
                   })}
+                </p>
+              </div>
+              <button onClick={onClose} className="pg-btn pg-btn--primary w-full justify-center">
+                {t('failover:done', { defaultValue: 'Done' })}
+              </button>
+            </div>
+          )}
+
+          {phase === 'joined' && (
+            <div className="space-y-5">
+              <div className="flex flex-col items-center gap-3 py-2 text-center">
+                <CheckCircle size={28} className="text-green-400" />
+                <p className="text-sm text-[var(--pg-text)]">
+                  {t('failover:alreadyTakenOver', { name: takerLabel || t('failover:anotherDevice') })}
                 </p>
               </div>
               <button onClick={onClose} className="pg-btn pg-btn--primary w-full justify-center">

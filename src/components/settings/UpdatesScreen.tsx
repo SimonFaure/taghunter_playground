@@ -132,7 +132,7 @@ export function UpdatesScreen() {
                 </div>
               )}
 
-              {status.isDesktop ? (
+              {status.canSelfUpdate ? (
                 <DesktopUpdateInstaller version={status.latestVersion} />
               ) : status.storeUrl ? (
                 <button

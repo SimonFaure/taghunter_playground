@@ -6,6 +6,7 @@ import { AuthProvider, useAuth } from './components/auth/AuthProvider';
 import { FullscreenHint } from './components/FullscreenHint';
 import { captureError } from './services/telemetry';
 import { loadConfig } from './utils/config';
+import { syncAutostart } from './utils/autostart';
 import { LeaderboardPage } from './components/LeaderboardPage';
 import { TimeRangeLeaderboard } from './components/TimeRangeLeaderboard';
 import { readProjectorTargetFromUrl } from './services/projectorWindow';
@@ -135,6 +136,10 @@ if (!projectorTarget) {
       if (cfg.fullscreenOnLaunch) {
         await getCurrentWindow().setFullscreen(true);
       }
+      // Re-assert the launch-on-boot registration against the saved
+      // preference (a reinstall wipes the Run value; see utils/autostart.ts).
+      // This also re-points it at the current exe path.
+      await syncAutostart(Boolean(cfg.autoLaunch));
     } catch (err) {
       console.error('[main] fullscreen-on-launch failed:', err);
     }

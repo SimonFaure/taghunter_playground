@@ -19,3 +19,7 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# Classes Rust reaches by name over JNI (ClassLoader.loadClass): R8 must neither
+# strip nor rename them, or the lookup throws ClassNotFoundException.
+-keep class com.taghunter.playground.ApkInstaller { *; }
+-keep class com.taghunter.playground.sportident.** { *; }

@@ -61,6 +61,25 @@ pub fn mother_set_hotspot_band(band: String) {
 
 // ─── tauri commands ──────────────────────────────────────────────────────────
 
+/// Opens Windows' own Mobile hotspot page - the operator's check when our start
+/// fails: if Windows' toggle fails too, it is the Wi-Fi driver, not Tag Hunter.
+/// (The opener plugin's default scope only allows http(s)/mailto/tel.)
+#[tauri::command]
+pub fn open_windows_hotspot_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg("ms-settings:network-mobilehotspot")
+            .spawn()
+            .map_err(|e| format!("open ms-settings: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(format!("not supported on {PLATFORM}"))
+    }
+}
+
 #[tauri::command]
 pub async fn mother_start_hotspot(
     ssid: String,
@@ -174,40 +193,42 @@ mod windows_impl {
     use windows::Networking::Connectivity::{ConnectionProfile, NetworkInformation};
     use windows::Networking::NetworkOperators::{
         NetworkOperatorTetheringAccessPointConfiguration, NetworkOperatorTetheringManager,
-        TetheringOperationStatus, TetheringOperationalState, TetheringWiFiBand,
+        TetheringCapability, TetheringOperationStatus, TetheringOperationalState,
+        TetheringWiFiBand,
     };
 
+    /// Start failures are coded `HOTSPOT_ERR:<code>|<detail>` so the renderer
+    /// can explain them in the licensee's language (HotspotIssueBanner).
+    fn coded(code: &str, detail: String) -> String {
+        format!("HOTSPOT_ERR:{code}|{detail}")
+    }
+
     pub fn start(ssid: &str, password: &str) -> Result<(), String> {
-        let profile = pick_profile()?;
+        let profile = pick_profile().map_err(|e| coded("no_profile", e))?;
+
+        // Windows says up front when tethering is off-limits (policy, SKU,
+        // driver/hardware) - no point firing StartTetheringAsync then.
+        if let Ok(cap) =
+            NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(&profile)
+        {
+            if cap != TetheringCapability::Enabled {
+                let name = describe_capability(cap);
+                return Err(coded(
+                    &format!("capability_{name}"),
+                    format!("tethering capability {name} ({})", adapter_description()),
+                ));
+            }
+        }
+
         let manager = NetworkOperatorTetheringManager::CreateFromConnectionProfile(&profile)
             .map_err(|e| format!("CreateFromConnectionProfile: {}", e.message()))?;
 
-        // Configure SSID + passphrase. ConfigureAccessPointAsync is a no-op
-        // when the new config matches the current; safe to call every start.
-        let config = NetworkOperatorTetheringAccessPointConfiguration::new()
-            .map_err(|e| format!("AccessPointConfiguration::new: {}", e.message()))?;
-        config
-            .SetSsid(&HSTRING::from(ssid))
-            .map_err(|e| format!("SetSsid: {}", e.message()))?;
-        config
-            .SetPassphrase(&HSTRING::from(password))
-            .map_err(|e| format!("SetPassphrase: {}", e.message()))?;
-        // Band (Windows 10 2004+). Unsupported API/band → leave Windows' choice.
         let band = if super::HOTSPOT_BAND_24.load(std::sync::atomic::Ordering::Relaxed) {
             TetheringWiFiBand::TwoPointFourGigahertz
         } else {
             TetheringWiFiBand::Auto
         };
-        if config.IsBandSupported(band).unwrap_or(false) {
-            let _ = config.SetBand(band);
-        }
-
-        let configure_op = manager
-            .ConfigureAccessPointAsync(&config)
-            .map_err(|e| format!("ConfigureAccessPointAsync: {}", e.message()))?;
-        configure_op
-            .get()
-            .map_err(|e| format!("ConfigureAccessPointAsync await: {}", e.message()))?;
+        configure(&manager, ssid, password, band)?;
 
         // Already on? Return success without re-starting.
         let state = manager
@@ -217,23 +238,129 @@ mod windows_impl {
             return Ok(());
         }
 
-        let start_op = manager
-            .StartTetheringAsync()
-            .map_err(|e| format!("StartTetheringAsync: {}", e.message()))?;
-        let result = start_op
-            .get()
-            .map_err(|e| format!("StartTetheringAsync await: {}", e.message()))?;
-        let status = result
-            .Status()
-            .map_err(|e| format!("StartTetheringAsync.Status: {}", e.message()))?;
-        if status != TetheringOperationStatus::Success {
-            return Err(format!(
-                "StartTetheringAsync returned {:?} ({})",
-                status,
+        let status = start_tethering(&manager)?;
+        if status == TetheringOperationStatus::Success {
+            return Ok(());
+        }
+        // Single-radio adapters (e.g. MediaTek RZ616) can't host a 2.4 GHz AP
+        // while their station link sits on 5 GHz: Windows fails with a bare
+        // `Unknown`. Fall back to Auto so the AP shares the upstream's band -
+        // a hotspot on 5 GHz beats no hotspot at all.
+        if band == TetheringWiFiBand::TwoPointFourGigahertz {
+            eprintln!(
+                "[hotspot] 2.4 GHz start failed ({}); retrying with band Auto",
                 describe_op_status(status),
+            );
+            // Let the failed attempt settle before reconfiguring.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            configure(&manager, ssid, password, TetheringWiFiBand::Auto)?;
+            let retry = start_tethering(&manager)?;
+            if retry == TetheringOperationStatus::Success {
+                return Ok(());
+            }
+            return Err(coded(
+                failure_code(retry),
+                format!(
+                    "StartTetheringAsync returned {:?} ({}) on 2.4 GHz and {:?} ({}) on Auto band ({})",
+                    status,
+                    describe_op_status(status),
+                    retry,
+                    describe_op_status(retry),
+                    adapter_description(),
+                ),
             ));
         }
+        Err(coded(
+            failure_code(status),
+            format!(
+                "StartTetheringAsync returned {:?} ({}) ({})",
+                status,
+                describe_op_status(status),
+                adapter_description(),
+            ),
+        ))
+    }
+
+    fn failure_code(s: TetheringOperationStatus) -> &'static str {
+        if s == TetheringOperationStatus::WiFiDeviceOff {
+            "wifi_off"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// Wi-Fi card description (e.g. "RZ616 Wi-Fi 6E 160MHz") for support -
+    /// a bare `Unknown` from Windows is almost always a driver matter.
+    /// Only called on failure; best effort.
+    fn adapter_description() -> String {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let ps = "$w = Get-NetAdapter -Physical | Where-Object { $_.NdisPhysicalMedium -eq 9 } | Select-Object -First 1; \
+                  if ($w) { Write-Output ($w.InterfaceDescription + ' / driver ' + $w.DriverVersion) }";
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Wi-Fi adapter unknown".into())
+    }
+
+    fn describe_capability(c: TetheringCapability) -> &'static str {
+        match c {
+            TetheringCapability::Enabled => "Enabled",
+            TetheringCapability::DisabledByGroupPolicy => "DisabledByGroupPolicy",
+            TetheringCapability::DisabledByHardwareLimitation => "DisabledByHardwareLimitation",
+            TetheringCapability::DisabledByOperator => "DisabledByOperator",
+            TetheringCapability::DisabledBySku => "DisabledBySku",
+            TetheringCapability::DisabledByRequiredAppNotInstalled => {
+                "DisabledByRequiredAppNotInstalled"
+            }
+            TetheringCapability::DisabledDueToUnknownCause => "DisabledDueToUnknownCause",
+            TetheringCapability::DisabledBySystemCapability => "DisabledBySystemCapability",
+            _ => "other",
+        }
+    }
+
+    /// Configure SSID + passphrase + band. ConfigureAccessPointAsync is a
+    /// no-op when the new config matches the current; safe to call every start.
+    fn configure(
+        manager: &NetworkOperatorTetheringManager,
+        ssid: &str,
+        password: &str,
+        band: TetheringWiFiBand,
+    ) -> Result<(), String> {
+        let config = NetworkOperatorTetheringAccessPointConfiguration::new()
+            .map_err(|e| format!("AccessPointConfiguration::new: {}", e.message()))?;
+        config
+            .SetSsid(&HSTRING::from(ssid))
+            .map_err(|e| format!("SetSsid: {}", e.message()))?;
+        config
+            .SetPassphrase(&HSTRING::from(password))
+            .map_err(|e| format!("SetPassphrase: {}", e.message()))?;
+        // Band (Windows 10 2004+). Unsupported API/band → leave Windows' choice.
+        if config.IsBandSupported(band).unwrap_or(false) {
+            let _ = config.SetBand(band);
+        }
+        manager
+            .ConfigureAccessPointAsync(&config)
+            .map_err(|e| format!("ConfigureAccessPointAsync: {}", e.message()))?
+            .get()
+            .map_err(|e| format!("ConfigureAccessPointAsync await: {}", e.message()))?;
         Ok(())
+    }
+
+    fn start_tethering(
+        manager: &NetworkOperatorTetheringManager,
+    ) -> Result<TetheringOperationStatus, String> {
+        manager
+            .StartTetheringAsync()
+            .map_err(|e| format!("StartTetheringAsync: {}", e.message()))?
+            .get()
+            .map_err(|e| format!("StartTetheringAsync await: {}", e.message()))?
+            .Status()
+            .map_err(|e| format!("StartTetheringAsync.Status: {}", e.message()))
     }
 
     pub fn stop() -> Result<(), String> {

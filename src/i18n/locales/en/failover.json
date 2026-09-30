@@ -42,5 +42,8 @@
   "errHostingActiveGame": "This device is hosting a running game (\"{{name}}\") and no other mother serves it. End the game, or have another device take it over first (\"Make mother\" on one of its satellites).",
   "regainNoOther": "No other mother can be reached: this device stays the mother.",
   "promotedBodyHotspot": "This device is now the mother and broadcasts the Tag Hunter Wi-Fi. Satellites rejoin on their own within about a minute; otherwise, on the satellite: Settings → Network → Find a mother.",
-  "bannerReconnecting": "Reconnecting to the mother, please don't touch anything."
+  "bannerReconnecting": "Reconnecting to the mother, please don't touch anything.",
+  "takingOverBy": "{{name}} is taking over, reconnecting, do not touch anything.",
+  "anotherDevice": "Another device",
+  "alreadyTakenOver": "{{name}} has already taken over: this device joined it, nothing else to do."
 }

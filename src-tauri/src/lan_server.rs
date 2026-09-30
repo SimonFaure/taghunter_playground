@@ -1713,10 +1713,29 @@ fn is_auth_refusal(err: &str) -> bool {
     err.contains("HTTP 401") || err.contains("HTTP 403")
 }
 
+/// Does a discovered mother outrank this device's own claim on the game?
+/// A strictly higher epoch always does. An EQUAL epoch means two satellites
+/// promoted from the same snapshot in the same few seconds (retours sept. #10,
+/// "first click wins" racing itself): the lower uuid wins, so exactly one of
+/// the two yields and the venue converges on a single mother.
+pub(crate) fn outranks_local_mother(
+    their_epoch: Option<i64>,
+    their_uuid: &str,
+    my_epoch: i64,
+    self_uuid: Option<&str>,
+) -> bool {
+    match their_epoch {
+        Some(e) if e > my_epoch => true,
+        Some(e) if e == my_epoch && my_epoch > 0 => self_uuid.map_or(false, |me| their_uuid < me),
+        _ => false,
+    }
+}
+
 /// "Regain control" detection. Returns the live mother to take over from, if
 /// any. Works whether or not THIS device has a local copy of the game:
 ///  - browse mDNS for a DIFFERENT mother of this client at a HIGHER epoch than
-///    our own (our local active game's epoch, or 0 if we have none);
+///    our own (our local active game's epoch, or 0 if we have none), or at the
+///    SAME epoch with a lower uuid (`outranks_local_mother`);
 ///  - resolve the game id+name from our own local row if we have one, otherwise
 ///    ask that mother (`list_active`) using our best outbound secret.
 /// None when there's no higher-epoch mother, or we can't see/authenticate to it.
@@ -1760,7 +1779,7 @@ pub async fn get_takeover_target(
         .into_iter()
         .filter(|m| m.client_id == Some(client_id))
         .filter(|m| self_uuid.as_deref() != Some(m.mother_uuid.as_str()))
-        .filter(|m| m.epoch.map_or(false, |e| e > my_epoch))
+        .filter(|m| outranks_local_mother(m.epoch, &m.mother_uuid, my_epoch, self_uuid.as_deref()))
         .collect();
     mothers.sort_by_key(|m| std::cmp::Reverse(m.epoch.unwrap_or(0)));
 
@@ -3055,7 +3074,7 @@ async fn dispatch_launched_games(
         ("GET", "list_paired_with_status") => {
             list_paired_with_status(&state, peer_id, &q.rest).await
         }
-        ("GET", "list_paired_for_launch") => list_paired_for_launch(&state).await,
+        ("GET", "list_paired_for_launch") => list_paired_for_launch(&state, peer_id).await,
         ("POST", "queue_command") => queue_command(&state, peer_id, body).await,
         ("POST", "queue_command_bulk") => queue_command_bulk(&state, peer_id, body).await,
         ("POST", "ack_command") => ack_command(&state, peer_id, body).await,
@@ -4883,27 +4902,38 @@ async fn list_paired_with_status(
 // Same shape as a single `list_paired_with_status` row, but without a launched
 // game to anchor against - used by the launch-wizard's step 3 to render the
 // device picker BEFORE the game has been created. `lgd_id` is always null.
-async fn list_paired_for_launch(state: &AppState) -> Result<Value, ApiErr> {
+//
+// The mother's own row (is_self) is never bumped by a ping - the mother doesn't
+// ping itself - so it would always read "offline" to a child launching from
+// here. We ARE the mother answering this request, so it's online by definition,
+// and its reader flag comes from the live in-process presence instead.
+async fn list_paired_for_launch(state: &AppState, caller_device_id: i64) -> Result<Value, ApiErr> {
+    let self_has_reader = match state.app.try_state::<ReaderPresence>() {
+        Some(p) => *p.inner.lock().await,
+        None => false,
+    };
     let rows = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
             let mut stmt = c.prepare(
                 "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
                         pd.last_seen_at, pd.has_reader, pd.reader_last_seen_at,
-                        CASE WHEN pd.last_seen_at IS NOT NULL
-                               AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
+                        CASE WHEN pd.is_self = 1
+                               OR (pd.last_seen_at IS NOT NULL
+                                   AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25)
                              THEN 1 ELSE 0 END AS online
                    FROM paired_devices pd
                  ORDER BY pd.is_self DESC, online DESC, pd.last_seen_at DESC",
             )?;
             let rows = stmt.query_map([], |r| {
+                let is_self = r.get::<_, i64>(3)? == 1;
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
                     "device_label": r.get::<_, String>(1)?,
                     "peer_os": r.get::<_, Option<String>>(2)?,
-                    "is_self": r.get::<_, i64>(3)? == 1,
+                    "is_self": is_self,
                     "last_seen_at": r.get::<_, Option<String>>(4)?,
-                    "has_reader": r.get::<_, i64>(5)? == 1,
+                    "has_reader": if is_self { self_has_reader } else { r.get::<_, i64>(5)? == 1 },
                     "reader_last_seen_at": r.get::<_, Option<String>>(6)?,
                     "online": r.get::<_, i64>(7)? == 1,
                     "lgd_id": Value::Null,
@@ -4912,7 +4942,10 @@ async fn list_paired_for_launch(state: &AppState) -> Result<Value, ApiErr> {
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await?;
-    Ok(json!({ "devices": rows }))
+    // `is_self` marks the MOTHER's row (the DB owner), whoever asks. A child
+    // launching from here needs to know which row is ITSELF - see
+    // list_paired_with_status for the same field.
+    Ok(json!({ "devices": rows, "caller_device_id": caller_device_id }))
 }
 
 /// Mother-only push queue. Three command kinds today:
@@ -4994,9 +5027,13 @@ async fn queue_command_inner(
     // it via /ping.php), so a row targeting the mother would sit unread
     // forever. Video commands are still meaningful on the mother's screen - a
     // satellite operator driving the room's main display - so those are
-    // executed IN-PROCESS further down instead of being enqueued. Every other
-    // kind stays rejected: `join_game` & co. only make sense for a satellite.
-    if target_device_id == state.self_peer_id && !matches!(kind, "play_video" | "stop_video") {
+    // executed IN-PROCESS further down instead of being enqueued. Same for
+    // `join_game`: a child (e.g. an operator-only tablet) launching a game can
+    // pick the mother as a participating device. Every other kind stays
+    // rejected: they only make sense for a satellite.
+    if target_device_id == state.self_peer_id
+        && !matches!(kind, "play_video" | "stop_video" | "join_game")
+    {
         return Err(ApiErr::bad("Cannot queue a command targeting self"));
     }
     let launched_game_id = payload
@@ -5121,8 +5158,8 @@ async fn queue_command_inner(
         _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
     }
 
-    // Self-targeted video command (a satellite operator driving the mother's
-    // own screen). Emit the very same `taghunter://lan-command` event the
+    // Self-targeted command (video: a satellite operator driving the mother's
+    // own screen; join_game: a child launching onto the mother). Emit the very same `taghunter://lan-command` event the
     // satellite path emits on /ping.php pickup - <OperatorVideoOverlay> at the
     // App root already handles it - instead of inserting an unreadable queue
     // row. The overlay's usual "repoint at the pushing mother, then fetch the
@@ -5157,11 +5194,14 @@ async fn queue_command_inner(
             }
         }
         use tauri::Emitter;
+        // `local: true` tells the renderer the game lives in OUR db: a
+        // self-targeted join_game must enter it through our own server route,
+        // not repoint at some paired mother.
         state
             .app
             .emit(
                 "taghunter://lan-command",
-                json!({ "id": 0, "kind": kind, "payload": enriched }),
+                json!({ "id": 0, "kind": kind, "payload": enriched, "local": true }),
             )
             .map_err(|e| {
                 ApiErr::status(
@@ -8468,6 +8508,21 @@ pub async fn client_describe_local_role(
 #[cfg(test)]
 mod adopt_tests {
     use super::*;
+
+    #[test]
+    fn takeover_tie_break_lower_uuid_wins() {
+        // Strictly higher epoch always wins, whatever the uuids.
+        assert!(outranks_local_mother(Some(5), "zzz", 4, Some("aaa")));
+        // Lower epoch never does.
+        assert!(!outranks_local_mother(Some(3), "aaa", 4, Some("zzz")));
+        // Equal epoch: the lower uuid wins, so exactly one side yields.
+        assert!(outranks_local_mother(Some(4), "aaa", 4, Some("bbb")));
+        assert!(!outranks_local_mother(Some(4), "bbb", 4, Some("aaa")));
+        // No own uuid, no epoch, or no local game: no tie-break.
+        assert!(!outranks_local_mother(Some(4), "aaa", 4, None));
+        assert!(!outranks_local_mother(None, "aaa", 0, Some("bbb")));
+        assert!(!outranks_local_mother(Some(0), "aaa", 0, Some("bbb")));
+    }
 
     const SCHEMA: &str = r#"
         CREATE TABLE lg_launched_games (
