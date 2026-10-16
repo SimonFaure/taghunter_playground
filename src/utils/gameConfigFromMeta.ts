@@ -11,6 +11,23 @@ import type { GameConfig } from '../components/LaunchGameModal';
  * `name`/`numberOfTeams` aren't reliably present in meta, so the caller passes
  * them explicitly (from the launched_games row / the current config).
  */
+function clashFieldsFromMeta(metaMap: Record<string, string>): Partial<GameConfig> {
+  const out: Partial<GameConfig> = {};
+  if (metaMap.clashRegistrationMode === 'self' || metaMap.clashRegistrationMode === 'bulk') {
+    out.clashRegistrationMode = metaMap.clashRegistrationMode;
+  }
+  if (metaMap.clash_config) {
+    try {
+      const cc = JSON.parse(metaMap.clash_config) as { max_per_clan?: number; purge_enabled?: boolean };
+      if (typeof cc.max_per_clan === 'number') out.clashMaxPerClan = cc.max_per_clan;
+      if (typeof cc.purge_enabled === 'boolean') out.clashPurgeEnabled = cc.purge_enabled;
+    } catch {
+      /* malformed clash_config: leave defaults */
+    }
+  }
+  return out;
+}
+
 export function gameConfigFromMeta(
   metaMap: Record<string, string>,
   base: { name: string; numberOfTeams: number },
@@ -27,6 +44,8 @@ export function gameConfigFromMeta(
     autoResetTeam: metaMap.autoResetTeam !== 'false',
     delayBeforeReset: parseInt(metaMap.delayBeforeReset || '2'),
     enterToReset: metaMap.enterToReset === 'true',
+    // Missing key ⇒ false: games launched before the option keep the reveal walk.
+    noRevealAnimation: metaMap.noRevealAnimation === 'true',
     showIdleLayout: metaMap.showIdleLayout !== 'false',
     idleSubtitle: metaMap.idleSubtitle ?? undefined,
     malusPerMinute: metaMap.malusPerMinute != null ? parseInt(metaMap.malusPerMinute) : undefined,
@@ -44,6 +63,12 @@ export function gameConfigFromMeta(
     language: metaMap.language || undefined,
     visibilityHideDelaySec: parseInt(metaMap.visibilityHideDelaySec || '10'),
     testMode: metaMap.testMode === 'true',
+    simulated: metaMap.simulated === 'true',
+    // Clash: registration mode is persisted at launch; purge / clan cap / clan
+    // count live in clash_config. Without these a satellite (or a re-entered
+    // page) treated "predefined teams" as self-registration.
+    ...clashFieldsFromMeta(metaMap),
+    rosterImported: metaMap.rosterImported === 'true',
     victoryType: (metaMap.victoryType as 'speed' | 'score') || undefined,
     playMode: (metaMap.playMode as 'solo' | 'team') || undefined,
     tagquestSelfRegister: metaMap.tagquestSelfRegister === 'true',
@@ -54,6 +79,9 @@ export function gameConfigFromMeta(
     // Missing key ⇒ false: games launched before the option keep raw scores.
     tagquestScoreWeighting: metaMap.tagquestScoreWeighting === 'true',
     cluesPage: metaMap.cluesPage ? JSON.parse(metaMap.cluesPage) : undefined,
+    // Missing key ⇒ undefined: games launched before the toggle keep the
+    // scenario's own show_legend setting.
+    tracksShowLegend: metaMap.tracksShowLegend != null ? metaMap.tracksShowLegend === 'true' : undefined,
     // Mystery/tracks first-bip videos. Re-derived here so re-entering a game
     // (Play button) or reloading after a config edit doesn't silently drop the
     // overlay. Missing key ⇒ false: games launched before the keys existed

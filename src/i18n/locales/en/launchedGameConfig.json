@@ -16,6 +16,7 @@
   "fieldAutoResetTeam": "Auto-reset page",
   "fieldDelayBeforeReset": "Delay Before Reset (seconds)",
   "fieldEnterToReset": "Use Enter to refresh the page",
+  "fieldNoRevealAnimation": "No animation",
   "fieldShowIdleLayout": "Show idle layout when idle",
   "fieldIdleSubtitle": "Idle screen subtitle",
   "fieldAutoRegisterTeam": "Auto register team",

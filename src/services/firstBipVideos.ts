@@ -40,9 +40,9 @@ export async function resolveFirstBipVideos(
     }
   }
 
-  // Intro = per-scenario scenario_video. Subtitle files live in
-  // scenarios/<uniqid>/v<N>/ and are referenced from medias.sounds under
-  // keys like scenario_video_subtitle_<lang>.
+  // Intro = per-scenario scenario_video. Subtitle files sync with the rest of
+  // the scenario media and are referenced from the sound bucket under keys
+  // like scenario_video_subtitle_<lang> (see collectIntroSubtitleUrls).
   if (config.playIntroOnBip) {
     const introFilename =
       (rawGameData as { scenario_video?: unknown } | null)?.scenario_video
@@ -54,8 +54,7 @@ export async function resolveFirstBipVideos(
       const bare = introFilename.split('/').filter(Boolean).pop() ?? introFilename;
       const url = await scenarioStore.getMediaPath(gameUniqid, bare);
       if (url) {
-        const sounds = (rawGameData as { medias?: { sounds?: Record<string, string> } } | null)?.medias?.sounds;
-        const subtitles = await collectIntroSubtitleUrls(sounds, gameUniqid);
+        const subtitles = await collectIntroSubtitleUrls(rawGameData, gameUniqid);
         sources.push({
           kind: 'intro',
           videoUrl: url,

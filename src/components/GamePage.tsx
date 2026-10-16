@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { GameConfig } from './LaunchGameModal';
 import { MysteryGamePage } from './MysteryGamePage';
@@ -14,6 +14,7 @@ import { VideoControlModal } from './VideoControlModal';
 import { PinExitPrompt } from './PinExitPrompt';
 import { loadConfig } from '../utils/config';
 import * as scenarioStore from '../services/scenarioStore';
+import { fetchScenarioFromMother, motherRoute, type MotherFetchFailure } from '../services/peerContent';
 import {
   endLaunchedGame,
   deleteLaunchedGame,
@@ -26,6 +27,13 @@ import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
 import { onPendingConfigReload, onPendingRejoin } from '../services/pendingJoinStore';
 import { setBaseInGame, setBaseHome } from '../services/screenState';
 import { setActiveLaunchedGameId } from '../services/activeGameStore';
+
+// Game simulator floating window (tester builds only - inline guard so the
+// stable build drops the chunk).
+const SimFloatingWindow =
+  import.meta.env.DEV || import.meta.env.VITE_QA_HARNESS === '1'
+    ? lazy(() => import('../simulator/SimFloatingWindow').then((m) => ({ default: m.SimFloatingWindow })))
+    : null;
 import { Settings, FlaskConical, Trophy, Monitor, StopCircle, Trash2, X, Gamepad2, Play, Clock, CheckCircle, Film } from 'lucide-react';
 
 interface GamePageProps {
@@ -81,6 +89,21 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
 
   const [gameMetadata, setGameMetadata] = useState<GameMetadata | null>(null);
   const [loading, setLoading] = useState(true);
+  // game-data.json absent locally (scenario never synced to this device).
+  // Holds the best title we know; bumping `loadAttempt` re-runs the loader.
+  const [missingScenario, setMissingScenario] = useState<{ title: string } | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  // Fetching that scenario from the mother (offline venue). Each bump of
+  // `motherFetchRun` starts one fetch; the first one starts by itself when the
+  // scenario turns out missing, later ones from the panel's button.
+  const [motherFetch, setMotherFetch] = useState<
+    | { kind: 'idle' }
+    | { kind: 'fetching'; file: string | null; pct: number | null; filesDone: number }
+    | { kind: 'failed'; reason: MotherFetchFailure }
+  >({ kind: 'idle' });
+  const [motherFetchRun, setMotherFetchRun] = useState(0);
+  const autoFetchArmedRef = useRef(true);
+  const motherFetchAbortRef = useRef<AbortController | null>(null);
 
   const [showPanel, setShowPanel] = useState(false);
   const tapCountRef = useRef(0);
@@ -136,20 +159,32 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
         // Slice 2: scenario metadata + game-data.json come from the local
         // SQLite/FS store. No remote scenarios endpoint anymore.
         const gd = (await scenarioStore.getGameData(gameUniqid)) as any;
-        if (gd) {
-          let type: string | undefined;
-          let title: string | undefined;
-          if (gd.game && gd.game.type) {
-            type = gd.game.type;
-            title = gd.game.title || t('gamePanel.unknownGame');
-          } else if (gd.scenario) {
-            type = gd.scenario.scenario_type;
-            title = gd.scenario.title || gd.scenario.name;
+        if (!gd) {
+          // No game data on this device: every renderer would sit on its own
+          // "Loading game data…" forever (or "unsupported type" with no row).
+          // Say so instead, with a retry once the scenario has been synced.
+          const row = await scenarioStore.get(gameUniqid).catch(() => null);
+          setMissingScenario({ title: row?.title || initialConfig.name || gameUniqid });
+          // Routed to a mother: ask it for the scenario, once on our own.
+          if (autoFetchArmedRef.current && motherRoute()) {
+            autoFetchArmedRef.current = false;
+            setMotherFetchRun((n) => n + 1);
           }
-          if (type && title) {
-            setGameMetadata({ type, title });
-            return;
-          }
+          return;
+        }
+        setMissingScenario(null);
+        let type: string | undefined;
+        let title: string | undefined;
+        if (gd.game && gd.game.type) {
+          type = gd.game.type;
+          title = gd.game.title || t('gamePanel.unknownGame');
+        } else if (gd.scenario) {
+          type = gd.scenario.scenario_type;
+          title = gd.scenario.title || gd.scenario.name;
+        }
+        if (type && title) {
+          setGameMetadata({ type, title });
+          return;
         }
         const row = await scenarioStore.get(gameUniqid);
         if (row) {
@@ -165,7 +200,39 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
     };
 
     loadGameMetadata();
-  }, [gameUniqid, t]);
+  }, [gameUniqid, t, initialConfig.name, loadAttempt]);
+
+  // Scenario missing and we're routed to a mother: fetch it from there, then
+  // reload. Videos may still be missing afterwards - the renderers already play
+  // on without them.
+  useEffect(() => {
+    if (motherFetchRun === 0) return;
+    const ctrl = new AbortController();
+    motherFetchAbortRef.current = ctrl;
+    let filesDone = 0;
+    setMotherFetch({ kind: 'fetching', file: null, pct: null, filesDone: 0 });
+    void fetchScenarioFromMother(gameUniqid, {
+      patternUniqid: initialConfig.pattern || null,
+      signal: ctrl.signal,
+      onProgress: (p) => {
+        if (ctrl.signal.aborted) return;
+        if (p.done) filesDone += 1;
+        const file = p.label.replace(/^Scenario media: /, '');
+        const pct = p.total ? Math.min(100, Math.round((p.loaded / p.total) * 100)) : null;
+        setMotherFetch({ kind: 'fetching', file: p.done ? null : file, pct: p.done ? null : pct, filesDone });
+      },
+    }).then((res) => {
+      if (ctrl.signal.aborted) return;
+      if (res.ok) {
+        setMotherFetch({ kind: 'idle' });
+        setLoading(true);
+        setLoadAttempt((n) => n + 1);
+      } else {
+        setMotherFetch({ kind: 'failed', reason: res.reason });
+      }
+    });
+    return () => ctrl.abort();
+  }, [motherFetchRun, gameUniqid, initialConfig.pattern]);
 
   // Publish this device's screen state as "in this game" while a game page is
   // mounted, so the mother's Devices modal can show what each peer is showing.
@@ -327,6 +394,73 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
         />
       );
     }
+    if (missingScenario) {
+      const fetching = motherFetch.kind === 'fetching' ? motherFetch : null;
+      const failedReason =
+        motherFetch.kind === 'failed' && motherFetch.reason !== 'cancelled' && motherFetch.reason !== 'no_mother'
+          ? motherFetch.reason
+          : null;
+      const canAskMother = !fetching && motherRoute() !== null;
+      return (
+        <div className="min-h-full bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-slate-800/80 border border-slate-700 rounded-xl p-6 text-center">
+            <h2 className="text-white text-xl font-semibold mb-3">{t('gamePanel.missingTitle')}</h2>
+            {fetching ? (
+              <div className="mb-6">
+                <p className="text-slate-300 text-sm mb-3">{t('gamePanel.missingFetching')}</p>
+                <div className="h-2 w-full bg-slate-700 rounded overflow-hidden mb-2">
+                  <div
+                    className={`h-full bg-blue-500 transition-all ${fetching.pct === null ? 'animate-pulse w-full opacity-40' : ''}`}
+                    style={fetching.pct !== null ? { width: `${fetching.pct}%` } : undefined}
+                  />
+                </div>
+                {fetching.file && fetching.pct !== null && (
+                  <p className="text-slate-400 text-xs truncate">
+                    {t('gamePanel.missingFetchingFile', { file: fetching.file, pct: fetching.pct })}
+                  </p>
+                )}
+                {fetching.filesDone > 0 && (
+                  <p className="text-slate-400 text-xs">{t('gamePanel.missingFilesDone', { count: fetching.filesDone })}</p>
+                )}
+              </div>
+            ) : (
+              <p className="text-slate-300 text-sm mb-6">
+                {failedReason
+                  ? t(`gamePanel.missingReason_${failedReason}`)
+                  : t('gamePanel.missingBody', { title: missingScenario.title })}
+              </p>
+            )}
+            <div className="flex gap-3 justify-center">
+              <button
+                onClick={() => {
+                  motherFetchAbortRef.current?.abort();
+                  guardedBack();
+                }}
+                className="px-4 py-3 bg-slate-600 hover:bg-slate-500 text-white rounded-lg text-sm font-medium transition"
+              >
+                {fetching ? t('gamePanel.missingCancel') : t('gamePanel.missingBack')}
+              </button>
+              {!fetching && (
+                <button
+                  onClick={() => {
+                    setMotherFetch({ kind: 'idle' });
+                    if (canAskMother) {
+                      setMotherFetchRun((n) => n + 1);
+                    } else {
+                      setLoading(true);
+                      setLoadAttempt((n) => n + 1);
+                    }
+                  }}
+                  className="px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition"
+                >
+                  {canAskMother ? t('gamePanel.missingFromMother') : t('gamePanel.missingRetry')}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
     if (gameMetadata?.type === 'mystery') {
       return <MysteryGamePage config={config} gameUniqid={gameUniqid} launchedGameId={launchedGameId} onBack={guardedBack} onGameEnd={handleGameEnd} />;
     }
@@ -349,6 +483,12 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
   return (
     <div className="fixed inset-0 z-[100] overflow-auto">
       {renderGame()}
+
+      {SimFloatingWindow && launchedGameId !== null && (
+        <Suspense fallback={null}>
+          <SimFloatingWindow launchedGameId={launchedGameId} />
+        </Suspense>
+      )}
 
       <div
         className="fixed top-0 right-0 w-20 h-20 z-[110] cursor-default select-none"

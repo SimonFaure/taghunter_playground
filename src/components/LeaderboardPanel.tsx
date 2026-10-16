@@ -119,6 +119,9 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
     try {
       const state = await getLaunchedGameState(launchedGameId, 0);
       setGameEnded(!!state.ended);
+      // From the game TYPE, not the `clash_config` meta: a TagQuest
+      // self-register team launch carries one too (its per-team cap).
+      setIsClash((state.game_type ?? '').toLowerCase() === 'clash');
       data = state.teams.map((t) => ({
         id: t.id,
         team_number: t.team_number,
@@ -191,11 +194,8 @@ export function LeaderboardPanel({ launchedGameId, gameName, config = {}, compac
         if (map.teamsConfig) {
           try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
-        // Clash clans never get a start_time or an end_time, so the generic
-        // status line read "Did not start" under every clan for the whole match
-        // (retours #97). A registered clan IS in the match - the only states it
-        // has are "playing" and "over".
-        if (map.clash_config) setIsClash(true);
+        // Clash (clans never get a start_time or an end_time, retours #97) is
+        // detected in fetchTeams from the state's game_type.
       } catch (err) {
         console.error('[LeaderboardPanel] meta load failed:', err);
       }

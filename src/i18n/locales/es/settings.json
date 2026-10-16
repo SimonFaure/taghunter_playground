@@ -25,7 +25,6 @@
   "launchOnStartupLabel": "Iniciar al arrancar",
   "launchOnStartupDesc": "Arrancar automáticamente cuando se enciende el ordenador.",
   "beMotherLabel": "Ser la madre en este dispositivo",
-  "beMotherDesc": "Alojar las partidas en este dispositivo al abrir la aplicación. Si no hay otra madre activa, este dispositivo asume el rol y (en modo punto de acceso) inicia el hotspot Wi-Fi para que los satélites se reconecten. Varios dispositivos pueden activarlo - el primero que arranca se convierte en la madre y los demás se unen. Se aplica en el próximo inicio.",
   "sectionDeviceRole": "Rol del dispositivo",
   "operatorOnlyLabel": "Dispositivo solo de operador",
   "operatorOnlyDesc": "Gestionar y lanzar juegos desde este dispositivo sin jugar nunca en él.",

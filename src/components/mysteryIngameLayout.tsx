@@ -6,7 +6,8 @@
  * rectangle in % of the 1920×1080 canonical stage plus an optional horizontal
  * `align`. Font size is driven by the box dimensions: the largest single-line
  * font that fits both width and height (so long team names shrink to fit) - the
- * same O(1) `measureText` approach as TracksTextFit.
+ * same O(1) `measureText` approach as TracksTextFit. The team name may carry a
+ * `minFontSize`: below it the name goes over two lines (teamNameFit.tsx).
  *
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │ DUPLICATED VERBATIM - keep in sync:                                      │
@@ -18,6 +19,7 @@
  */
 
 import { useLayoutEffect, useState } from 'react';
+import { fitTeamNameText, readMinFontSize, renderFitLines, TEAM_NAME_TWO_LINE_HEIGHT, type TextFit } from './teamNameFit';
 
 export type IngameAlign = 'left' | 'center' | 'right';
 
@@ -28,6 +30,12 @@ export interface IngameBox {
   width: number; // 0–100 (% of canonical width)
   height: number; // 0–100 (% of canonical height)
   align?: IngameAlign; // default 'center'
+  /**
+   * Team name only: minimum font size in px on the canonical 1920×1080 stage.
+   * When the one-line auto-fit size drops below it, the name is drawn over two
+   * lines instead. Absent = 20 px (TEAM_NAME_MIN_FONT_DEFAULT); 0 = always one line.
+   */
+  minFontSize?: number;
 }
 
 /** Fixed-role keyed map stored at game_meta.ingame_layout. */
@@ -80,32 +88,6 @@ export function resolveIngameLayout(layout: IngameLayout | undefined | null): Re
 /** Drop-shadow applied to in-game text (matches the historical renderer). */
 const INGAME_TEXT_SHADOW = '0 1px 4px rgba(0,0,0,0.7)';
 
-// Reusable offscreen 2D context for text measurement. Created lazily; only
-// used synchronously inside a layout effect.
-let cachedCtx: CanvasRenderingContext2D | null = null;
-function getMeasurementContext(): CanvasRenderingContext2D | null {
-  if (cachedCtx) return cachedCtx;
-  if (typeof document === 'undefined') return null;
-  const canvas = document.createElement('canvas');
-  cachedCtx = canvas.getContext('2d');
-  return cachedCtx;
-}
-
-/**
- * Largest font-size (px) where a single line of `text` fits both box width and
- * box height. Bold weight (700) is baked in for the canvas measurement.
- *   - Width:  `(f / 100) * widthAt100 ≤ boxW`
- *   - Height: `f ≤ boxH`
- */
-function fitFontSizePx(text: string, fontFamily: string, boxW: number, boxH: number, minPx: number): number {
-  const ctx = getMeasurementContext();
-  if (!ctx || !text) return Math.max(minPx, Math.min(boxH, 16));
-  ctx.font = `700 100px ${fontFamily || 'sans-serif'}`;
-  const w = ctx.measureText(text).width;
-  if (w <= 0) return Math.max(minPx, boxH);
-  return Math.max(minPx, Math.min(boxW / (w / 100), boxH));
-}
-
 export interface MysteryLayoutBoxProps {
   box: IngameBox;
   /** Stage dimensions in px (the fit box the % positions resolve against). */
@@ -115,6 +97,12 @@ export interface MysteryLayoutBoxProps {
   fontFamily: string;
   color: string;
   minPx?: number;
+  /** Rendered px per canonical (1920-wide) px - what `box.minFontSize` is
+   *  scaled by. Defaults to `stageWidth / 1920`; the layout editor passes it
+   *  explicitly because it renders each box inside a box-sized "stage". */
+  canvasScale?: number;
+  /** True for the team-name box: the only one that wraps under its min size. */
+  isTeamName?: boolean;
 }
 
 /**
@@ -131,18 +119,26 @@ export function MysteryLayoutBox({
   fontFamily,
   color,
   minPx = 6,
+  canvasScale,
+  isTeamName,
 }: MysteryLayoutBoxProps) {
   const boxWidthPx = (box.width / 100) * stageWidth;
   const boxHeightPx = (box.height / 100) * stageHeight;
-  const [fontSize, setFontSize] = useState(minPx);
+  const wrapBelowPx = isTeamName ? readMinFontSize(box.minFontSize) * (canvasScale ?? stageWidth / 1920) : 0;
+  const [fit, setFit] = useState<TextFit>({ fontSize: minPx, lines: [text] });
 
   useLayoutEffect(() => {
     if (boxWidthPx <= 0 || boxHeightPx <= 0) {
-      setFontSize(minPx);
+      setFit({ fontSize: minPx, lines: [text] });
       return;
     }
-    setFontSize(fitFontSizePx(text, fontFamily, boxWidthPx, boxHeightPx, minPx));
-  }, [text, fontFamily, boxWidthPx, boxHeightPx, minPx]);
+    setFit(
+      fitTeamNameText(text, { family: fontFamily, weight: 700 }, boxWidthPx, boxHeightPx, {
+        minPx: wrapBelowPx,
+        floorPx: minPx,
+      }),
+    );
+  }, [text, fontFamily, boxWidthPx, boxHeightPx, minPx, wrapBelowPx]);
 
   const align = box.align ?? 'center';
   const justifyContent = align === 'left' ? 'flex-start' : align === 'right' ? 'flex-end' : 'center';
@@ -178,13 +174,14 @@ export function MysteryLayoutBox({
             fontFamily: fontFamily || undefined,
             fontWeight: 700,
             color,
-            fontSize: `${fontSize}px`,
-            lineHeight: 1,
+            fontSize: `${fit.fontSize}px`,
+            lineHeight: fit.lines.length > 1 ? TEAM_NAME_TWO_LINE_HEIGHT : 1,
             whiteSpace: 'nowrap',
+            textAlign: align,
             textShadow: INGAME_TEXT_SHADOW,
           }}
         >
-          {text}
+          {renderFitLines(fit.lines)}
         </span>
       </div>
     </div>

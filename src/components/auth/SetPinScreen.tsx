@@ -93,6 +93,7 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
           {phase === 'choose' && (
             <OtpInput
               length={4}
+              masked
               value={firstEntry}
               onChange={setFirstEntry}
               onComplete={handleFirstComplete}
@@ -103,6 +104,7 @@ export function SetPinScreen({ user, onPinSet }: SetPinScreenProps) {
           {phase === 'confirm' && (
             <OtpInput
               length={4}
+              masked
               value={secondEntry}
               onChange={setSecondEntry}
               onComplete={handleSecondComplete}

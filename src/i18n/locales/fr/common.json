@@ -14,5 +14,7 @@
   "no": "Non",
   "dismiss": "Fermer",
   "pinResetBanner": "Le code PIN de l'appareil a été réinitialisé avec un code de récupération. Définissez un nouveau code PIN pour réactiver les protections.",
-  "setNewPin": "Définir un nouveau code PIN"
+  "setNewPin": "Définir un nouveau code PIN",
+  "showPin": "Afficher le code",
+  "hidePin": "Masquer le code"
 }

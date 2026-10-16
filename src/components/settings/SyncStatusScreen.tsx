@@ -274,7 +274,9 @@ function SyncExplainer() {
             <Trans t={t} i18nKey="explainerWhatBody">
               Sync downloads your game content - scenarios, patterns, images and
               videos - from Tag Hunter Studio onto this device, so everything is
-              ready to play, even without internet. It runs automatically, and{' '}
+              ready to play, even without internet. At launch the app checks for
+              new content and asks before downloading it; after that it keeps
+              itself up to date, and{' '}
               <span className="font-medium">Sync now</span> forces an immediate
               check for the latest content.
             </Trans>

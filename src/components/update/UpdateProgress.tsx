@@ -5,7 +5,7 @@
 // a click. Before relaunching it checks whether a game / LAN mother session is
 // live and, if so, asks the operator to confirm - but still allows it.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Download, RotateCw, Loader2, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -15,7 +15,9 @@ import { listLaunchedGames } from '../../services/launchedGames';
 import {
   downloadUpdate,
   installAndRelaunch,
+  stagedUpdateVersion,
   type DownloadProgress,
+  type UpdateSource,
 } from '../../services/updateService';
 
 type Phase = 'idle' | 'downloading' | 'downloaded' | 'installing' | 'error';
@@ -42,9 +44,23 @@ async function aGameIsRunning(): Promise<boolean> {
   }
 }
 
-export function DesktopUpdateInstaller({ version }: { version?: string | null }) {
+export function DesktopUpdateInstaller({ version, source = 'cloud' }: { version?: string | null; source?: UpdateSource }) {
   const { t } = useTranslation();
   const [phase, setPhase] = useState<Phase>('idle');
+
+  // Downloaded earlier (this session or before a restart): the installer cache
+  // still holds it, so go straight to "Restart to apply".
+  useEffect(() => {
+    let cancelled = false;
+    void stagedUpdateVersion().then((staged) => {
+      if (!cancelled && staged && (!version || staged === version)) {
+        setPhase((p) => (p === 'idle' ? 'downloaded' : p));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [version]);
   const [progress, setProgress] = useState<DownloadProgress>({ downloaded: 0, total: null });
   const [error, setError] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -175,7 +191,7 @@ export function DesktopUpdateInstaller({ version }: { version?: string | null })
         onConfirm={startDownload}
         onCancel={() => setDownloadConfirmOpen(false)}
         title={t('update:downloadConfirmTitle')}
-        message={t('update:downloadConfirmMessage', {
+        message={t(source === 'mother' ? 'update:downloadConfirmMessageMother' : 'update:downloadConfirmMessage', {
           version: version ?? '',
         })}
         confirmText={t('update:downloadUpdate')}

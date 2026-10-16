@@ -20,17 +20,6 @@
     "label": "Nom de l’appareil",
     "placeholder": "ex. PC de l’accueil"
   },
-  "hotspot": {
-    "title": "Point d’accès Wi-Fi par défaut ?",
-    "subtitle": "Utiliser cet ordinateur comme point d’accès Wi-Fi par défaut auquel vos autres appareils se connecteront automatiquement.",
-    "yes": "Oui, utiliser cet ordinateur comme point d’accès",
-    "no": "Non",
-    "note": "Le point d’accès s’activera au prochain démarrage de l’application - votre connexion Internet reste active pour le reste de la configuration.",
-    "conflictTitle": "Un point d’accès par défaut existe déjà",
-    "conflictBody": "Votre compte possède déjà un point d’accès par défaut ({{names}}). Ajouter cet ordinateur comme point d’accès par défaut supplémentaire ?",
-    "conflictConfirm": "Ajouter comme point d’accès supplémentaire",
-    "conflictCancel": "Ne pas l’ajouter"
-  },
   "mother": {
     "title": "Poste mère par défaut ?",
     "subtitle": "Utiliser cet ordinateur comme poste mère par défaut : il héberge vos parties sur le réseau local.",

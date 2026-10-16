@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Wifi, Server, Check, ServerCog } from 'lucide-react';
+import { Server, Check, ServerCog } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { AuthUser } from '../../../services/authStore';
 import { OnboardingShell } from './OnboardingShell';
@@ -8,11 +8,8 @@ import { setCachedDeviceDisplayName, getDeviceMetadata } from '../../../services
 import { loadConfig, saveConfig } from '../../../utils/config';
 import { isAndroid } from '../../../utils/platform';
 import { setTheme, getStoredTheme, type ThemeName } from '../../../services/theme';
-import {
-  setDefaultMother,
-  enqueuePendingOp,
-  setDefaultMotherLocal,
-} from '../../../services/lanNetworks';
+import { setDefaultMotherLocal } from '../../../services/lanNetworks';
+import { setConfiguredMother } from '../../../services/deviceRole';
 import {
   ONBOARDING_KEYS,
   markStepAnswered,
@@ -21,7 +18,7 @@ import {
   type PostPinStep,
 } from '../../../services/onboardingStore';
 
-// Steps: name → hotspot → mother → operator-only → appearance. Forward-only into
+// Steps: name → mother → operator-only → appearance. Forward-only into
 // here from the PIN gate; Back is allowed among these steps (all idempotent re-writes).
 // The studio writes are best-effort (grill Q13): the LOCAL effect applies first,
 // the announce is attempted, and a failure enqueues a durable retry - never
@@ -56,17 +53,7 @@ export function PostPinOnboarding({ user, onComplete }: Props) {
         user={user}
         busy={busy}
         setBusy={setBusy}
-        onDone={() => setStep(isAndroid() ? 'appearance' : 'hotspot')}
-      />
-    );
-  }
-  if (step === 'hotspot') {
-    return (
-      <HotspotStep
-        busy={busy}
-        setBusy={setBusy}
-        onBack={() => setStep('name')}
-        onDone={() => setStep('mother')}
+        onDone={() => setStep(isAndroid() ? 'appearance' : 'mother')}
       />
     );
   }
@@ -75,7 +62,7 @@ export function PostPinOnboarding({ user, onComplete }: Props) {
       <MotherStep
         busy={busy}
         setBusy={setBusy}
-        onBack={() => setStep('hotspot')}
+        onBack={() => setStep('name')}
         onDone={() => setStep('operatorOnly')}
       />
     );
@@ -168,65 +155,7 @@ function NameStep({
   );
 }
 
-// ── Step 5: default hotspot ─────────────────────────────────────────────────
-function HotspotStep({
-  busy,
-  setBusy,
-  onBack,
-  onDone,
-}: {
-  busy: boolean;
-  setBusy: (b: boolean) => void;
-  onBack: () => void;
-  onDone: () => void;
-}) {
-  const { t } = useTranslation('onboarding');
-  const [choice, setChoice] = useState<boolean>(false); // default No
-
-  async function handleContinue() {
-    setBusy(true);
-    if (choice) {
-      // Be a hotspot-mode mother on this device (mother/hotspot role rework):
-      // the device hosts games and raises the AP at boot. The live AP starts
-      // NEXT launch, not now (so the remaining online steps keep internet). The
-      // hotspot creds themselves are authored in studio and arrive on sync -
-      // nothing is uploaded from here anymore.
-      const cfg = await loadConfig();
-      await saveConfig({ ...cfg, beMotherWhenAvailable: true });
-    }
-    await markStepAnswered(ONBOARDING_KEYS.hotspot);
-    setBusy(false);
-    onDone();
-  }
-
-  return (
-    <OnboardingShell
-      stepNumber={6}
-      title={t('hotspot.title')}
-      subtitle={t('hotspot.subtitle')}
-      onPrimary={handleContinue}
-      onBack={onBack}
-      busy={busy}
-    >
-      <ChoiceCard
-        icon={<Wifi className="w-5 h-5" />}
-        label={t('hotspot.yes')}
-        active={choice}
-        onClick={() => setChoice(true)}
-      />
-      <ChoiceCard
-        label={t('hotspot.no')}
-        active={!choice}
-        onClick={() => setChoice(false)}
-      />
-      {choice && (
-        <p className="text-xs text-[var(--pg-text-dim)] pt-1">{t('hotspot.note')}</p>
-      )}
-    </OnboardingShell>
-  );
-}
-
-// ── Step 6: default mother ──────────────────────────────────────────────────
+// ── Step 5: default mother ──────────────────────────────────────────────────
 function MotherStep({
   busy,
   setBusy,
@@ -243,19 +172,10 @@ function MotherStep({
 
   async function handleContinue() {
     setBusy(true);
-    if (choice) {
-      try {
-        await setDefaultMother(true);
-      } catch (err) {
-        console.error('[onboarding] set_default_mother failed, queued:', err);
-        await enqueuePendingOp({ kind: 'mother', on: true, motherUuid: null });
-      }
-      // Designating this device as the venue's mother also makes it boot as the
-      // mother (mother/hotspot role rework). Router-mode mothers raise no AP.
-      const cfg = await loadConfig();
-      await saveConfig({ ...cfg, beMotherWhenAvailable: true });
-    }
-    await setDefaultMotherLocal(choice);
+    // "Yes" sets this device as the licensee's mother: the config flag (it then
+    // boots as the mother), the Studio inventory and its local mirror.
+    if (choice) await setConfiguredMother(true);
+    else await setDefaultMotherLocal(false);
     await markStepAnswered(ONBOARDING_KEYS.mother);
     setBusy(false);
     onDone();
@@ -263,7 +183,7 @@ function MotherStep({
 
   return (
     <OnboardingShell
-      stepNumber={7}
+      stepNumber={6}
       title={t('mother.title')}
       subtitle={t('mother.subtitle')}
       onPrimary={handleContinue}
@@ -314,7 +234,7 @@ function OperatorOnlyStep({
 
   return (
     <OnboardingShell
-      stepNumber={8}
+      stepNumber={7}
       title={t('operatorOnly.title')}
       subtitle={t('operatorOnly.subtitle')}
       onPrimary={handleContinue}
@@ -364,7 +284,7 @@ function AppearanceStep({
 
   return (
     <OnboardingShell
-      stepNumber={isAndroid() ? 6 : 9}
+      stepNumber={isAndroid() ? 6 : 8}
       title={t('appearance.title')}
       subtitle={t('appearance.subtitle')}
       onPrimary={handleFinish}

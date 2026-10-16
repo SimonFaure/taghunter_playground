@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import * as cardsRepo from '../../services/cardsRepo';
 import * as cardsStore from '../../services/cardsStore';
-import { runCycleNow, getState } from '../../services/syncOrchestrator';
+import { syncCardsNow, getState } from '../../services/syncOrchestrator';
 import { on } from '../../services/syncEvents';
 import { useAuth } from '../auth/AuthProvider';
 
@@ -155,7 +155,7 @@ export function CardsManager() {
       await reload();
       // Best-effort: trigger an immediate sync cycle so the studio sees it
       // soon. If offline / sync busy, no-op - next normal cycle handles it.
-      void runCycleNow('manual').catch(() => undefined);
+      void syncCardsNow().catch(() => undefined);
     } catch (err) {
       flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errRegisterFailed'));
     } finally {
@@ -189,7 +189,7 @@ export function CardsManager() {
       flashMessage('success', t('cardsManager:cardUpdated'));
       setEditState({ kind: 'none' });
       await reload();
-      void runCycleNow('manual').catch(() => undefined);
+      void syncCardsNow().catch(() => undefined);
     } catch (err) {
       flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errUpdateFailed'));
     } finally {
@@ -210,7 +210,7 @@ export function CardsManager() {
       flashMessage('success', t('cardsManager:cardDeleted'));
       setConfirmDelete(null);
       await reload();
-      void runCycleNow('manual').catch(() => undefined);
+      void syncCardsNow().catch(() => undefined);
     } catch (err) {
       flashMessage('error', err instanceof Error ? err.message : t('cardsManager:errDeleteFailed'));
     } finally {
@@ -255,7 +255,7 @@ export function CardsManager() {
         t('cardsManager:importResult', { inserted: body.inserted ?? 0, updated: body.updated ?? 0 }) +
           (body.skipped ? t('cardsManager:importResultSkipped', { skipped: body.skipped }) : '')
       );
-      await runCycleNow('manual').catch(() => undefined);
+      await syncCardsNow().catch(() => undefined);
       closeImport();
       await reload();
     } catch (err) {
@@ -293,7 +293,7 @@ export function CardsManager() {
             className="hidden"
           />
           <button
-            onClick={() => runCycleNow('manual')}
+            onClick={() => void syncCardsNow().catch(() => undefined)}
             disabled={busy || getState().cycleInFlight}
             className="pg-btn pg-btn--ghost pg-btn--sm disabled:opacity-50"
             title={t('cardsManager:refreshTitle')}

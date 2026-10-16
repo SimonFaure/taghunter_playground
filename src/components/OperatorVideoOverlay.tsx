@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
-import { resolveVideosByKind, type VideoSource } from '../services/videoResolution';
+import { resolveVideosByKind, applySubtitleChoice, type VideoSource } from '../services/videoResolution';
 import { getLaunchedGameState } from '../services/launchedGames';
 import { pointLaunchedGamesAtMother } from '../services/lanMotherBoot';
 import { getPairedMother } from '../services/lanPairing';
@@ -22,6 +22,9 @@ interface LanCommand {
     launched_game_id?: number;
     kinds?: Array<'intro' | 'tutorial'>;
     language?: string;
+    // Subtitle track the operator picked ('off' | '<lang>'). Absent = this
+    // device's own default.
+    subtitle_lang?: string;
     // Present only on a command this device's OWN mother server dispatched
     // in-process (a satellite operator targeting the mother's screen). The
     // server resolved the scenario identity for us - see queue_command_inner -
@@ -84,6 +87,7 @@ export function OperatorVideoOverlay() {
           const gid = cmd.payload.launched_game_id;
           const kinds = cmd.payload.kinds ?? [];
           const language = cmd.payload.language ?? 'fr';
+          const subtitleChoice = cmd.payload.subtitle_lang;
           if (!gid || kinds.length === 0) return;
           // Locally dispatched by our own mother server: the scenario identity
           // rode along in the payload, so there is nothing to repoint or fetch.
@@ -99,7 +103,7 @@ export function OperatorVideoOverlay() {
               console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
               return;
             }
-            void startVideosDeferred(local);
+            void startVideosDeferred(applySubtitleChoice(local, subtitleChoice));
             return;
           }
           // The pushed game lives in the PUSHING mother's SQLite. Repoint our
@@ -138,7 +142,7 @@ export function OperatorVideoOverlay() {
           // Preempt any in-progress playback by replacing the source list
           // wholesale once the screen is quiet. FirstBipVideoOverlay's keyed
           // <video> remount on index/source change handles the transition.
-          void startVideosDeferred(resolved);
+          void startVideosDeferred(applySubtitleChoice(resolved, subtitleChoice));
         }
       });
       if (cancelled) {

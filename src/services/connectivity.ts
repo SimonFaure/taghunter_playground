@@ -47,7 +47,7 @@ export async function probeStudioReachable(timeoutMs = 8000): Promise<boolean> {
 
 /**
  * The truthful "is studio reachable" signal: the cached probe result when
- * fresh, else one live probe. On the normal venue setup - hotspot with no
+ * fresh, else one live probe. On the normal venue setup - a router with no
  * upstream internet - navigator.onLine reads true while this correctly
  * reads false.
  */

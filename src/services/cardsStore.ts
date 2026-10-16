@@ -156,41 +156,57 @@ export async function pushPendingMutations(): Promise<PushResult> {
   let conflicts = 0;
   let failed = 0;
 
+  const body = (item: cardsRepo.PendingCardRow) => ({
+    id: item.id,
+    key_number: item.key_number,
+    key_name: item.key_name,
+    color: item.color,
+  });
+  const createCard = (item: cardsRepo.PendingCardRow) =>
+    apiCall('cards', 'create_card', { method: 'POST', bearer: true, body: body(item) });
+  const updateCard = (item: cardsRepo.PendingCardRow) =>
+    apiCall('cards', 'update_card', { method: 'PUT', bearer: true, body: body(item) });
+  const isApi = (err: unknown, status: number, code?: string) =>
+    err instanceof ApiError &&
+    err.status === status &&
+    (code === undefined || (err.body as { error_code?: string } | null)?.error_code === code);
+
   for (const item of pending) {
     try {
+      // Creates and updates are pushed as an upsert: an edit shared over the
+      // LAN may reach the studio after another device already created the
+      // chip (create -> 409 card_id_exists -> update), or after an admin
+      // deleted it (update -> 404 -> create).
       if (item.operation === 'create') {
-        await apiCall('cards', 'create_card', {
-          method: 'POST',
-          bearer: true,
-          body: {
-            id: item.id,
-            key_number: item.key_number,
-            key_name: item.key_name,
-            color: item.color,
-          },
-        });
-        await cardsRepo.markSynced(item.id, 'create');
+        try {
+          await createCard(item);
+        } catch (err) {
+          if (!isApi(err, 409, 'card_id_exists')) throw err;
+          await updateCard(item);
+        }
+        await cardsRepo.markSynced(item.id, 'create', item.mutation_id);
         pushed += 1;
       } else if (item.operation === 'update') {
-        await apiCall('cards', 'update_card', {
-          method: 'PUT',
-          bearer: true,
-          body: {
-            id: item.id,
-            key_number: item.key_number,
-            key_name: item.key_name,
-            color: item.color,
-          },
-        });
-        await cardsRepo.markSynced(item.id, 'update');
+        try {
+          await updateCard(item);
+        } catch (err) {
+          if (!isApi(err, 404)) throw err;
+          await createCard(item);
+        }
+        await cardsRepo.markSynced(item.id, 'update', item.mutation_id);
         pushed += 1;
       } else if (item.operation === 'delete') {
-        await apiCall('cards', 'delete_card', {
-          method: 'DELETE',
-          bearer: true,
-          query: { id: item.id },
-        });
-        await cardsRepo.markSynced(item.id, 'delete');
+        try {
+          await apiCall('cards', 'delete_card', {
+            method: 'DELETE',
+            bearer: true,
+            query: { id: item.id },
+          });
+        } catch (err) {
+          // Already gone (an older studio answers 404 instead of success).
+          if (!isApi(err, 404)) throw err;
+        }
+        await cardsRepo.markSynced(item.id, 'delete', item.mutation_id);
         pushed += 1;
       }
     } catch (err) {

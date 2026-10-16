@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentSsid } from './wifi';
 import { discoverOtherMothers } from './lanPairing';
 import { getActiveLaunchedGameId } from './activeGameStore';
+import { deviceRoleOf, isConfiguredMother, type DeviceRole } from './deviceRole';
 
 const POLL_MS = 10_000;
 // While a game is live we ping faster so the failover snapshot the mother
@@ -27,10 +28,10 @@ const FAILURE_THRESHOLD = 2;
 const DISCOVER_MIN_INTERVAL_MS = 30_000;
 
 type LocalRole = {
-  is_mother_hosting: boolean;
   mother_server_running: boolean;
   paired_devices_count: number;
   paired_mothers_count: number;
+  substitute_for_label: string | null;
 };
 
 // useLocalRole (footer pills) and useMotherConnection (connection state machine)
@@ -73,7 +74,6 @@ export type MotherConnectionState =
   | { kind: 'hidden' }
   | { kind: 'checking' }
   | { kind: 'mother_hosting'; clientCount: number }
-  | { kind: 'mother_partial' }
   | { kind: 'mother_idle' }
   | { kind: 'mother_detected'; count: number }
   | { kind: 'child_ok'; motherLabel: string | null; ssid: string | null }
@@ -81,21 +81,23 @@ export type MotherConnectionState =
   | { kind: 'child_offline' };
 
 // The raw "what is this device right now" booleans, straight from
-// `client_describe_local_role` with no state-machine collapsing. The footer
-// renders these as two plain pills: whether THIS device is the mother (it runs
-// the LAN server that hosts launched games) and whether its Wi-Fi hotspot is
-// broadcasting. null until the first poll resolves.
+// `client_describe_local_role` with no state-machine collapsing: whether THIS
+// device is the mother (it runs the LAN server that hosts launched games).
+// null until the first poll resolves.
 export type LocalRoleState = {
   // `mother_server_running`: the axum LAN server is up, so this device is the
-  // mother hosting the games (independent of whether a hotspot is on - e.g.
-  // router mode hosts without a hotspot).
+  // mother hosting the games.
   isMother: boolean;
-  // `is_mother_hosting`: this device's own Wi-Fi hotspot is currently on.
-  isHotspot: boolean;
   // `paired_mothers_count`: how many mothers this device is paired to. Drives the
   // footer "Mother" pill's paired/not-paired state when this device is NOT itself
   // the mother.
   pairedMotherCount: number;
+  // What this device IS: 'mother' = set as the mother ("Rôle de ce poste"),
+  // whether or not it is serving right now; 'substitute' = hosting in the
+  // mother's absence; 'satellite' otherwise. See services/deviceRole.ts.
+  role: DeviceRole;
+  // The mother a substitute stands in for (its device name), when known.
+  substituteFor: string | null;
 } | null;
 
 export function useLocalRole(): LocalRoleState {
@@ -107,12 +109,13 @@ export function useLocalRole(): LocalRoleState {
       if (inFlight) return;
       inFlight = true;
       try {
-        const r = await describeLocalRoleCached();
+        const [r, configured] = await Promise.all([describeLocalRoleCached(), isConfiguredMother()]);
         if (cancelled || !r) return;
         setRole({
           isMother: r.mother_server_running,
-          isHotspot: r.is_mother_hosting,
           pairedMotherCount: r.paired_mothers_count,
+          role: deviceRoleOf(configured, r.mother_server_running),
+          substituteFor: r.substitute_for_label,
         });
       } finally {
         inFlight = false;
@@ -153,31 +156,25 @@ export function useMotherConnection(): MotherConnectionState {
         const role = await describeLocalRoleCached();
         if (cancelled || !role) return;
 
-        if (role.is_mother_hosting) {
-          setState(
-            role.mother_server_running
-              ? { kind: 'mother_hosting', clientCount: role.paired_devices_count }
-              : { kind: 'mother_partial' },
-          );
+        // The LAN server only runs on the mother (the boot fence, a yield and
+        // "I'm not a mother" all leave it stopped), so a running server IS the
+        // role - whatever the pairing tables say. A mother never seeks a
+        // mother: no ping, no browse. Leftover paired_mothers rows (it followed
+        // another device once, then took the role back through a plain server
+        // start, which doesn't clear them) used to send it down the ping path
+        // below, where the dead mother made it look like an offline satellite.
+        // The reverse leftover is harmless here: paired_devices rows kept after
+        // a demote don't make a mother, since the server is stopped.
+        if (role.mother_server_running) {
+          setState({ kind: 'mother_idle' });
           failuresRef.current = 0;
           return;
         }
+
         // A device paired to a mother is a SATELLITE: fall through to the ping
         // below so the mother sees us (updates last_seen → "connected") AND
-        // relays queued commands (join/reconnect), even if we still carry
-        // leftover paired_devices rows from a past mother role. Treat
-        // paired_devices as "idle mother" ONLY when we are not a satellite -
-        // otherwise the ping never runs and the mother thinks we're offline.
+        // relays queued commands (join/reconnect).
         if (role.paired_mothers_count === 0) {
-          // Leftover paired_devices rows alone do NOT make this device a mother:
-          // a device that was promoted and then demoted ("I'm not a mother")
-          // keeps them - and become_mother emptied its paired_mothers - so it
-          // kept wearing the crown with no server running. Require the server.
-          if (role.paired_devices_count > 0 && role.mother_server_running) {
-            setState({ kind: 'mother_idle' });
-            failuresRef.current = 0;
-            return;
-          }
           // Not a mother, not paired to one. Throttled mDNS browse: if a mother
           // is broadcasting nearby, surface it so the operator knows they can
           // pair. When throttled, keep the prior state so the hint doesn't

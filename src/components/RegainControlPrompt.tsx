@@ -1,87 +1,73 @@
-// "Regain control" startup prompt (mother-failover).
+// The two questions the device SET as the mother may ask, and the only ones the
+// role rules leave to the operator (services/hostingRole.ts):
 //
-// Scenario: device M was the mother, it failed, device S was promoted, then
-// everything restarts. On boot M's epoch fence (slice 6) makes it stand down
-// because S advertises a higher epoch - leaving M idle with the console line
-// "standing down - another device is the current mother (higher epoch)".
+//  - "Reprendre le contrôle ?": the mother is back while a game is still
+//    running on the substitute that stood in for it. Take the game back now, or
+//    let it finish there - the mother then takes the hosting back by itself.
+//  - "Deux postes mères": another device is set as mother too, and nothing says
+//    which designation came last. Asked once; the answer settles it.
 //
-// This prompt detects exactly that situation (`get_takeover_target`: this device
-// has an active LOCAL game but a different, higher-epoch mother is live on the
-// LAN) and offers the operator a one-tap takeover. Takeover pulls the live
-// mother's CURRENT state first, then promotes - so no data is lost. It's a
-// deliberate operator choice, never automatic.
+// Everything else is automatic and silent. This used to pop up on every device
+// whose copy of a game differed from the current host's, whatever its role, and
+// neither button could save the game (the refusal was `stale_snapshot`). Copies
+// now converge by themselves: the newer one wins.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
 import { Crown, AlertTriangle, Loader2, CheckCircle, X } from 'lucide-react';
-import { takeoverMother, onRegainCheckRequested, type TakeoverTarget } from '../services/lanMotherBoot';
+import {
+  onHostingNotice, takeBackNow, resolveTwoMothers, type HostingNotice,
+} from '../services/hostingRole';
+import { displayDeviceLabel } from '../services/lanPairing';
 import { ErrorDetails } from './ErrorDetails';
 
-type Phase = 'confirm' | 'taking' | 'success' | 'error' | 'no_other';
+type Phase = 'confirm' | 'taking' | 'success' | 'error';
 
 export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
   const { t } = useTranslation();
-  const [target, setTarget] = useState<TakeoverTarget | null>(null);
+  const [notice, setNotice] = useState<HostingNotice>({ kind: 'none' });
+  // Asked once per substitute / per rival: "Laisser finir" and "Plus tard" are
+  // answers, not something to ask again every 20 s. The Network page keeps the
+  // action available.
+  const [answered, setAnswered] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>('confirm');
   const [error, setError] = useState<unknown>(null);
 
-  const check = useCallback(async () => {
-    if (clientId == null) return;
-    try {
-      const tgt = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId });
-      if (tgt) {
-        setPhase('confirm');
-        setTarget(tgt);
-      }
-    } catch {
-      /* no target / browse failed - nothing to prompt */
-    }
-  }, [clientId]);
+  useEffect(() => onHostingNotice(setNotice), []);
 
-  useEffect(() => {
-    if (clientId == null) return;
-    // One-shot check a few seconds after boot, once ensureMotherServer has had a
-    // chance to start/stand-down. get_takeover_target only returns a target when
-    // a higher-epoch mother of this client is live AND answers.
-    const id = setTimeout(() => void check(), 2500);
-    // A returning mother in hotspot mode only sees the live mother after it has
-    // found and joined the venue's Wi-Fi (~15 s later): it asks us to look again.
-    const off = onRegainCheckRequested(() => void check());
-    return () => {
-      clearTimeout(id);
-      off();
-    };
-  }, [clientId, check]);
+  const subject =
+    notice.kind === 'substitute_busy' ? notice.substitute
+    : notice.kind === 'two_mothers' ? notice.other
+    : null;
+  const askKey = subject ? `${notice.kind}:${subject.mother_uuid}` : null;
+  // Keep the result of an action on screen after the notice it answered cleared.
+  const open = phase !== 'confirm' || (askKey != null && askKey !== answered);
+  if (!open || clientId == null) return null;
 
-  if (!target) return null;
+  const name = displayDeviceLabel(subject?.label) || t('failover:anotherDevice');
+  const twoMothers = notice.kind === 'two_mothers';
+  const dismissable = phase !== 'taking';
+  const close = () => {
+    setAnswered(askKey);
+    setPhase('confirm');
+    setError(null);
+  };
 
-  const takeover = async () => {
+  const run = async (action: () => Promise<void>) => {
     setPhase('taking');
     setError(null);
     try {
-      // Never act on the target found at boot: its address may be long gone
-      // (retours sept. #14 - "error sending request for url
-      // (http://192.168.137.138:47800/ping.php)"). Resolve it again, verified.
-      const fresh = clientId == null
-        ? null
-        : await invoke<TakeoverTarget | null>('get_takeover_target', { clientId }).catch(() => null);
-      if (!fresh) {
-        // Nobody else is serving any more: this device simply stays the mother.
-        setPhase('no_other');
-        return;
-      }
-      setTarget(fresh);
-      await takeoverMother(fresh);
+      await action();
+      setAnswered(askKey);
       setPhase('success');
     } catch (e) {
       setError(e);
       setPhase('error');
     }
   };
-
-  const dismissable = phase !== 'taking';
-  const close = () => setTarget(null);
+  const takeBack = () => void run(() => takeBackNow(clientId));
+  // Either answer restarts Playground to apply it.
+  const keep = (thisDevice: boolean) => void run(() => resolveTwoMothers(thisDevice));
 
   return (
     <div
@@ -96,7 +82,7 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
               <Crown size={16} className="text-yellow-400" />
             </div>
             <h2 className="pg-modal-title">
-              {t('failover:regainTitle', { defaultValue: 'Take back control?' })}
+              {twoMothers ? t('failover:twoMothersTitle') : t('failover:regainTitle')}
             </h2>
           </div>
           {dismissable && (
@@ -110,30 +96,38 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
           {phase === 'confirm' && (
             <div className="space-y-5">
               <p className="text-sm text-[var(--pg-text)]">
-                {t('failover:regainBody', {
-                  defaultValue:
-                    'The game "{{name}}" is currently hosted by another device - it took over while this one was offline. Take back control on this device?',
-                  name: target.game_name,
-                })}
+                {twoMothers ? t('failover:twoMothersBody', { name }) : t('failover:regainBody', { name })}
               </p>
               <div className="flex items-center gap-2 text-xs text-[var(--pg-text-dim)]">
                 <AlertTriangle size={14} className="text-yellow-400 shrink-0" />
-                <span>
-                  {t('failover:regainNote', {
-                    defaultValue:
-                      'This device pulls the latest game state from the current host before taking over, so nothing is lost.',
-                  })}
-                </span>
+                <span>{twoMothers ? t('failover:twoMothersNote') : t('failover:regainNote')}</span>
               </div>
-              <div className="flex gap-2.5">
-                <button onClick={close} className="pg-btn flex-1 justify-center">
-                  {t('failover:regainKeep', { defaultValue: 'Keep current host' })}
-                </button>
-                <button onClick={takeover} className="pg-btn pg-btn--primary flex-1 justify-center">
-                  <Crown size={16} />
-                  {t('failover:regainConfirm', { defaultValue: 'Take over' })}
-                </button>
-              </div>
+              {twoMothers ? (
+                <div className="space-y-2.5">
+                  <div className="flex gap-2.5">
+                    <button onClick={() => keep(true)} className="pg-btn pg-btn--primary flex-1 justify-center">
+                      <Crown size={16} />
+                      {t('failover:twoMothersKeepThis')}
+                    </button>
+                    <button onClick={() => keep(false)} className="pg-btn flex-1 justify-center">
+                      {name}
+                    </button>
+                  </div>
+                  <button onClick={close} className="pg-btn w-full justify-center">
+                    {t('failover:twoMothersLater')}
+                  </button>
+                </div>
+              ) : (
+                <div className="flex gap-2.5">
+                  <button onClick={close} className="pg-btn flex-1 justify-center">
+                    {t('failover:regainKeep')}
+                  </button>
+                  <button onClick={takeBack} className="pg-btn pg-btn--primary flex-1 justify-center">
+                    <Crown size={16} />
+                    {t('failover:regainConfirm')}
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -141,9 +135,7 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
             <div className="flex flex-col items-center gap-3 py-4 text-center">
               <Loader2 size={28} className="animate-spin text-[var(--pg-accent-bright)]" />
               <p className="text-sm text-[var(--pg-text)]">
-                {t('failover:regainTaking', {
-                  defaultValue: 'Pulling the latest state and taking over…',
-                })}
+                {twoMothers ? t('devicesLan:relaunchingToApply') : t('failover:regainTaking')}
               </p>
             </div>
           )}
@@ -153,23 +145,8 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
               <div className="flex flex-col items-center gap-3 py-2 text-center">
                 <CheckCircle size={28} className="text-green-400" />
                 <p className="text-sm text-[var(--pg-text)]">
-                  {t('failover:regainDone', {
-                    defaultValue:
-                      'This device is now the mother. Open the game to continue - other devices will reconnect.',
-                  })}
+                  {twoMothers ? t('devicesLan:relaunchingToApply') : t('failover:regainDone')}
                 </p>
-              </div>
-              <button onClick={close} className="pg-btn pg-btn--primary w-full justify-center">
-                {t('failover:done', { defaultValue: 'Done' })}
-              </button>
-            </div>
-          )}
-
-          {phase === 'no_other' && (
-            <div className="space-y-5">
-              <div className="flex flex-col items-center gap-3 py-2 text-center">
-                <CheckCircle size={28} className="text-green-400" />
-                <p className="text-sm text-[var(--pg-text)]">{t('failover:regainNoOther')}</p>
               </div>
               <button onClick={close} className="pg-btn pg-btn--primary w-full justify-center">
                 {t('failover:done')}
@@ -182,11 +159,13 @@ export function RegainControlPrompt({ clientId }: { clientId: number | null }) {
               <ErrorDetails error={error} />
               <div className="flex gap-2.5">
                 <button onClick={close} className="pg-btn flex-1 justify-center">
-                  {t('failover:close', { defaultValue: 'Close' })}
+                  {t('failover:close')}
                 </button>
-                <button onClick={takeover} className="pg-btn pg-btn--primary flex-1 justify-center">
-                  {t('failover:retry', { defaultValue: 'Retry' })}
-                </button>
+                {!twoMothers && (
+                  <button onClick={takeBack} className="pg-btn pg-btn--primary flex-1 justify-center">
+                    {t('failover:retry')}
+                  </button>
+                )}
               </div>
             </div>
           )}

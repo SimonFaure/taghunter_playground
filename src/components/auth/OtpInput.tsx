@@ -1,4 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Eye, EyeOff } from 'lucide-react';
 
 interface OtpInputProps {
   value: string;
@@ -6,10 +8,15 @@ interface OtpInputProps {
   onComplete?: (value: string) => void;
   disabled?: boolean;
   length?: number;
+  /** Secret entry (PIN): digits render as dots, with an eye button to reveal them. */
+  masked?: boolean;
 }
 
-export function OtpInput({ value, onChange, onComplete, disabled, length = 6 }: OtpInputProps) {
+export function OtpInput({ value, onChange, onComplete, disabled, length = 6, masked = false }: OtpInputProps) {
+  const { t } = useTranslation();
   const inputs = useRef<(HTMLInputElement | null)[]>([]);
+  const [revealed, setRevealed] = useState(false);
+  const hidden = masked && !revealed;
 
   useEffect(() => {
     inputs.current[0]?.focus();
@@ -29,13 +36,14 @@ export function OtpInput({ value, onChange, onComplete, disabled, length = 6 }: 
   const digits = Array.from({ length }, (_, i) => value[i] ?? '');
 
   return (
-    <div className="flex gap-2 justify-center">
+    <div className="flex gap-2 justify-center items-center">
       {digits.map((d, i) => (
         <input
           key={i}
           ref={(el) => { inputs.current[i] = el; }}
-          type="text"
+          type={hidden ? 'password' : 'text'}
           inputMode="numeric"
+          autoComplete="off"
           maxLength={1}
           value={d}
           disabled={disabled}
@@ -64,6 +72,20 @@ export function OtpInput({ value, onChange, onComplete, disabled, length = 6 }: 
           className="w-12 h-14 text-center text-2xl font-mono bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] text-[var(--pg-text)] focus:outline-none focus:border-[var(--pg-accent-line)] disabled:opacity-50"
         />
       ))}
+      {masked && (
+        <button
+          type="button"
+          // Keep focus on the digit being typed; the click only flips visibility.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setRevealed((r) => !r)}
+          title={revealed ? t('common:hidePin') : t('common:showPin')}
+          aria-label={revealed ? t('common:hidePin') : t('common:showPin')}
+          aria-pressed={revealed}
+          className="ml-1 p-2 rounded-[var(--pg-radius-md)] text-[var(--pg-text-dim)] hover:text-[var(--pg-text)] hover:bg-[var(--pg-surface-2)]"
+        >
+          {revealed ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+        </button>
+      )}
     </div>
   );
 }

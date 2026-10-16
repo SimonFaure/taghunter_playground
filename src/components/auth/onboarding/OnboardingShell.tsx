@@ -4,15 +4,15 @@ import { useTranslation } from 'react-i18next';
 import { isAndroid } from '../../../utils/platform';
 
 // Shared layout for the wizard-owned first-launch steps (language, internet,
-// name, hotspot, mother, operator-only, appearance). The OTP + PIN steps reuse
+// name, mother, operator-only, appearance). The OTP + PIN steps reuse
 // their existing dedicated screens, so they don't render through here. Design:
 // plans/playground-first-launch-onboarding.md.
-// Android tablets skip hotspot/mother/operator-only (utils/platform.ts), so
+// Android tablets skip mother/operator-only (utils/platform.ts), so
 // their wizard is 6 steps and appearance is step 6.
-const TOTAL_STEPS = isAndroid() ? 6 : 9;
+const TOTAL_STEPS = isAndroid() ? 6 : 8;
 
 interface OnboardingShellProps {
-  /** 1-based step number (1=language … 9=appearance) for the "Step X of 9" pill. */
+  /** 1-based step number (1=language … 8=appearance) for the "Step X of 8" pill. */
   stepNumber: number;
   title: string;
   subtitle?: string;

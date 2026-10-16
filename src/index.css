@@ -220,6 +220,15 @@ body::-webkit-scrollbar-corner {
   background: var(--pg-surface);
   border-bottom: 0.5px solid var(--pg-line);
 }
+/* Too narrow for brand + nav + icons on one row (measured in App.tsx): the nav
+   tabs drop to a second row, brand and icons stay on the first. */
+.pg-topbar--stacked {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+.pg-topbar--stacked .pg-nav {
+  order: 3;
+}
 .pg-brand {
   display: flex;
   align-items: center;
@@ -1406,4 +1415,15 @@ body::-webkit-scrollbar-corner {
     padding-top: 0.35em !important;
     padding-bottom: 0.35em !important;
   }
+}
+
+/* Video subtitles (.vtt tracks): no black box behind the cue, white text kept
+   legible over any frame by a shadow instead.
+   Mirrored in taghunter_playground and studio-taghunter index.css. */
+video::cue {
+  background: transparent;
+  color: #fff;
+  font-family: -apple-system, "SF Pro Display", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-weight: 500;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 6px rgba(0, 0, 0, 0.6);
 }

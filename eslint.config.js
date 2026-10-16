@@ -21,7 +21,9 @@ const I18N_GUARDED = [
   'src/components/LaunchGameModal.tsx',
   'src/components/TeamDetailsModal.tsx',
   'src/components/GameDevicesModal.tsx',
+  'src/components/DevicesFleetModal.tsx',
   'src/components/LaunchedGameConfigModal.tsx',
+  'src/components/ScoreWeightingFormula.tsx',
   'src/components/LaunchConfigModal.tsx',
   'src/components/ScenarioDetailsModal.tsx',
   'src/components/VideoControlModal.tsx',
@@ -71,6 +73,8 @@ const I18N_GUARDED = [
   'src/components/ClashGameRenderer.tsx',
   'src/components/ClashRegistrationScreen.tsx',
   'src/components/ClashResultsScreen.tsx',
+  // Licensee "Report a problem" modal (launched-games page).
+  'src/components/BugReportModal.tsx',
 ];
 
 export default tseslint.config(

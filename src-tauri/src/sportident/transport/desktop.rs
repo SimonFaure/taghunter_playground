@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tokio::sync::mpsc;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
 use super::{BytesRx, PortInfo, SerialTransport, TransportError};
 
@@ -71,6 +71,13 @@ pub async fn open(
         .flow_control(tokio_serial::FlowControl::None)
         .open_native_async()
         .map_err(|e| TransportError::Other(format!("open {}: {}", device_id, e)))?;
+
+    // Discard whatever the driver buffered before we opened (tail of a
+    // previous session's frames, line noise at power-up). A stray 0x02 in
+    // there reads as a false STX and holds real frames back.
+    if let Err(e) = stream.clear(tokio_serial::ClearBuffer::Input) {
+        eprintln!("[sportident] clear input buffer on {} failed: {}", device_id, e);
+    }
 
     let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Result<Bytes, TransportError>>();
     // Bounded so a runaway producer can't OOM us. 32 pending frames is well

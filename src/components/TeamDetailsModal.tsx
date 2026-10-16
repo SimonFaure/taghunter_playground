@@ -37,6 +37,7 @@ import {
   type RosterTeam,
 } from '../services/tagquestScoring';
 import { parseDbTs, formatDbTime } from '../utils/dbTime';
+import { gameClock } from '../services/gameClock';
 
 interface Team {
   id: number;
@@ -170,6 +171,16 @@ function readCheckpointOverrides(meta: Record<string, string>, teamId: number): 
   }
 }
 
+// Mystery "count the punches already on the card" flag, stored under
+// `stale_punches_allowed` in meta as JSON: { "<teamId>": true }.
+function readStaleAllowed(meta: Record<string, string>, teamId: number): boolean {
+  try {
+    return JSON.parse(meta.stale_punches_allowed || '{}')?.[String(teamId)] === true;
+  } catch {
+    return false;
+  }
+}
+
 // Read a per-team numeric value from a JSON map stored in launched-game meta
 // (e.g. `late_malus` / `late_malus_overrides` = { "<teamId>": number }).
 // Returns null when absent/unparseable.
@@ -217,11 +228,15 @@ function rowEpochSeconds(iso: string): number {
 // When a card is reused across runs, all its rows are present; we window to this
 // team's [start, end] (with a skew margin) so the right start/finish pair is
 // used, falling back to every row if windowing leaves nothing.
+//
+// `countStale` mirrors the operator's "count the punches already on the card"
+// switch: the baseline is still measured (`staleCount`) but not subtracted.
 function liveCodesForTeam(
   records: RawDataRecord[],
   startTime: number | null,
   endTime: number | null,
-): Set<string> {
+  countStale = false,
+): { codes: Set<string>; staleCount: number } {
   const byCard = new Map<number, RawDataRecord[]>();
   for (const r of records) {
     const cid = Number((r.raw_data as { id?: number } | null)?.id);
@@ -233,11 +248,12 @@ function liveCodesForTeam(
 
   const SKEW_MARGIN_SEC = 60;
   const codes = new Set<string>();
+  let staleCount = 0;
   for (const allRows of byCard.values()) {
     let rows = allRows;
     if (startTime != null) {
       const lo = startTime - SKEW_MARGIN_SEC;
-      const hi = (endTime ?? Math.floor(Date.now() / 1000)) + SKEW_MARGIN_SEC;
+      const hi = (endTime ?? Math.floor(gameClock.now() / 1000)) + SKEW_MARGIN_SEC;
       const windowed = allRows.filter((r) => {
         const e = rowEpochSeconds(r.created_at);
         return !Number.isFinite(e) || (e >= lo && e <= hi);
@@ -252,12 +268,13 @@ function liveCodesForTeam(
         .filter((p) => p.time != null && String(p.time) !== '00:00:00')
         .map((p) => `${p.code}@${p.time}`),
     );
+    staleCount += baseline.size;
     for (const p of finishRow.raw_data?.punches ?? []) {
-      if (baseline.has(`${p.code}@${p.time}`)) continue;
+      if (!countStale && baseline.has(`${p.code}@${p.time}`)) continue;
       codes.add(String(p.code));
     }
   }
-  return codes;
+  return { codes, staleCount };
 }
 
 // Tracks variant of liveCodesForTeam: returns the slot position on the card of
@@ -285,7 +302,7 @@ function liveHitSlotsForTeam(
     let rows = allRows;
     if (startTime != null) {
       const lo = startTime - SKEW_MARGIN_SEC;
-      const hi = (endTime ?? Math.floor(Date.now() / 1000)) + SKEW_MARGIN_SEC;
+      const hi = (endTime ?? Math.floor(gameClock.now() / 1000)) + SKEW_MARGIN_SEC;
       const windowed = allRows.filter((r) => {
         const e = rowEpochSeconds(r.created_at);
         return !Number.isFinite(e) || (e >= lo && e <= hi);
@@ -439,6 +456,11 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   // is subtracted from the enigma points to form the team's score.
   const [lateMalusAuto, setLateMalusAuto] = useState(0);
   const [lateMalusOverride, setLateMalusOverride] = useState<number | null>(null);
+  // Mystery: operator chose to count the punches already on the card at the
+  // start bip (a player who played before bipping in). Persisted in meta as
+  // `stale_punches_allowed` = { "<teamId>": true }; the engine honours it at the
+  // finishing bip.
+  const [staleAllowed, setStaleAllowedState] = useState(false);
   // Mystery late-malus inputs (from launched-game meta): penalty per started
   // minute over the limit, and the game's time limit in minutes. Used to
   // re-derive the auto malus when the operator edits the start/end times.
@@ -638,6 +660,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
         setEnigmaOverrides(readEnigmaOverrides(meta, team.id));
         setLateMalusAuto(readNumForTeam(meta.late_malus, team.id) ?? 0);
         setLateMalusOverride(readNumForTeam(meta.late_malus_overrides, team.id));
+        setStaleAllowedState(readStaleAllowed(meta, team.id));
         setMalusPerMinute(meta.malusPerMinute != null ? parseInt(meta.malusPerMinute) || 0 : 0);
         setTimeLimitMin(meta.duration != null ? parseInt(meta.duration) || 0 : 0);
         const patternUniqid = meta.pattern || '';
@@ -886,14 +909,16 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   // exactly as the engine does at the finishing bip - see liveCodesForTeam. The
   // base status of each enigma is derived from this set + the pattern's
   // good/wrong station codes, matching MysteryGamePage's scoring.
-  const punchedCodes = liveCodesForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time);
+  const live = liveCodesForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time, staleAllowed);
+  const punchedCodes = live.codes;
+  const staleCount = live.staleCount;
 
   const findGameEnigma = (enigmaId: string): GameEnigma | undefined =>
     gameData?.game_enigmas?.find((ge) => ge.number === enigmaId);
 
-  const detectBaseStatus = (pe: patternStore.PatternEnigma): EnigmaStatus => {
-    const hasGood = pe.good_answers.some((a) => punchedCodes.has(a));
-    const hasWrong = pe.wrong_answers.some((a) => punchedCodes.has(a));
+  const detectBaseStatus = (pe: patternStore.PatternEnigma, codes: Set<string> = punchedCodes): EnigmaStatus => {
+    const hasGood = pe.good_answers.some((a) => codes.has(a));
+    const hasWrong = pe.wrong_answers.some((a) => codes.has(a));
     if (hasGood && hasWrong) return 'both';
     if (hasGood) return 'found';
     if (hasWrong) return 'wrong';
@@ -939,10 +964,10 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const effectiveLateMalus = lateMalusOverride != null ? lateMalusOverride : lateMalusAuto;
 
   // Enigma points (override-applied) only - before the late malus.
-  const enigmaPointsTotal = (overrides: Record<string, EnigmaStatus>): number =>
+  const enigmaPointsTotal = (overrides: Record<string, EnigmaStatus>, codes: Set<string> = punchedCodes): number =>
     patternEnigmas.reduce((sum, pe) => {
       const ge = findGameEnigma(pe.enigma_id);
-      const eff = overrides[pe.enigma_id] ?? detectBaseStatus(pe);
+      const eff = overrides[pe.enigma_id] ?? detectBaseStatus(pe, codes);
       return sum + enigmaPoints(eff, toPoints(ge?.good_answer_points), wrongAnswerPoints(ge?.wrong_answer_points), bothMalus, noAnswerMalus);
     }, 0);
 
@@ -951,7 +976,8 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   const recomputeMysteryScore = (
     overrides: Record<string, EnigmaStatus>,
     lateMalusVal: number = effectiveLateMalus,
-  ): number => enigmaPointsTotal(overrides) - lateMalusVal;
+    codes: Set<string> = punchedCodes,
+  ): number => enigmaPointsTotal(overrides, codes) - lateMalusVal;
 
   // Set (or, when the chosen status equals the detected one, clear) an enigma's
   // override: persist the override map to launched-game meta, then recompute and
@@ -1019,6 +1045,43 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
     } catch (err) {
       console.error('[TeamDetailsModal] setLateMalus failed:', err);
       setLateMalusOverride(prev); // roll back
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  // Count (or stop counting) the punches that were already on the card at the
+  // start bip. Persists the flag to launched-game meta (read by the engine at the
+  // finishing bip); if the run is already scored, recompute + persist the score
+  // here. Optimistic; reverts local state on failure.
+  const setStaleAllowed = async (value: boolean) => {
+    if (mutating) return;
+    const prev = staleAllowed;
+    setMutating(true);
+    setStaleAllowedState(value); // optimistic
+    try {
+      const meta = await getLaunchedGameMeta(launchedGameId);
+      let all: Record<string, boolean>;
+      try {
+        all = JSON.parse(meta.stale_punches_allowed || '{}');
+        if (!all || typeof all !== 'object') all = {};
+      } catch {
+        all = {};
+      }
+      if (value) all[String(team.id)] = true;
+      else delete all[String(team.id)];
+      await updateLaunchedGameMeta(launchedGameId, { ...meta, stale_punches_allowed: JSON.stringify(all) });
+
+      if (currentTeam.end_time != null) {
+        const codes = liveCodesForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time, value).codes;
+        const score = recomputeMysteryScore(enigmaOverrides, effectiveLateMalus, codes);
+        await updateTeam(team.id, { score });
+        setCurrentTeam((t) => ({ ...t, score }));
+      }
+      onTeamUpdated?.();
+    } catch (err) {
+      console.error('[TeamDetailsModal] setStaleAllowed failed:', err);
+      setStaleAllowedState(prev); // roll back
     } finally {
       setMutating(false);
     }
@@ -1288,6 +1351,29 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
                 )}
               </div>
             </div>
+            {/* Card not empty at the start bip: its punches are ignored unless
+                the operator chooses to count them (player played before bipping in). */}
+            {(staleCount > 0 || staleAllowed) && (
+              <div className="mt-3 flex items-center gap-3 flex-wrap">
+                <span className="pg-stat-label">
+                  <AlertTriangle size={11} /> {t('teamDetails:stalePunchesLabel', { count: staleCount })}
+                </span>
+                <button
+                  onClick={() => setStaleAllowed(!staleAllowed)}
+                  disabled={mutating}
+                  className={`pg-btn pg-btn--sm ${staleAllowed ? 'pg-btn--ghost' : 'pg-btn--primary'} disabled:opacity-50`}
+                  title={t('teamDetails:stalePunchesHint')}
+                >
+                  {staleAllowed ? t('teamDetails:stalePunchesIgnore') : t('teamDetails:stalePunchesCount')}
+                </button>
+                {staleAllowed && (
+                  <span className="text-amber-400 text-[10px] font-medium inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
+                    {t('teamDetails:stalePunchesCounted')}
+                  </span>
+                )}
+              </div>
+            )}
             </>
           ) : isTracks ? (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">

@@ -7,6 +7,7 @@ import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import { useGameSounds } from '../hooks/useGameSounds';
 import { localizedStatus, type GameMessageType } from '../services/gameMessages';
 import { tIngame } from '../i18n/ingame';
 import {
@@ -27,7 +28,8 @@ import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { SelfRegisterOverlay } from './SelfRegisterOverlay';
-import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
+import { resolveFirstBipVideos } from '../services/firstBipVideos';
+import { usePendingStarts } from '../hooks/usePendingStarts';
 import {
   TracksGameRenderer,
   readLocalized,
@@ -38,6 +40,7 @@ import {
   type SceneTextCategory,
 } from './TracksGameRenderer';
 import { TRACKS_LEGEND_ID, TRACKS_LEGEND_DEFAULT_BOX } from './TracksLegend';
+import { tracksLegendDefaultOn } from '../services/launchResolve';
 import {
   checkpointsForRoute,
   computeScore,
@@ -48,6 +51,7 @@ import {
   type TracksCheckpoint,
   type TracksScoreType,
 } from '../services/tracksScoring';
+import { gameClock } from '../services/gameClock';
 
 interface TracksGamePageProps {
   config: GameConfig;
@@ -67,6 +71,9 @@ interface HudFrameBox {
   /** Author-set value font size, in % of the box height. Undefined = the
    *  renderer's default (45 with a caption, 55 without). Retours point 45. */
   textScale?: number;
+  /** Team-name frame only: min font size in px on a 1920×1080 screen; below it
+   *  the name wraps to two lines. Undefined = 20 px default; 0 = never wrap. */
+  minFontSize?: number;
 }
 
 /** HUD frame element ids written to `scenarios.scenario_layout.elements[]` by
@@ -105,9 +112,16 @@ interface TracksGameData {
   /** Saved positions for the 4 HUD frames (team_name, timer, score, time),
    *  keyed by element id; empty map → renderer uses its default top strip. */
   hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>>;
-  /** Feedback-image legend box (`game_meta.show_legend`); null when the option
-   *  is off or the author hid the box. No saved box → the studio default. */
-  legendBox: HudFrameBox | null;
+  /** Feedback-image legend box geometry: the box saved in the layout editor,
+   *  else the studio default. Whether it is drawn is a per-launch choice
+   *  (`config.tracksShowLegend`) defaulting to `legendDefaultOn`. */
+  legendBox: HudFrameBox;
+  /** The scenario's own choice: `game_meta.show_legend` on and the box not
+   *  hidden by the author. */
+  legendDefaultOn: boolean;
+  /** Author-written legend captions (`text_legend_*`), each a
+   *  Localized<string> | string; blank/missing ⇒ the app's own caption. */
+  legendTexts: { wrongOrder: unknown; missing: unknown };
   /** Author-editable run messages (text_* UI strings), each a
    *  Localized<string> | string. Surfaced by the runtime only when the author
    *  filled the field in; an empty/missing key keeps the built-in behaviour. */
@@ -160,6 +174,27 @@ function resolveTracksText(
   let out = raw.replace(TEAM_TOKEN_RE, (vars?.team ?? '').trim());
   if (vars?.count != null) out = out.replace(COUNT_TOKEN_RE, String(vars.count));
   return out.trim();
+}
+
+/**
+ * A legend caption in `lang`: the author's text for THAT language when they
+ * wrote one, else the app's own caption. Deliberately no cross-language
+ * fallback (unlike readLocalized): the app caption exists in every language,
+ * so it beats showing a French custom caption to an English team.
+ */
+function resolveLegendLabel(
+  authored: unknown,
+  appKey: 'legend_wrong_order' | 'legend_missing_checkpoint',
+  lang: string,
+): string {
+  const own =
+    typeof authored === 'string'
+      ? authored
+      : authored && typeof authored === 'object'
+        ? (authored as Record<string, unknown>)[lang]
+        : '';
+  const text = typeof own === 'string' ? own.trim() : '';
+  return text || tIngame('ingame_tracks', appKey, lang);
 }
 
 const SOUND_SLOTS = [
@@ -261,13 +296,13 @@ function normalizeTracksGameData(raw: any): TracksGameData {
           ? raw.game_data.scenario_layout.elements
           : [];
   const hudLayout: Partial<Record<(typeof HUD_FRAME_IDS)[number], HudFrameBox>> = {};
-  let legendBox: HudFrameBox | null = gm.show_legend === true ? { ...TRACKS_LEGEND_DEFAULT_BOX } : null;
+  let legendBox: HudFrameBox = { ...TRACKS_LEGEND_DEFAULT_BOX };
   for (const el of layoutElements) {
     const le = el as Record<string, unknown> | null;
-    if (legendBox && le && le.id === TRACKS_LEGEND_ID) {
-      if (le.hidden === true) {
-        legendBox = null;
-      } else if (
+    if (le && le.id === TRACKS_LEGEND_ID) {
+      // A hidden box keeps its geometry: the operator can still ask for the
+      // legend at launch, and it then shows where the author last placed it.
+      if (
         typeof le.x === 'number' && typeof le.y === 'number' &&
         typeof le.width === 'number' && typeof le.height === 'number'
       ) {
@@ -292,10 +327,12 @@ function normalizeTracksGameData(raw: any): TracksGameData {
         id: (typeof HUD_FRAME_IDS)[number];
         x: number; y: number; width: number; height: number;
         textScale?: unknown;
+        minFontSize?: unknown;
       };
       hudLayout[e.id] = {
         x: e.x, y: e.y, width: e.width, height: e.height,
         ...(typeof e.textScale === 'number' && e.textScale > 0 ? { textScale: e.textScale } : {}),
+        ...(typeof e.minFontSize === 'number' && e.minFontSize >= 0 ? { minFontSize: e.minFontSize } : {}),
       };
     }
   }
@@ -320,6 +357,11 @@ function normalizeTracksGameData(raw: any): TracksGameData {
     textCategories,
     hudLayout,
     legendBox,
+    legendDefaultOn: tracksLegendDefaultOn(raw),
+    legendTexts: {
+      wrongOrder: gm.text_legend_wrong_order,
+      missing: gm.text_legend_missing_checkpoint,
+    },
     texts: (() => {
       const t: Record<string, unknown> = {};
       for (const k of TRACKS_TEXT_KEYS) if (gm[k] != null) t[k] = gm[k];
@@ -350,10 +392,10 @@ function timedPunches(card: CardData): Array<{ code: number; time: string }> {
  * run duration negative).
  */
 function epochForSecondsOfDay(sod: number): number {
-  const midnight = new Date();
+  const midnight = gameClock.date();
   midnight.setHours(0, 0, 0, 0);
   const guess = Math.floor(midnight.getTime() / 1000) + sod;
-  return Math.min(guess, Math.floor(Date.now() / 1000));
+  return Math.min(guess, Math.floor(gameClock.now() / 1000));
 }
 
 export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onGameEnd }: TracksGamePageProps) {
@@ -384,6 +426,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // messages share it, so a team bipping while one is on screen waits its turn
   // (and shows in the bottom line) instead of racing the current reveal.
   const queue = usePresentationQueue();
+  // Stops the sounds when the page is left mid-reveal (quit / rankings).
+  const playAudio = useGameSounds();
 
   // Focused-team display state - driven by the most recent bip.
   // Default screen is the resting background image; the map only appears for the
@@ -406,6 +450,8 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // Clues page: checkpoints punched but not credited (itinerary wrong order) -
   // drawn with the wrong-order image, like the reveal, not as "missing".
   const [cluesWrongIds, setCluesWrongIds] = useState<Set<string>>(new Set());
+  // Clues page: seconds left before it closes itself (drawn bottom-right).
+  const [cluesCountdown, setCluesCountdown] = useState<number | null>(null);
   // The focused team's resolved route (per-team meta override else launch
   // default) - drives which markers render and which checkpoints score.
   const [focusRoute, setFocusRoute] = useState(config.route ?? 'default');
@@ -413,17 +459,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // reveal; blank otherwise (no HUD over the background during the run).
   const [focusFrozenSec, setFocusFrozenSec] = useState<number | null>(null);
 
-  // First-bip video overlay state. Captures the start to finalize once all
-  // videos have played (mirrors MysteryGamePage).
-  const [firstBipVideos, setFirstBipVideos] = useState<VideoSource[] | null>(null);
-  const pendingFirstBipFinalizeRef = useRef<(() => Promise<void>) | null>(null);
-  // Self-register overlay state. Shown on a team's first bip when enabled, BEFORE
-  // any videos. `finalize(name)` persists the name + proceeds; `abort()` cancels
-  // the start (and deletes the team if this bip created it).
-  const [selfReg, setSelfReg] = useState<{
-    finalize: (name: string, language: string) => Promise<void>;
-    abort: () => Promise<void>;
-  } | null>(null);
+  // Pending starts, one queue per overlay, keyed by team (mirrors
+  // MysteryGamePage). Self-register prompt first when enabled: `finalize(name)`
+  // persists the name + proceeds; `abort()` cancels the start (and deletes the
+  // team if that bip created it). Then the first-bip videos, after which the
+  // team's start is finalized.
+  const pendingStarts = usePendingStarts();
+  const { selfReg, videoStart } = pendingStarts;
 
   const detectedReader = useDetectedReaderPort();
 
@@ -443,6 +485,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     show_text: config.cluesPage?.show_text !== false,
     show_image: config.cluesPage?.show_image !== false,
   };
+  // How long the clues page stays up. Missing ⇒ 10 s (games launched before
+  // the option existed).
+  const cluesDurationSec = Math.max(1, Math.round(Number(config.cluesPage?.duration_sec) || 10));
 
   useEffect(() => {
     const load = async () => {
@@ -486,13 +531,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
   const playSound = useCallback(
     (slot: string) => {
-      const a = audioElements[slot];
-      if (a) {
-        a.currentTime = 0;
-        a.play().catch((e) => console.error('[TracksGamePage] sound error:', e));
-      }
+      playAudio(audioElements[slot]).catch((e) => console.error('[TracksGamePage] sound error:', e));
     },
-    [audioElements],
+    [audioElements, playAudio],
   );
 
   const scoreText = useCallback(
@@ -566,7 +607,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             // Card already finished a run.
             const lastEnd = Math.max(...teamsForCard.map((t) => t.end_time ?? 0));
             const cooldownSec = (config.reuseDelayMinutes ?? 5) * 60;
-            const cooled = !!config.reuseCards && Date.now() / 1000 >= lastEnd + cooldownSec;
+            const cooled = !!config.reuseCards && gameClock.now() / 1000 >= lastEnd + cooldownSec;
             if (cooled) {
               team = await ensureTeamForCard(launchedGameId, card.id, state, !!config.useNamePool);
               if (!team) {
@@ -583,7 +624,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 if (config.reuseCards) {
                   const remainingMin = Math.max(
                     1,
-                    Math.ceil((lastEnd + cooldownSec - Date.now() / 1000) / 60),
+                    Math.ceil((lastEnd + cooldownSec - gameClock.now() / 1000) / 60),
                   );
                   showMessage(
                     localizedStatus('reuse_cooldown', language, { n: remainingMin }),
@@ -650,10 +691,12 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                 setFocusScoreText(scoreText(finishedTeam.score ?? 0));
                 setFocusFrozenSec(cluesFrozenSec);
                 setScreen('clues');
-                if (gd.autoReset) {
-                  await new Promise((r) => setTimeout(r, 6000));
-                } else {
-                  await waitForEnter();
+                // The page closes itself after the launch-configured duration,
+                // counting down on screen (no Enter wait, whatever autoReset is).
+                for (let left = cluesDurationSec; left > 0; left--) {
+                  setCluesCountdown(left);
+                  // eslint-disable-next-line no-await-in-loop
+                  await new Promise((r) => setTimeout(r, 1000));
                 }
                 resetDisplay();
               });
@@ -734,6 +777,16 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
         // First bip → (self-register name) → (videos) → start the team's clock.
         if (runStartSec == null) {
+          // This team's start is already on its way (name prompt or videos
+          // queued/showing): a repeat bip must not open a second one - it only
+          // brings the team's own name prompt back on screen.
+          if (!pendingStarts.claim(team.id)) {
+            if (!pendingStarts.raiseSelfReg(team.id)) {
+              console.log('[TracksGamePage] start already pending for team', team.id, '- bip ignored');
+            }
+            return;
+          }
+          const startTeamId = team.id;
           // The start sequence, parameterised by the effective team name: persist
           // a self-registered rename, then gate the clock on any first-bip videos.
           const proceedAfterName = async (effectiveName: string, teamLanguage?: string) => {
@@ -752,7 +805,14 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             }
 
             const finalizeStart = async () => {
-              const startSec = Math.floor(Date.now() / 1000);
+              try {
+                await finalizeStartInner();
+              } finally {
+                pendingStarts.release(startTeamId);
+              }
+            };
+            const finalizeStartInner = async () => {
+              const startSec = Math.floor(gameClock.now() / 1000);
               await updateTeam(team.id, { start_time: startSec });
               // The dirty-card gate above means the card is empty here on the
               // normal path; the only way to reach this with punches on it is
@@ -804,17 +864,22 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
             // Gate the start on the first-bip video overlay when enabled.
             const wantsVideos = !!(config.playTutorialOnBip || config.playIntroOnBip);
             if (wantsVideos) {
-              const rawForResolve = await scenarioStore.getGameData(gameUniqid);
-              const videos = await resolveFirstBipVideos(
-                { ...config, language: effLang },
-                gameUniqid,
-                'tracks',
-                rawForResolve
-              );
-              if (videos.length > 0) {
-                pendingFirstBipFinalizeRef.current = finalizeStart;
-                setFirstBipVideos(videos);
-                return;
+              // A resolve failure starts the team without videos rather than
+              // leaving its start stuck.
+              try {
+                const rawForResolve = await scenarioStore.getGameData(gameUniqid);
+                const videos = await resolveFirstBipVideos(
+                  { ...config, language: effLang },
+                  gameUniqid,
+                  'tracks',
+                  rawForResolve
+                );
+                if (videos.length > 0) {
+                  pendingStarts.enqueueVideoStart({ teamId: startTeamId, videos, finalize: finalizeStart });
+                  return;
+                }
+              } catch (err) {
+                console.error('[TracksGamePage] error resolving first-bip videos:', err);
               }
             }
 
@@ -825,10 +890,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
           // proceed with the entered name; on abort we cancel the start and delete
           // the team if this bip created it.
           if (config.selfRegisterTeam) {
-            setSelfReg({
+            pendingStarts.enqueueSelfReg({
+              teamId: startTeamId,
+              cardId: card.id,
               finalize: (name: string, language: string) => proceedAfterName(name, language),
               abort: async () => {
-                setSelfReg(null);
+                pendingStarts.dropSelfReg(startTeamId);
+                pendingStarts.release(startTeamId);
                 if (createdNow) {
                   try {
                     await deleteTeam(team.id);
@@ -847,7 +915,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
         // Second bip → score the run from the card's punch codes. On the
         // recovery path the run closed at its last punch, not at this bip.
-        const endTime = recoveredEndSec ?? Math.floor(Date.now() / 1000);
+        const endTime = recoveredEndSec ?? Math.floor(gameClock.now() / 1000);
         const allCps = gd.checkpoints;
         const routeCps = checkpointsForRoute(allCps, teamRoute);
         const stations = await patternStore.getTracksCheckpointStations(config.pattern);
@@ -1140,7 +1208,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.messageDisplayDuration, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.numberOfTeams, config.playTutorialOnBip, config.playIntroOnBip, gameUniqid, playSound, scoreText, showMessage, language],
+    [launchedGameId, route, scoreType, trackPlayMode, timeLimitMin, malusPerMinute, displayMode, config.pattern, config.messageDisplayDuration, config.autoRegisterTeam, config.selfRegisterTeam, config.reuseCards, config.reuseDelayMinutes, config.numberOfTeams, config.playTutorialOnBip, config.playIntroOnBip, config.cluesPage, gameUniqid, playSound, scoreText, showMessage, language],
   );
 
   const resetDisplay = () => {
@@ -1150,6 +1218,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     setBigReveal(null);
     setCluesFoundIds(new Set());
     setCluesWrongIds(new Set());
+    setCluesCountdown(null);
     setTopRevealUrl('');
     setGameMessage('');
     setFocusFrozenSec(null);
@@ -1199,17 +1268,19 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     let cancelled = false;
     const initUSB = async () => {
       if (!siReader.isAvailable()) return;
+      // Bound before reader detection so the game simulator's injected reads
+      // (no physical reader) reach the page too; harmless without events.
+      siReader.setCardDetectedCallback((card: CardData) => {
+        void saveCardDataRef.current(card);
+        setLastCardData(card);
+        setShowCardAlert(true);
+        setTimeout(() => setShowCardAlert(false), 5000);
+      });
       const detected = await detectReaderPort();
       if (cancelled || !detected) return;
       try {
         const ok = await siReader.initializePort(detected.path);
         if (!ok) return;
-        siReader.setCardDetectedCallback((card: CardData) => {
-          void saveCardDataRef.current(card);
-          setLastCardData(card);
-          setShowCardAlert(true);
-          setTimeout(() => setShowCardAlert(false), 5000);
-        });
         siReader.setCardRemovedCallback(() => setShowCardAlert(false));
         siReader.setStationsDetectedCallback((_s: StationData[]) => {});
         await siReader.start();
@@ -1221,6 +1292,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     void initUSB();
     window.addEventListener('reader:status', onReaderStatus);
     return () => {
+      siReader.setCardDetectedCallback(undefined);
       cancelled = true;
       window.removeEventListener('reader:status', onReaderStatus);
       if (siReader.isAvailable()) siReader.stop().catch(() => {});
@@ -1294,30 +1366,27 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}>
       {selfReg && (
         <SelfRegisterOverlay
+          key={selfReg.teamId}
+          cardId={selfReg.cardId}
           language={language}
           scenarioLanguages={config.scenarioLanguages ?? []}
           scenarioAudience={config.namePoolAudience ?? 'kids'}
           allowLanguageChoice={!!config.allowPlayerLanguageChoice}
           addRandomName={!!config.addRandomNameOption}
           onSubmit={(name, lang) => {
-            const s = selfReg;
-            setSelfReg(null);
-            void s.finalize(name, lang);
+            pendingStarts.dropSelfReg(selfReg.teamId);
+            void selfReg.finalize(name, lang);
           }}
           onAbort={() => {
             void selfReg.abort();
           }}
         />
       )}
-      {firstBipVideos && (
+      {videoStart && (
         <FirstBipVideoOverlay
-          videos={firstBipVideos}
-          onComplete={async () => {
-            const finalize = pendingFirstBipFinalizeRef.current;
-            pendingFirstBipFinalizeRef.current = null;
-            setFirstBipVideos(null);
-            if (finalize) await finalize();
-          }}
+          key={videoStart.teamId}
+          videos={videoStart.videos}
+          onComplete={pendingStarts.completeVideoStart}
         />
       )}
       {/* Dev-only punch/hardware debug indicator - removed from production builds. */}
@@ -1369,7 +1438,9 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         scoreText={focusScoreText || (scoreType === 'percentage' ? '0%' : '0 pts')}
         showScore={data.showScore}
         legend={
-          data.legendBox
+          // Per-launch choice (launch modal > Advanced); a game launched before
+          // the toggle existed keeps the scenario's own setting.
+          (config.tracksShowLegend ?? data.legendDefaultOn)
             ? {
                 box: data.legendBox,
                 // Wrong order only exists in itinerary mode (free mode credits
@@ -1378,13 +1449,13 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
                   trackPlayMode === 'itinerary' && data.images.wrong_order_image
                     ? {
                         imageUrl: getImageUrl(data.images.wrong_order_image),
-                        label: tIngame('ingame_tracks', 'legend_wrong_order', hudLangCode),
+                        label: resolveLegendLabel(data.legendTexts.wrongOrder, 'legend_wrong_order', hudLangCode),
                       }
                     : null,
                 missing: data.images.missing_checkpoint_image
                   ? {
                       imageUrl: getImageUrl(data.images.missing_checkpoint_image),
-                      label: tIngame('ingame_tracks', 'legend_missing_checkpoint', hudLangCode),
+                      label: resolveLegendLabel(data.legendTexts.missing, 'legend_missing_checkpoint', hudLangCode),
                     }
                   : null,
               }
@@ -1395,6 +1466,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         checkpointsSummary={hudLang.summary}
         language={focusLanguage || language}
         clues={clues}
+        cluesCountdownSec={cluesCountdown}
         topRevealUrl={topRevealUrl}
         fontFamily={fontFamily}
         fontColor={data.font_color}

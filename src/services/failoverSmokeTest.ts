@@ -19,7 +19,7 @@ import { setLanOverride, getLanOverride, LOCAL_ONLY_ENDPOINTS } from './api';
 import { getDb } from './db';
 import { becomeMother, applyMotherSnapshot } from './lanMotherBoot';
 import { rejoinMotherNow } from './motherFailover';
-import { reconcileSupersededGamesTick } from './motherStateReconcile';
+import { reconcileWithMotherNow } from './motherStateReconcile';
 import {
   createLaunchedGame,
   getLaunchedGameState,
@@ -242,7 +242,7 @@ export const failoverQA = {
   discoverMothers: (timeoutMs = 4000) =>
     invoke('client_discover_mothers', { timeoutMs }),
   // F4 quick path - force a mDNS re-announce without changing the network.
-  refreshMdns: () => invoke('mother_refresh_mdns', { addresses: [] }),
+  refreshMdns: () => invoke('mother_refresh_mdns'),
   // H1–H5 - this device's cached failover snapshots (run on the satellite).
   snapshotCache: async () =>
     (await getDb()).select(
@@ -286,7 +286,15 @@ export const failoverQA = {
   // whole superseded-game sweep. `applySnapshot` should refuse with
   // `serving_locally` on a device that is hosting the game.
   applySnapshot: (launchedGameId: number) => applyMotherSnapshot(launchedGameId),
-  reconcileNow: () => reconcileSupersededGamesTick(),
+  // Exchange game copies with the mother this device is routed at, right now.
+  // Resolves to the report (pushed / pulled / dropped / refused), or null when
+  // there is no mother to reconcile with.
+  reconcileNow: () => reconcileWithMotherNow(),
+  // Every game this device holds, with what orders two copies of a game.
+  gameVersions: async () =>
+    (await getDb()).select(
+      'SELECT id, name, summary_uuid, mother_epoch, state_version, ended, ended_at FROM lg_launched_games ORDER BY id',
+    ),
 };
 
 declare global {

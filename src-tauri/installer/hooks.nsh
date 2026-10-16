@@ -1,8 +1,8 @@
 ; NSIS installer hooks for Tag Hunter Playground.
 ;
 ; Adds a Windows Firewall rule so the mother device's LAN server accepts inbound
-; TCP from satellites joined to its hotspot. Windows classes the hotspot as a
-; "Public" network and blocks custom inbound TCP by default, which is why a mother
+; TCP from satellites on the same router / venue network. Windows blocks custom
+; inbound TCP by default (always on a "Public" network), which is why a mother
 ; is discoverable over mDNS (multicast is allowed) yet unreachable over HTTP.
 ;
 ; These netsh calls require elevation. When the installer runs elevated they add

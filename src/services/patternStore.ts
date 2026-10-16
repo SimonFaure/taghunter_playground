@@ -248,6 +248,77 @@ export async function upsertFromManifest(rows: PatternManifestRow[], seenAt: str
   }
 }
 
+// A pattern fetched from the LAN mother that this device's manifest doesn't
+// list yet (newer than our last cloud sync, or imported on the mother). Creates
+// the row only; an existing one is left to the manifest. A mother-imported
+// pattern stays is_local so our cloud sync never tombstones it.
+export async function insertFromPeerIfMissing(p: {
+  pattern_uniqid: string;
+  name?: string;
+  game_type?: string;
+  is_default?: boolean;
+  is_local?: boolean;
+  version: number;
+}): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `INSERT OR IGNORE INTO patterns (
+       pattern_uniqid, name, game_type, pattern_slug, description, is_default,
+       remote_version, local_version, pattern_data_json, last_manifest_seen_at,
+       failed_attempts, is_local
+     ) VALUES ($1, $2, $3, NULL, NULL, $4, $5, NULL, NULL, $6, 0, $7)`,
+    [
+      p.pattern_uniqid,
+      p.name ?? p.pattern_uniqid,
+      p.game_type ?? 'tracks',
+      p.is_default ? 1 : 0,
+      parseManifestVersion(p.version),
+      new Date().toISOString(),
+      p.is_local ? 1 : 0,
+    ]
+  );
+}
+
+// A downloaded pattern in the studio's download_pattern shape (plus manifest
+// fields), to push to the LAN mother. null when not downloaded.
+export async function exportForPeer(patternUniqid: string): Promise<{
+  pattern_uniqid: string;
+  name: string;
+  game_type: string;
+  pattern_slug: string | null;
+  description: string | null;
+  is_default: boolean;
+  is_local: boolean;
+  version: number;
+  pattern_data: unknown;
+  stations: Record<string, string> | null;
+} | null> {
+  const row = await get(patternUniqid);
+  if (!row || row.local_version == null || !row.pattern_data_json) return null;
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(row.pattern_data_json);
+  } catch {
+    return null;
+  }
+  // `{ pattern_data, stations }` envelope; older rows hold the bare data.
+  const env = parsed && typeof parsed === 'object' && 'pattern_data' in parsed
+    ? (parsed as { pattern_data: unknown; stations?: Record<string, string> | null })
+    : { pattern_data: parsed, stations: null };
+  return {
+    pattern_uniqid: row.pattern_uniqid,
+    name: row.name,
+    game_type: row.game_type,
+    pattern_slug: row.pattern_slug ?? null,
+    description: row.description ?? null,
+    is_default: row.is_default,
+    is_local: row.is_local,
+    version: row.local_version,
+    pattern_data: env.pattern_data,
+    stations: env.stations ?? null,
+  };
+}
+
 // Pattern downloads return a JSON payload (not files); store inline.
 export async function markDownloaded(
   patternUniqid: string,

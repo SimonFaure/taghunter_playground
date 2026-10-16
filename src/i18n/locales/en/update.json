@@ -1,6 +1,7 @@
 {
   "availableDesktop": "Version {{version}} is available.",
   "availableStore": "Version {{version}} is available on the app store.",
+  "availableFromMother": "Version {{version}} is available on the mother.",
   "updateButton": "Update",
   "openStoreButton": "Open store",
   "dismiss": "Dismiss",
@@ -23,6 +24,7 @@
   "updateFromDeviceStore": "Please update Tag Hunter Playground from your device's app store.",
   "downloadConfirmTitle": "Download update",
   "downloadConfirmMessage": "This update ({{version}}) will be installed on this device. Remember to update your other devices (make sure you are connected to the Internet to download the update).",
+  "downloadConfirmMessageMother": "This update ({{version}}) will be copied from the mother, then installed on this device.",
   "ready": "Update ready to install",
   "appUpdatesTitle": "App updates",
   "currentVersionLabel": "Current version",
@@ -31,6 +33,7 @@
   "upToDate": "You're on the latest version.",
   "serverUnreachable": "Couldn't reach the update server. Check your connection and try again.",
   "versionAvailable": "Version {{version}} available",
+  "fromMotherHint": "No internet: the update comes from the mother. Its Tag Hunter signature is checked before installing.",
   "updateRequiredHint": "This update is required to keep using the app.",
   "uninstallTitle": "Uninstall this app",
   "uninstallBody": "Removes Tag Hunter Playground and all of its locally stored data from this computer.",

@@ -7,28 +7,36 @@
 //   2. satellite → "Mon poste mère"; mother → "Wi-Fi Tag Hunter" + "Mes satellites";
 //   3. everything else folded under "Avancé" (collapsed by default), with the
 //      role-changing actions grouped at the bottom, in red, behind confirmations.
-// Second pass (retours sept. #10 follow-up): the mother's Wi-Fi card shows only
-// the mode + name/password (technical settings moved to Avancé), satellites get
-// no hotspot control at all, and "Reprendre" is first-click-wins.
+// Second pass (retours sept. #10 follow-up): "Reprendre" is first-click-wins.
+// Hotspot removal (2026-09-30): the app no longer manages Wi-Fi - every PC joins
+// the same router / venue network through Windows. The mother's card shows its
+// network + IP address(es); satellites can pair by typing that IP.
+// Role split (2026-10-02): the status card says ONE thing, from the device's
+// role (services/deviceRole.ts) - the mother, a substitute hosting in its
+// absence, or a satellite. It used to read "poste mère" on a substitute exactly
+// as on the real mother, and "Reconnexion au poste mère" on a mother that was
+// about to host. "Confier le rôle" and "Je ne suis pas un poste mère" are gone:
+// the role changes in "Rôle de ce poste" only.
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Loader2, Monitor, Search, Settings, Wifi,
+  AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Crown, Loader2, Monitor, Search,
 } from 'lucide-react';
 import { useLocalRole, useMotherConnection } from '../../services/motherConnection';
 import { onMotherReachState, onMotherTakeover, type ReachState, type TakeoverMother } from '../../services/motherFailover';
-import { rejoinCurrentMother } from '../../services/childControlLink';
-import { onHotspotIssue, raiseMotherHotspotIfConfigured, type HotspotIssue } from '../../services/lanMotherBoot';
+import { rejoinCurrentMother, refreshLaunchedGamesRoute } from '../../services/childControlLink';
 import {
-  describeHotspotError, hotspotErrorSuggestsRouter, openWindowsHotspotSettings,
-} from '../../services/hotspotErrors';
+  onHostingNotice, takeBackNow, resolveTwoMothers, canHostAsSubstitute, type HostingNotice,
+} from '../../services/hostingRole';
+import { forceBecomeMother } from '../../services/lanMotherBoot';
+import { wasRoleResetByUpdate } from '../../services/deviceRole';
+import { useAuth } from '../auth/AuthProvider';
 import { ErrorDetails } from '../ErrorDetails';
 import {
-  hotspotStatus, listPairedDevices, listPairedMothers, isRecent, formatLanTime, displayDeviceLabel,
+  listPairedDevices, listPairedMothers, isRecent, formatLanTime, displayDeviceLabel,
   type PairedMotherRow,
 } from '../../services/lanPairing';
-import { getNetworkSource, getRouterCreds, type NetworkSource } from '../../services/lanCredentials';
 import { getCurrentSsid } from '../../services/wifi';
 import { parseDbTs } from '../../utils/dbTime';
 import { MotherLanSection } from './MotherLanSection';
@@ -39,13 +47,12 @@ import { LanDiagnostics } from './LanDiagnostics';
 import { FirewallPanel } from './FirewallPanel';
 import { ForceMotherPanel } from './ForceMotherPanel';
 import { RejoinMotherPanel } from './RejoinMotherPanel';
-import { NotMotherPanel } from './NotMotherPanel';
 import { DefaultRolesPanel } from './DefaultRolesPanel';
 import { WindowsHealthPanel } from './WindowsHealthPanel';
 
 type RowKey =
-  | 'role' | 'mode' | 'wifi' | 'wifiDetails' | 'join' | 'firewall' | 'windows' | 'diagnostic'
-  | 'rejoin' | 'resume' | 'handover' | 'notMother';
+  | 'role' | 'join' | 'byIp' | 'firewall' | 'windows' | 'diagnostic'
+  | 'rejoin' | 'resume';
 
 const POLL_MS = 5000;
 
@@ -85,36 +92,36 @@ export function NetworkScreen() {
   const [reach, setReach] = useState<ReachState>('ok');
   const [advOpen, setAdvOpen] = useState(false);
   const [openRow, setOpenRow] = useState<RowKey | null>(null);
-  const [source, setSource] = useState<NetworkSource>('hotspot');
   const [ssid, setSsid] = useState<string | null>(null);
-  const [apRunning, setApRunning] = useState<boolean | null>(null);
   const [satellitesOnline, setSatellitesOnline] = useState(0);
   const [busy, setBusy] = useState(false);
   const [searchResult, setSearchResult] = useState<'not_found' | null>(null);
 
   const [taker, setTaker] = useState<TakeoverMother | null>(null);
-  const [apIssue, setApIssue] = useState<HotspotIssue | null>(null);
+  const auth = useAuth();
+  const [notice, setNotice] = useState<HostingNotice>({ kind: 'none' });
+  // "Héberger en remplacement" / "Reprendre maintenant", run from the status card.
+  const [acting, setActing] = useState(false);
+  const [actError, setActError] = useState<unknown>(null);
+  const [roleReset, setRoleReset] = useState(false);
 
   useEffect(() => onMotherReachState(setReach), []);
-  useEffect(() => onHotspotIssue(setApIssue), []);
   useEffect(() => onMotherTakeover(setTaker), []);
+  useEffect(() => onHostingNotice(setNotice), []);
+  useEffect(() => {
+    void wasRoleResetByUpdate().then(setRoleReset);
+  }, []);
 
-  const isMother = !!role && (role.isMother || role.isHotspot);
+  // `isMother`: this device is HOSTING (its LAN server runs) - as the mother or
+  // as a substitute. `deviceRole` says which.
+  const isMother = !!role && role.isMother;
+  const deviceRole = role?.role ?? 'satellite';
 
   const refresh = useCallback(async () => {
-    const src = await getNetworkSource().catch(() => 'hotspot' as NetworkSource);
-    setSource(src);
+    setSsid(await getCurrentSsid());
     if (isMother) {
-      const [st, devices, router] = await Promise.all([
-        hotspotStatus().catch(() => null),
-        listPairedDevices().catch(() => []),
-        getRouterCreds().catch(() => null),
-      ]);
-      setApRunning(st?.running ?? null);
-      setSsid(src === 'router' ? router?.ssid ?? null : st?.ssid ?? null);
+      const devices = await listPairedDevices().catch(() => []);
       setSatellitesOnline(devices.filter((d) => !d.is_self && isRecent(d.last_seen_at)).length);
-    } else {
-      setSsid(await getCurrentSsid());
     }
   }, [isMother]);
 
@@ -141,13 +148,18 @@ export function NetworkScreen() {
     }
   };
 
-  const startAp = async () => {
-    setBusy(true);
+  const act = async (action: (clientId: number) => Promise<unknown>) => {
+    const clientId = auth.user?.client_id;
+    if (clientId == null) return;
+    setActing(true);
+    setActError(null);
     try {
-      await raiseMotherHotspotIfConfigured();
-      await refresh();
+      await action(clientId);
+      await refreshLaunchedGamesRoute().catch(() => {});
+    } catch (e) {
+      setActError(e);
     } finally {
-      setBusy(false);
+      setActing(false);
     }
   };
 
@@ -163,54 +175,58 @@ export function NetworkScreen() {
   // ── status card content ──
   const motherName = mother?.mother_label || (conn.kind === 'child_ok' ? conn.motherLabel : null) || t('statusUnnamedMother');
   const motherLastSec = secondsSince(mother?.last_seen_at);
-  let tone: 'ok' | 'warn' | 'busy';
+  // 'info': a settled state that is not the normal one (a substitute hosting,
+  // the mother waiting for a game to finish elsewhere) - amber, no spinner.
+  let tone: 'ok' | 'warn' | 'busy' | 'info';
   let title: string;
   let body: ReactNode;
   let action: ReactNode = null;
-  if (isMother) {
-    const apDown = source === 'hotspot' && apRunning === false;
-    tone = apDown ? 'warn' : 'ok';
-    title = apDown ? t('statusMotherApDownTitle') : t('statusAllGood');
-    // Why Windows refused the last start, in plain language (driver, policy...).
-    const apError =
-      apDown && apIssue?.kind === 'raise_failed' ? describeHotspotError(apIssue.message, t) : null;
-    body = apDown
-      ? (
-          <>
-            {t('statusMotherApDownBody')}
-            {apError && (
-              <>
-                <ErrorDetails error={apError} tone="warning" className="mt-3" />
-                {hotspotErrorSuggestsRouter(apError.code) && (
-                  <span className="block text-sm mt-2">{t('hotspotErr_routerHint')}</span>
-                )}
-              </>
-            )}
-          </>
-        )
-      : t(source === 'router' ? 'statusMotherRouterBody' : 'statusMotherBody', {
-          ssid: ssid ?? '-',
-          count: satellitesOnline,
-        });
-    if (apDown) {
-      action = (
-        <button className="pg-btn pg-btn--primary" disabled={busy} onClick={() => void startAp()}>
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wifi className="w-4 h-4" />}
-          {t('statusStartAp')}
+  if (isMother && deviceRole === 'mother') {
+    tone = 'ok';
+    title = t('statusAllGood');
+    body = t('statusMotherRouterBody', { ssid: ssid ?? t('networkCardWired'), count: satellitesOnline });
+  } else if (isMother) {
+    // Hosting without being set as the mother: a substitute.
+    const stoodInFor = displayDeviceLabel(role.substituteFor);
+    tone = 'info';
+    title = t('statusSubstituteTitle');
+    body = stoodInFor
+      ? t('statusSubstituteBody', { mother: stoodInFor, count: satellitesOnline })
+      : t('statusSubstituteBodyUnknown', { count: satellitesOnline });
+  } else if (deviceRole === 'mother' && notice.kind === 'substitute_busy') {
+    // The mother, back while a game still runs on its substitute.
+    const name = displayDeviceLabel(notice.substitute.label) || t('failover:anotherDevice');
+    tone = 'info';
+    title = t('statusMotherWaitingTitle', { name });
+    body = t('statusMotherWaitingBody', { name });
+    action = (
+      <button className="pg-btn pg-btn--primary" disabled={acting} onClick={() => void act(takeBackNow)}>
+        {acting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crown className="w-4 h-4" />}
+        {t('statusTakeBackNow')}
+      </button>
+    );
+  } else if (deviceRole === 'mother' && notice.kind === 'two_mothers') {
+    // Either answer restarts Playground to apply it.
+    const name = displayDeviceLabel(notice.other.label) || t('failover:anotherDevice');
+    tone = 'warn';
+    title = t('statusTwoMothersTitle');
+    body = t('statusTwoMothersBody', { name });
+    action = (
+      <div className="flex flex-wrap items-center gap-3">
+        <button className="pg-btn pg-btn--primary" disabled={acting} onClick={() => void act(() => resolveTwoMothers(true))}>
+          <Crown className="w-4 h-4" />
+          {t('failover:twoMothersKeepThis')}
         </button>
-      );
-      if (apError) {
-        action = (
-          <div className="flex flex-wrap items-center gap-3">
-            {action}
-            <button className="pg-btn pg-btn--ghost" onClick={() => void openWindowsHotspotSettings().catch(() => {})}>
-              <Settings className="w-4 h-4" />
-              {t('hotspotErrOpenWindows')}
-            </button>
-          </div>
-        );
-      }
-    }
+        <button className="pg-btn" disabled={acting} onClick={() => void act(() => resolveTwoMothers(false))}>
+          {name}
+        </button>
+      </div>
+    );
+  } else if (deviceRole === 'mother') {
+    // Set as the mother and about to host: it never looks for a mother.
+    tone = 'busy';
+    title = t('statusMotherStartingTitle');
+    body = t('statusMotherStartingBody');
   } else if (taker && reach !== 'ok') {
     // Another satellite took over (first click wins): this one is joining it.
     tone = 'busy';
@@ -236,12 +252,33 @@ export function NetworkScreen() {
   } else {
     tone = 'warn';
     title = t('statusNoMotherTitle');
-    body = ssid ? t('statusNoMotherOnWifi', { ssid }) : t('statusNoMotherNoWifi');
+    body = (
+      <>
+        {ssid ? t('statusNoMotherOnWifi', { ssid }) : t('statusNoMotherNoWifi')}
+        {roleReset && <span className="block mt-1">{t('statusRoleResetNote')}</span>}
+      </>
+    );
     action = (
       <div className="flex flex-wrap items-center gap-3">
         <button className="pg-btn pg-btn--primary" disabled={busy} onClick={() => void searchMother()}>
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
           {t('statusSearchMother')}
+        </button>
+        {/* Nothing hosts by itself except the mother: with none on the network,
+            the operator decides that this PC stands in for it. */}
+        {canHostAsSubstitute() && (
+          <button
+            className="pg-btn"
+            disabled={acting}
+            title={t('statusHostAsSubstituteHint')}
+            onClick={() => void act((clientId) => forceBecomeMother(clientId, { allowIdle: true }))}
+          >
+            {acting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Crown className="w-4 h-4" />}
+            {t('statusHostAsSubstitute')}
+          </button>
+        )}
+        <button className="text-sm font-semibold text-[var(--pg-accent-bright)] hover:underline" onClick={() => openAdvanced('byIp')}>
+          {t('byIpTitle')}
         </button>
         <button className="text-sm font-semibold text-[var(--pg-accent-bright)] hover:underline" onClick={() => openAdvanced('diagnostic')}>
           {t('statusDiagnosticLink')}
@@ -253,40 +290,33 @@ export function NetworkScreen() {
   const toneCls =
     tone === 'ok'
       ? 'border-[var(--pg-ok-line)] bg-[var(--pg-ok-bg)]'
-      : tone === 'busy'
+      : tone === 'busy' || tone === 'info'
         ? 'border-amber-500/40 bg-amber-500/10'
         : 'border-[var(--pg-warn-line)] bg-[var(--pg-warn-bg)]';
   const icon =
     tone === 'ok' ? <CheckCircle className="w-7 h-7 text-[var(--pg-ok-icon)]" />
     : tone === 'busy' ? <Loader2 className="w-7 h-7 text-amber-400 animate-spin" />
+    : tone === 'info' ? <Crown className="w-7 h-7 text-amber-400" />
     : <AlertTriangle className="w-7 h-7 text-[var(--pg-warn-icon)]" />;
 
   // Taking over a game is offered only once the mother has been gone a while
   // (the #22 "lost" state) - never while reconnecting, never on a satellite that
   // simply isn't connected yet, and not once another satellite took over.
-  const offerResume = !isMother && reach === 'lost' && !taker;
+  const offerResume =
+    !isMother && deviceRole !== 'mother' && reach === 'lost' && !taker && canHostAsSubstitute();
 
   const rows: Array<{ key: RowKey; title: string; hint: string; body: ReactNode; danger?: boolean; hidden?: boolean }> = [
-    { key: 'mode', title: t('advModeTitle'), hint: t('advModeHint'), body: <MotherLanSection view="mode" />, hidden: isMother },
-    { key: 'wifi', title: t('advWifiTitle'), hint: t('advWifiHint'), body: <SatelliteLanSection parts={['wifi']} />, hidden: isMother },
-    { key: 'wifiDetails', title: t('advWifiDetailsTitle'), hint: t('advWifiDetailsHint'), body: <MotherLanSection view="details" />, hidden: !isMother },
     { key: 'join', title: t('advJoinTitle'), hint: t('advJoinHint'), body: <SatelliteLanSection parts={['join']} />, hidden: isMother },
+    { key: 'byIp', title: t('byIpTitle'), hint: t('advByIpHint'), body: <SatelliteLanSection parts={['byIp']} />, hidden: isMother },
     { key: 'firewall', title: t('advFirewallTitle'), hint: t('advFirewallHint'), body: <FirewallPanel hintKey={isMother ? 'firewallHint' : 'firewallHintChild'} /> },
-    { key: 'windows', title: t('winHealthTitle'), hint: t('advWindowsHint'), body: <WindowsHealthPanel />, hidden: !isMother },
+    { key: 'windows', title: t('winHealthTitle'), hint: t('advWindowsHint'), body: <WindowsHealthPanel /> },
     {
       key: 'diagnostic', title: t('advDiagTitle'), hint: t('advDiagHint'),
-      body: (
-        <div className="space-y-5">
-          {!isMother && <SatelliteLanSection parts={['wizard']} />}
-          <LanDiagnostics />
-        </div>
-      ),
+      body: <LanDiagnostics />,
     },
     { key: 'rejoin', title: t('advRejoinTitle'), hint: t('advRejoinHint'), body: <RejoinMotherPanel />, hidden: isMother },
-    { key: 'role', title: t('advRoleTitle'), hint: isMother ? t('advRoleHintMother') : t('advRoleHintSatellite'), body: <DefaultRolesPanel />, danger: true },
+    { key: 'role', title: t('advRoleTitle'), hint: deviceRole === 'mother' ? t('advRoleHintMother') : t('advRoleHintSatellite'), body: <DefaultRolesPanel />, danger: true },
     { key: 'resume', title: t('advResumeTitle'), hint: t('advResumeHint'), body: <ForceMotherPanel firstClickWins />, danger: true, hidden: !offerResume },
-    { key: 'handover', title: t('handoverTitle'), hint: t('handoverHint'), body: <PairedDevicesPanel mode="handover" />, danger: true, hidden: !isMother },
-    { key: 'notMother', title: t('notMotherTitle'), hint: t('advNotMotherHint'), body: <NotMotherPanel />, danger: true, hidden: !isMother },
   ];
   const visible = rows.filter((r) => !r.hidden);
   const safeRows = visible.filter((r) => !r.danger);
@@ -327,20 +357,22 @@ export function NetworkScreen() {
             <div className="text-sm text-[var(--pg-text)]">{body}</div>
           </div>
           {action}
+          {actError != null && <ErrorDetails error={actError} />}
           {searchResult === 'not_found' && (
             <p className="text-xs text-[var(--pg-text-dim)]">{t('statusSearchNotFound')}</p>
           )}
-          {isMother && <WindowsHealthPanel compact />}
+          <WindowsHealthPanel compact />
         </div>
       </div>
 
-      {/* 2. Role-specific cards. */}
+      {/* 2. Role-specific cards. A device set as the mother has no "Mon poste
+          mère" card, even while it is not hosting yet: it is the mother. */}
       {isMother ? (
         <>
-          <MotherLanSection view="summary" />
+          <MotherLanSection />
           <PairedDevicesPanel />
         </>
-      ) : (
+      ) : deviceRole === 'mother' ? null : (
         <div className="pg-panel">
           <h3 className="pg-panel-title mb-3">{t('myMotherTitle')}</h3>
           {mother ? (
@@ -380,7 +412,7 @@ export function NetworkScreen() {
           </button>
         </div>
       )}
-      {!isMother && mother && <MotherSatellitesPanel />}
+      {!isMother && deviceRole !== 'mother' && mother && <MotherSatellitesPanel />}
 
       {/* 3. Everything else, folded. */}
       <div className="pg-panel">

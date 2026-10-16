@@ -34,7 +34,9 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 serialport = "4"
 regex = "1"
-tokio = { version = "1", features = ["time", "process", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio = { version = "1", features = ["time", "process", "rt", "rt-multi-thread", "macros", "net", "sync", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
 axum = "0.8"
 tokio-rusqlite = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -42,7 +44,7 @@ chrono = { version = "0.4", features = ["serde"] }
 mdns-sd = "0.13"
 rand = "0.8"
 if-addrs = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # SportIdent reader stack (moved from feature-gated to mandatory after the
 # step-7 cutover deleted the legacy JS path).
@@ -55,10 +57,23 @@ bytes = "1"
 # buffering a multi-hundred-MB video in the WebView heap (sha256_file command).
 sha2 = "0.10"
 
+# LAN app updates: a mother checks an installer a satellite pushes to it against
+# the updater signing key (same scheme as tauri-plugin-updater) before offering
+# it to other devices (update_cache.rs).
+minisign-verify = "0.2"
+base64 = "0.22"
+
+[dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`) for the SportIdent
+# reader's handshake retry / read watchdog / stale-frame timers.
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Foundation",
     "Foundation_Collections",
+    # legacy_net_cleanup: one-shot stop of a hotspot left on by a pre-router
+    # build (WinRT tethering). Drop both with that module.
     "Networking_Connectivity",
     "Networking_NetworkOperators",
     # cp210x_driver: SetupDi* device enumeration + ShellExecuteExW UAC-elevated
@@ -72,10 +87,6 @@ windows = { version = "0.58", features = [
     "Win32_Devices_Properties",
     "Win32_UI_Shell",
     "Win32_System_Registry",
-    # wifi_scan_fresh: WlanScan forces a real radio scan - `netsh wlan show
-    # networks` only reads Windows' cached list, which can miss a hotspot that
-    # just appeared for minutes (retours sept. #1/#19).
-    "Win32_NetworkManagement_WiFi",
 ] }
 
 # Desktop-only: app self-update + OS autostart. The Tauri updater cannot

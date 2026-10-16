@@ -1,24 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Crown, Radio, Wifi, Usb, Loader2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Crown, Radio, Usb, VolumeX } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { platform } from '@tauri-apps/plugin-os';
 import { invoke } from '@tauri-apps/api/core';
 import { useLocalRole, useMotherConnection } from '../services/motherConnection';
-import { connectConfiguredNetwork } from '../services/wifiAutoConnect';
 import { isReaderConnected } from '../services/sportidentService';
 import { loadConfig } from '../utils/config';
+import { setSoundMuted, useSoundMuted } from '../utils/soundMute';
 
 const READER_POLL_MS = 10_000;
 
 type ReaderState = 'unknown' | 'ok' | 'bad';
-type Toast = { kind: 'ok' | 'err'; text: string };
 
 // Top-bar status cluster (replaces the retired footer): a separator after the
 // utility buttons, then
 //  - the LAN role at a glance: crown = this device IS the mother; radio =
-//    child connected to a mother; amber Wi-Fi button = child NOT connected,
-//    one tap joins the mother's Wi-Fi (same auto-connect engine as the Join
-//    tab, Windows-only since the Wi-Fi primitives only exist there);
+//    child connected to a mother (amber when not connected);
 //  - the SI reader indicator. Its 10s poll is ALSO the app-wide reader
 //    heartbeat: it pushes ReaderPresence to the Rust side (reported to the
 //    mother via ping) and emits the 'reader:status' event game pages and the
@@ -28,25 +24,13 @@ export function TopbarStatus() {
   const { t } = useTranslation('devicesLan');
   const localRole = useLocalRole();
   const conn = useMotherConnection();
-
-  const [isWindows, setIsWindows] = useState<boolean | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [toast, setToast] = useState<Toast | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const soundMuted = useSoundMuted();
 
   const [readerState, setReaderState] = useState<ReaderState>('unknown');
   // Operator-only devices have no reader role - the reader indicator (and its
   // poll) are hidden entirely. Re-read on the 'operator-mode:changed' event
   // the Settings toggle dispatches so it reacts without a reload.
   const [operatorOnly, setOperatorOnly] = useState(false);
-
-  useEffect(() => {
-    try {
-      setIsWindows(platform() === 'windows');
-    } catch {
-      setIsWindows(false);
-    }
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -97,105 +81,44 @@ export function TopbarStatus() {
     };
   }, [operatorOnly]);
 
-  const flash = useCallback((next: Toast) => {
-    setToast(next);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 5000);
-  }, []);
-
-  useEffect(() => () => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-  }, []);
-
-  const connect = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    setToast(null);
-    try {
-      // Directly attempt the networks saved in wifi_networks (no scan gate) so an
-      // explicit press connects even if the SSID missed the last Wi-Fi scan.
-      const r = await connectConfiguredNetwork();
-      switch (r.kind) {
-        case 'connected':
-          flash({ kind: 'ok', text: t('autoConnected', { ssid: r.ssid }) });
-          break;
-        case 'failed':
-          flash({ kind: 'err', text: t('autoConnectFailed', { ssid: r.ssid }) });
-          break;
-        case 'noop':
-          flash({
-            kind: 'err',
-            text:
-              r.reason === 'no-networks'
-                ? t('noStudioHotspot')
-                : r.reason === 'already-on-known'
-                  ? t('connectAlready')
-                  : t('connectNotFound'),
-          });
-          break;
-      }
-    } catch (e) {
-      flash({ kind: 'err', text: (e as Error)?.message || String(e) });
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, flash, t]);
-
   const connected = conn.kind === 'child_ok';
   const motherLabel = conn.kind === 'child_ok' ? conn.motherLabel : null;
-  // "Acts as the mother" comes from the connection state machine, NOT the raw
-  // mother_server_running flag: a satellite whose local server happens to be up
-  // (be-mother preference left on, pre-demote leftovers) but which is paired to
-  // a real mother must NOT wear the crown. The state machine collapses that
-  // correctly - mother_* kinds mean this device genuinely hosts/provides the
-  // LAN; child_* kinds mean it follows a mother. The raw flag is only the
-  // fallback for a mother with nothing paired yet (kind 'hidden'/'mother_detected').
+  // "Acts as the mother" is the running LAN server, nothing else: only the
+  // mother runs it (a satellite, a stood-down or a demoted device has none), so
+  // it wears the crown even when it still carries paired_mothers rows from a
+  // time it followed another device. The mother_* kinds say the same thing.
   const actsAsMother =
+    localRole?.isMother === true ||
     conn.kind === 'mother_hosting' ||
-    conn.kind === 'mother_partial' ||
-    conn.kind === 'mother_idle' ||
-    (localRole?.isMother === true && (localRole?.pairedMotherCount ?? 0) === 0);
+    conn.kind === 'mother_idle';
 
   // Role slots, empty during the first poll ('checking') so a connected
-  // satellite doesn't flash the amber icons on load. A child shows its
-  // connection status icon PLUS, when not connected, the one-tap "join the
-  // mother's Wi-Fi" action button right next to it (Windows-only - the Wi-Fi
-  // join primitives only exist there).
+  // satellite doesn't flash the amber icons on load.
   let roleSlot: React.ReactNode = null;
   if (localRole !== null && conn.kind !== 'checking') {
     if (actsAsMother) {
       roleSlot = (
-        <span className="pg-status-icon text-green-400" title={t('nav:motherThisDevice')}>
+        <span
+          className={`pg-status-icon ${localRole?.role === 'substitute' ? 'text-amber-400' : 'text-green-400'}`}
+          title={localRole?.role === 'substitute' ? t('nav:motherSubstituteThisDevice') : t('nav:motherThisDevice')}
+        >
           <Crown size={16} />
         </span>
       );
     } else {
       roleSlot = (
-        <>
-          <span
-            className={`pg-status-icon ${connected ? 'text-green-400' : 'text-amber-400'}`}
-            title={
-              connected
-                ? motherLabel
-                  ? t('nav:motherConnectedTo', { label: motherLabel })
-                  : t('nav:motherConnected')
-                : t('nav:motherNotConnected')
-            }
-          >
-            <Radio size={16} />
-          </span>
-          {!connected && isWindows === true && (
-            <button
-              onClick={() => void connect()}
-              disabled={busy}
-              className="pg-icon-btn text-amber-400"
-              aria-label={t('connectTooltip')}
-              title={busy ? t('connectSearching') : t('connectTooltip')}
-            >
-              {busy ? <Loader2 size={16} className="animate-spin" /> : <Wifi size={16} />}
-            </button>
-          )}
-        </>
+        <span
+          className={`pg-status-icon ${connected ? 'text-green-400' : 'text-amber-400'}`}
+          title={
+            connected
+              ? motherLabel
+                ? t('nav:motherConnectedTo', { label: motherLabel })
+                : t('nav:motherConnected')
+              : t('nav:motherNotConnected')
+          }
+        >
+          <Radio size={16} />
+        </span>
       );
     }
   }
@@ -224,19 +147,18 @@ export function TopbarStatus() {
           <Usb size={16} />
         </span>
       )}
-
-      {toast && (
-        <div
-          className={`fixed top-16 right-4 z-50 max-w-xs text-sm rounded-lg px-3 py-2 border shadow-lg ${
-            toast.kind === 'ok'
-              ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
-              : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'
-          }`}
-          role="status"
+      {/* Ctrl+M mute: shown only while muted, click to restore the sound. */}
+      {soundMuted && (
+        <button
+          type="button"
+          className="pg-status-icon text-[var(--pg-accent-bright)]"
+          title={t('soundMute:mutedIndicator')}
+          onClick={() => setSoundMuted(false)}
         >
-          {toast.text}
-        </div>
+          <VolumeX size={16} />
+        </button>
       )}
+
     </>
   );
 }

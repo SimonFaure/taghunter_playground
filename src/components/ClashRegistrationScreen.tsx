@@ -14,6 +14,7 @@ import { Check, Play, Users } from 'lucide-react';
 import { type ClashStandings } from '../services/clash';
 import { tIngame } from '../i18n/ingame';
 import type { ClashClanVisual } from './ClashGameRenderer';
+import { useSimBus } from '../services/simBus';
 
 /** Split marker for the two sentences that style part of themselves (the clan
  *  name, the Start-game label). Interpolating a sentinel then splitting on it
@@ -63,6 +64,12 @@ export function ClashRegistrationScreen({
   assignedTeamNumbers = null,
   lang,
 }: ClashRegistrationScreenProps) {
+  // Game simulator: pick the team for the next mock player's bip, then press
+  // Start once everyone is registered - the same handlers a tap calls.
+  useSimBus((a) => {
+    if (a.kind === 'selectTeam') onSelectClan(a.teamId);
+    else if (a.kind === 'pressStart') onStart();
+  });
   const tc = (key: string, vars?: Record<string, string | number>) =>
     tIngame('ingame_clash', key, lang, vars);
   // Station assignment (self mode): a locked station renders only its clan(s).

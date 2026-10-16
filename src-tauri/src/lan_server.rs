@@ -11,8 +11,9 @@
 // `lg_launched_game_raw_data`.
 //
 // mDNS: the mother registers a `_taghunter._tcp.local.` instance on start so
-// clients can browse for it on the same Wi-Fi without typing IPs. Hotspot
-// creation is slices C + D.
+// clients can browse for it on the same network without typing IPs. The
+// network itself is a router / venue LAN the PCs join through Windows (the
+// mother hotspot was retired 2026-09-30).
 //
 // The server runs in the existing tokio runtime spawned by Tauri. State is
 // held in a `MotherServerState` resource managed at app build time.
@@ -95,13 +96,22 @@ pub struct ScreenPresence {
     inner: Mutex<Option<String>>,
 }
 
+/// Client-side: this device's "Operator only device" setting, pushed by JS
+/// (`services/operatorMode.ts` -> `client_set_operator_only`) at boot and on
+/// toggle. Sent in every ping so the mother refuses to push a game onto it;
+/// read directly for the mother's own row.
+#[derive(Default)]
+pub struct OperatorPresence {
+    inner: Mutex<bool>,
+}
+
 struct Running {
     port: u16,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
     mdns: Option<MdnsHandle>,
-    // Kept so the mDNS announcement can be re-registered (e.g. once the hotspot
-    // interface comes up) without restarting the whole server.
+    // Kept so the mDNS announcement can be re-registered (e.g. once the PC gets
+    // a LAN address) without restarting the whole server.
     mother_uuid: String,
     mdns_label: Option<String>,
     // Mother-failover slice 3: advertised in the mDNS TXT so a re-pointing
@@ -110,6 +120,63 @@ struct Running {
     // boot; a promotion re-registers mDNS with a higher value.
     client_id: i64,
     epoch: i64,
+    // Why this device hosts: the mother set in "Rôle de ce poste", or a
+    // substitute standing in for it. Advertised with `since` (see `HostRole`).
+    role: HostRole,
+    since: i64,
+}
+
+/// Who is serving. `Mother` is the device configured as the mother (the
+/// install-time choice, or a later "Rôle de ce poste"). `Substitute` took a
+/// game over while the mother was away: it hands everything back and stops
+/// serving as soon as a `Mother` is on the network again.
+///
+/// Advertised in the mDNS TXT (`role` = `m` / `s`) and in the hello reply, with
+/// `since` = when the device was designated mother (ms since epoch, 0 unknown).
+/// Two configured mothers on one network: the later designation keeps the role.
+/// A peer that advertises no role runs an older build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostRole {
+    Mother,
+    Substitute,
+}
+
+impl HostRole {
+    fn from_configured(configured: Option<bool>) -> Self {
+        if configured == Some(true) { Self::Mother } else { Self::Substitute }
+    }
+    fn code(self) -> &'static str {
+        match self {
+            Self::Mother => "m",
+            Self::Substitute => "s",
+        }
+    }
+}
+
+/// Must this device stand down for a mother it discovered?
+///
+/// - A substitute always does: it never competes with anyone already serving.
+/// - The configured mother ignores substitutes (they yield to it).
+/// - Two configured mothers: the later designation wins; with no usable date
+///   on either side the lower uuid serves, so exactly one of them does.
+/// - A peer with no role (older build): the pre-role rule, first one up wins.
+pub(crate) fn must_stand_down(
+    my_role: HostRole,
+    my_since: i64,
+    my_uuid: &str,
+    their_role: Option<&str>,
+    their_since: Option<i64>,
+    their_uuid: &str,
+) -> bool {
+    match (my_role, their_role) {
+        (HostRole::Substitute, _) => true,
+        (HostRole::Mother, Some("s")) => false,
+        (HostRole::Mother, Some("m")) => {
+            let theirs = their_since.unwrap_or(0);
+            theirs > my_since || (theirs == my_since && their_uuid < my_uuid)
+        }
+        (HostRole::Mother, _) => true,
+    }
 }
 
 struct MdnsHandle {
@@ -141,8 +208,8 @@ pub struct MotherServerStatus {
 // ─── tauri commands: mother lifecycle ────────────────────────────────────────
 
 // Best-effort: open the Windows Firewall for our executable so satellites can
-// reach the axum server over the hotspot/link-local interface (Windows classes
-// it "Public" and blocks custom inbound TCP by default - mDNS multicast is
+// reach the axum server over the LAN (Windows blocks custom inbound TCP by
+// default, always on a "Public" network, and blocks custom inbound TCP by default - mDNS multicast is
 // allowed, which is why discovery works but the pair request can't connect).
 // Requires admin; silently no-ops otherwise. Idempotent (delete-then-add by name).
 #[cfg(target_os = "windows")]
@@ -209,7 +276,7 @@ fn try_open_firewall() {}
 
 // Add the inbound firewall rules WITH ELEVATION. The plain `try_open_firewall`
 // above only works when the app already runs as admin (rare); on a normal install
-// the rule is never added, so satellites on the hotspot's "Public" profile can't
+// the rule is never added, so satellites on a "Public" network profile can't
 // open a TCP connection to the mother's server (mDNS multicast still works, which
 // is why the mother is *discoverable* but *unreachable*). This escalates via a
 // single UAC prompt (an elevated PowerShell script).
@@ -355,17 +422,82 @@ pub async fn mother_firewall_rule_status() -> Result<Option<bool>, String> {
 // already the mother at a higher epoch. Not a real error - a deliberate refusal.
 pub const MOTHER_SUPERSEDED: &str = "mother_superseded: another device is the current mother (higher epoch)";
 
+/// LAN protocol version. Every device of a fleet must speak the same one: a
+/// mother refuses satellites on another version (HTTP 426 `LAN_PROTO_MISMATCH`)
+/// and a satellite refuses such a mother. A peer that sends none is a
+/// hotspot-era build = 1. Bump ONLY for a breaking LAN change, never per release.
+pub const LAN_PROTO: u32 = 2;
+const LAN_PROTO_HEADER: &str = "x-lan-proto";
+
+/// A reqwest client builder for satellite -> mother calls: carries the
+/// `X-Lan-Proto` header on every request.
+pub(crate) fn lan_client_builder() -> reqwest::ClientBuilder {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        LAN_PROTO_HEADER,
+        reqwest::header::HeaderValue::from(LAN_PROTO),
+    );
+    reqwest::Client::builder().default_headers(headers)
+}
+
+/// The LAN protocol a mother announced in a JSON reply (1 when absent).
+fn announced_proto(body: &Value) -> u32 {
+    body.get("lan_proto").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(1)
+}
+
+/// Mother-side gate: refuse any LAN request from a peer on another protocol.
+/// Exempt: loopback (this device's own renderer), `pair.php?action=hello`,
+/// which old peers may still call to read our version, and `/update.php`
+/// (an outdated satellite updates from us). Requests served without
+/// ConnectInfo (unit tests) are let through.
+async fn lan_proto_gate(request: Request<Body>, next: axum::middleware::Next) -> Response {
+    let remote = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let is_hello = request.uri().path() == "/pair.php"
+        && request.uri().query().map_or(false, |q| q.split('&').any(|kv| kv == "action=hello"));
+    // App updates work across protocol versions: an outdated satellite must be
+    // able to fetch the installer that brings it back to ours.
+    let is_update = request.uri().path() == "/update.php";
+    let exempt = match remote {
+        None => true,
+        Some(a) => a.ip().is_loopback(),
+    };
+    if exempt || is_hello || is_update {
+        return next.run(request).await;
+    }
+    let peer_proto = request
+        .headers()
+        .get(LAN_PROTO_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    if peer_proto == LAN_PROTO {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(json!({
+            "error": "LAN_PROTO_MISMATCH",
+            "peer_proto": peer_proto,
+            "lan_proto": LAN_PROTO,
+            "app_version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
+}
+
 // F13: preferred well-known ports for the mother's axum server. Binding a
-// predictable port lets a child probe the hotspot gateway (192.168.137.1)
-// DIRECTLY over HTTP when mDNS multicast is filtered on the Windows "Public"
-// profile - the direct-probe fallback (client_probe_gateway_mother). The
-// server still advertises its ACTUAL bound port over mDNS, so a rare conflict
-// that forces the OS-picked fallback below only loses the gateway fast-path,
-// never discovery itself.
+// predictable port lets a satellite pair by typing only the mother's IP
+// (`client_pair_by_address` probes these in order) when mDNS multicast is
+// filtered by the router or venue network. The server still advertises its
+// ACTUAL bound port over mDNS, so a rare conflict that forces the OS-picked
+// fallback below only loses the by-address path, never discovery itself.
 pub const PREFERRED_PORTS: [u16; 4] = [47800, 47801, 47802, 47803];
 
 /// Bind the axum listener. `requested == 0` means "OS picks" from the caller,
-/// but we first try the PREFERRED_PORTS in order (so the gateway direct-probe
+/// but we first try the PREFERRED_PORTS in order (so pairing by address
 /// has a known port to hit) and fall back to an OS-assigned port only if they
 /// are all taken. A non-zero `requested` is honored verbatim (tests / explicit).
 async fn bind_mother_listener(requested: u16) -> std::io::Result<TcpListener> {
@@ -387,7 +519,13 @@ pub async fn mother_start_local_server(
     client_id: i64,
     port: u16,
     mdns_label: Option<String>,
+    // true = this device is set as the mother ("Rôle de ce poste"); anything
+    // else starts it as a substitute. `designated_at` is when it was set (ms).
+    configured: Option<bool>,
+    designated_at: Option<i64>,
 ) -> Result<MotherServerInfo, String> {
+    let role = HostRole::from_configured(configured);
+    let since = if role == HostRole::Mother { designated_at.unwrap_or(0) } else { 0 };
     let mut guard = state.inner.lock().await;
     if guard.is_some() {
         return Err("Mother server is already running".into());
@@ -435,23 +573,16 @@ pub async fn mother_start_local_server(
         .await
         .unwrap_or(1);
 
-    // Unified boot fence (mother/hotspot role rework, E1 "preferred mother"):
-    // if ANY other mother of this client is already live, it was here first -
-    // stand down and join it rather than starting a second, competing server.
-    // The TS boot path then auto-pairs with + routes at the winner.
+    // Boot fence: never start a second, competing server. Who stands down is
+    // decided by ROLE (`must_stand_down`), not by who booted first: the device
+    // set as the mother starts even when a substitute is serving (the
+    // substitute then yields to it), while a substitute, or a mother facing a
+    // later-designated mother, stands down. Presence used to decide alone, so
+    // the mother changed PC with the power-on order.
     //
-    // This is deliberately PRESENCE-based, not epoch-based: epoch only orders two
-    // mothers claiming the SAME game (the runtime failover-yield poll + re-point
-    // still use it for that). At boot, comparing OUR epoch to a mother hosting a
-    // DIFFERENT game is meaningless - and that mistake is exactly what let a
-    // device with stale local games (migrated from the old "every device hosts"
-    // model) wrongly keep hosting instead of deferring to the real mother.
-    //
-    // Known edge: two willing mothers powered on simultaneously can both see each
-    // other and both stand down (→ no mother). The TS boot path now schedules a
-    // delayed re-check after a stand-down (re-runs ensureMotherServer if no
-    // mother materialized), so this self-recovers; the Network-tab "Make this
-    // device the mother" button remains the manual override.
+    // Epoch plays no part here: it only orders two devices claiming the SAME
+    // game (the runtime yield poll + re-point use it for that). Comparing ours
+    // to a mother hosting a DIFFERENT game is meaningless.
     {
         // Whether this device still holds a live game - used by the error path
         // below: a game-holding device must keep serving even when the browse is
@@ -477,15 +608,22 @@ pub async fn mother_start_local_server(
         match browsed {
             Ok(mothers) => {
                 let my_uuid = &self_pair.mother_device_uuid;
+                // A mother on another LAN protocol (an outdated build) can't
+                // serve our satellites anyway - never stand down for it.
                 let superseded = mothers.iter().any(|m| {
-                    &m.mother_uuid != my_uuid && m.client_id == Some(client_id)
+                    &m.mother_uuid != my_uuid
+                        && m.client_id == Some(client_id)
+                        && m.lan_proto == LAN_PROTO
+                        && must_stand_down(role, since, my_uuid, m.role.as_deref(), m.since, &m.mother_uuid)
                 });
                 if superseded {
                     return Err(MOTHER_SUPERSEDED.into());
                 }
             }
             Err(e) => {
-                if !has_active_game {
+                // The device set as the mother starts regardless: it is the one
+                // every other device defers to.
+                if !has_active_game && role != HostRole::Mother {
                     // Sentinel prefix kept so the TS caller treats this as a calm
                     // stand-down (and its delayed re-check retries once mDNS works).
                     return Err(format!(
@@ -499,6 +637,12 @@ pub async fn mother_start_local_server(
         }
     }
 
+    conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+        Ok(note_hosting_role(c, role)?)
+    })
+    .await
+    .map_err(|e| format!("record hosting role: {e}"))?;
+
     let app_state = AppState {
         db: Arc::new(conn),
         media_root: resolve_media_root(&app)?,
@@ -507,6 +651,9 @@ pub async fn mother_start_local_server(
         self_peer_id: self_pair.peer_id,
         last_bump: Arc::new(Mutex::new(HashMap::new())),
         app: app.clone(),
+        role,
+        since,
+        content_slots: crate::content_server::Slots::new(),
     };
 
     let app_router = build_router(app_state);
@@ -523,7 +670,10 @@ pub async fn mother_start_local_server(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let join = tokio::spawn(async move {
-        let _ = axum::serve(listener, app_router)
+        let _ = axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
@@ -531,11 +681,8 @@ pub async fn mother_start_local_server(
     });
 
     // Register mDNS broadcast (best-effort: failure shouldn't kill the server).
-    // No explicit addrs at boot - in hotspot mode the AP interface doesn't exist
-    // yet (start_mdns advertises nothing until mother_refresh_mdns runs once the
-    // hotspot is up); in router mode start_mdns picks up the router IPv4 now.
-    let boot_source = read_lan_network_source(&app).await;
-    let mdns = match start_mdns(&self_pair.mother_device_uuid, mdns_label.as_deref(), actual_port, client_id, epoch, &[], &boot_source) {
+    // start_mdns advertises this host's LAN IPv4s (router / venue network).
+    let mdns = match start_mdns(&self_pair.mother_device_uuid, mdns_label.as_deref(), actual_port, client_id, epoch, role, since) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("[lan_server] mDNS start failed: {e} (continuing without)");
@@ -552,6 +699,8 @@ pub async fn mother_start_local_server(
         mdns_label,
         client_id,
         epoch,
+        role,
+        since,
     });
 
     Ok(MotherServerInfo {
@@ -561,6 +710,43 @@ pub async fn mother_start_local_server(
         mother_peer_secret: self_pair.peer_secret,
         mother_peer_id: self_pair.peer_id,
     })
+}
+
+/// Record why this device is about to serve. A substitute remembers the mother
+/// it stands in for (the one it last followed) so the Network page can say
+/// "en remplacement de PC2"; a configured mother forgets any such note. Display
+/// only: nothing decides on these keys.
+fn note_hosting_role(c: &rusqlite::Connection, role: HostRole) -> rusqlite::Result<()> {
+    if role == HostRole::Mother {
+        c.execute(
+            "DELETE FROM schema_meta WHERE key IN ('substitute_for_uuid', 'substitute_for_label')",
+            [],
+        )?;
+        return Ok(());
+    }
+    let lost: Option<(String, Option<String>)> = c
+        .query_row(
+            "SELECT mother_uuid, mother_label FROM paired_mothers
+             ORDER BY last_seen_at IS NULL, last_seen_at DESC, paired_at DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    // No paired mother = a substitute starting again after its own takeover
+    // (which dropped the rows): keep what it noted then.
+    if let Some((uuid, label)) = lost {
+        for (key, value) in [("substitute_for_uuid", Some(uuid)), ("substitute_for_label", label)] {
+            match value {
+                Some(v) => c.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![key, v],
+                )?,
+                None => c.execute("DELETE FROM schema_meta WHERE key = ?", params![key])?,
+            };
+        }
+    }
+    Ok(())
 }
 
 // ─── slice 4: become mother (promote this satellite into the new mother) ──────
@@ -573,8 +759,6 @@ pub struct BecomeMotherInfo {
     pub mother_peer_secret: String,
     pub mother_peer_id: i64,
     pub epoch: i64,
-    pub hotspot_started: bool,
-    pub hotspot_error: Option<String>,
 }
 
 // Typed rows parsed out of the snapshot JSON *before* the DB transaction so
@@ -603,6 +787,9 @@ struct GameRow {
     // Optional so a snapshot written by an older build (which didn't carry it)
     // still parses; it simply mirrors as NULL, exactly as before.
     ended_at: Option<i64>,
+    // Per-game version (migration 37). A snapshot from a build that doesn't
+    // carry it falls back to the snapshot's device-wide counter.
+    state_version: i64,
 }
 struct MetaRow { meta_name: String, meta_value: Option<String> }
 struct DevRow {
@@ -707,9 +894,12 @@ fn parse_snapshot_rows(snap: &Value) -> Result<SnapshotRows, String> {
         ended: vbool(game_v, "ended"),
         created_at: vstr(game_v, "created_at").unwrap_or_default(),
         ended_at: vi64(game_v, "ended_at"),
+        state_version: vi64(game_v, "state_version")
+            .or_else(|| vi64(snap, "state_version"))
+            .unwrap_or(0),
     };
 
-    let arr = |k: &str| snap.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let arr =|k: &str| snap.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let mut paired_devices = Vec::new();
     for v in arr("paired_devices") {
         paired_devices.push(PdRow {
@@ -980,8 +1170,8 @@ fn apply_game_rows(
     let game_id = game.id;
     let launched_by_self: i64 = if preserve_launched_by_self {
         tx.query_row(
-            "SELECT launched_by_self FROM lg_launched_games WHERE id = ?",
-            params![game_id],
+            "SELECT launched_by_self FROM lg_launched_games WHERE id = ? AND summary_uuid = ?",
+            params![game_id, game.summary_uuid],
             |r| r.get(0),
         )
         .optional()?
@@ -996,14 +1186,14 @@ fn apply_game_rows(
         "INSERT INTO lg_launched_games
            (id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
             game_type, duration, start_time, started, ended, mother_epoch, created_at,
-            ended_at, launched_by_self)
+            ended_at, launched_by_self, state_version)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                 COALESCE(NULLIF(?13,''), CURRENT_TIMESTAMP), ?14, ?15)",
+                 COALESCE(NULLIF(?13,''), CURRENT_TIMESTAMP), ?14, ?15, ?16)",
         params![
             game.id, game.summary_uuid, game.client_id, game.game_uniqid, game.name,
             game.number_of_teams, game.game_type, game.duration, game.start_time,
             game.started as i64, game.ended as i64, mother_epoch, game.created_at,
-            game.ended_at, launched_by_self
+            game.ended_at, launched_by_self, game.state_version
         ],
     )?;
     for m in &rows.meta {
@@ -1098,8 +1288,8 @@ fn apply_game_rows(
 
 /// Promote THIS device (a satellite holding a cached snapshot) into the new
 /// mother for `launched_game_id`. Adopts the snapshot's game state + pairing
-/// table, bumps the epoch, starts the local server + mDNS, and best-effort
-/// raises the same-named hotspot. See plans/mother-failover-promote-any-device.md.
+/// table, bumps the epoch, and starts the local server + mDNS on the LAN.
+/// See plans/mother-failover-promote-any-device.md.
 ///
 /// Identity reconciliation (the careful bit): the snapshot's `paired_devices`
 /// has the OLD mother as `is_self=1`. This device is one of the *non-self* rows,
@@ -1117,7 +1307,13 @@ pub async fn become_mother(
     launched_game_id: i64,
     port: u16,
     mdns_label: Option<String>,
+    // Same meaning as on `mother_start_local_server`. A takeover from the red
+    // banner passes false: the device hosts as a substitute.
+    configured: Option<bool>,
+    designated_at: Option<i64>,
 ) -> Result<BecomeMotherInfo, String> {
+    let role = HostRole::from_configured(configured);
+    let since = if role == HostRole::Mother { designated_at.unwrap_or(0) } else { 0 };
     // NOTE: a server already running on this device is stopped only once every
     // guard below has passed and the snapshot is adopted (step 5-ter). Stopping
     // it up front meant any refusal - no snapshot, scenario not synced, stale
@@ -1240,19 +1436,6 @@ pub async fn become_mother(
     let self_uuid = client_device_uuid.clone();
     let new_self_secret = random_token(32);
     let adopt_label = mdns_label.clone();
-    // Network creds from the snapshot, to be mirrored into schema_meta inside
-    // the adoption transaction. The JS boot raise path does this via
-    // saveHotspotCreds, but a promoted mother never runs that path - without
-    // the mirror, read_mother_wifi relays null after a failover (late children
-    // can't learn the SSID offline) and our own snapshots carry no wifi block,
-    // so a SECOND failover could not re-raise the AP at all.
-    let wifi_mirror: Option<(String, String, String)> = snap.get("wifi").and_then(|w| {
-        let source = vstr(w, "source").unwrap_or_else(|| "hotspot".to_string());
-        match (vstr(w, "ssid"), vstr(w, "password")) {
-            (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => Some((s, p, source)),
-            _ => None,
-        }
-    });
     // None = an older snapshot without the field: keep our own list.
     let snap_revoked: Option<Vec<String>> = snap.get("revoked_devices").and_then(|v| v.as_array()).map(|a| {
         a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
@@ -1318,28 +1501,6 @@ pub async fn become_mother(
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![self_uuid],
             )?;
-            // 5c-bis. Mirror the adopted network creds so read_mother_wifi keeps
-            // relaying them post-failover and our own snapshots keep carrying a
-            // wifi block (second-generation failover). Router-mode snapshots
-            // carry router creds - route them to the router keys.
-            if let Some((ssid, password, source)) = &wifi_mirror {
-                let (ssid_key, pw_key) = if source == "router" {
-                    ("lan_router_ssid", "lan_router_password")
-                } else {
-                    ("hotspot_ssid", "hotspot_password")
-                };
-                for (k, v) in [
-                    ("lan_network_source", source.as_str()),
-                    (ssid_key, ssid.as_str()),
-                    (pw_key, password.as_str()),
-                ] {
-                    tx.execute(
-                        "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
-                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        params![k, v],
-                    )?;
-                }
-            }
             // With the identity keys settled, collapse any leftover rows for
             // OUR previous identity and drop self-referential mother links
             // (see heal_self_identity).
@@ -1353,6 +1514,8 @@ pub async fn become_mother(
             // contact with the mother" on the device that just got promoted.
             // If we later stand down, yieldToMother re-creates the row via
             // client_save_paired_mother, so nothing is lost.
+            // (Read the mother we stand in for BEFORE the rows go.)
+            note_hosting_role(&tx, role)?;
             tx.execute("DELETE FROM paired_mothers", [])?;
             // Take over the state-version counter too, or every snapshot WE ship
             // as the new mother looks stale to the satellites (see
@@ -1396,6 +1559,9 @@ pub async fn become_mother(
         self_peer_id,
         last_bump: Arc::new(Mutex::new(HashMap::new())),
         app: app.clone(),
+        role,
+        since,
+        content_slots: crate::content_server::Slots::new(),
     };
     let app_router = build_router(app_state);
     let listener = bind_mother_listener(port)
@@ -1406,20 +1572,16 @@ pub async fn become_mother(
     let _ = tokio::task::spawn_blocking(try_open_firewall).await;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let join = tokio::spawn(async move {
-        let _ = axum::serve(listener, app_router)
+        let _ = axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await;
     });
-    // Adopt the OLD mother's network mode from the snapshot so a router-mode
-    // failover advertises its router IPv4 immediately (a hotspot-mode failover
-    // stays address-less until the AP is re-raised + mDNS refreshed below).
-    let boot_source = snap
-        .get("wifi")
-        .and_then(|w| vstr(w, "source"))
-        .unwrap_or_else(|| "hotspot".to_string());
-    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game_client_id, new_epoch, &[], &boot_source) {
+    let mdns = match start_mdns(&mother_uuid, mdns_label.as_deref(), actual_port, game_client_id, new_epoch, role, since) {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("[lan_server] become_mother mDNS start failed: {e} (continuing)");
@@ -1437,88 +1599,9 @@ pub async fn become_mother(
             mdns_label,
             client_id: game_client_id,
             epoch: new_epoch,
+            role,
+            since,
         });
-    }
-
-    // 7. Best-effort: raise the same-named hotspot the old mother was running,
-    // then re-announce mDNS on the AP subnet so satellites can resolve us.
-    let mut hotspot_started = false;
-    let mut hotspot_error: Option<String> = None;
-    // The mode to host in: the dead mother's, else THIS device's configured one
-    // (`read_lan_network_source` defaults to "hotspot", the mode the fleet ships
-    // in). Deriving it from `snap.wifi.source` ALONE was the bug: read_mother_wifi
-    // returns null whenever the mother's hotspot_ssid/password were empty, so
-    // `source` fell back to "" and the whole AP branch was skipped - promotion
-    // returned Ok with hotspot_started=false AND hotspot_error=None, which the
-    // modal rendered as an unqualified success while the venue had no Wi-Fi.
-    let source = match snap.get("wifi").and_then(|w| vstr(w, "source")) {
-        Some(s) if !s.is_empty() => s,
-        _ => read_lan_network_source(&app).await,
-    };
-    if source == "hotspot" {
-        // Creds from the snapshot when the dead mother published them, else our
-        // own schema_meta (studio sync writes there, and step 5c-bis just
-        // mirrored the snapshot's).
-        let creds = match snap.get("wifi").and_then(|w| {
-            match (vstr(w, "ssid"), vstr(w, "password")) {
-                (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => Some((s, p)),
-                _ => None,
-            }
-        }) {
-            Some(c) => Some(c),
-            None => read_local_hotspot_creds(&app).await,
-        };
-        match creds {
-            // No AP means no LAN: satellites can never reach us. Report it - the
-            // operator has to bring the devices onto another network by hand.
-            None => {
-                hotspot_error = Some(
-                    "no Wi-Fi credentials on this device, so the access point could not be raised. \
-                     Set them in Settings > Network, then retry."
-                        .into(),
-                );
-            }
-            Some((ssid, password)) => match {
-                // Retours sept. #21: still associated to the OLD mother's
-                // same-SSID AP (it may well still be on the air) - leave it
-                // first, or we end up with its 192.168.137.x lease next to our
-                // own .1 and advertise both.
-                crate::leave_ssid_as_client(&ssid).await;
-                crate::hotspot::mother_start_hotspot(ssid, password).await
-            } {
-                Ok(info) => {
-                    hotspot_started = true;
-                    // Re-register mDNS with the AP IPv4s so clients resolve us.
-                    let mut guard = state.inner.lock().await;
-                    if let Some(running) = guard.as_mut() {
-                        let addrs: Vec<String> = info
-                            .ipv4_addresses
-                            .into_iter()
-                            .filter(|a| a != "127.0.0.1")
-                            .collect();
-                        if let Some(old) = running.mdns.take() {
-                            let _ = old.daemon.unregister(&old.full_name);
-                            let _ = old.daemon.shutdown();
-                        }
-                        running.mdns = start_mdns(
-                            &running.mother_uuid,
-                            running.mdns_label.as_deref(),
-                            running.port,
-                            running.client_id,
-                            running.epoch,
-                            &addrs,
-                            // This branch only runs for hotspot-mode failover, so
-                            // lock advertisement to the AP subnet.
-                            "hotspot",
-                        )
-                        .ok();
-                    }
-                }
-                Err(e) => {
-                    hotspot_error = Some(e);
-                }
-            },
-        }
     }
 
     Ok(BecomeMotherInfo {
@@ -1528,8 +1611,6 @@ pub async fn become_mother(
         mother_peer_secret: self_peer_secret,
         mother_peer_id: self_peer_id,
         epoch: new_epoch,
-        hotspot_started,
-        hotspot_error,
     })
 }
 
@@ -1561,7 +1642,7 @@ pub struct ApplyOutcome {
 /// This is `become_mother`'s row application and nothing else. It deliberately
 /// does NOT: bump the epoch, rebuild `paired_devices` (we keep our own secrets),
 /// touch `paired_mothers`, write identity or wifi keys, heal identities, or
-/// start any server/mDNS/hotspot. It adopts the epoch it mirrors, so a later
+/// start any server/mDNS. It adopts the epoch it mirrors, so a later
 /// snapshot from the same owner is not seen as stale.
 ///
 /// Four guards make it safe to run on a timer: a local row must already exist
@@ -1656,6 +1737,371 @@ pub async fn apply_mother_snapshot(
     })
 }
 
+// ─── game reconciliation: the newer copy wins, whoever holds it ──────────────
+
+/// What orders two copies of the same game (same `summary_uuid`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GameVersion {
+    pub epoch: i64,
+    pub ended: bool,
+    pub state_version: i64,
+}
+
+/// Is copy `a` more advanced than copy `b`?
+///
+/// A higher `mother_epoch` always wins: it is a later lineage (a substitute
+/// took the game over). Within one epoch an ended copy beats an unfinished
+/// one, then the per-game version decides. Equal copies are not "newer", so
+/// two devices holding the same state never trade it back and forth.
+pub(crate) fn is_newer(a: GameVersion, b: GameVersion) -> bool {
+    (a.epoch, a.ended, a.state_version) > (b.epoch, b.ended, b.state_version)
+}
+
+pub(crate) struct AdoptOutcome {
+    pub applied: bool,
+    /// `applied`, `corrupt_snapshot`, `wrong_client`, `tombstoned`,
+    /// `not_newer`, `unknown_game` or `id_collision_active`.
+    pub reason: &'static str,
+    /// The id the game has HERE after the adoption (0 when refused).
+    pub game_id: i64,
+    pub mother_epoch: i64,
+    pub ended: bool,
+}
+
+impl AdoptOutcome {
+    fn refused(reason: &'static str) -> Self {
+        Self { applied: false, reason, game_id: 0, mother_epoch: 0, ended: false }
+    }
+}
+
+/// Hands out row ids no local row and no incoming row uses.
+struct IdAlloc {
+    next: i64,
+}
+
+impl IdAlloc {
+    fn new(tx: &rusqlite::Transaction, table: &str, incoming_max: i64) -> rusqlite::Result<Self> {
+        let max_row: i64 = tx.query_row(&format!("SELECT COALESCE(MAX(id), 0) FROM {table}"), [], |r| r.get(0))?;
+        let seq: i64 = tx
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = ?", params![table], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(Self { next: max_row.max(seq).max(incoming_max) + 1 })
+    }
+    fn take(&mut self) -> i64 {
+        let v = self.next;
+        self.next += 1;
+        v
+    }
+}
+
+/// Does this id of `table` belong to another game than `game_id`?
+fn id_taken_elsewhere(tx: &rusqlite::Transaction, table: &str, id: i64, game_id: i64) -> rusqlite::Result<bool> {
+    Ok(tx
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1 AND launched_game_id <> ?2"),
+            params![id, game_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Same question, restricted to games still running here.
+fn id_taken_by_live_game(tx: &rusqlite::Transaction, table: &str, id: i64, game_id: i64) -> rusqlite::Result<bool> {
+    Ok(tx
+        .query_row(
+            &format!(
+                "SELECT 1 FROM {table} x JOIN lg_launched_games g ON g.id = x.launched_game_id
+                  WHERE x.id = ?1 AND x.launched_game_id <> ?2 AND g.ended = 0"
+            ),
+            params![id, game_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Tables whose rows carry an id nothing else references.
+const LEAF_TABLES: [&str; 5] = [
+    "lg_launched_game_raw_data",
+    "lg_team_completed_quests",
+    "lg_clash_members",
+    "lg_clash_validations",
+    "lg_clash_consumed",
+];
+
+/// Move the INCOMING rows of an ended game onto ids that are free here, and
+/// leave every local row where it is.
+///
+/// `rekey_conflicting_local_rows` does the opposite (it keeps the snapshot's
+/// ids and renumbers the local rows), which is right for a game satellites are
+/// still playing: they address it by those ids. For a finished game nobody
+/// does, while the receiving mother may be running ANOTHER game whose teams
+/// satellites address by id right now. Team ids are allocated per device, so
+/// a game created on a substitute nearly always collides with the mother's.
+fn remap_incoming_ids(tx: &rusqlite::Transaction, rows: &mut SnapshotRows, game_id: i64) -> rusqlite::Result<()> {
+    rows.game.id = game_id;
+
+    let incoming_max = rows.teams.iter().map(|t| t.id).max().unwrap_or(0);
+    let mut alloc = IdAlloc::new(tx, "lg_teams", incoming_max)?;
+    let mut team_map: HashMap<i64, i64> = HashMap::new();
+    for t in rows.teams.iter_mut() {
+        if id_taken_elsewhere(tx, "lg_teams", t.id, game_id)? {
+            let fresh = alloc.take();
+            team_map.insert(t.id, fresh);
+            t.id = fresh;
+        }
+    }
+    let team = |id: i64| team_map.get(&id).copied().unwrap_or(id);
+    for q in rows.cqs.iter_mut() { q.team_id = team(q.team_id); }
+    for m in rows.clash_members.iter_mut() { m.team_id = team(m.team_id); }
+    for v in rows.clash_validations.iter_mut() { v.team_id = team(v.team_id); }
+    for e in rows.clash_effectif.iter_mut() { e.team_id = team(e.team_id); }
+    for p in rows.clash_purges.iter_mut() { p.team_id = team(p.team_id); }
+
+    fn leaf(tx: &rusqlite::Transaction, table: &str, game_id: i64, ids: Vec<&mut i64>) -> rusqlite::Result<()> {
+        let incoming_max = ids.iter().map(|i| **i).max().unwrap_or(0);
+        let mut alloc = IdAlloc::new(tx, table, incoming_max)?;
+        for id in ids {
+            if id_taken_elsewhere(tx, table, *id, game_id)? {
+                *id = alloc.take();
+            }
+        }
+        Ok(())
+    }
+    leaf(tx, "lg_launched_game_raw_data", game_id, rows.raw_data.iter_mut().map(|r| &mut r.id).collect())?;
+    leaf(tx, "lg_team_completed_quests", game_id, rows.cqs.iter_mut().map(|r| &mut r.id).collect())?;
+    leaf(tx, "lg_clash_members", game_id, rows.clash_members.iter_mut().map(|r| &mut r.id).collect())?;
+    leaf(tx, "lg_clash_validations", game_id, rows.clash_validations.iter_mut().map(|r| &mut r.id).collect())?;
+    leaf(tx, "lg_clash_consumed", game_id, rows.clash_consumed.iter_mut().map(|r| &mut r.id).collect())?;
+    leaf(tx, "lg_clash_purges", game_id, rows.clash_purges.iter_mut().map(|r| &mut r.id).collect())?;
+    Ok(())
+}
+
+/// Would keeping the incoming ids renumber rows of a game still running here?
+fn collides_with_live_game(tx: &rusqlite::Transaction, rows: &SnapshotRows) -> rusqlite::Result<bool> {
+    let game_id = rows.game.id;
+    let live_game: bool = tx
+        .query_row(
+            "SELECT 1 FROM lg_launched_games WHERE id = ?1 AND summary_uuid <> ?2 AND ended = 0",
+            params![game_id, rows.game.summary_uuid],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if live_game {
+        return Ok(true);
+    }
+    for t in &rows.teams {
+        if id_taken_by_live_game(tx, "lg_teams", t.id, game_id)? {
+            return Ok(true);
+        }
+    }
+    let leaves: [(&str, Vec<i64>); 6] = [
+        (LEAF_TABLES[0], rows.raw_data.iter().map(|r| r.id).collect()),
+        (LEAF_TABLES[1], rows.cqs.iter().map(|r| r.id).collect()),
+        (LEAF_TABLES[2], rows.clash_members.iter().map(|r| r.id).collect()),
+        (LEAF_TABLES[3], rows.clash_validations.iter().map(|r| r.id).collect()),
+        (LEAF_TABLES[4], rows.clash_consumed.iter().map(|r| r.id).collect()),
+        ("lg_clash_purges", rows.clash_purges.iter().map(|r| r.id).collect()),
+    ];
+    for (table, ids) in leaves {
+        for id in ids {
+            if id_taken_by_live_game(tx, table, id, game_id)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Re-point the game's `device_id` references at THIS device's pairing table.
+///
+/// They are `paired_devices.id` values of the device that built the bundle.
+/// `apply_game_rows` is only sound when those ids mean the same thing here,
+/// which holds after `become_mother` (it rebuilds the table from the snapshot)
+/// but not for a game pushed by a peer: a device paired on the substitute after
+/// the takeover has another id here, or none. Each referenced device is matched
+/// by its uuid; one this device has never seen gets a row, so punches stay
+/// attributed and the `mine=1` filter keeps working. Existing rows are never
+/// modified - in particular their secrets.
+fn map_device_ids(tx: &rusqlite::Transaction, rows: &mut SnapshotRows) -> rusqlite::Result<()> {
+    let referenced: HashSet<i64> = rows
+        .devices
+        .iter()
+        .map(|d| d.device_id)
+        .chain(rows.raw_data.iter().map(|r| r.device_id))
+        .collect();
+    let self_uuid: Option<String> = tx
+        .query_row("SELECT value FROM schema_meta WHERE key = 'client_device_uuid'", [], |r| r.get(0))
+        .optional()?;
+
+    let mut map: HashMap<i64, i64> = HashMap::new();
+    for pd in rows.paired_devices.iter().filter(|pd| referenced.contains(&pd.id)) {
+        let local: Option<i64> = tx
+            .query_row("SELECT id FROM paired_devices WHERE peer_uuid = ?", params![pd.peer_uuid], |r| r.get(0))
+            .optional()?;
+        let id = match local {
+            Some(id) => id,
+            None => {
+                // The bundle's secret lets that device keep its token, unless it
+                // was removed here on purpose or the secret is already someone's.
+                let unusable: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM paired_devices WHERE peer_secret = ?1
+                         UNION ALL SELECT 1 FROM revoked_devices WHERE peer_uuid = ?2",
+                        params![pd.peer_secret, pd.peer_uuid],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .unwrap_or(Some(true))
+                    .unwrap_or(false);
+                let secret = if unusable { random_token(32) } else { pd.peer_secret.clone() };
+                let is_self = self_uuid.as_deref() == Some(pd.peer_uuid.as_str());
+                tx.execute(
+                    "INSERT INTO paired_devices
+                       (peer_uuid, peer_label, peer_os, peer_app_version, peer_secret, is_self)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![pd.peer_uuid, pd.peer_label, pd.peer_os, pd.peer_app_version, secret, is_self as i64],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        map.insert(pd.id, id);
+    }
+
+    let dev = |id: i64| map.get(&id).copied().unwrap_or(id);
+    for r in rows.raw_data.iter_mut() {
+        r.device_id = dev(r.device_id);
+    }
+    // UNIQUE(launched_game_id, device_id): two bundle ids can land on one row.
+    let mut seen: HashSet<i64> = HashSet::new();
+    let devices = std::mem::take(&mut rows.devices);
+    for mut d in devices {
+        d.device_id = dev(d.device_id);
+        if seen.insert(d.device_id) {
+            rows.devices.push(d);
+        }
+    }
+    Ok(())
+}
+
+/// Take a peer's copy of ONE game when it is more advanced than ours.
+///
+/// This is how copies converge. A substitute pushes what it hosted to the
+/// mother (`push_snapshot`); a satellite pulls the mother's later state of a
+/// game it holds (`client_reconcile_with_mother`). Both end here, so one rule
+/// decides everywhere: `is_newer`.
+///
+/// The game is identified by `summary_uuid`, never by its integer id, which is
+/// allocated per device. `hosted` (the pusher was the game's host) is what
+/// allows creating a row this device has never had: without it an old mirror
+/// would bring back a game that was deleted here before tombstones existed.
+///
+/// The game keeps the EPOCH of the copy it comes from, even when the mother
+/// adopts a game that is still running. Raising it (as a promotion does) would
+/// put the adopted copy in a later lineage than the device that really played
+/// the game on: a satellite's cached snapshot pushed first would then outrank
+/// the substitute's final, ended copy arriving later, and the end of the game
+/// would be lost. Satellites still accept what the mother ships afterwards:
+/// `seed_state_version` puts its counter past the copy's version, and their
+/// cache guard compares versions within one epoch.
+///
+/// Runs inside the caller's transaction; the caller commits only when
+/// `applied`.
+pub(crate) fn adopt_peer_snapshot(
+    tx: &rusqlite::Transaction,
+    snap: &Value,
+    client_id: i64,
+    hosted: bool,
+) -> rusqlite::Result<AdoptOutcome> {
+    let Ok(mut rows) = parse_snapshot_rows(snap) else {
+        return Ok(AdoptOutcome::refused("corrupt_snapshot"));
+    };
+    if rows.game.client_id != client_id {
+        return Ok(AdoptOutcome::refused("wrong_client"));
+    }
+    let incoming = GameVersion {
+        epoch: rows.mother_epoch,
+        ended: rows.game.ended,
+        state_version: rows.game.state_version,
+    };
+
+    let tombstone: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT mother_epoch, state_version FROM lg_game_tombstones WHERE summary_uuid = ?",
+            params![rows.game.summary_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((epoch, state_version)) = tombstone {
+        if !is_newer(incoming, GameVersion { epoch, ended: true, state_version }) {
+            return Ok(AdoptOutcome::refused("tombstoned"));
+        }
+    }
+
+    let local: Option<(i64, i64, bool, i64)> = tx
+        .query_row(
+            "SELECT id, mother_epoch, ended, state_version FROM lg_launched_games WHERE summary_uuid = ?",
+            params![rows.game.summary_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0, r.get(3)?)),
+        )
+        .optional()?;
+    match local {
+        Some((_, epoch, ended, state_version)) => {
+            if !is_newer(incoming, GameVersion { epoch, ended, state_version }) {
+                return Ok(AdoptOutcome::refused("not_newer"));
+            }
+        }
+        None if !hosted => return Ok(AdoptOutcome::refused("unknown_game")),
+        None => {}
+    }
+
+    tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+    let incoming_game_id = rows.game.id;
+    let local_id = local.map(|l| l.0);
+    if rows.game.ended {
+        // Our id when we already hold the game, the pusher's when it is free
+        // here, a new one otherwise.
+        let game_id = match local_id {
+            Some(id) => id,
+            None => {
+                let taken: bool = tx
+                    .query_row("SELECT 1 FROM lg_launched_games WHERE id = ?", params![incoming_game_id], |_| Ok(true))
+                    .optional()?
+                    .unwrap_or(false);
+                if taken { IdAlloc::new(tx, "lg_launched_games", incoming_game_id)?.take() } else { incoming_game_id }
+            }
+        };
+        remap_incoming_ids(tx, &mut rows, game_id)?;
+    } else {
+        if let Some(id) = local_id {
+            rows.game.id = id;
+        }
+        if collides_with_live_game(tx, &rows)? {
+            return Ok(AdoptOutcome::refused("id_collision_active"));
+        }
+    }
+    map_device_ids(tx, &mut rows)?;
+
+    let epoch = rows.mother_epoch;
+    apply_game_rows(tx, &rows, epoch, /* preserve_launched_by_self */ true)?;
+    seed_state_version(tx, rows.state_version.max(rows.game.state_version))?;
+    tx.execute(
+        "DELETE FROM lg_game_tombstones WHERE summary_uuid = ?",
+        params![rows.game.summary_uuid],
+    )?;
+
+    Ok(AdoptOutcome {
+        applied: true,
+        reason: "applied",
+        game_id: rows.game.id,
+        mother_epoch: epoch,
+        ended: rows.game.ended,
+    })
+}
+
 #[derive(Serialize)]
 pub struct TakeoverTarget {
     pub launched_game_id: i64,
@@ -1664,6 +2110,9 @@ pub struct TakeoverTarget {
     pub port: u16,
     pub mother_uuid: String,
     pub epoch: i64,
+    /// The mother's advertised device name, so the device that yields to it
+    /// saves a paired mother with a name instead of "Poste mère".
+    pub label: Option<String>,
 }
 
 /// Every secret this device could present to the CURRENT mother of its game,
@@ -1778,6 +2227,7 @@ pub async fn get_takeover_target(
         .unwrap_or_default()
         .into_iter()
         .filter(|m| m.client_id == Some(client_id))
+        .filter(|m| m.lan_proto == LAN_PROTO)
         .filter(|m| self_uuid.as_deref() != Some(m.mother_uuid.as_str()))
         .filter(|m| outranks_local_mother(m.epoch, &m.mother_uuid, my_epoch, self_uuid.as_deref()))
         .collect();
@@ -1799,7 +2249,7 @@ pub async fn get_takeover_target(
         })
         .await
         .map_err(|e| e.to_string())?;
-    let client = reqwest::Client::builder()
+    let client = lan_client_builder()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_millis(1500))
         .build()
@@ -1808,7 +2258,7 @@ pub async fn get_takeover_target(
 
     // Retours sept. #14: the target used to be "first matching address of the
     // highest-epoch advertisement", unverified - a mother advertising a stale
-    // client lease (192.168.137.138) sent the regain button at an address that
+    // client lease (e.g. an old DHCP address) sent the regain button at an address that
     // no longer existed, while the "someone took over" state never cleared.
     // Now every advertised address of every candidate is tried, best epoch
     // first, and only an address that ANSWERS becomes the target. A candidate
@@ -1885,8 +2335,9 @@ pub async fn get_takeover_target(
         game_name: name,
         addr,
         port: m.port,
-        mother_uuid: m.mother_uuid,
         epoch: m.epoch.unwrap_or(0),
+        label: m.label,
+        mother_uuid: m.mother_uuid,
     }))
 }
 
@@ -1923,7 +2374,7 @@ async fn pull_snapshot_over_http(
     secret: &str,
     launched_game_id: i64,
 ) -> Result<Option<Value>, String> {
-    let client = reqwest::Client::builder()
+    let client = lan_client_builder()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_millis(1500))
         .build()
@@ -2033,62 +2484,54 @@ async fn upsert_cached_snapshot(
     .await
 }
 
-/// Re-announce the mother over mDNS, advertising `addresses` explicitly (plus
-/// auto-detected interfaces). Call this after the hotspot starts so clients
-/// resolve the hotspot's AP-subnet IPv4 instead of only the stale link-local /
-/// APIPA addresses captured when the server first booted. No-op if the server
-/// isn't running.
+/// Re-announce the mother over mDNS with this host's CURRENT LAN IPv4s - e.g.
+/// after the PC joined the router's Wi-Fi once the server was already up. No-op
+/// if the server isn't running.
 #[tauri::command]
 pub async fn mother_refresh_mdns(
-    app: AppHandle,
     state: tauri::State<'_, MotherServerState>,
-    addresses: Vec<String>,
 ) -> Result<(), String> {
-    // Read the LAN source BEFORE taking the server lock (it opens its own db
-    // connection). start_mdns then locks `addresses` + our interface IPs down to
-    // the designated isolated LAN, so a hotspot-mode mother re-announces ONLY its
-    // AP subnet - never the office/upstream IP the caller may have passed.
-    let source = read_lan_network_source(&app).await;
     let mut guard = state.inner.lock().await;
-    let running = match guard.as_mut() {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    // Drop loopback; keep usable LAN/link-local addrs (start_mdns filters to the
-    // designated LAN). Tear down the old announcement before re-registering.
-    let addrs: Vec<String> = addresses
-        .into_iter()
-        .filter(|a| a != "127.0.0.1" && a != "::1")
-        .collect();
+    match guard.as_mut() {
+        Some(running) => reregister_mdns(running),
+        None => Ok(()),
+    }
+}
+
+/// Drop the server's mDNS announcement and register it again from its current
+/// fields (addresses, epoch).
+fn reregister_mdns(running: &mut Running) -> Result<(), String> {
     if let Some(old) = running.mdns.take() {
         let _ = old.daemon.unregister(&old.full_name);
         let _ = old.daemon.shutdown();
     }
-    match start_mdns(&running.mother_uuid, running.mdns_label.as_deref(), running.port, running.client_id, running.epoch, &addrs, &source) {
-        Ok(h) => {
-            running.mdns = Some(h);
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    let handle = start_mdns(
+        &running.mother_uuid,
+        running.mdns_label.as_deref(),
+        running.port,
+        running.client_id,
+        running.epoch,
+        running.role,
+        running.since,
+    )?;
+    running.mdns = Some(handle);
+    Ok(())
 }
 
-/// Self-healing mDNS keepalive for the mother. The hotspot's APIPA address
-/// (169.254.*) self-assigns a few seconds AFTER the AP interface comes up, so the
-/// `refreshMdns` fired right after `startHotspot` can register while there's still
-/// no designated address (inert). A cheap periodic call from JS re-registers the
-/// announcement the moment a designated address exists - and ONLY then, so a
-/// healthy announcement is never churned. Returns true if it (re)registered.
+/// Self-healing mDNS keepalive for the mother. A mother that booted before its
+/// PC got a LAN address (Wi-Fi not joined yet, cable unplugged) registers an
+/// INERT announcement. A cheap periodic call from JS re-registers the
+/// announcement the moment a LAN address exists - and ONLY then, so a healthy
+/// announcement is never churned. Returns true if it (re)registered.
 #[tauri::command]
 pub async fn mother_ensure_mdns_live(
-    app: AppHandle,
     state: tauri::State<'_, MotherServerState>,
 ) -> Result<bool, String> {
     // Not-a-mother check FIRST: this command is polled on EVERY device every
     // 10s, but only a running mother with an INERT announcement can act on it.
-    // Bail under a short lock before paying for read_lan_network_source's SQLite
-    // open + the if_addrs interface scan - a pure satellite (the common case)
-    // used to do both every 10s for a guaranteed Ok(false).
+    // Bail under a short lock before paying for the if_addrs interface scan - a
+    // pure satellite (the common case) would do it every 10s for a guaranteed
+    // Ok(false).
     {
         let guard = state.inner.lock().await;
         match guard.as_ref() {
@@ -2101,11 +2544,9 @@ pub async fn mother_ensure_mdns_live(
             }
         }
     }
-    let source = read_lan_network_source(&app).await;
     let locals: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
-    let designated = designated_lan_addrs(&source, &locals);
-    if designated.is_empty() {
-        return Ok(false); // nothing to advertise yet (AP has no address)
+    if designated_lan_addrs(&locals).is_empty() {
+        return Ok(false); // nothing to advertise yet (no LAN address)
     }
     // Re-acquire to mutate; re-check the state we dropped the lock on.
     let mut guard = state.inner.lock().await;
@@ -2121,26 +2562,7 @@ pub async fn mother_ensure_mdns_live(
     if !is_inert {
         return Ok(false);
     }
-    if let Some(old) = running.mdns.take() {
-        let _ = old.daemon.unregister(&old.full_name);
-        let _ = old.daemon.shutdown();
-    }
-    // Pass no extra_addrs: start_mdns merges the live interface IPs itself.
-    match start_mdns(
-        &running.mother_uuid,
-        running.mdns_label.as_deref(),
-        running.port,
-        running.client_id,
-        running.epoch,
-        &[],
-        &source,
-    ) {
-        Ok(h) => {
-            running.mdns = Some(h);
-            Ok(true)
-        }
-        Err(e) => Err(e),
-    }
+    reregister_mdns(running).map(|_| true)
 }
 
 #[tauri::command]
@@ -2234,7 +2656,7 @@ fn resolve_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("playground.db"))
 }
 
-fn resolve_media_root(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn resolve_media_root(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -2376,7 +2798,7 @@ const SELF_PLACEHOLDER_LABEL: &str = "__mother_self__";
 
 /// Repair self-identity drift in the pairing tables (idempotent; runs at every
 /// server start and after snapshot adoption). A device that re-keyed its
-/// identity - mother/hotspot role rework, `become_mother` snapshot adoption -
+/// identity - mother role rework, `become_mother` snapshot adoption -
 /// can leave behind:
 ///
 ///  1. a stale `paired_devices` row for its OWN previous identity, which then
@@ -2467,12 +2889,13 @@ fn random_token(bytes: usize) -> String {
 // ─── axum wiring ─────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
-    db: Arc<DbConnection>,
+pub(crate) struct AppState {
+    pub(crate) db: Arc<DbConnection>,
     /// `<app_data_dir>/media` - where synced content lives. Used by add_team to
-    /// read the team-name pools JSON (media/name_pools/team_names.json).
-    media_root: PathBuf,
-    client_id: i64,
+    /// read the team-name pools JSON (media/name_pools/team_names.json), and by
+    /// /content.php to serve scenario blobs to satellites.
+    pub(crate) media_root: PathBuf,
+    pub(crate) client_id: i64,
     /// Stable identity of this mother device. Returned by /ping.php so the
     /// child can verify it's still talking to the same machine it paired with.
     mother_uuid: String,
@@ -2483,19 +2906,33 @@ struct AppState {
     /// Handle on the hosting app, so a command a satellite targets at the
     /// MOTHER's own screen can be executed in-process (emitted straight to
     /// this device's renderer) instead of queued - see `queue_command_inner`.
-    app: AppHandle,
+    pub(crate) app: AppHandle,
     /// Debounce map for `bump_presence` - peer_id → last write Instant. The
     /// 5s window keeps the row from churning under the satellite's 1s state
     /// polling, while the 25s online window in `list_paired_with_status`
     /// still reads a fresh enough timestamp.
     last_bump: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Fixed for the server's lifetime; announced in the hello reply.
+    role: HostRole,
+    since: i64,
+    /// Blob-stream slots for /content.php (total + per satellite).
+    pub(crate) content_slots: Arc<crate::content_server::Slots>,
 }
 
 fn build_router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/launched_games.php", any(dispatch_launched_games))
         .route("/pair.php", any(dispatch_pair))
         .route("/ping.php", any(dispatch_ping))
+        .route("/content.php", any(crate::content_server::dispatch_content));
+    // App installers for satellites (update_cache.rs). Best-effort: a mother
+    // without an app data dir still serves games.
+    match crate::update_cache::router(&state.app) {
+        Ok(updates) => router = router.merge(updates),
+        Err(e) => eprintln!("[lan_server] /update.php not mounted: {e}"),
+    }
+    router
+        .layer(axum::middleware::from_fn(lan_proto_gate))
         .with_state(state)
 }
 
@@ -2508,9 +2945,9 @@ struct ActionQuery {
 
 // ─── auth ────────────────────────────────────────────────────────────────────
 
-async fn resolve_peer(state: &AppState, headers: &HeaderMap) -> Result<i64, Response> {
+pub(crate) async fn resolve_peer(state: &AppState, headers: &HeaderMap) -> Result<i64, Response> {
     let id = resolve_peer_for_ping(state, headers).await?;
-    bump_presence(state, id, None, None).await;
+    bump_presence(state, id, None, None, None).await;
     Ok(id)
 }
 
@@ -2551,6 +2988,7 @@ async fn bump_presence(
     peer_id: i64,
     has_reader: Option<bool>,
     screen_state: Option<String>,
+    operator_only: Option<bool>,
 ) {
     {
         let mut guard = state.last_bump.lock().await;
@@ -2561,7 +2999,7 @@ async fn bump_presence(
         // promptly even if the last bump was <5s ago. (The /ping.php path always
         // carries a screen_state once the satellite has reported one, so the
         // change-triggered out-of-band ping is never debounced away.)
-        if has_reader.is_none() && screen_state.is_none() {
+        if has_reader.is_none() && screen_state.is_none() && operator_only.is_none() {
             if let Some(prev) = guard.get(&peer_id) {
                 if now.duration_since(*prev) < Duration::from_secs(5) {
                     return;
@@ -2573,6 +3011,7 @@ async fn bump_presence(
 
     let db = state.db.clone();
     let has_reader_i64: Option<i64> = has_reader.map(|b| if b { 1 } else { 0 });
+    let operator_only_i64: Option<i64> = operator_only.map(|b| if b { 1 } else { 0 });
     tokio::spawn(async move {
         let _ = db
             .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -2584,9 +3023,10 @@ async fn bump_presence(
                                 WHEN ?1 = 1 THEN CURRENT_TIMESTAMP
                                 ELSE reader_last_seen_at
                             END,
-                            screen_state_json = COALESCE(?2, screen_state_json)
+                            screen_state_json = COALESCE(?2, screen_state_json),
+                            operator_only = COALESCE(?4, operator_only)
                       WHERE id = ?3",
-                    params![has_reader_i64, screen_state, peer_id],
+                    params![has_reader_i64, screen_state, peer_id, operator_only_i64],
                 )?;
                 Ok(())
             })
@@ -2665,29 +3105,44 @@ async fn pickup_pending_commands(state: &AppState, peer_id: i64) -> Vec<Value> {
 /// `/ping.php` snapshot delivery (slice 1) can cheaply tell whether a
 /// satellite's cached copy is stale without diffing rows. Returns the new
 /// value (best-effort; never panics). Behavior-neutral until slice 1 reads it.
-async fn bump_state_version(state: &AppState) -> i64 {
+async fn bump_state_version(state: &AppState, game_id: Option<i64>) -> i64 {
     state
         .db
-        .call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
-            c.execute(
-                "INSERT INTO schema_meta(key, value) VALUES('lg_state_version', '1')
-                 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
-                [],
-            )?;
-            let v: String = c.query_row(
-                "SELECT value FROM schema_meta WHERE key = 'lg_state_version'",
-                [],
-                |r| r.get(0),
-            )?;
-            Ok(v.parse::<i64>().unwrap_or(0))
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
+            Ok(bump_state_version_sync(c, game_id)?)
         })
         .await
         .unwrap_or(0)
 }
 
+/// Advance the device counter and, when the change belongs to one game, stamp
+/// that game with the new value. The stamp is the game's own version: it is
+/// what `is_newer` compares between two devices' copies.
+fn bump_state_version_sync(c: &rusqlite::Connection, game_id: Option<i64>) -> rusqlite::Result<i64> {
+    c.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('lg_state_version', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        [],
+    )?;
+    let v: String = c.query_row(
+        "SELECT value FROM schema_meta WHERE key = 'lg_state_version'",
+        [],
+        |r| r.get(0),
+    )?;
+    let v = v.parse::<i64>().unwrap_or(0);
+    if let Some(id) = game_id {
+        c.execute(
+            "UPDATE lg_launched_games SET state_version = ?1 WHERE id = ?2",
+            params![v, id],
+        )?;
+    }
+    Ok(v)
+}
+
 /// Mutating POST actions bump `lg_state_version`; the command-channel and
 /// cloud-bookkeeping POSTs are excluded so a video/join push or a summary
-/// ack doesn't trigger a needless snapshot re-send.
+/// ack doesn't trigger a needless snapshot re-send. `push_snapshot` seeds the
+/// counter itself while adopting.
 fn action_mutates_game_state(method: &str, action: &str) -> bool {
     method == "POST"
         && !matches!(
@@ -2697,7 +3152,51 @@ fn action_mutates_game_state(method: &str, action: &str) -> bool {
                 | "ack_command"
                 | "sync_summaries"
                 | "mark_summaries_pushed"
+                | "push_snapshot"
+                | "customers_create"
         )
+}
+
+/// Which body field names the game a mutating action touches. `create` is
+/// absent (the id is in its reply), as are `delete_game` / `archive_game`
+/// (the row is gone afterwards; they leave a tombstone instead).
+fn stamp_field(action: &str) -> Option<&'static str> {
+    match action {
+        "update_meta" | "merge_meta" | "start_game" | "end_game" | "add_time" => Some("id"),
+        "update_team" | "end_team" | "delete_team" => Some("team_id"),
+        "record_punch"
+        | "add_team"
+        | "register_device"
+        | "record_completed_quest"
+        | "delete_completed_quest"
+        | "clash_register"
+        | "clash_unregister"
+        | "clash_validate" => Some("launched_game_id"),
+        _ => None,
+    }
+}
+
+/// The game a mutating action is about to change. Resolved BEFORE the action
+/// runs: `delete_team` removes the row the team lookup needs.
+async fn stamp_target(state: &AppState, action: &str, body: &Value) -> Option<i64> {
+    let field = stamp_field(action)?;
+    let n = body.get(field).and_then(|v| v.as_i64())?;
+    if field != "team_id" {
+        return Some(n);
+    }
+    state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+            Ok(c.query_row(
+                "SELECT launched_game_id FROM lg_teams WHERE id = ?",
+                params![n],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Adopt a snapshot's `state_version` into THIS device's counter, taking the
@@ -2757,268 +3256,279 @@ async fn read_state_version(state: &AppState) -> i64 {
 /// with those silently amputated), plus `state_version` + `mother_epoch` for
 /// staleness + fencing. Returns None if the game id is unknown.
 async fn build_snapshot(state: &AppState, game_id: i64, state_version: i64) -> Option<Value> {
-    let wifi = read_mother_wifi(state).await;
     let mother_uuid = state.mother_uuid.clone();
     state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<Value>> {
-            let game: Option<Value> = c
-                .query_row(
-                    // `ended_at` travels with the snapshot: Clash scoring integrates
-                    // up to min(now, start+duration, ended_at), so a device that
-                    // adopts or mirrors this game without it computes WRONG final
-                    // standings for a manually-ended game.
-                    //
-                    // `launched_by_self` deliberately does NOT travel: it is a
-                    // per-device fact ("I launched this"), and it drives the
-                    // `mine=1` filter behind the "This device" list. Shipping the
-                    // mother's value would rewrite every other device's history.
-                    "SELECT id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
-                            game_type, duration, start_time, started, ended, mother_epoch, created_at,
-                            ended_at
-                     FROM lg_launched_games WHERE id = ?",
-                    params![game_id],
-                    |r| {
-                        Ok(json!({
-                            "id": r.get::<_, i64>(0)?,
-                            "summary_uuid": r.get::<_, String>(1)?,
-                            "client_id": r.get::<_, i64>(2)?,
-                            "game_uniqid": r.get::<_, String>(3)?,
-                            "name": r.get::<_, String>(4)?,
-                            "number_of_teams": r.get::<_, i64>(5)?,
-                            "game_type": r.get::<_, String>(6)?,
-                            "duration": r.get::<_, i64>(7)?,
-                            "start_time": r.get::<_, Option<String>>(8)?,
-                            "started": r.get::<_, i64>(9)? != 0,
-                            "ended": r.get::<_, i64>(10)? != 0,
-                            "mother_epoch": r.get::<_, i64>(11)?,
-                            "created_at": r.get::<_, String>(12)?,
-                            "ended_at": r.get::<_, Option<i64>>(13)?,
-                        }))
-                    },
-                )
-                .optional()?;
-            let Some(game) = game else { return Ok(None) };
-            let epoch = game.get("mother_epoch").and_then(|v| v.as_i64()).unwrap_or(1);
-
-            let meta: Vec<Value> = c
-                .prepare(
-                    "SELECT meta_name, meta_value FROM lg_launched_game_meta
-                     WHERE launched_game_id = ?",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "meta_name": r.get::<_, String>(0)?,
-                        "meta_value": r.get::<_, Option<String>>(1)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let devices: Vec<Value> = c
-                .prepare(
-                    "SELECT device_id, device_label, os, os_version, connected
-                     FROM lg_launched_game_devices WHERE launched_game_id = ?",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "device_id": r.get::<_, i64>(0)?,
-                        "device_label": r.get::<_, Option<String>>(1)?,
-                        "os": r.get::<_, Option<String>>(2)?,
-                        "os_version": r.get::<_, Option<String>>(3)?,
-                        "connected": r.get::<_, i64>(4)? != 0,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let raw_data: Vec<Value> = c
-                .prepare(
-                    "SELECT id, device_id, raw_data, created_at
-                     FROM lg_launched_game_raw_data
-                     WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "device_id": r.get::<_, i64>(1)?,
-                        "raw_data": r.get::<_, String>(2)?,
-                        "created_at": r.get::<_, String>(3)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let teams: Vec<Value> = c
-                .prepare(
-                    "SELECT id, team_number, team_name, pattern, score, key_id,
-                            start_time, end_time, language
-                     FROM lg_teams WHERE launched_game_id = ? ORDER BY team_number ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "team_number": r.get::<_, i64>(1)?,
-                        "team_name": r.get::<_, Option<String>>(2)?,
-                        "pattern": r.get::<_, i64>(3)?,
-                        "score": r.get::<_, i64>(4)?,
-                        "key_id": r.get::<_, Option<i64>>(5)?,
-                        "start_time": r.get::<_, Option<i64>>(6)?,
-                        "end_time": r.get::<_, Option<i64>>(7)?,
-                        "language": r.get::<_, Option<String>>(8)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            let completed_quests: Vec<Value> = c
-                .prepare(
-                    "SELECT id, team_id, teammate_chip_id, quest_id, quest_number,
-                            points_awarded, created_at
-                     FROM lg_team_completed_quests
-                     WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "team_id": r.get::<_, i64>(1)?,
-                        "teammate_chip_id": r.get::<_, Option<i64>>(2)?,
-                        "quest_id": r.get::<_, Option<i64>>(3)?,
-                        "quest_number": r.get::<_, String>(4)?,
-                        "points_awarded": r.get::<_, i64>(5)?,
-                        "created_at": r.get::<_, String>(6)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            // Whole pairing table - peer secrets included so satellites keep
-            // authenticating to the new mother with the bearer they already hold.
-            let paired_devices: Vec<Value> = c
-                .prepare(
-                    "SELECT id, peer_uuid, peer_label, peer_os, peer_app_version,
-                            peer_secret, is_self
-                     FROM paired_devices",
-                )?
-                .query_map([], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "peer_uuid": r.get::<_, String>(1)?,
-                        "peer_label": r.get::<_, String>(2)?,
-                        "peer_os": r.get::<_, Option<String>>(3)?,
-                        "peer_app_version": r.get::<_, Option<String>>(4)?,
-                        "peer_secret": r.get::<_, String>(5)?,
-                        "is_self": r.get::<_, i64>(6)? != 0,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
-            // Clash V2 per-game state. Cheap for non-clash games (indexed
-            // lookups over empty tables); required for Clash - a promotion
-            // without these rows silently zeroes territory domination,
-            // banked punches, effectif weighting and purge history.
-            let clash_members: Vec<Value> = c
-                .prepare(
-                    "SELECT id, team_id, chip_id, created_at
-                     FROM lg_clash_members WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "team_id": r.get::<_, i64>(1)?,
-                        "chip_id": r.get::<_, i64>(2)?,
-                        "created_at": r.get::<_, String>(3)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let clash_validations: Vec<Value> = c
-                .prepare(
-                    "SELECT id, team_id, chip_id, combo_index, territory_index, seq, created_at
-                     FROM lg_clash_validations WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "team_id": r.get::<_, i64>(1)?,
-                        "chip_id": r.get::<_, i64>(2)?,
-                        "combo_index": r.get::<_, i64>(3)?,
-                        "territory_index": r.get::<_, i64>(4)?,
-                        "seq": r.get::<_, i64>(5)?,
-                        "created_at": r.get::<_, String>(6)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let clash_consumed: Vec<Value> = c
-                .prepare(
-                    "SELECT id, chip_id, punch_key, created_at
-                     FROM lg_clash_consumed WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "chip_id": r.get::<_, i64>(1)?,
-                        "punch_key": r.get::<_, String>(2)?,
-                        "created_at": r.get::<_, String>(3)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let clash_effectif: Vec<Value> = c
-                .prepare(
-                    "SELECT team_id, size FROM lg_clash_effectif WHERE launched_game_id = ?",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "team_id": r.get::<_, i64>(0)?,
-                        "size": r.get::<_, i64>(1)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let clash_purges: Vec<Value> = c
-                .prepare(
-                    "SELECT id, team_id, chip_id, territory_index, seq, created_at
-                     FROM lg_clash_purges WHERE launched_game_id = ? ORDER BY id ASC",
-                )?
-                .query_map(params![game_id], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
-                        "team_id": r.get::<_, i64>(1)?,
-                        "chip_id": r.get::<_, i64>(2)?,
-                        "territory_index": r.get::<_, i64>(3)?,
-                        "seq": r.get::<_, i64>(4)?,
-                        "created_at": r.get::<_, String>(5)?,
-                    }))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // Sticky removals travel too, so a promoted mother keeps refusing
-            // the devices the operator removed (retours sept. #8). Empty when
-            // the table doesn't exist yet.
-            let revoked_devices: Vec<String> = c
-                .prepare("SELECT peer_uuid FROM revoked_devices")
-                .and_then(|mut st| {
-                    st.query_map([], |r| r.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap_or_default();
-
-            Ok(Some(json!({
-                "schema": 1,
-                "state_version": state_version,
-                "mother_epoch": epoch,
-                "mother_uuid": mother_uuid,
-                "wifi": wifi,
-                "game": game,
-                "meta": meta,
-                "devices": devices,
-                "raw_data": raw_data,
-                "teams": teams,
-                "completed_quests": completed_quests,
-                "paired_devices": paired_devices,
-                "revoked_devices": revoked_devices,
-                "clash_members": clash_members,
-                "clash_validations": clash_validations,
-                "clash_consumed": clash_consumed,
-                "clash_effectif": clash_effectif,
-                "clash_purges": clash_purges,
-            })))
+            Ok(build_snapshot_sync(c, &mother_uuid, game_id, state_version)?)
         })
         .await
         .ok()
         .flatten()
+}
+
+/// `build_snapshot` on a bare connection: a device with NO running server (a
+/// satellite that hosted the game earlier) builds the bundle it pushes to the
+/// mother with this. `mother_uuid` is then the device's own uuid.
+fn build_snapshot_sync(
+    c: &rusqlite::Connection,
+    mother_uuid: &str,
+    game_id: i64,
+    state_version: i64,
+) -> rusqlite::Result<Option<Value>> {
+    let game: Option<Value> = c
+        .query_row(
+            // `ended_at` travels with the snapshot: Clash scoring integrates
+            // up to min(now, start+duration, ended_at), so a device that
+            // adopts or mirrors this game without it computes WRONG final
+            // standings for a manually-ended game.
+            //
+            // `launched_by_self` deliberately does NOT travel: it is a
+            // per-device fact ("I launched this"), and it drives the
+            // `mine=1` filter behind the "This device" list. Shipping the
+            // mother's value would rewrite every other device's history.
+            "SELECT id, summary_uuid, client_id, game_uniqid, name, number_of_teams,
+                    game_type, duration, start_time, started, ended, mother_epoch, created_at,
+                    ended_at, state_version
+             FROM lg_launched_games WHERE id = ?",
+            params![game_id],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "summary_uuid": r.get::<_, String>(1)?,
+                    "client_id": r.get::<_, i64>(2)?,
+                    "game_uniqid": r.get::<_, String>(3)?,
+                    "name": r.get::<_, String>(4)?,
+                    "number_of_teams": r.get::<_, i64>(5)?,
+                    "game_type": r.get::<_, String>(6)?,
+                    "duration": r.get::<_, i64>(7)?,
+                    "start_time": r.get::<_, Option<String>>(8)?,
+                    "started": r.get::<_, i64>(9)? != 0,
+                    "ended": r.get::<_, i64>(10)? != 0,
+                    "mother_epoch": r.get::<_, i64>(11)?,
+                    "created_at": r.get::<_, String>(12)?,
+                    "ended_at": r.get::<_, Option<i64>>(13)?,
+                    "state_version": r.get::<_, i64>(14)?,
+                }))
+            },
+        )
+        .optional()?;
+    let Some(game) = game else { return Ok(None) };
+    let epoch = game.get("mother_epoch").and_then(|v| v.as_i64()).unwrap_or(1);
+
+    let meta: Vec<Value> = c
+        .prepare(
+            "SELECT meta_name, meta_value FROM lg_launched_game_meta
+             WHERE launched_game_id = ?",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "meta_name": r.get::<_, String>(0)?,
+                "meta_value": r.get::<_, Option<String>>(1)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let devices: Vec<Value> = c
+        .prepare(
+            "SELECT device_id, device_label, os, os_version, connected
+             FROM lg_launched_game_devices WHERE launched_game_id = ?",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "device_id": r.get::<_, i64>(0)?,
+                "device_label": r.get::<_, Option<String>>(1)?,
+                "os": r.get::<_, Option<String>>(2)?,
+                "os_version": r.get::<_, Option<String>>(3)?,
+                "connected": r.get::<_, i64>(4)? != 0,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let raw_data: Vec<Value> = c
+        .prepare(
+            "SELECT id, device_id, raw_data, created_at
+             FROM lg_launched_game_raw_data
+             WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "device_id": r.get::<_, i64>(1)?,
+                "raw_data": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let teams: Vec<Value> = c
+        .prepare(
+            "SELECT id, team_number, team_name, pattern, score, key_id,
+                    start_time, end_time, language
+             FROM lg_teams WHERE launched_game_id = ? ORDER BY team_number ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "team_number": r.get::<_, i64>(1)?,
+                "team_name": r.get::<_, Option<String>>(2)?,
+                "pattern": r.get::<_, i64>(3)?,
+                "score": r.get::<_, i64>(4)?,
+                "key_id": r.get::<_, Option<i64>>(5)?,
+                "start_time": r.get::<_, Option<i64>>(6)?,
+                "end_time": r.get::<_, Option<i64>>(7)?,
+                "language": r.get::<_, Option<String>>(8)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let completed_quests: Vec<Value> = c
+        .prepare(
+            "SELECT id, team_id, teammate_chip_id, quest_id, quest_number,
+                    points_awarded, created_at
+             FROM lg_team_completed_quests
+             WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "team_id": r.get::<_, i64>(1)?,
+                "teammate_chip_id": r.get::<_, Option<i64>>(2)?,
+                "quest_id": r.get::<_, Option<i64>>(3)?,
+                "quest_number": r.get::<_, String>(4)?,
+                "points_awarded": r.get::<_, i64>(5)?,
+                "created_at": r.get::<_, String>(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Whole pairing table - peer secrets included so satellites keep
+    // authenticating to the new mother with the bearer they already hold.
+    let paired_devices: Vec<Value> = c
+        .prepare(
+            "SELECT id, peer_uuid, peer_label, peer_os, peer_app_version,
+                    peer_secret, is_self
+             FROM paired_devices",
+        )?
+        .query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "peer_uuid": r.get::<_, String>(1)?,
+                "peer_label": r.get::<_, String>(2)?,
+                "peer_os": r.get::<_, Option<String>>(3)?,
+                "peer_app_version": r.get::<_, Option<String>>(4)?,
+                "peer_secret": r.get::<_, String>(5)?,
+                "is_self": r.get::<_, i64>(6)? != 0,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Clash V2 per-game state. Cheap for non-clash games (indexed
+    // lookups over empty tables); required for Clash - a promotion
+    // without these rows silently zeroes territory domination,
+    // banked punches, effectif weighting and purge history.
+    let clash_members: Vec<Value> = c
+        .prepare(
+            "SELECT id, team_id, chip_id, created_at
+             FROM lg_clash_members WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "team_id": r.get::<_, i64>(1)?,
+                "chip_id": r.get::<_, i64>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let clash_validations: Vec<Value> = c
+        .prepare(
+            "SELECT id, team_id, chip_id, combo_index, territory_index, seq, created_at
+             FROM lg_clash_validations WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "team_id": r.get::<_, i64>(1)?,
+                "chip_id": r.get::<_, i64>(2)?,
+                "combo_index": r.get::<_, i64>(3)?,
+                "territory_index": r.get::<_, i64>(4)?,
+                "seq": r.get::<_, i64>(5)?,
+                "created_at": r.get::<_, String>(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let clash_consumed: Vec<Value> = c
+        .prepare(
+            "SELECT id, chip_id, punch_key, created_at
+             FROM lg_clash_consumed WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "chip_id": r.get::<_, i64>(1)?,
+                "punch_key": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, String>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let clash_effectif: Vec<Value> = c
+        .prepare(
+            "SELECT team_id, size FROM lg_clash_effectif WHERE launched_game_id = ?",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "team_id": r.get::<_, i64>(0)?,
+                "size": r.get::<_, i64>(1)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let clash_purges: Vec<Value> = c
+        .prepare(
+            "SELECT id, team_id, chip_id, territory_index, seq, created_at
+             FROM lg_clash_purges WHERE launched_game_id = ? ORDER BY id ASC",
+        )?
+        .query_map(params![game_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "team_id": r.get::<_, i64>(1)?,
+                "chip_id": r.get::<_, i64>(2)?,
+                "territory_index": r.get::<_, i64>(3)?,
+                "seq": r.get::<_, i64>(4)?,
+                "created_at": r.get::<_, String>(5)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Sticky removals travel too, so a promoted mother keeps refusing
+    // the devices the operator removed (retours sept. #8). Empty when
+    // the table doesn't exist yet.
+    let revoked_devices: Vec<String> = c
+        .prepare("SELECT peer_uuid FROM revoked_devices")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(json!({
+        "schema": 1,
+        "state_version": state_version,
+        "mother_epoch": epoch,
+        "mother_uuid": mother_uuid,
+        "game": game,
+        "meta": meta,
+        "devices": devices,
+        "raw_data": raw_data,
+        "teams": teams,
+        "completed_quests": completed_quests,
+        "paired_devices": paired_devices,
+        "revoked_devices": revoked_devices,
+        "clash_members": clash_members,
+        "clash_validations": clash_validations,
+        "clash_consumed": clash_consumed,
+        "clash_effectif": clash_effectif,
+        "clash_purges": clash_purges,
+    })))
 }
 
 async fn dispatch_launched_games(
@@ -3047,8 +3557,13 @@ async fn dispatch_launched_games(
         }
     };
 
+    let mutates = action_mutates_game_state(method.as_str(), action);
+    let stamp_id = if mutates { stamp_target(&state, action, &body).await } else { None };
+
     let result: Result<Value, ApiErr> = match (method.as_str(), action) {
         ("POST", "create") => create(&state, peer_id, body).await,
+        ("GET", "inventory") => inventory(&state).await,
+        ("POST", "push_snapshot") => push_snapshot(&state, body).await,
         ("GET", "list") => list(&state, &q.rest).await,
         ("GET", "list_active") => list_active(&state).await,
         ("GET", "get_meta") => get_meta(&state, &q.rest).await,
@@ -3069,12 +3584,16 @@ async fn dispatch_launched_games(
         ("POST", "sync_summaries") => sync_summaries(&state).await,
         ("POST", "mark_summaries_pushed") => mark_summaries_pushed(&state, body).await,
         ("GET", "list_archived_summaries") => list_archived_summaries(&state).await,
+        ("GET", "customers_list") => customers_list(&state).await,
+        ("POST", "customers_create") => customers_create(&state, body).await,
+        ("POST", "assign_customer") => assign_customer(&state, body).await,
         ("POST", "register_device") => register_device(&state, peer_id, body).await,
         ("GET", "get_devices") => get_devices(&state, &q.rest).await,
         ("GET", "list_paired_with_status") => {
             list_paired_with_status(&state, peer_id, &q.rest).await
         }
         ("GET", "list_paired_for_launch") => list_paired_for_launch(&state, peer_id).await,
+        ("GET", "list_fleet") => list_fleet(&state, peer_id).await,
         ("POST", "queue_command") => queue_command(&state, peer_id, body).await,
         ("POST", "queue_command_bulk") => queue_command_bulk(&state, peer_id, body).await,
         ("POST", "ack_command") => ack_command(&state, peer_id, body).await,
@@ -3086,6 +3605,14 @@ async fn dispatch_launched_games(
         ("GET", "clash_members") => clash_members(&state, &q.rest).await,
         ("POST", "clash_validate") => clash_validate(&state, body).await,
         ("GET", "clash_state") => clash_state(&state, &q.rest).await,
+        // The mother's wall clock (ms): devices measure their offset to it so a
+        // simulated game clock shared across PCs means the same instant on each.
+        ("GET", "server_time") => Ok(json!({
+            "now_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        })),
         ("", _) | (_, "") => Err(ApiErr::bad("action is required")),
         _ => Err(ApiErr::status(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -3095,8 +3622,9 @@ async fn dispatch_launched_games(
 
     // Slice 0: a successful state-changing action advances the per-mother
     // version counter. Read side (snapshot delivery) lands in slice 1.
-    if result.is_ok() && action_mutates_game_state(method.as_str(), action) {
-        bump_state_version(&state).await;
+    if let (true, Ok(v)) = (mutates, &result) {
+        let game_id = if action == "create" { v.get("id").and_then(|x| x.as_i64()) } else { stamp_id };
+        bump_state_version(&state, game_id).await;
     }
 
     match result {
@@ -3130,11 +3658,9 @@ async fn dispatch_pair(
     let result: Result<Value, ApiErr> = match (method.as_str(), action) {
         ("POST", "request") => pair_request_handler(&state, body).await,
         // Unauthenticated identity probe: lets a child that reached this server
-        // by a KNOWN address (the hotspot gateway 192.168.137.1 at a fixed port)
-        // confirm a mother is here and learn its uuid/client_id/epoch WITHOUT
-        // mDNS - the direct-probe fallback for when multicast is filtered on the
-        // Windows "Public" profile (the #1 discovery failure). Same shape a
-        // resolved mDNS record yields.
+        // by a typed address (pairing by IP) confirm a mother is here and learn
+        // its uuid/client_id/epoch WITHOUT mDNS - the fallback for networks that
+        // filter multicast. Same shape a resolved mDNS record yields.
         ("GET", "hello") => pair_hello_handler(&state).await,
         // ("GET", "status") retired with the manual-approval ceremony: this
         // mother never returns 'pending', so nothing has a request_id to poll.
@@ -3145,7 +3671,17 @@ async fn dispatch_pair(
         )),
     };
     match result {
-        Ok(v) => json_ok(v),
+        Ok(mut v) => {
+            // Every pair reply announces our protocol, so a satellite can refuse
+            // a mother on another one (see client_pair_with_mother).
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("lan_proto".into(), json!(LAN_PROTO));
+                obj.insert("app_version".into(), json!(env!("CARGO_PKG_VERSION")));
+                // This mother serves scenario content on /content.php.
+                obj.insert("content_caps".into(), json!(crate::content_server::CONTENT_CAPS));
+            }
+            json_ok(v)
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -3179,6 +3715,7 @@ async fn dispatch_ping(
         serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
     };
     let has_reader = body.get("has_reader").and_then(|v| v.as_bool());
+    let operator_only = body.get("operator_only").and_then(|v| v.as_bool());
     // The satellite's current screen state travels as a nested object; we store
     // it verbatim as a JSON string. Absent (or explicit null) leaves the stored
     // value untouched via COALESCE in bump_presence.
@@ -3193,16 +3730,11 @@ async fn dispatch_ping(
     let known_version = body.get("known_version").and_then(|v| v.as_i64());
     let launched_game_id = body.get("launched_game_id").and_then(|v| v.as_i64());
 
-    bump_presence(&state, peer_id, has_reader, screen_state).await;
+    bump_presence(&state, peer_id, has_reader, screen_state, operator_only).await;
     let commands = pickup_pending_commands(&state, peer_id).await;
 
-    // Feature A: hand the satellite this mother's active Wi-Fi creds so it can
-    // auto-rejoin next time. Read straight from schema_meta (the JS side wrote
-    // them via lanCredentials.ts into the same SQLite DB). Only included when a
-    // password is present (router mode is blank until the operator types one).
-    let mother_wifi = read_mother_wifi(&state).await;
-
     let state_version = read_state_version(&state).await;
+    let content_rev = crate::content_server::content_rev(&state).await;
     let snapshot = match launched_game_id {
         Some(gid) if known_version != Some(state_version) => {
             build_snapshot(&state, gid, state_version).await
@@ -3213,42 +3745,13 @@ async fn dispatch_ping(
     json_ok(json!({
         "mother_uuid": state.mother_uuid,
         "commands": commands,
-        "mother_wifi": mother_wifi,
+        "lan_proto": LAN_PROTO,
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "content_caps": crate::content_server::CONTENT_CAPS,
+        "content_rev": content_rev,
         "state_version": state_version,
         "snapshot": snapshot,
     }))
-}
-
-/// Active hotspot/router creds from schema_meta as {ssid,password,source}, or
-/// null when none usable. Mirrors `services/lanCredentials.ts` key names.
-async fn read_mother_wifi(state: &AppState) -> Option<Value> {
-    let rows: std::collections::HashMap<String, String> = state
-        .db
-        .call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<std::collections::HashMap<String, String>> {
-            let mut map = std::collections::HashMap::new();
-            let mut stmt = c.prepare(
-                "SELECT key, value FROM schema_meta WHERE key IN \
-                 ('lan_network_source','hotspot_ssid','hotspot_password','lan_router_ssid','lan_router_password')",
-            )?;
-            let mapped = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            for row in mapped {
-                let (k, v) = row?;
-                map.insert(k, v);
-            }
-            Ok(map)
-        })
-        .await
-        .ok()?;
-
-    let source = rows.get("lan_network_source").map(String::as_str).unwrap_or("hotspot");
-    let (ssid, password) = if source == "router" {
-        (rows.get("lan_router_ssid"), rows.get("lan_router_password"))
-    } else {
-        (rows.get("hotspot_ssid"), rows.get("hotspot_password"))
-    };
-    let ssid = ssid.filter(|s| !s.is_empty())?;
-    let password = password.filter(|s| !s.is_empty())?;
-    Some(json!({ "ssid": ssid, "password": password, "source": source }))
 }
 
 // ─── error type ──────────────────────────────────────────────────────────────
@@ -3376,7 +3879,7 @@ async fn create(state: &AppState, peer_id: i64, body: Value) -> Result<Value, Ap
         ));
     }
 
-    let meta_pairs: Vec<(String, Option<String>)> = body
+    let mut meta_pairs: Vec<(String, Option<String>)> = body
         .get("meta")
         .and_then(|v| v.as_object())
         .map(|m| {
@@ -3392,6 +3895,12 @@ async fn create(state: &AppState, peer_id: i64, body: Value) -> Result<Value, Ap
                 .collect()
         })
         .unwrap_or_default();
+    // A launch-time customer is stamped with the mother's clock: every LAN
+    // assignment then compares on one clock (project_licensee_customers).
+    if meta_pairs.iter().any(|(k, v)| k == "customerId" && v.is_some()) {
+        meta_pairs.retain(|(k, _)| k != "customerAssignedAt");
+        meta_pairs.push(("customerAssignedAt".to_string(), Some(now_iso_ms())));
+    }
 
     let teams: Vec<TeamInput> = body
         .get("teams")
@@ -3626,6 +4135,122 @@ impl TeamInput {
     }
 }
 
+/// Every game this device holds for the client, with what orders two copies
+/// (`is_newer`), plus the tombstones of the games deleted or archived here.
+/// A peer compares it with its own list to decide what to push and what to
+/// pull (`client_reconcile_with_mother`).
+fn inventory_sync(c: &rusqlite::Connection, client_id: i64) -> rusqlite::Result<(Vec<Value>, Vec<Value>)> {
+    let games = c
+        .prepare(
+            "SELECT id, summary_uuid, name, mother_epoch, state_version, ended, ended_at
+             FROM lg_launched_games WHERE client_id = ?",
+        )?
+        .query_map(params![client_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "summary_uuid": r.get::<_, String>(1)?,
+                "name": r.get::<_, String>(2)?,
+                "mother_epoch": r.get::<_, i64>(3)?,
+                "state_version": r.get::<_, i64>(4)?,
+                "ended": r.get::<_, i64>(5)? != 0,
+                "ended_at": r.get::<_, Option<i64>>(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tombstones = c
+        .prepare("SELECT summary_uuid, kind, mother_epoch, state_version FROM lg_game_tombstones")?
+        .query_map([], |r| {
+            Ok(json!({
+                "summary_uuid": r.get::<_, String>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "mother_epoch": r.get::<_, i64>(2)?,
+                "state_version": r.get::<_, i64>(3)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((games, tombstones))
+}
+
+async fn inventory(state: &AppState) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    let (games, tombstones) = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<Value>, Vec<Value>)> {
+            Ok(inventory_sync(c, client_id)?)
+        })
+        .await?;
+    Ok(json!({
+        "mother_uuid": state.mother_uuid,
+        "client_id": client_id,
+        "games": games,
+        "tombstones": tombstones,
+    }))
+}
+
+/// Renderer event fired when a peer's copy of a game replaced ours, so open
+/// game lists reload.
+const GAMES_RECONCILED_EVENT: &str = "taghunter://games-reconciled";
+
+/// A peer hands this mother its copy of one game. Body:
+/// `{ snapshot: <build_snapshot bundle>, hosted: bool }`. Never an HTTP error
+/// for a refusal: `applied: false` with a `reason` is an answer the pusher
+/// acts on (see `adopt_peer_snapshot`).
+async fn push_snapshot(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let snap = body
+        .get("snapshot")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| ApiErr::bad("snapshot is required"))?;
+    let hosted = vbool(&body, "hosted");
+    let client_id = state.client_id;
+    let outcome = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<AdoptOutcome> {
+            let tx = c.transaction()?;
+            let outcome = adopt_peer_snapshot(&tx, &snap, client_id, hosted)?;
+            if outcome.applied {
+                // This device HOSTS the game from now on. A snapshot of it cached
+                // while following another host (same id, epoch at least ours)
+                // would make it read as a mere copy - see the "hosted" rule in
+                // `client_reconcile_with_mother`.
+                tx.execute(
+                    "DELETE FROM mother_snapshots WHERE launched_game_id = ?",
+                    params![outcome.game_id],
+                )?;
+                tx.commit()?;
+            }
+            Ok(outcome)
+        })
+        .await?;
+
+    if outcome.applied {
+        // A running game can come in at a higher epoch than the one this server
+        // advertises (its frozen copy was older): advertise it, or satellites
+        // that cached that epoch keep looking for another host.
+        if !outcome.ended {
+            let server = state.app.state::<MotherServerState>();
+            let mut guard = server.inner.lock().await;
+            if let Some(running) = guard.as_mut() {
+                if outcome.mother_epoch > running.epoch {
+                    running.epoch = outcome.mother_epoch;
+                    let _ = reregister_mdns(running);
+                }
+            }
+        }
+        use tauri::Emitter;
+        let _ = state.app.emit(
+            GAMES_RECONCILED_EVENT,
+            json!({ "launched_game_id": outcome.game_id, "ended": outcome.ended }),
+        );
+    }
+    Ok(json!({
+        "applied": outcome.applied,
+        "reason": outcome.reason,
+        "game_id": outcome.game_id,
+        "mother_epoch": outcome.mother_epoch,
+    }))
+}
+
 async fn list(
     state: &AppState,
     rest: &HashMap<String, String>,
@@ -3642,56 +4267,87 @@ async fn list(
     let games = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
-            // Composed WHERE clause: client scope + optional ended + optional
-            // ownership, so the four param combinations share one query builder.
-            let mut where_sql = String::from("WHERE client_id = ?");
-            match ended_filter.as_deref() {
-                Some("0") => where_sql.push_str(" AND ended = 0"),
-                Some("1") => where_sql.push_str(" AND ended = 1"),
-                _ => {}
-            }
-            if mine {
-                where_sql.push_str(
-                    " AND (launched_by_self = 1
-                           OR EXISTS (SELECT 1 FROM lg_launched_game_devices d
-                                        JOIN paired_devices pd ON pd.id = d.device_id
-                                       WHERE d.launched_game_id = lg_launched_games.id
-                                         AND pd.is_self = 1))",
-                );
-            }
-            let sql = format!(
-                "SELECT id, game_uniqid, name, number_of_teams, game_type, duration,
-                        start_time, started, ended, created_at, updated_at,
-                        EXISTS(SELECT 1 FROM lg_launched_game_meta m
-                               WHERE m.launched_game_id = lg_launched_games.id
-                                 AND m.meta_name = 'testMode'
-                                 AND m.meta_value = 'true') AS is_test
-                 FROM lg_launched_games
-                 {where_sql}
-                 ORDER BY created_at DESC"
-            );
-            let args: Vec<SqlValue> = vec![SqlValue::Integer(client_id)];
-            let mut stmt = c.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "game_uniqid": r.get::<_, String>(1)?,
-                    "name": r.get::<_, String>(2)?,
-                    "number_of_teams": r.get::<_, i64>(3)?,
-                    "game_type": r.get::<_, String>(4)?,
-                    "duration": r.get::<_, i64>(5)?,
-                    "start_time": r.get::<_, Option<String>>(6)?,
-                    "started": r.get::<_, i64>(7)?,
-                    "ended": r.get::<_, i64>(8)?,
-                    "created_at": r.get::<_, String>(9)?,
-                    "updated_at": r.get::<_, String>(10)?,
-                    "is_test": r.get::<_, i64>(11)? != 0,
-                }))
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            Ok(list_games_sync(c, client_id, ended_filter.as_deref(), mine)?)
         })
         .await?;
     Ok(json!({ "games": games }))
+}
+
+/// The `list` query on a bare connection, so a device with no running server
+/// can read its own games (`client_list_local_games`).
+fn list_games_sync(
+    c: &rusqlite::Connection,
+    client_id: i64,
+    ended_filter: Option<&str>,
+    mine: bool,
+) -> rusqlite::Result<Vec<Value>> {
+    // Composed WHERE clause: client scope + optional ended + optional
+    // ownership, so the four param combinations share one query builder.
+    let mut where_sql = String::from("WHERE client_id = ?");
+    match ended_filter {
+        Some("0") => where_sql.push_str(" AND ended = 0"),
+        Some("1") => where_sql.push_str(" AND ended = 1"),
+        _ => {}
+    }
+    if mine {
+        where_sql.push_str(
+            " AND (launched_by_self = 1
+                   OR EXISTS (SELECT 1 FROM lg_launched_game_devices d
+                                JOIN paired_devices pd ON pd.id = d.device_id
+                               WHERE d.launched_game_id = lg_launched_games.id
+                                 AND pd.is_self = 1))",
+        );
+    }
+    let sql = format!(
+        "SELECT id, game_uniqid, name, number_of_teams, game_type, duration,
+                start_time, started, ended, created_at, updated_at,
+                EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                       WHERE m.launched_game_id = lg_launched_games.id
+                         AND m.meta_name IN ('testMode', 'simulated')
+                         AND m.meta_value = 'true') AS is_test,
+                summary_uuid,
+                EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                       WHERE m.launched_game_id = lg_launched_games.id
+                         AND m.meta_name = 'simulated'
+                         AND m.meta_value = 'true') AS is_simulated,
+                (SELECT m.meta_value FROM lg_launched_game_meta m
+                  WHERE m.launched_game_id = lg_launched_games.id
+                    AND m.meta_name = 'customerId' LIMIT 1) AS customer_id,
+                (SELECT m.meta_value FROM lg_launched_game_meta m
+                  WHERE m.launched_game_id = lg_launched_games.id
+                    AND m.meta_name = 'customerName' LIMIT 1) AS customer_name
+         FROM lg_launched_games
+         {where_sql}
+         ORDER BY created_at DESC"
+    );
+    let args: Vec<SqlValue> = vec![SqlValue::Integer(client_id)];
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "game_uniqid": r.get::<_, String>(1)?,
+            "name": r.get::<_, String>(2)?,
+            "number_of_teams": r.get::<_, i64>(3)?,
+            "game_type": r.get::<_, String>(4)?,
+            "duration": r.get::<_, i64>(5)?,
+            "start_time": r.get::<_, Option<String>>(6)?,
+            "started": r.get::<_, i64>(7)?,
+            "ended": r.get::<_, i64>(8)?,
+            "created_at": r.get::<_, String>(9)?,
+            "updated_at": r.get::<_, String>(10)?,
+            "is_test": r.get::<_, i64>(11)? != 0,
+            // Cross-device identity: lets a satellite recognise its own
+            // local copy of a game the mother also lists.
+            "summary_uuid": r.get::<_, String>(12)?,
+            // Game simulator session (tester builds). Also counted in is_test
+            // above so it is excluded from stats/archive and deletable.
+            "is_simulated": r.get::<_, i64>(13)? != 0,
+            // Licensee customer (project_licensee_customers), from meta.
+            "customer_id": r.get::<_, Option<String>>(14)?,
+            "customer_name": r.get::<_, Option<String>>(15)?,
+        }))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
 }
 
 async fn list_active(state: &AppState) -> Result<Value, ApiErr> {
@@ -3769,11 +4425,15 @@ async fn update_meta(state: &AppState, body: Value) -> Result<Value, ApiErr> {
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
             let tx = c.transaction()?;
+            // The customer keys are left alone: callers write back a meta map
+            // they read earlier, which would revert a reassignment made since.
+            // Only create + assign_customer write them.
             tx.execute(
-                "DELETE FROM lg_launched_game_meta WHERE launched_game_id = ?",
+                "DELETE FROM lg_launched_game_meta WHERE launched_game_id = ?
+                   AND meta_name NOT IN ('customerId', 'customerName', 'customerAssignedAt')",
                 params![id],
             )?;
-            for (k, v) in &meta_pairs {
+            for (k, v) in meta_pairs.iter().filter(|(k, _)| !is_customer_meta_key(k)) {
                 tx.execute(
                     "INSERT INTO lg_launched_game_meta
                        (launched_game_id, meta_name, meta_value) VALUES (?, ?, ?)",
@@ -3818,7 +4478,8 @@ async fn merge_meta(state: &AppState, body: Value) -> Result<Value, ApiErr> {
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
             let tx = c.transaction()?;
-            for (k, v) in &meta_pairs {
+            // Customer keys: assign_customer only (see update_meta).
+            for (k, v) in meta_pairs.iter().filter(|(k, _)| !is_customer_meta_key(k)) {
                 // No UNIQUE(launched_game_id, meta_name) on this table, so
                 // delete-then-insert rather than ON CONFLICT. Both statements
                 // are scoped to the single key, inside one transaction.
@@ -4012,7 +4673,14 @@ async fn update_team(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let mut sets: Vec<&'static str> = Vec::new();
     let mut args: Vec<SqlValue> = Vec::new();
     if let Some(v) = body.get("score") {
-        if let Some(n) = v.as_i64() {
+        // The column is an INTEGER, but a Tracks percentage is rarely a whole
+        // number (4 of 24 checkpoints = 16.66…). `as_i64()` is None for a JSON
+        // float, so such a score used to be dropped silently and every Tracks
+        // team stayed at 0 (rankings, clues page, team summary). Round instead.
+        let n = v
+            .as_i64()
+            .or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64));
+        if let Some(n) = n {
             sets.push("score = ?");
             args.push(SqlValue::Integer(n));
         }
@@ -4312,13 +4980,36 @@ async fn end_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
             // Stamp the freeze moment (first end wins) so clash's per-minute
             // scoring stops accruing at an early manual-end, not at the scheduled
             // timer expiry. Harmless for other game types.
+            let now = game_now_secs(c, id)?;
             c.execute(
                 "UPDATE lg_launched_games
                  SET ended = 1,
-                     ended_at = COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER))
+                     ended_at = COALESCE(ended_at, ?2)
                  WHERE id = ?1",
-                params![id],
+                params![id, now],
             )?;
+
+            // Clash: lg_teams.score is only persisted on a validation, so it
+            // misses the per-minute points earned since the last one. Recompute
+            // the standings now that ended_at freezes them, so the saved score
+            // is final. Never blocks ending the game. Gated on the game TYPE, not
+            // on `clash_config`: a TagQuest self-register team launch carries one
+            // too (for its per-team cap only, no territories), and recomputing
+            // it as Clash persisted 0 for every team.
+            let game_type: Option<String> = c
+                .query_row(
+                    "SELECT game_type FROM lg_launched_games WHERE id = ?",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if game_type.as_deref().is_some_and(|g| g.eq_ignore_ascii_case("clash")) {
+                if let Ok(Some(cfg)) = load_clash_config(c, id) {
+                    if let Err(e) = compute_clash_standings(c, id, &cfg, true) {
+                        eprintln!("[lan_server] end_game {id}: final clash standings failed: {e}");
+                    }
+                }
+            }
 
             // Closing the game closes every run still open, for EVERY game type:
             // a team the operator (or the timer) stopped mid-run is finished, not
@@ -4382,6 +5073,24 @@ async fn add_time(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     Ok(json!({ "success": true, "duration": new_duration }))
 }
 
+/// Remember that a game was deleted or archived HERE, at the version it had.
+/// Call just before the row goes. A device that hosted the game earlier would
+/// otherwise push it back at every reconciliation; with the tombstone, only a
+/// copy that is newer than the one thrown away comes back (see `is_newer`).
+fn write_tombstone(c: &rusqlite::Connection, game_id: i64, kind: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO lg_game_tombstones (summary_uuid, kind, mother_epoch, state_version)
+         SELECT summary_uuid, ?2, mother_epoch, state_version FROM lg_launched_games WHERE id = ?1
+         ON CONFLICT(summary_uuid) DO UPDATE SET
+           kind = excluded.kind,
+           mother_epoch = excluded.mother_epoch,
+           state_version = excluded.state_version,
+           created_at = CURRENT_TIMESTAMP",
+        params![game_id, kind],
+    )?;
+    Ok(())
+}
+
 async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let id = json_i64(&body, "id")?;
     let client_id = state.client_id;
@@ -4398,6 +5107,7 @@ async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
                  WHERE launched_game_id = ? AND client_id = ? AND archived_at IS NULL",
                 params![id, client_id],
             )?;
+            write_tombstone(c, id, "deleted")?;
             c.execute(
                 "DELETE FROM lg_launched_games WHERE id = ? AND client_id = ?",
                 params![id, client_id],
@@ -4427,14 +5137,20 @@ struct ComputedSummary {
     teams_played: i64,
     players_played: i64,
     content_hash: String,
+    /// The licensee customer, from the game's meta (project_licensee_customers).
+    /// Not part of content_hash: a reassignment sets customer_dirty instead.
+    customer_id: Option<String>,
+    customer_name: Option<String>,
+    customer_assigned_at: Option<String>,
 }
 
-/// True when the launch was flagged as a test (meta testMode='true'). Tests are
-/// never summarised.
+/// True when the launch was flagged as a test (meta testMode='true') or is a
+/// game-simulator session (meta simulated='true'). Neither is ever summarised.
 fn game_is_test(c: &rusqlite::Connection, game_id: i64) -> rusqlite::Result<bool> {
     let n: i64 = c.query_row(
         "SELECT COUNT(*) FROM lg_launched_game_meta
-         WHERE launched_game_id = ?1 AND meta_name = 'testMode' AND meta_value = 'true'",
+         WHERE launched_game_id = ?1 AND meta_name IN ('testMode', 'simulated')
+           AND meta_value = 'true'",
         params![game_id],
         |r| r.get(0),
     )?;
@@ -4506,6 +5222,7 @@ fn compute_summary(
         "{game_type}|{game_uniqid}|{name}|{}|{teams_launched}|{teams_played}|{players_played}",
         played_at.clone().unwrap_or_default()
     );
+    let (customer_id, customer_name, customer_assigned_at) = meta_customer(c, game_id)?;
 
     Ok(Some(ComputedSummary {
         summary_uuid,
@@ -4518,6 +5235,9 @@ fn compute_summary(
         teams_played,
         players_played,
         content_hash,
+        customer_id,
+        customer_name,
+        customer_assigned_at,
     }))
 }
 
@@ -4531,25 +5251,39 @@ fn upsert_summary(
     s: &ComputedSummary,
     now: &str,
 ) -> rusqlite::Result<()> {
-    let existing: Option<String> = c
+    let existing: Option<(String, Option<String>)> = c
         .query_row(
-            "SELECT content_hash FROM lg_game_summaries WHERE summary_uuid = ?1",
+            "SELECT content_hash, customer_assigned_at FROM lg_game_summaries WHERE summary_uuid = ?1",
             params![s.summary_uuid],
-            |r| Ok(r.get::<_, Option<String>>(0)?.unwrap_or_default()),
+            |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
-    match existing {
+    // A customer (re)assignment newer than the stored one is copied over and
+    // flagged dirty, independently of the stats hash below.
+    if let (Some((_, stored_at)), Some(at)) = (&existing, &s.customer_assigned_at) {
+        if stored_at.as_deref().map_or(true, |old| at.as_str() > old) {
+            c.execute(
+                "UPDATE lg_game_summaries
+                   SET customer_id = ?2, customer_name = ?3, customer_assigned_at = ?4,
+                       customer_dirty = 1, updated_at = ?5
+                 WHERE summary_uuid = ?1",
+                params![s.summary_uuid, s.customer_id, s.customer_name, at, now],
+            )?;
+        }
+    }
+    match existing.map(|(h, _)| h) {
         None => {
             c.execute(
                 "INSERT INTO lg_game_summaries
                    (summary_uuid, launched_game_id, client_id, game_uniqid, name, game_type,
                     played_at, teams_launched, teams_played, players_played, content_hash,
-                    pushed_at, archived_at, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12,?12)",
+                    pushed_at, archived_at, created_at, updated_at,
+                    customer_id, customer_name, customer_assigned_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12,?12,?13,?14,?15)",
                 params![
                     s.summary_uuid, game_id, s.client_id, s.game_uniqid, s.name, s.game_type,
                     s.played_at, s.teams_launched, s.teams_played, s.players_played,
-                    s.content_hash, now
+                    s.content_hash, now, s.customer_id, s.customer_name, s.customer_assigned_at
                 ],
             )?;
         }
@@ -4580,18 +5314,37 @@ async fn sync_summaries(state: &AppState) -> Result<Value, ApiErr> {
     let client_id = state.client_id;
     let to_push = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<Value>, Vec<Value>)> {
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
             // 1. Auto-end stale games (>24h since start, or since creation when
             //    never started - the latter just clears them from the list).
-            c.execute(
-                "UPDATE lg_launched_games
-                   SET ended = 1, updated_at = ?2
+            //    The freeze moment and a new version are stamped too: this is a
+            //    change of the game like any other, and reconciliation compares
+            //    copies on (epoch, ended, version).
+            let stale: i64 = c.query_row(
+                "SELECT COUNT(*) FROM lg_launched_games
                  WHERE client_id = ?1 AND ended = 0
                    AND COALESCE(start_time, created_at) < datetime('now','-24 hours')",
-                params![client_id, now],
+                params![client_id],
+                |r| r.get(0),
             )?;
+            if stale > 0 {
+                let version = bump_state_version_sync(c, None)?;
+                c.execute(
+                    "UPDATE lg_launched_games
+                       SET ended = 1, updated_at = ?2, state_version = ?3,
+                           ended_at = COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER))
+                     WHERE client_id = ?1 AND ended = 0
+                       AND COALESCE(start_time, created_at) < datetime('now','-24 hours')",
+                    params![client_id, now, version],
+                )?;
+            }
+
+            // 1b. Adopt newer studio-side customer reassignments (studio's
+            //     game view, cached by the customers sync). Before the recompute
+            //     so the meta it reads is already up to date.
+            flow_back_customer_assignments(c, client_id)?;
 
             // 2. Recompute summaries for all ended games still present locally.
             let ids: Vec<i64> = {
@@ -4607,16 +5360,20 @@ async fn sync_summaries(state: &AppState) -> Result<Value, ApiErr> {
                 }
             }
 
-            // 3. Return everything still awaiting a push (new, changed, or a
-            //    previous push that never got acked).
+            // 3. Return everything still awaiting a push (new, changed, a
+            //    customer reassignment, or a previous push that never got acked).
+            //    customer_assigned_at is sent only when set: an older studio
+            //    ignores it, a newer one leaves the customer alone without it.
+            let merges = customer_redirects(c, client_id)?;
             let mut stmt = c.prepare(
                 "SELECT summary_uuid, name, game_type, game_uniqid, played_at,
-                        teams_launched, teams_played, players_played
+                        teams_launched, teams_played, players_played,
+                        customer_id, customer_name, customer_assigned_at
                  FROM lg_game_summaries
-                 WHERE client_id = ?1 AND pushed_at IS NULL",
+                 WHERE client_id = ?1 AND (pushed_at IS NULL OR customer_dirty = 1)",
             )?;
             let rows = stmt.query_map(params![client_id], |r| {
-                Ok(json!({
+                let mut v = json!({
                     "summary_uuid": r.get::<_, String>(0)?,
                     "name": r.get::<_, String>(1)?,
                     "game_type": r.get::<_, String>(2)?,
@@ -4625,12 +5382,35 @@ async fn sync_summaries(state: &AppState) -> Result<Value, ApiErr> {
                     "teams_launched": r.get::<_, Option<i64>>(5)?,
                     "teams_played": r.get::<_, i64>(6)?,
                     "players_played": r.get::<_, i64>(7)?,
+                });
+                if let Some(at) = r.get::<_, Option<String>>(10)? {
+                    let cid = r.get::<_, Option<String>>(8)?.map(|id| resolve_customer_id(&merges, &id));
+                    v["customer_id"] = json!(cid);
+                    v["customer_name"] = json!(r.get::<_, Option<String>>(9)?);
+                    v["customer_assigned_at"] = json!(at);
+                }
+                Ok(v)
+            })?;
+            let summaries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+            // Customers quick-created on this LAN, not yet sent to studio.
+            let mut stmt = c.prepare(
+                "SELECT id, name, type, created_at FROM customers
+                 WHERE client_id = ?1 AND origin = 'local' AND pushed_at IS NULL AND deleted = 0",
+            )?;
+            let rows = stmt.query_map(params![client_id], |r| {
+                Ok(json!({
+                    "customer_id": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "type": r.get::<_, Option<String>>(2)?,
+                    "created_at": r.get::<_, String>(3)?,
                 }))
             })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            let customers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((summaries, customers))
         })
         .await?;
-    Ok(json!({ "summaries": to_push }))
+    Ok(json!({ "summaries": to_push.0, "customers": to_push.1 }))
 }
 
 /// Marks the given summary_uuids as pushed (pushed_at = now) so they aren't
@@ -4646,7 +5426,18 @@ async fn mark_summaries_pushed(state: &AppState, body: Value) -> Result<Value, A
                 .collect()
         })
         .unwrap_or_default();
-    if uuids.is_empty() {
+    // customer_assigned: {summary_uuid: customer_assigned_at|null} as pushed.
+    // The dirty flag is cleared only when the assignment did not change since
+    // (a reassignment during the push must go out next time). Absent (older
+    // caller): cleared unconditionally.
+    let assigned: Option<serde_json::Map<String, Value>> =
+        body.get("customer_assigned").and_then(|v| v.as_object()).cloned();
+    let customer_ids: Vec<String> = body
+        .get("customer_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    if uuids.is_empty() && customer_ids.is_empty() {
         return Ok(json!({ "updated": 0 }));
     }
     let updated = state
@@ -4659,6 +5450,31 @@ async fn mark_summaries_pushed(state: &AppState, body: Value) -> Result<Value, A
                     "UPDATE lg_game_summaries SET pushed_at = ?3, updated_at = ?3
                      WHERE client_id = ?1 AND summary_uuid = ?2 AND pushed_at IS NULL",
                     params![client_id, u, now],
+                )?;
+                match assigned.as_ref().map(|m| m.get(u)) {
+                    Some(Some(at)) => {
+                        c.execute(
+                            "UPDATE lg_game_summaries SET customer_dirty = 0
+                             WHERE client_id = ?1 AND summary_uuid = ?2
+                               AND customer_assigned_at IS ?3",
+                            params![client_id, u, at.as_str()],
+                        )?;
+                    }
+                    Some(None) => {}
+                    None => {
+                        c.execute(
+                            "UPDATE lg_game_summaries SET customer_dirty = 0
+                             WHERE client_id = ?1 AND summary_uuid = ?2",
+                            params![client_id, u],
+                        )?;
+                    }
+                }
+            }
+            for id in &customer_ids {
+                c.execute(
+                    "UPDATE customers SET pushed_at = ?3, updated_at = ?3
+                     WHERE client_id = ?1 AND id = ?2 AND pushed_at IS NULL",
+                    params![client_id, id, now],
                 )?;
             }
             Ok(n)
@@ -4689,6 +5505,7 @@ async fn archive_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
             } else {
                 false
             };
+            write_tombstone(c, id, "archived")?;
             // Cascades to lg_teams / lg_team_completed_quests / meta / devices /
             // raw_data. The summary row (no FK to the game) survives.
             c.execute(
@@ -4709,7 +5526,8 @@ async fn list_archived_summaries(state: &AppState) -> Result<Value, ApiErr> {
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
             let mut stmt = c.prepare(
                 "SELECT summary_uuid, name, game_type, game_uniqid, played_at,
-                        teams_launched, teams_played, players_played, archived_at, pushed_at
+                        teams_launched, teams_played, players_played, archived_at, pushed_at,
+                        customer_id, customer_name
                  FROM lg_game_summaries
                  WHERE client_id = ?1 AND archived_at IS NOT NULL
                  ORDER BY (played_at IS NULL), played_at DESC",
@@ -4726,12 +5544,446 @@ async fn list_archived_summaries(state: &AppState) -> Result<Value, ApiErr> {
                     "players_played": r.get::<_, i64>(7)?,
                     "archived_at": r.get::<_, Option<String>>(8)?,
                     "pushed": r.get::<_, Option<String>>(9)?.is_some(),
+                    "customer_id": r.get::<_, Option<String>>(10)?,
+                    "customer_name": r.get::<_, Option<String>>(11)?,
                 }))
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await?;
     Ok(json!({ "summaries": rows }))
+}
+
+// ─── licensee customers (project_licensee_customers) ──────────────────────────
+//
+// The licensee's OWN customers (companies, schools...), not the licensee
+// (`client_id`). The mother owns the LAN's view: the `customers` cache synced
+// from studio (TS customersStore), quick-creates made on any device of the LAN
+// (origin='local', pushed as `customer_upsert` telemetry), and each game's
+// assignment - meta customerId / customerName / customerAssignedAt while the
+// game lives, lg_game_summaries.customer_* after. customerAssignedAt (ISO UTC
+// ms, mother clock) decides against a studio-side edit: strictly newest wins.
+
+const CUSTOMER_META_KEYS: [&str; 3] = ["customerId", "customerName", "customerAssignedAt"];
+
+fn is_customer_meta_key(k: &str) -> bool {
+    CUSTOMER_META_KEYS.contains(&k)
+}
+
+fn now_iso_ms() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.chars().enumerate().all(|(i, ch)| {
+            if matches!(i, 8 | 13 | 18 | 23) { ch == '-' } else { ch.is_ascii_hexdigit() }
+        })
+}
+
+/// (customerId, customerName, customerAssignedAt) from a game's meta.
+fn meta_customer(
+    c: &rusqlite::Connection,
+    game_id: i64,
+) -> rusqlite::Result<(Option<String>, Option<String>, Option<String>)> {
+    let mut stmt = c.prepare(
+        "SELECT meta_name, meta_value FROM lg_launched_game_meta
+         WHERE launched_game_id = ?1
+           AND meta_name IN ('customerId', 'customerName', 'customerAssignedAt')",
+    )?;
+    let mut out = (None, None, None);
+    let rows = stmt.query_map(params![game_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (k, v) = row?;
+        match k.as_str() {
+            "customerId" => out.0 = v.filter(|s| !s.is_empty()),
+            "customerName" => out.1 = v,
+            _ => out.2 = v.filter(|s| !s.is_empty()),
+        }
+    }
+    Ok(out)
+}
+
+/// Write a game's customer meta (None id = no customer, still timestamped so
+/// the removal wins over an older assignment elsewhere).
+fn write_meta_customer(
+    c: &rusqlite::Connection,
+    game_id: i64,
+    customer_id: Option<&str>,
+    customer_name: Option<&str>,
+    at: &str,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "DELETE FROM lg_launched_game_meta WHERE launched_game_id = ?1
+           AND meta_name IN ('customerId', 'customerName', 'customerAssignedAt')",
+        params![game_id],
+    )?;
+    let put = |k: &str, v: &str| {
+        c.execute(
+            "INSERT INTO lg_launched_game_meta (launched_game_id, meta_name, meta_value) VALUES (?1, ?2, ?3)",
+            params![game_id, k, v],
+        )
+    };
+    if let Some(id) = customer_id {
+        put("customerId", id)?;
+        if let Some(n) = customer_name {
+            put("customerName", n)?;
+        }
+    }
+    put("customerAssignedAt", at)?;
+    Ok(())
+}
+
+/// Merged id -> the id it was merged into (studio tombstones, cached).
+fn customer_redirects(c: &rusqlite::Connection, client_id: i64) -> rusqlite::Result<HashMap<String, String>> {
+    let mut stmt = c.prepare(
+        "SELECT id, merged_into_id FROM customers WHERE client_id = ?1 AND merged_into_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![client_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    rows.collect()
+}
+
+fn resolve_customer_id(redirects: &HashMap<String, String>, id: &str) -> String {
+    let mut cur = id.to_string();
+    for _ in 0..5 {
+        match redirects.get(&cur) {
+            Some(next) => cur = next.clone(),
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Adopt studio-side reassignments newer than the local one: the summary takes
+/// the studio value without being marked dirty (no echo back), and a game still
+/// on the device gets its meta rewritten so its chip and next recompute agree.
+fn flow_back_customer_assignments(c: &rusqlite::Connection, client_id: i64) -> rusqlite::Result<usize> {
+    let pending: Vec<(String, Option<String>, String)> = {
+        let mut stmt = c.prepare(
+            "SELECT s.summary_uuid, cg.customer_id, cg.customer_assigned_at
+             FROM lg_game_summaries s
+             JOIN customer_games cg ON cg.summary_uuid = s.summary_uuid AND cg.client_id = s.client_id
+             WHERE s.client_id = ?1 AND cg.customer_assigned_at IS NOT NULL
+               AND (s.customer_assigned_at IS NULL OR cg.customer_assigned_at > s.customer_assigned_at)",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (uuid, customer_id, at) in &pending {
+        let name: Option<String> = match customer_id {
+            Some(id) => c
+                .query_row("SELECT name FROM customers WHERE id = ?1", params![id], |r| r.get(0))
+                .optional()?,
+            None => None,
+        };
+        c.execute(
+            "UPDATE lg_game_summaries
+               SET customer_id = ?2, customer_name = ?3, customer_assigned_at = ?4, customer_dirty = 0
+             WHERE client_id = ?1 AND summary_uuid = ?5",
+            params![client_id, customer_id, name, at, uuid],
+        )?;
+        let game_id: Option<i64> = c
+            .query_row(
+                "SELECT id FROM lg_launched_games WHERE client_id = ?1 AND summary_uuid = ?2",
+                params![client_id, uuid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(gid) = game_id {
+            write_meta_customer(c, gid, customer_id.as_deref(), name.as_deref(), at)?;
+            bump_state_version_sync(c, Some(gid))?;
+        }
+    }
+    Ok(pending.len())
+}
+
+/// The LAN's customer list + per-customer played scenarios (the scenario-list
+/// badges). A game counts once, under the newest of: studio's view, the local
+/// summary, or a running game's meta. Test / simulated games never count, nor
+/// an ended game nobody played (no summary).
+fn customers_list_sync(c: &rusqlite::Connection, client_id: i64) -> rusqlite::Result<Value> {
+    let redirects = customer_redirects(c, client_id)?;
+    let mut customers: Vec<Value> = Vec::new();
+    let mut known: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = c.prepare(
+            "SELECT id, name, type, city, archived, deleted, merged_into_id FROM customers
+             WHERE client_id = ?1 ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, ty, city, archived, deleted, merged) = row?;
+            known.insert(id.clone());
+            if merged.is_none() && deleted == 0 {
+                customers.push(json!({ "id": id, "name": name, "type": ty, "city": city, "archived": archived != 0 }));
+            }
+        }
+    }
+
+    // summary_uuid -> (customer_id, game_uniqid, played_at, assigned_at, from_studio)
+    type Cand = (Option<String>, Option<String>, Option<String>, String, bool);
+    let mut best: HashMap<String, Cand> = HashMap::new();
+    let mut orphans: HashMap<String, String> = HashMap::new();
+    let mut consider = |uuid: String, cand: Cand| {
+        let keep_old = best
+            .get(&uuid)
+            .map_or(false, |old| old.3 > cand.3 || (old.3 == cand.3 && old.4));
+        if !keep_old {
+            best.insert(uuid, cand);
+        }
+    };
+    {
+        let mut stmt = c.prepare(
+            "SELECT summary_uuid, customer_id, game_uniqid, played_at, customer_assigned_at
+             FROM customer_games WHERE client_id = ?1 AND customer_assigned_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, String>(4)?))
+        })?;
+        for row in rows {
+            let (u, cid, g, p, at) = row?;
+            consider(u, (cid, g, p, at, true));
+        }
+    }
+    {
+        let mut stmt = c.prepare(
+            "SELECT summary_uuid, customer_id, game_uniqid, played_at, customer_assigned_at, customer_name
+             FROM lg_game_summaries WHERE client_id = ?1 AND customer_assigned_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get(2)?, r.get(3)?,
+                r.get::<_, String>(4)?, r.get::<_, Option<String>>(5)?))
+        })?;
+        for row in rows {
+            let (u, cid, g, p, at, name) = row?;
+            if let (Some(id), Some(n)) = (&cid, name) {
+                orphans.insert(id.clone(), n);
+            }
+            consider(u, (cid, g, p, at, false));
+        }
+    }
+    {
+        let mut stmt = c.prepare(
+            "SELECT g.summary_uuid, g.game_uniqid, COALESCE(g.start_time, g.created_at),
+                    (SELECT meta_value FROM lg_launched_game_meta m WHERE m.launched_game_id = g.id AND m.meta_name = 'customerId' LIMIT 1),
+                    (SELECT meta_value FROM lg_launched_game_meta m WHERE m.launched_game_id = g.id AND m.meta_name = 'customerName' LIMIT 1),
+                    (SELECT meta_value FROM lg_launched_game_meta m WHERE m.launched_game_id = g.id AND m.meta_name = 'customerAssignedAt' LIMIT 1)
+             FROM lg_launched_games g
+             WHERE g.client_id = ?1 AND g.ended = 0
+               AND NOT EXISTS (SELECT 1 FROM lg_launched_game_meta m WHERE m.launched_game_id = g.id
+                                 AND m.meta_name IN ('testMode', 'simulated') AND m.meta_value = 'true')",
+        )?;
+        let rows = stmt.query_map(params![client_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?, r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?))
+        })?;
+        for row in rows {
+            let (u, g, p, cid, name, at) = row?;
+            let Some(at) = at else { continue };
+            if let (Some(id), Some(n)) = (&cid, name) {
+                orphans.insert(id.clone(), n);
+            }
+            consider(u, (cid, g, p, at, false));
+        }
+    }
+
+    // customer x scenario -> (last played, count)
+    let mut played: HashMap<(String, String), (Option<String>, i64)> = HashMap::new();
+    for (cid, uniqid, played_at, _, _) in best.into_values() {
+        let (Some(cid), Some(uniqid)) = (cid, uniqid) else { continue };
+        let e = played.entry((resolve_customer_id(&redirects, &cid), uniqid)).or_insert((None, 0));
+        e.1 += 1;
+        if played_at > e.0 {
+            e.0 = played_at;
+        }
+    }
+    let played: Vec<Value> = played
+        .into_iter()
+        .map(|((cid, uniqid), (last, count))| {
+            json!({ "customer_id": cid, "game_uniqid": uniqid, "last_played_at": last, "count": count })
+        })
+        .collect();
+
+    // Ids games still carry but this cache lacks (a promoted mother whose
+    // cache is older, a quick-create on a device since replaced): keep them
+    // nameable from the games' own snapshot.
+    for (id, name) in orphans {
+        if !known.contains(&id) {
+            known.insert(id.clone());
+            customers.push(json!({ "id": id, "name": name, "type": null, "city": null, "archived": false }));
+        }
+    }
+
+    let cloud_supported: bool = c
+        .query_row(
+            "SELECT remote_version IS NOT NULL FROM customers_state WHERE client_id = ?1",
+            params![client_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    Ok(json!({
+        "supported": true,
+        "cloud_supported": cloud_supported,
+        "customers": customers,
+        "redirects": redirects,
+        "played": played,
+    }))
+}
+
+async fn customers_list(state: &AppState) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    Ok(state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Value> {
+            Ok(customers_list_sync(c, client_id)?)
+        })
+        .await?)
+}
+
+/// Quick-create a customer from any device of the LAN (name only, works
+/// offline). Idempotent on the client-generated id, so a retry is harmless.
+async fn customers_create(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let name: String = json_str(&body, "name")?.trim().chars().take(190).collect();
+    if name.is_empty() {
+        return Err(ApiErr::bad("name is required"));
+    }
+    let id = match body.get("id").and_then(|v| v.as_str()) {
+        Some(s) if looks_like_uuid(&s.to_lowercase()) => s.to_lowercase(),
+        Some(_) => return Err(ApiErr::bad("id must be a UUID")),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    // A code from studio's admin-managed customer types; studio validates it.
+    let ty = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty() && t.len() <= 40)
+        .map(|t| t.to_string());
+    let client_id = state.client_id;
+    let row = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<Value>> {
+            c.execute(
+                "INSERT OR IGNORE INTO customers (id, client_id, name, type, origin)
+                 VALUES (?1, ?2, ?3, ?4, 'local')",
+                params![id, client_id, name, ty],
+            )?;
+            Ok(c
+                .query_row(
+                    "SELECT id, name, type, city, archived FROM customers WHERE id = ?1 AND client_id = ?2",
+                    params![id, client_id],
+                    |r| {
+                        Ok(json!({
+                            "id": r.get::<_, String>(0)?,
+                            "name": r.get::<_, String>(1)?,
+                            "type": r.get::<_, Option<String>>(2)?,
+                            "city": r.get::<_, Option<String>>(3)?,
+                            "archived": r.get::<_, i64>(4)? != 0,
+                        }))
+                    },
+                )
+                .optional()?)
+        })
+        .await?;
+    row.map(|customer| json!({ "customer": customer }))
+        .ok_or_else(|| ApiErr::bad("customer id already used"))
+}
+
+/// Set / change / clear a game's customer, by summary_uuid: the live game's
+/// meta (running or ended) and/or its summary (survives Archive). Stamped with
+/// the mother's clock; the summary is flagged for re-push.
+fn assign_customer_sync(
+    c: &rusqlite::Connection,
+    client_id: i64,
+    summary_uuid: &str,
+    customer_id: Option<&str>,
+    fallback_name: Option<&str>,
+    at: &str,
+) -> rusqlite::Result<bool> {
+    let name: Option<String> = match customer_id {
+        Some(id) => c
+            .query_row("SELECT name FROM customers WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?
+            .or_else(|| fallback_name.map(|s| s.to_string())),
+        None => None,
+    };
+    let game_id: Option<i64> = c
+        .query_row(
+            "SELECT id FROM lg_launched_games WHERE client_id = ?1 AND summary_uuid = ?2",
+            params![client_id, summary_uuid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(gid) = game_id {
+        write_meta_customer(c, gid, customer_id, name.as_deref(), at)?;
+        bump_state_version_sync(c, Some(gid))?;
+    }
+    let n = c.execute(
+        "UPDATE lg_game_summaries
+           SET customer_id = ?3, customer_name = ?4, customer_assigned_at = ?5, customer_dirty = 1
+         WHERE client_id = ?1 AND summary_uuid = ?2",
+        params![client_id, summary_uuid, customer_id, name, at],
+    )?;
+    Ok(game_id.is_some() || n > 0)
+}
+
+async fn assign_customer(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+    let client_id = state.client_id;
+    // By summary_uuid (any game, archived included) or by the live game's id.
+    let summary_uuid = match body.get("summary_uuid").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            let id = json_i64(&body, "id")?;
+            state
+                .db
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+                    Ok(c.query_row(
+                        "SELECT summary_uuid FROM lg_launched_games WHERE id = ?1 AND client_id = ?2",
+                        params![id, client_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?)
+                })
+                .await?
+                .ok_or_else(|| ApiErr::not_found("game not found"))?
+        }
+    };
+    let customer_id = match body.get("customer_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if looks_like_uuid(&s.to_lowercase()) => Some(s.to_lowercase()),
+        Some(_) => return Err(ApiErr::bad("customer_id must be a UUID or null")),
+    };
+    let fallback_name = body.get("customer_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let at = now_iso_ms();
+    let at_reply = at.clone();
+    let found = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+            let tx = c.transaction()?;
+            let found = assign_customer_sync(
+                &tx, client_id, &summary_uuid, customer_id.as_deref(), fallback_name.as_deref(), &at,
+            )?;
+            tx.commit()?;
+            Ok(found)
+        })
+        .await?;
+    if !found {
+        return Err(ApiErr::not_found("game not found"));
+    }
+    Ok(json!({ "success": true, "assigned_at": at_reply }))
 }
 
 async fn register_device(
@@ -4806,6 +6058,8 @@ async fn list_paired_with_status(
 ) -> Result<Value, ApiErr> {
     let launched_game_id = parse_i64(rest, "launched_game_id")?;
     require_game_owned(state, launched_game_id).await?;
+    let (self_has_reader, self_screen_state) = self_presence(state).await;
+    let (op_ids, self_op) = operator_only_ids(state).await;
     let rows = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String, Option<String>, i64, Option<String>, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, i64, Option<String>)>> {
@@ -4860,23 +6114,34 @@ async fn list_paired_with_status(
         screen_state_json,
     ) in rows
     {
+        // The mother's own row is never bumped by a ping (it doesn't ping
+        // itself), so its DB columns read "offline, no reader, no screen" - which
+        // greyed out Reconnect on the mother for anyone viewing from a child. We
+        // ARE that device answering: online by definition, live presence.
+        let self_row = is_self == 1;
         // Stored as an opaque JSON string; re-parse so the frontend receives a
         // real object (null when never reported / unparseable).
-        let screen_state: Value = screen_state_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or(Value::Null);
+        let screen_state: Value = if self_row {
+            self_screen_state.clone()
+        } else {
+            screen_state_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or(Value::Null)
+        };
+        let online = if self_row { 1 } else { online };
         let row = json!({
             "id": id,
             "device_label": peer_label,
             "peer_os": peer_os,
-            "is_self": is_self == 1,
-            "has_reader": has_reader == 1,
+            "is_self": self_row,
+            "has_reader": if self_row { self_has_reader } else { has_reader == 1 },
             "reader_last_seen_at": reader_last_seen_at,
             "online": online == 1,
             "last_seen_at": last_seen_at,
             "lgd_id": lgd_id,
             "screen_state": screen_state,
+            "operator_only": if self_row { self_op } else { op_ids.contains(&id) },
         });
         if lgd_id.is_some() {
             in_game.push(row);
@@ -4912,6 +6177,7 @@ async fn list_paired_for_launch(state: &AppState, caller_device_id: i64) -> Resu
         Some(p) => *p.inner.lock().await,
         None => false,
     };
+    let (op_ids, self_op) = operator_only_ids(state).await;
     let rows = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
@@ -4927,8 +6193,10 @@ async fn list_paired_for_launch(state: &AppState, caller_device_id: i64) -> Resu
             )?;
             let rows = stmt.query_map([], |r| {
                 let is_self = r.get::<_, i64>(3)? == 1;
+                let id = r.get::<_, i64>(0)?;
                 Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
+                    "id": id,
+                    "operator_only": if is_self { self_op } else { op_ids.contains(&id) },
                     "device_label": r.get::<_, String>(1)?,
                     "peer_os": r.get::<_, Option<String>>(2)?,
                     "is_self": is_self,
@@ -4948,6 +6216,133 @@ async fn list_paired_for_launch(state: &AppState, caller_device_id: i64) -> Resu
     Ok(json!({ "devices": rows, "caller_device_id": caller_device_id }))
 }
 
+/// Operator-only peers (as last reported in their pings) + this device's own
+/// live setting (the mother never pings itself).
+async fn operator_only_ids(state: &AppState) -> (std::collections::HashSet<i64>, bool) {
+    let self_op = match state.app.try_state::<OperatorPresence>() {
+        Some(p) => *p.inner.lock().await,
+        None => false,
+    };
+    let ids = state
+        .db
+        .call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<std::collections::HashSet<i64>> {
+            let mut stmt = c.prepare("SELECT id FROM paired_devices WHERE operator_only = 1 AND is_self = 0")?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?;
+            Ok(ids)
+        })
+        .await
+        .unwrap_or_default();
+    (ids, self_op)
+}
+
+/// This (hosting) device's live reader + screen state, for its own `is_self`
+/// row - the mother never pings itself, so the DB columns stay stale.
+async fn self_presence(state: &AppState) -> (bool, Value) {
+    let has_reader = match state.app.try_state::<ReaderPresence>() {
+        Some(p) => *p.inner.lock().await,
+        None => false,
+    };
+    let screen_state = match state.app.try_state::<ScreenPresence>() {
+        Some(p) => p
+            .inner
+            .lock()
+            .await
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    (has_reader, screen_state)
+}
+
+// Every paired device with its live status, for the top-bar "Devices" modal
+// (not tied to one launched game). Each row also lists the ACTIVE games the
+// device is registered in - a device can be registered yet showing something
+// else (it left the game page without leaving the game), which the screen
+// state alone can't tell.
+async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, ApiErr> {
+    let (self_has_reader, self_screen_state) = self_presence(state).await;
+    let (op_ids, self_op) = operator_only_ids(state).await;
+    let client_id = state.client_id;
+    let (devices, regs) = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<(i64, String, Option<String>, bool, Option<String>, bool, bool, Option<String>)>, Vec<(i64, i64, String)>)> {
+            let mut stmt = c.prepare(
+                "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
+                        pd.last_seen_at, pd.has_reader,
+                        CASE WHEN pd.last_seen_at IS NOT NULL
+                               AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
+                             THEN 1 ELSE 0 END AS online,
+                        pd.screen_state_json
+                   FROM paired_devices pd
+                 ORDER BY pd.is_self DESC, online DESC, pd.peer_label COLLATE NOCASE ASC",
+            )?;
+            let devices = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)? == 1,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, i64>(5)? == 1,
+                        r.get::<_, i64>(6)? == 1,
+                        r.get::<_, Option<String>>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Newest game first, so the first entry is the one to rejoin.
+            let mut stmt = c.prepare(
+                "SELECT lgd.device_id, lg.id, lg.name
+                   FROM lg_launched_game_devices lgd
+                   JOIN lg_launched_games lg ON lg.id = lgd.launched_game_id
+                  WHERE lg.client_id = ? AND lg.ended = 0
+                  ORDER BY lg.id DESC",
+            )?;
+            let regs = stmt
+                .query_map(params![client_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((devices, regs))
+        })
+        .await?;
+
+    let rows: Vec<Value> = devices
+        .into_iter()
+        .map(|(id, label, os, is_self, last_seen_at, has_reader, online, screen_json)| {
+            let screen_state = if is_self {
+                self_screen_state.clone()
+            } else {
+                screen_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .unwrap_or(Value::Null)
+            };
+            let games: Vec<Value> = regs
+                .iter()
+                .filter(|(dev, _, _)| *dev == id)
+                .map(|(_, gid, name)| json!({ "launched_game_id": gid, "name": name }))
+                .collect();
+            json!({
+                "id": id,
+                "device_label": label,
+                "peer_os": os,
+                "is_self": is_self,
+                "online": is_self || online,
+                "last_seen_at": last_seen_at,
+                "has_reader": if is_self { self_has_reader } else { has_reader },
+                "screen_state": screen_state,
+                "operator_only": if is_self { self_op } else { op_ids.contains(&id) },
+                "games": games,
+            })
+        })
+        .collect();
+    Ok(json!({ "devices": rows, "caller_device_id": caller_device_id }))
+}
+
 /// Mother-only push queue. Three command kinds today:
 /// - `join_game`     - payload `{launched_game_id}` - target satellite is
 ///                     expected to register_device + navigate to GamePage.
@@ -4962,6 +6357,8 @@ async fn list_paired_for_launch(state: &AppState, caller_device_id: i64) -> Resu
 /// - `reload_config` - payload `{launched_game_id}` - target (must be in the
 ///                     game) re-derives its running game page's config from the
 ///                     freshly-saved meta, so a config edit applies live.
+/// - `lock_device` / `show_logo` - payload `{}` - raise the PIN lock overlay /
+///                     the idle logo screen on any paired device.
 ///
 /// Authorization: any authenticated paired device may queue commands. Children
 /// operate the mother's games (add teams, launch on another device, push videos,
@@ -5031,8 +6428,14 @@ async fn queue_command_inner(
     // `join_game`: a child (e.g. an operator-only tablet) launching a game can
     // pick the mother as a participating device. Every other kind stays
     // rejected: they only make sense for a satellite.
+    // Game simulator remote control (tester builds) may also drive the mother.
+    let sim_self = cfg!(feature = "devtools") && kind == "sim_control";
     if target_device_id == state.self_peer_id
-        && !matches!(kind, "play_video" | "stop_video" | "join_game")
+        && !sim_self
+        && !matches!(
+            kind,
+            "play_video" | "stop_video" | "join_game" | "lock_device" | "show_logo"
+        )
     {
         return Err(ApiErr::bad("Cannot queue a command targeting self"));
     }
@@ -5047,6 +6450,17 @@ async fn queue_command_inner(
             let gid = launched_game_id
                 .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
             require_game_owned(state, gid).await?;
+            // An operator-only device (every Android tablet) controls games but
+            // never plays one: refuse to push it into a game, whoever asks.
+            let (op_ids, self_op) = operator_only_ids(state).await;
+            let target_op = if target_device_id == state.self_peer_id {
+                self_op
+            } else {
+                op_ids.contains(&target_device_id)
+            };
+            if target_op {
+                return Err(ApiErr::status(StatusCode::CONFLICT, "target_operator_only"));
+            }
             // `rejoin: true` is the Devices-modal "Reconnect" action: re-push a
             // navigate-to-game command to a device that's ALREADY a participant
             // but has drifted off the game page. It must bypass the
@@ -5155,11 +6569,26 @@ async fn queue_command_inner(
                 .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
             require_game_owned(state, gid).await?;
         }
+        "sim_control" if cfg!(feature = "devtools") => {
+            // Game simulator remote control (tester builds only): start /
+            // pause / speed / stop the simulator executor on the target. The
+            // target's executor re-checks the game; here we only verify that
+            // the caller owns it.
+            let gid = launched_game_id
+                .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
+            require_game_owned(state, gid).await?;
+        }
+        "lock_device" | "show_logo" => {
+            // Top-bar Devices modal: raise the PIN lock overlay / the idle logo
+            // screen on any paired device, in a game or not. Display-only, no
+            // game to validate; the target's own PIN still gates unlocking.
+        }
         _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
     }
 
     // Self-targeted command (video: a satellite operator driving the mother's
-    // own screen; join_game: a child launching onto the mother). Emit the very same `taghunter://lan-command` event the
+    // own screen; join_game: a child launching onto the mother; lock_device /
+    // show_logo: a child locking or blanking the mother). Emit the very same `taghunter://lan-command` event the
     // satellite path emits on /ping.php pickup - <OperatorVideoOverlay> at the
     // App root already handles it - instead of inserting an unreadable queue
     // row. The overlay's usual "repoint at the pushing mother, then fetch the
@@ -5387,28 +6816,25 @@ async fn record_completed_quest(state: &AppState, body: Value) -> Result<Value, 
         return Err(ApiErr::not_found("Team not found"));
     }
 
-    let qn_for_dup = quest_number.clone();
-    if !allow_duplicates {
-        let existing: Option<i64> = state
-            .db
-            .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
-                Ok(c.query_row(
-                    "SELECT id FROM lg_team_completed_quests
-                     WHERE team_id = ? AND quest_number = ?",
-                    params![team_id, qn_for_dup],
-                    |r| r.get(0),
-                )
-                .optional()?)
-            })
-            .await?;
-        if let Some(eid) = existing {
-            return Ok(json!({ "inserted": false, "id": eid }));
-        }
-    }
-
-    let new_id = state
+    // Duplicate check + insert in ONE db call (the connection runs calls one at
+    // a time): split in two, two teammates' reads arriving together could both
+    // pass the check and record the same quest twice.
+    let (inserted, id) = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(bool, i64)> {
+            if !allow_duplicates {
+                let existing: Option<i64> = c
+                    .query_row(
+                        "SELECT id FROM lg_team_completed_quests
+                         WHERE team_id = ? AND quest_number = ?",
+                        params![team_id, quest_number],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(eid) = existing {
+                    return Ok((false, eid));
+                }
+            }
             c.execute(
                 "INSERT INTO lg_team_completed_quests
                    (launched_game_id, team_id, teammate_chip_id, quest_number, points_awarded)
@@ -5421,10 +6847,10 @@ async fn record_completed_quest(state: &AppState, body: Value) -> Result<Value, 
                     points_awarded,
                 ],
             )?;
-            Ok(c.last_insert_rowid())
+            Ok((true, c.last_insert_rowid()))
         })
         .await?;
-    Ok(json!({ "inserted": true, "id": new_id }))
+    Ok(json!({ "inserted": inserted, "id": id }))
 }
 
 // Delete the most-recent completion row for (team, quest_number). Used by the
@@ -5601,6 +7027,77 @@ fn clash_owner(counts: &HashMap<i64, i64>) -> Option<i64> {
 /// by the locked effectif multiplier (largest clan ÷ this clan). The same
 /// replay derives the event feed (conquest / attack / neutralized). Exact
 /// weighted values are returned alongside the rounded display value.
+/// "Now" for one game, in epoch seconds: the game simulator's virtual clock when
+/// the game carries a `sim_clock` meta (tester builds - written by the
+/// simulator director), else the wall clock. Keeps Clash ownership minutes,
+/// validation stamps and the end stamp in the same timeline as the pages.
+fn game_now_secs(c: &rusqlite::Connection, lgid: i64) -> rusqlite::Result<i64> {
+    let real_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let raw: Option<String> = c
+        .query_row(
+            "SELECT meta_value FROM lg_launched_game_meta
+              WHERE launched_game_id = ?1 AND meta_name = 'sim_clock'",
+            params![lgid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(v) = raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        if let (Some(ra), Some(va), Some(sp)) = (
+            v.get("realAnchor").and_then(|x| x.as_f64()),
+            v.get("virtualAnchor").and_then(|x| x.as_f64()),
+            v.get("speed").and_then(|x| x.as_f64()),
+        ) {
+            let eff = v.get("pausedAt").and_then(|x| x.as_f64()).unwrap_or(real_ms as f64);
+            return Ok(((va + (eff - ra) * sp) / 1000.0) as i64);
+        }
+    }
+    Ok(real_ms / 1000)
+}
+
+/// The territories a Purge may hit, best first: those where the leading clan
+/// has validations (`leader_count` > 0), by that count, then pts/min. Within a
+/// full tie, a deterministic pick leads (FNV-1a over game id + the tied
+/// indexes): stable while the tied set is unchanged, NOT re-rolled per query,
+/// so the displayed target is what a purge hits. The rest follow by index.
+fn clash_purge_order(territories: &[ClashTerr], lgid: i64, leader_count: impl Fn(i64) -> i64) -> Vec<i64> {
+    let key = |t: &ClashTerr| (leader_count(t.index), t.points);
+    let mut rest: Vec<&ClashTerr> = territories.iter().filter(|t| leader_count(t.index) > 0).collect();
+    let mut order: Vec<i64> = Vec::new();
+    while let Some(best) = rest.iter().map(|t| key(t)).max() {
+        let mut group: Vec<&ClashTerr> = rest.iter().copied().filter(|t| key(t) == best).collect();
+        rest.retain(|t| key(t) != best);
+        group.sort_by_key(|t| t.index);
+        if group.len() > 1 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            let mut mix = |x: u64| {
+                h = (h ^ x).wrapping_mul(0x100000001b3);
+            };
+            mix(lgid as u64);
+            for t in &group {
+                mix(t.index as u64);
+            }
+            let lead = group.remove((h % group.len() as u64) as usize);
+            order.push(lead.index);
+        }
+        order.extend(group.iter().map(|t| t.index));
+    }
+    order
+}
+
+/// The territory a clan's Purge hits: the first of `order` (clash_purge_order)
+/// that the purging clan does not own - never its own territory. Err = the
+/// refusal status: "no_target" (nothing to purge) or "own_territory" (every
+/// candidate is the purger's own).
+fn clash_purge_pick(order: &[i64], owner_of: impl Fn(i64) -> Option<i64>, purger: i64) -> Result<i64, &'static str> {
+    if order.is_empty() {
+        return Err("no_target");
+    }
+    order.iter().copied().find(|ti| owner_of(*ti) != Some(purger)).ok_or("own_territory")
+}
+
 fn compute_clash_standings(
     c: &rusqlite::Connection,
     lgid: i64,
@@ -5681,7 +7178,7 @@ fn compute_clash_standings(
             params![lgid],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-    let now: i64 = c.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
+    let now: i64 = game_now_secs(c, lgid)?;
     let start = start_opt.unwrap_or(now);
     let integration_end: i64 = match start_opt {
         None => start,
@@ -5857,75 +7354,44 @@ fn compute_clash_standings(
         }));
     }
 
-    // ── The Purge: current global target + spent quotas ─────────────────────
-    // Target = the territory where the LEADING clan (unique #1 by exact
-    // weighted score) has the most validation counts; tie → highest pts/min;
-    // still tied → a deterministic pick that is stable while the tied set is
-    // unchanged (FNV-1a over game id + sorted candidate indexes - NOT re-rolled
-    // per query, so the displayed target always equals what a purge would hit).
-    // No unique leader, or the leader has zero validations everywhere ⇒ no
-    // target. Design: project_clash_purge_feature.
-    let purge_target: Option<i64> = if !cfg.purge_enabled {
-        None
+    // ── The Purge: target order + spent quotas ──────────────────────────────
+    // The territories a Purge may hit, best first: those where the LEADING
+    // clan (unique #1 by exact weighted score) has validations, by its count,
+    // then pts/min (see clash_purge_order). The first one is the displayed
+    // target. A purging clan never hits a territory it owns: it gets the first
+    // one in this order that it does not own (clash_validate). No unique
+    // leader, or the leader has zero validations everywhere ⇒ no target.
+    // Design: project_clash_purge_feature.
+    let purge_order: Vec<i64> = if !cfg.purge_enabled {
+        Vec::new()
     } else {
-        let leader: Option<i64> = {
-            let best = exact_scores
-                .iter()
-                .map(|(_, s)| *s)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let top: Vec<i64> = exact_scores
-                .iter()
-                .filter(|(_, s)| *s == best)
-                .map(|(t, _)| *t)
-                .collect();
-            if top.len() == 1 { Some(top[0]) } else { None }
-        };
-        leader.and_then(|leader| {
-            let leader_count = |terr: i64| -> i64 {
+        let best = exact_scores
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let top: Vec<i64> = exact_scores
+            .iter()
+            .filter(|(_, s)| *s == best)
+            .map(|(t, _)| *t)
+            .collect();
+        if top.len() == 1 {
+            let leader = top[0];
+            clash_purge_order(&cfg.territories, lgid, |terr| {
                 t_counts
                     .get(&terr)
                     .and_then(|m| m.get(&leader))
                     .copied()
                     .unwrap_or(0)
-            };
-            let max_count = cfg
-                .territories
-                .iter()
-                .map(|t| leader_count(t.index))
-                .max()
-                .unwrap_or(0);
-            if max_count == 0 {
-                return None;
-            }
-            let mut candidates: Vec<&ClashTerr> = cfg
-                .territories
-                .iter()
-                .filter(|t| leader_count(t.index) == max_count)
-                .collect();
-            let max_points = candidates.iter().map(|t| t.points).max().unwrap_or(0);
-            candidates.retain(|t| t.points == max_points);
-            candidates.sort_by_key(|t| t.index);
-            if candidates.len() == 1 {
-                return Some(candidates[0].index);
-            }
-            // Deterministic FNV-1a "random" among the tied candidates.
-            let mut h: u64 = 0xcbf29ce484222325;
-            let mut mix = |x: u64| {
-                let mut hh = h ^ x;
-                hh = hh.wrapping_mul(0x100000001b3);
-                h = hh;
-            };
-            mix(lgid as u64);
-            for t in &candidates {
-                mix(t.index as u64);
-            }
-            Some(candidates[(h % candidates.len() as u64) as usize].index)
-        })
+            })
+        } else {
+            Vec::new()
+        }
     };
     let purge_json = json!({
         "enabled": cfg.purge_enabled,
         "station": cfg.purge_station,
-        "target_territory_index": purge_target,
+        "target_territory_index": purge_order.first(),
+        "target_order": purge_order,
         "used_by": purge_used_by,
     });
 
@@ -6211,46 +7677,47 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                     purge_json =
                         Some(json!({ "attempted": true, "status": "already_used" }));
                 } else {
-                    // Target + current owner as of this instant (pre-purge state).
+                    // Target as of this instant (pre-purge state): the first
+                    // territory of the order that this clan does not own. Only
+                    // its own territories left ⇒ refused, quota not spent.
                     let pre = compute_clash_standings(&tx, launched_game_id, &cfg, false)?;
-                    let target = pre
+                    let order: Vec<i64> = pre
                         .get("purge")
-                        .and_then(|p| p.get("target_territory_index"))
-                        .and_then(|v| v.as_i64());
-                    match target {
-                        None => {
-                            purge_json =
-                                Some(json!({ "attempted": true, "status": "no_target" }));
+                        .and_then(|p| p.get("target_order"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                        .unwrap_or_default();
+                    let owner_of = |ti: i64| -> Option<i64> {
+                        pre.get("territories")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.iter().find(|t| t.get("index").and_then(|x| x.as_i64()) == Some(ti)))
+                            .and_then(|t| t.get("owner_team_id"))
+                            .and_then(|v| v.as_i64())
+                    };
+                    match clash_purge_pick(&order, owner_of, team_id) {
+                        Err(status) => {
+                            purge_json = Some(json!({ "attempted": true, "status": status }));
                         }
-                        Some(ti) => {
-                            let owner: Option<i64> = pre
-                                .get("territories")
-                                .and_then(|v| v.as_array())
-                                .and_then(|arr| {
-                                    arr.iter().find(|t| {
-                                        t.get("index").and_then(|x| x.as_i64()) == Some(ti)
-                                    })
-                                })
-                                .and_then(|t| t.get("owner_team_id"))
-                                .and_then(|v| v.as_i64());
-                            if owner == Some(team_id) {
-                                purge_json = Some(
-                                    json!({ "attempted": true, "status": "own_territory" }),
-                                );
-                            } else {
-                                seq += 1;
-                                tx.execute(
-                                    "INSERT INTO lg_clash_purges
-                                       (launched_game_id, team_id, chip_id, territory_index, seq)
-                                     VALUES (?, ?, ?, ?, ?)",
-                                    params![launched_game_id, team_id, chip_id, ti, seq],
-                                )?;
-                                purge_json = Some(json!({
-                                    "attempted": true,
-                                    "status": "ok",
-                                    "territory_index": ti,
-                                }));
-                            }
+                        Ok(ti) => {
+                            seq += 1;
+                            tx.execute(
+                                "INSERT INTO lg_clash_purges
+                                   (launched_game_id, team_id, chip_id, territory_index, seq, created_at)
+                                 VALUES (?, ?, ?, ?, ?, datetime(?, 'unixepoch'))",
+                                params![
+                                    launched_game_id,
+                                    team_id,
+                                    chip_id,
+                                    ti,
+                                    seq,
+                                    game_now_secs(&tx, launched_game_id)?
+                                ],
+                            )?;
+                            purge_json = Some(json!({
+                                "attempted": true,
+                                "status": "ok",
+                                "territory_index": ti,
+                            }));
                         }
                     }
                 }
@@ -6277,9 +7744,17 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                 seq += 1;
                 tx.execute(
                     "INSERT INTO lg_clash_validations
-                       (launched_game_id, team_id, chip_id, combo_index, territory_index, seq)
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    params![launched_game_id, team_id, chip_id, t.index, t.index, seq],
+                       (launched_game_id, team_id, chip_id, combo_index, territory_index, seq, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, datetime(?, 'unixepoch'))",
+                    params![
+                        launched_game_id,
+                        team_id,
+                        chip_id,
+                        t.index,
+                        t.index,
+                        seq,
+                        game_now_secs(&tx, launched_game_id)?
+                    ],
                 )?;
                 credited.push(json!({ "territory_index": t.index }));
 
@@ -6392,29 +7867,59 @@ async fn clash_state(state: &AppState, rest: &HashMap<String, String>) -> Result
 
 // ─── action handlers: pair ───────────────────────────────────────────────────
 
-/// Unauthenticated identity for the gateway direct-probe (F13). Returns the
-/// same identity fields the mDNS TXT record carries so a child can build a
-/// DiscoveredMother without multicast. Epoch is computed live (MAX over this
+/// Unauthenticated identity probe (pairing by address, reachability test).
+/// Returns the same identity fields the mDNS TXT record carries so a child can
+/// build a DiscoveredMother without multicast, plus our LAN protocol/app version
+/// so an outdated peer can be told which side to update. Epoch is computed live (MAX over this
 /// client's active games, mirroring the value advertised at server start).
 async fn pair_hello_handler(state: &AppState) -> Result<Value, ApiErr> {
     let client_id = state.client_id;
-    let epoch: i64 = state
+    let self_peer_id = state.self_peer_id;
+    // `running_games`: unfinished games whose clock has not run out - what the
+    // returning mother asks before taking the hosting back from a substitute.
+    // The mDNS TXT can't say: it is not refreshed when a game ends. A game
+    // forgotten since yesterday (still `ended = 0` until the 24 h sweep) is not
+    // "running".
+    let (epoch, running_games, label): (i64, i64, Option<String>) = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<i64> {
-            Ok(c.query_row(
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(i64, i64, Option<String>)> {
+            let epoch: i64 = c.query_row(
                 "SELECT COALESCE(MAX(mother_epoch), 1)
                  FROM lg_launched_games WHERE client_id = ? AND ended = 0",
                 params![client_id],
                 |r| r.get(0),
-            )?)
+            )?;
+            let running: i64 = c.query_row(
+                "SELECT COUNT(*) FROM lg_launched_games
+                  WHERE client_id = ? AND ended = 0
+                    AND COALESCE(start_time, created_at) > datetime('now','-24 hours')
+                    AND (start_time IS NULL OR duration <= 0
+                         OR datetime(start_time, '+' || duration || ' minutes') > datetime('now'))",
+                params![client_id],
+                |r| r.get(0),
+            )?;
+            let label: Option<String> = c
+                .query_row(
+                    "SELECT peer_label FROM paired_devices WHERE id = ?",
+                    params![self_peer_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok((epoch, running, label.filter(|l| l != SELF_PLACEHOLDER_LABEL)))
         })
         .await
-        .unwrap_or(1);
+        .unwrap_or((1, 0, None));
     Ok(json!({
         "status": "ok",
         "mother_uuid": state.mother_uuid,
         "client_id": client_id,
         "epoch": epoch,
+        "role": state.role.code(),
+        "since": state.since,
+        "running_games": running_games,
+        "label": label,
+        "lan_proto": LAN_PROTO,
+        "app_version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -6429,9 +7934,9 @@ async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, Ap
         .get("peer_app_version")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    // Mother/hotspot role rework (E1 auto-pair): a joiner proves same-client
+    // Mother role rework (E1 auto-pair): a joiner proves same-client
     // membership by sending its client_id. The trust boundary is the LAN itself
-    // (venue Wi-Fi / hotspot password), so a device that's reachable AND claims
+    // (the venue network), so a device that's reachable AND claims
     // the mother's own client_id is auto-approved - no operator tap. Older
     // clients omit this field and fall through to the manual-approval flow.
     let peer_client_id = body.get("client_id").and_then(|v| v.as_i64());
@@ -6586,7 +8091,7 @@ async fn pair_request_handler(state: &AppState, body: Value) -> Result<Value, Ap
 
 // ─── tauri commands: pair management on mother ───────────────────────────────
 
-async fn open_db_for_command(app: &AppHandle) -> Result<DbConnection, String> {
+pub(crate) async fn open_db_for_command(app: &AppHandle) -> Result<DbConnection, String> {
     let path = resolve_db_path(app)?;
     let conn = DbConnection::open(path)
         .await
@@ -6900,6 +8405,9 @@ pub enum JoinOutcome {
     AlreadyPaired,
     Timeout,
     Unreachable { message: String },
+    /// The mother speaks another LAN protocol: one of the two PCs must be
+    /// updated. `theirs` < LAN_PROTO means the MOTHER is outdated.
+    ProtoMismatch { theirs: u32, their_app_version: Option<String> },
 }
 
 /// Do these two IPv4 addresses sit on the same /24? The one test that decides
@@ -6941,9 +8449,8 @@ fn order_pair_candidates(addresses: &[String]) -> Vec<String> {
 }
 
 /// Run the full pair handshake against a discovered mother FROM RUST (reqwest),
-/// so it is not subject to the webview's `http:` capability scope - the LAN AP
-/// hands out arbitrary IPs (192.168.137.1, 169.254.x APIPA, …) that are painful
-/// to allowlist. Tries each candidate address until one connects, POSTs the
+/// so it is not subject to the webview's `http:` capability scope - a router
+/// hands out arbitrary LAN IPs that are painful to allowlist. Tries each candidate address until one connects, POSTs the
 /// pair request, polls for approval, and on success persists the secret to
 /// `paired_mothers` + warms the endpoint cache so pings work immediately.
 #[tauri::command]
@@ -6957,7 +8464,7 @@ pub async fn client_pair_with_mother(
     peer_label: String,
     peer_os: Option<String>,
     peer_app_version: Option<String>,
-    // Mother/hotspot role rework: our own client_id, sent so a same-client mother
+    // Mother role rework: our own client_id, sent so a same-client mother
     // can auto-approve us on the LAN (E1) without an operator tap. None when the
     // caller doesn't know it (falls back to manual approval).
     client_id: Option<i64>,
@@ -7022,7 +8529,7 @@ pub async fn client_pair_with_mother(
         });
     }
 
-    let client = reqwest::Client::builder()
+    let client = lan_client_builder()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_millis(1500))
         .build()
@@ -7049,10 +8556,24 @@ pub async fn client_pair_with_mother(
             .await
         {
             Ok(resp) => {
+                let refused_proto = resp.status() == reqwest::StatusCode::UPGRADE_REQUIRED;
                 let body: serde_json::Value = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => { last_err = e.to_string(); continue; }
                 };
+                // A newer mother refused us (426), or an older one answered
+                // without announcing LAN_PROTO: never pair across protocols.
+                let theirs = if refused_proto {
+                    body.get("lan_proto").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(LAN_PROTO + 1)
+                } else {
+                    announced_proto(&body)
+                };
+                if theirs != LAN_PROTO {
+                    return Ok(JoinOutcome::ProtoMismatch {
+                        theirs,
+                        their_app_version: vstr(&body, "app_version"),
+                    });
+                }
                 match body.get("status").and_then(|s| s.as_str()) {
                     Some("already_paired") => return Ok(JoinOutcome::AlreadyPaired),
                     // Auto-pair fast path: the same-client mother approved us
@@ -7152,6 +8673,99 @@ pub async fn client_pair_with_mother(
     }
 }
 
+/// Unauthenticated `pair.php?action=hello` at one socket address; the parsed
+/// reply when a mother answers.
+async fn hello_at(sock: SocketAddr) -> Option<Value> {
+    let client = lan_client_builder()
+        .timeout(Duration::from_millis(1500))
+        .connect_timeout(Duration::from_millis(800))
+        .build()
+        .ok()?;
+    let resp = client
+        .get(format!("http://{sock}/pair.php?action=hello"))
+        .send()
+        .await
+        .ok()?;
+    let body: Value = resp.json().await.ok()?;
+    body.get("mother_uuid").and_then(|v| v.as_str()).filter(|u| !u.is_empty())?;
+    Some(body)
+}
+
+/// Pair with a mother by its typed IP - the fallback when the router or venue
+/// network filters mDNS multicast. `address` is "a.b.c.d" (the PREFERRED_PORTS
+/// are probed in order) or "a.b.c.d:port". On success the address is stored in
+/// `paired_mothers.manual_addr` so later reconnects work without mDNS.
+#[tauri::command]
+pub async fn client_pair_by_address(
+    app: AppHandle,
+    cache: tauri::State<'_, MotherEndpointCache>,
+    address: String,
+    peer_label: String,
+    peer_os: Option<String>,
+    peer_app_version: Option<String>,
+    client_id: Option<i64>,
+) -> Result<JoinOutcome, String> {
+    let address = address.trim();
+    let candidates: Vec<SocketAddr> = if let Ok(sock) = address.parse::<SocketAddr>() {
+        vec![sock]
+    } else if let Ok(ip) = address.parse::<Ipv4Addr>() {
+        PREFERRED_PORTS.iter().map(|p| SocketAddr::new(ip.into(), *p)).collect()
+    } else {
+        return Ok(JoinOutcome::Unreachable {
+            message: format!("invalid IPv4 address: {address}"),
+        });
+    };
+    let mut found: Option<(SocketAddr, Value)> = None;
+    for sock in candidates {
+        if let Some(hello) = hello_at(sock).await {
+            found = Some((sock, hello));
+            break;
+        }
+    }
+    let Some((sock, hello)) = found else {
+        return Ok(JoinOutcome::Unreachable {
+            message: format!("no Tag Hunter mother answered at {address}"),
+        });
+    };
+    let theirs = announced_proto(&hello);
+    if theirs != LAN_PROTO {
+        return Ok(JoinOutcome::ProtoMismatch {
+            theirs,
+            their_app_version: vstr(&hello, "app_version"),
+        });
+    }
+    let mother_uuid = vstr(&hello, "mother_uuid").unwrap_or_default();
+    let outcome = client_pair_with_mother(
+        app.clone(),
+        cache,
+        mother_uuid.clone(),
+        None,
+        vec![sock.ip().to_string()],
+        sock.port(),
+        peer_label,
+        peer_os,
+        peer_app_version,
+        client_id,
+        None,
+        Some(true),
+    )
+    .await?;
+    if matches!(outcome, JoinOutcome::Approved | JoinOutcome::AlreadyPaired) {
+        let conn = open_db_for_command(&app).await?;
+        let addr = sock.to_string();
+        conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+            c.execute(
+                "UPDATE paired_mothers SET manual_addr = ? WHERE mother_uuid = ?",
+                params![addr, mother_uuid],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(outcome)
+}
+
 // ─── tauri commands: mDNS ────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -7165,6 +8779,15 @@ pub struct DiscoveredMother {
     // mother that doesn't advertise them yet). Slice 5 uses these to re-point.
     pub client_id: Option<i64>,
     pub epoch: Option<i64>,
+    /// `lp` TXT key; 1 for a hotspot-era mother that doesn't advertise it. The
+    /// renderer never auto-joins a mother on another protocol and labels it
+    /// "to update" in the discovery list.
+    pub lan_proto: u32,
+    /// `role` TXT key: "m" = the device set as the mother, "s" = a substitute
+    /// (see `HostRole`). None for a build that predates roles.
+    pub role: Option<String>,
+    /// `since` TXT key: when that mother was designated (ms), 0 if unknown.
+    pub since: Option<i64>,
 }
 
 const MDNS_SERVICE_TYPE: &str = "_taghunter._tcp.local.";
@@ -7177,36 +8800,22 @@ fn start_mdns(
     // serving their client and prefer the highest epoch when re-pointing.
     client_id: i64,
     epoch: i64,
-    // Extra addresses to advertise (e.g. the hotspot AP IPv4 once it exists),
-    // merged with this host's interface IPv4s. The combined set is then LOCKED
-    // to the mother's DESIGNATED isolated LAN via `designated_lan_addrs` before
-    // it is advertised - see that fn and `source` below.
-    extra_addrs: &[String],
-    // The mother's LAN source ('hotspot' | 'router', schema_meta
-    // `lan_network_source`). Selects which of our IPs count as the designated
-    // isolated network so we NEVER advertise the mother on its internet-connected
-    // office/upstream interface (that would let an off-hotspot child join).
-    source: &str,
+    role: HostRole,
+    since: i64,
 ) -> Result<MdnsHandle, String> {
     let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
 
-    // Gather every candidate IPv4 (explicit extras + this host's interfaces),
-    // then lock down to the designated isolated LAN. We deliberately do NOT call
-    // `enable_addr_auto()`: it re-adds ALL interfaces at register time, which is
-    // exactly how the mother used to leak its office/upstream IP.
-    let mut candidates: Vec<String> = extra_addrs.to_vec();
-    for ip in local_ipv4s() {
-        candidates.push(ip.to_string());
-    }
+    // This host's interface IPv4s, filtered by `designated_lan_addrs`. We
+    // deliberately do NOT call `enable_addr_auto()`: it re-adds ALL interfaces
+    // (loopback, link-local, virtual adapters) at register time.
+    let mut candidates: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
     candidates.sort();
     candidates.dedup();
-    let advertised = designated_lan_addrs(source, &candidates);
+    let advertised = designated_lan_addrs(&candidates);
     if advertised.is_empty() {
-        // Designated LAN not up yet (hotspot mode before the AP is raised). Don't
-        // advertise a reachable service at all - a child must never resolve the
-        // mother on the office/upstream network. `mother_refresh_mdns` re-registers
-        // once the AP IPv4 exists. Inert handle: empty full_name -> unregister/
-        // shutdown are safe no-ops.
+        // No LAN address yet (Wi-Fi not joined). Inert handle: empty full_name ->
+        // unregister/shutdown are safe no-ops; `mother_ensure_mdns_live`
+        // re-registers once an address exists.
         return Ok(MdnsHandle {
             daemon,
             full_name: String::new(),
@@ -7219,6 +8828,9 @@ fn start_mdns(
     props.insert("uuid".into(), mother_uuid.to_string());
     props.insert("client_id".into(), client_id.to_string());
     props.insert("epoch".into(), epoch.to_string());
+    props.insert("lp".into(), LAN_PROTO.to_string());
+    props.insert("role".into(), role.code().to_string());
+    props.insert("since".into(), since.to_string());
     // Never advertise without a name: satellites fall back to the uuid prefix
     // ("3ea399e5"), which nobody on the field can map to a PC (retours sept. #7).
     // Promotion paths used to pass no label at all.
@@ -7282,6 +8894,14 @@ async fn run_mdns_discovery(timeout: Duration) -> Result<Vec<DiscoveredMother>, 
                 let epoch = props
                     .get_property_val_str("epoch")
                     .and_then(|s| s.parse::<i64>().ok());
+                let lan_proto = props
+                    .get_property_val_str("lp")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let role = props.get_property_val_str("role").map(|s| s.to_string());
+                let since = props
+                    .get_property_val_str("since")
+                    .and_then(|s| s.parse::<i64>().ok());
                 let addrs: Vec<String> = info
                     .get_addresses()
                     .iter()
@@ -7297,6 +8917,9 @@ async fn run_mdns_discovery(timeout: Duration) -> Result<Vec<DiscoveredMother>, 
                         label,
                         client_id,
                         epoch,
+                        lan_proto,
+                        role,
+                        since,
                     },
                 );
             }
@@ -7308,70 +8931,19 @@ async fn run_mdns_discovery(timeout: Duration) -> Result<Vec<DiscoveredMother>, 
     Ok(found.into_values().collect())
 }
 
-/// F13 direct-probe fallback: on a hotspot lease (192.168.137.x), hit the ICS
-/// gateway (192.168.137.1) over HTTP at the preferred ports and, if a mother
-/// answers `pair.php?action=hello`, return it as a DiscoveredMother. This finds
-/// the mother even when mDNS multicast is filtered on the Windows "Public"
-/// profile. Returns None when not on the hotspot subnet or nothing answers.
-async fn probe_gateway_mother() -> Option<DiscoveredMother> {
-    const GATEWAY: &str = "192.168.137.1";
-    // Only meaningful when WE hold a hotspot-subnet lease; otherwise the gateway
-    // isn't ours to probe (and a router-mode mother is found via mDNS anyway).
-    let on_hotspot = local_ipv4s()
-        .iter()
-        .any(|ip| ip.to_string().starts_with("192.168.137."));
-    if !on_hotspot {
-        return None;
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(700))
-        .connect_timeout(Duration::from_millis(400))
-        .build()
-        .ok()?;
-    for port in PREFERRED_PORTS {
-        let url = format!("http://{GATEWAY}:{port}/pair.php?action=hello");
-        let Ok(resp) = client.get(&url).send().await else { continue };
-        let Ok(body) = resp.json::<Value>().await else { continue };
-        let Some(uuid) = body.get("mother_uuid").and_then(|v| v.as_str()) else { continue };
-        if uuid.is_empty() {
-            continue;
-        }
-        return Some(DiscoveredMother {
-            mother_uuid: uuid.to_string(),
-            host: format!("{GATEWAY}.local."),
-            addresses: vec![GATEWAY.to_string()],
-            port,
-            label: None,
-            client_id: body.get("client_id").and_then(|v| v.as_i64()),
-            epoch: body.get("epoch").and_then(|v| v.as_i64()),
-        });
-    }
-    None
-}
-
 #[tauri::command]
 pub async fn client_discover_mothers(
     timeout_ms: Option<u64>,
 ) -> Result<Vec<DiscoveredMother>, String> {
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(2500));
-    // Run the mDNS browse and the gateway direct-probe concurrently, then merge.
-    // mDNS wins on a uuid collision (it carries the full advertised address list);
-    // the gateway probe only ADDS a mother multicast filtering would have hidden.
-    let (mdns_res, gw) = tokio::join!(run_mdns_discovery(timeout), probe_gateway_mother());
-    let mut mothers = mdns_res?;
-    if let Some(g) = gw {
-        if !mothers.iter().any(|m| m.mother_uuid == g.mother_uuid) {
-            mothers.push(g);
-        }
-    }
-    Ok(mothers)
+    run_mdns_discovery(timeout).await
 }
 
 /// Result of a manual reachability probe (Step 3 of the hand-driven connect
 /// flow). `ok` distinguishes "discoverable" (mDNS answered in Step 2) from
 /// "reachable" (the TCP connect actually completed) - the exact split that tells
 /// a MOTHER firewall block apart from a wrong-subnet child.
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct MotherProbe {
     /// true = at least one advertised address answered the hello.
     pub ok: bool,
@@ -7392,6 +8964,13 @@ pub struct MotherProbe {
     /// "unreachable" (no route / net-unreachable), "http" (answered but not a
     /// mother), or "other". None when ok. Drives which headline the child shows.
     pub category: Option<String>,
+    /// From the hello body, when ok: the mother's device name, why it hosts
+    /// ("m" / "s", None for an older build), when it was designated, and how
+    /// many games are running on it right now (see `pair_hello_handler`).
+    pub label: Option<String>,
+    pub role: Option<String>,
+    pub since: Option<i64>,
+    pub running_games: Option<i64>,
 }
 
 /// Walk a reqwest error's whole `source()` chain into one string, so the REAL
@@ -7453,11 +9032,12 @@ pub async fn client_probe_mother(
             latency_ms: None,
             errors: vec!["mother advertised no usable IPv4 address".into()],
             category: Some("other".into()),
+            ..Default::default()
         });
     }
     // Generous timeouts: a working-but-slow path (busy ICS host, first connect)
     // must not be cut off and mislabeled as a firewall block.
-    let client = reqwest::Client::builder()
+    let client = lan_client_builder()
         .timeout(Duration::from_millis(4000))
         .connect_timeout(Duration::from_millis(3000))
         .build()
@@ -7496,6 +9076,10 @@ pub async fn client_probe_mother(
                             latency_ms: Some(started.elapsed().as_millis() as u64),
                             errors: Vec::new(),
                             category: None,
+                            label: vstr(&body, "label"),
+                            role: vstr(&body, "role"),
+                            since: vi64(&body, "since"),
+                            running_games: vi64(&body, "running_games"),
                         });
                     }
                     Err(e) => {
@@ -7520,6 +9104,7 @@ pub async fn client_probe_mother(
         latency_ms: None,
         errors,
         category: Some(best_cat.to_string()),
+        ..Default::default()
     })
 }
 
@@ -7637,36 +9222,8 @@ pub async fn client_verify_mother_candidate(
     Ok(out)
 }
 
-/// Force a fresh DHCP lease. When a child connects to the mother's hotspot before
-/// the mother's ICS DHCP server is ready (or a DISCOVER is lost), Windows falls
-/// back to an APIPA address (169.254.*) that can't reach the mother's 192.168.137.1
-/// gateway - the device is "connected" but on the wrong subnet. `ipconfig /renew`
-/// re-runs DHCP on the current association, pulling a real 192.168.137.x lease.
-/// Returns the device's IPv4s after the renew so the caller can confirm it worked.
-#[cfg(target_os = "windows")]
-#[tauri::command]
-pub async fn wifi_renew_dhcp() -> Result<Vec<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("ipconfig")
-            .arg("/renew")
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-pub async fn wifi_renew_dhcp() -> Result<Vec<String>, String> {
-    Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
-}
-
-/// This device's non-loopback IPv4 addresses (no side effects). Used to detect
-/// the APIPA-stuck condition (all 169.254.* / no 192.168.137.*) cheaply.
+/// This device's non-loopback IPv4 addresses (no side effects). The mother's
+/// Network card shows them so a satellite can pair by typing one.
 #[tauri::command]
 pub async fn get_local_ipv4s() -> Result<Vec<String>, String> {
     Ok(local_ipv4s().iter().map(|i| i.to_string()).collect())
@@ -7674,8 +9231,8 @@ pub async fn get_local_ipv4s() -> Result<Vec<String>, String> {
 
 // Run a PowerShell script ELEVATED via a single UAC prompt, returning its exit
 // code. Writes the script to a temp .ps1 (no command-line quoting to get wrong)
-// and launches it with `Start-Process -Verb RunAs`. Used for the static-IP
-// fallback below - changing a NIC's IP config requires admin.
+// and launches it with `Start-Process -Verb RunAs`. Used by the firewall rule
+// and the Windows-health fixes, which need admin.
 #[cfg(target_os = "windows")]
 pub(crate) fn run_elevated_powershell(script: &str) -> Result<i32, String> {
     use std::os::windows::process::CommandExt;
@@ -7698,96 +9255,6 @@ pub(crate) fn run_elevated_powershell(script: &str) -> Result<i32, String> {
     }
 }
 
-/// Static-IP fallback: give this device's Wi-Fi adapter reachability to the
-/// mother's subnet when the mother's ICS DHCP won't hand out a lease (child stuck
-/// on APIPA). Derives the /24 from `gateway` (the mother's advertised address,
-/// e.g. 192.168.137.1) and adds a pseudo-random host in .100-.249 as a SECONDARY
-/// address. Crucially it does NOT disable DHCP and does NOT clear the existing
-/// addresses: the static IP just rides alongside, so the moment the device joins
-/// any OTHER Wi-Fi it still pulls a normal DHCP internet lease automatically - no
-/// manual "Obtain an IP address automatically" step, no auto-revert UAC. No
-/// default gateway is set (we never route the child's internet through the
-/// offline AP; reaching the mother on the same /24 is a direct L2 hop). We first
-/// drop any static WE previously added on this /24 so repeats don't pile up.
-/// Returns the assigned IP. Elevated (UAC).
-#[cfg(target_os = "windows")]
-#[tauri::command]
-pub async fn wifi_assign_static_ip(gateway: String) -> Result<String, String> {
-    let parts: Vec<&str> = gateway.split('.').collect();
-    if parts.len() != 4 || parts.iter().any(|p| p.parse::<u8>().is_err()) {
-        return Err(format!("invalid gateway address: {gateway}"));
-    }
-    let prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
-    let host = 100
-        + (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-            % 150);
-    let ip = format!("{prefix}.{host}");
-    let script = format!(
-        "$ErrorActionPreference='Stop'\r\n\
-         $a = Get-NetAdapter -Physical | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\\.11') }} | Select-Object -First 1\r\n\
-         if (-not $a) {{ exit 2 }}\r\n\
-         # Repair: if an older build left this adapter DHCP-Disabled, turn it back on.\r\n\
-         Set-NetIPInterface -InterfaceIndex $a.ifIndex -Dhcp Enabled -ErrorAction SilentlyContinue\r\n\
-         # Drop only OUR prior static on this /24 (leave DHCP leases + everything else).\r\n\
-         Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |\r\n\
-           Where-Object {{ $_.PrefixOrigin -eq 'Manual' -and $_.IPAddress -like '{prefix}.*' }} |\r\n\
-           Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue\r\n\
-         # Add the static as a SECONDARY address; DHCP stays enabled for internet elsewhere.\r\n\
-         New-NetIPAddress -InterfaceIndex $a.ifIndex -IPAddress {ip} -PrefixLength 24 -ErrorAction Stop | Out-Null\r\n\
-         exit 0\r\n"
-    );
-    let code = tokio::task::spawn_blocking(move || run_elevated_powershell(&script))
-        .await
-        .map_err(|e| e.to_string())??;
-    match code {
-        0 => Ok(ip),
-        2 => Err("no active Wi-Fi adapter found".into()),
-        c => Err(format!("static IP assignment failed (exit {c}) - the UAC prompt may have been declined")),
-    }
-}
-
-/// Remove the static-IP fallback: drop the manually-added address(es) and make
-/// sure DHCP is enabled (also repairs a device left DHCP-Disabled by an older
-/// build). Only touches MANUAL addresses - a real DHCP lease is never removed.
-/// Elevated (UAC). Idempotent.
-#[cfg(target_os = "windows")]
-#[tauri::command]
-pub async fn wifi_restore_dhcp() -> Result<(), String> {
-    let script = "$ErrorActionPreference='SilentlyContinue'\r\n\
-        $a = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\\.11') } | Select-Object -First 1\r\n\
-        if (-not $a) { exit 2 }\r\n\
-        Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 |\r\n\
-          Where-Object { $_.PrefixOrigin -eq 'Manual' } |\r\n\
-          Remove-NetIPAddress -Confirm:$false\r\n\
-        Set-NetIPInterface -InterfaceIndex $a.ifIndex -Dhcp Enabled\r\n\
-        Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses\r\n\
-        ipconfig /renew | Out-Null\r\n\
-        exit 0\r\n"
-        .to_string();
-    let code = tokio::task::spawn_blocking(move || run_elevated_powershell(&script))
-        .await
-        .map_err(|e| e.to_string())??;
-    if code != 0 && code != 2 {
-        return Err(format!("restore DHCP failed (exit {code})"));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-pub async fn wifi_assign_static_ip(_gateway: String) -> Result<String, String> {
-    Err("static IP fallback is Windows-only".into())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-pub async fn wifi_restore_dhcp() -> Result<(), String> {
-    Ok(())
-}
-
 #[derive(Serialize)]
 pub struct LanDiag {
     /// This device's mother server is running (it IS a mother right now).
@@ -7797,14 +9264,12 @@ pub struct LanDiag {
     /// (advertising no reachable address - the #1 reason a child can't discover
     /// this mother). Populated only once the designated-LAN address is up.
     mdns_full_name: String,
-    /// LAN source ('hotspot' | 'router') from schema_meta.
-    source: String,
     /// Every non-loopback IPv4 on this host right now.
     local_ipv4s: Vec<String>,
-    /// The subset of local_ipv4s the mother WOULD advertise after the LAN lock
+    /// The subset of local_ipv4s the mother WOULD advertise
     /// (`designated_lan_addrs`). EMPTY here while server_running is true is the
-    /// smoking gun: the hotspot interface has no 192.168.137.* address, so the
-    /// mother advertises nothing and is undiscoverable.
+    /// smoking gun: the PC has no LAN address, so the mother advertises nothing
+    /// and is undiscoverable.
     designated_addrs: Vec<String>,
     /// Raw mDNS browse result from THIS device (what a child would see). On a
     /// child this reveals whether the mother is discovered at all + its addresses.
@@ -7820,12 +9285,10 @@ pub struct LanDiag {
 /// without needing device logs.
 #[tauri::command]
 pub async fn lan_diag(
-    app: AppHandle,
     state: tauri::State<'_, MotherServerState>,
 ) -> Result<LanDiag, String> {
-    let source = read_lan_network_source(&app).await;
     let local_ipv4s: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
-    let designated_addrs = designated_lan_addrs(&source, &local_ipv4s);
+    let designated_addrs = designated_lan_addrs(&local_ipv4s);
     let (server_running, port, mdns_full_name) = {
         let guard = state.inner.lock().await;
         match &*guard {
@@ -7847,7 +9310,6 @@ pub async fn lan_diag(
         server_running,
         port,
         mdns_full_name,
-        source,
         local_ipv4s,
         designated_addrs,
         discovered,
@@ -7855,12 +9317,8 @@ pub async fn lan_diag(
     })
 }
 
-// Pick the best address out of a DiscoveredMother record. Prefer IPv4 (the
-// soft-AP scenario on Windows hands out IPv4 leases reliably); fall back to
-// IPv6 only if there are no IPv4 entries (rare, e.g. some virtual adapters).
-// This device's own non-loopback IPv4s (its office/upstream LAN IP, and its
-// hotspot IP 192.168.137.1 when hosting). Used to pick a mother address we can
-// actually route to.
+// This device's own non-loopback IPv4s (one per connected interface). Used to
+// pick a mother address we can actually route to.
 fn local_ipv4s() -> Vec<Ipv4Addr> {
     match if_addrs::get_if_addrs() {
         Ok(addrs) => addrs
@@ -7875,119 +9333,28 @@ fn local_ipv4s() -> Vec<Ipv4Addr> {
     }
 }
 
-/// Lock a candidate IPv4 list down to the mother's DESIGNATED isolated LAN, so
-/// the mother never advertises (nor hands children) its internet-connected
-/// office/upstream IP. A child must only ever be able to reach the mother over
-/// the isolated network - otherwise it can join "over the internet" while off the
-/// hotspot, which is exactly what we forbid (the app is built to run offline).
-///
-/// - `hotspot` (default): keep ONLY the Windows soft-AP subnet, 192.168.137.0/24.
-///   Windows ICS pins the tethering gateway at 192.168.137.1, so this is a stable
-///   constant (matches `select_address`'s and lanMotherBoot's assumptions). Empty
-///   until the AP is raised - correct: there is nothing to join before then, and
-///   `start_mdns` advertises no reachable service in that window.
-/// - `router`: the operator deliberately runs over a dedicated Wi-Fi router
-///   instead of the hotspot (router mode). Keep the routable private IPv4s,
-///   dropping the hotspot subnet, APIPA/link-local (169.254) and loopback. The
-///   router IP IS the designated LAN here.
-fn designated_lan_addrs(source: &str, candidates: &[String]) -> Vec<String> {
+/// The IPv4s a mother advertises: its routable LAN addresses (router / venue
+/// network / Ethernet), minus APIPA/link-local (169.254.*, a sign the interface
+/// has no DHCP lease - never reachable across the LAN) and loopback. The old
+/// Windows-ICS hotspot subnet (192.168.137.*) is dropped too: a PC still carrying
+/// it is on a leftover hotspot from a pre-router build, not on the shared LAN.
+fn designated_lan_addrs(candidates: &[String]) -> Vec<String> {
     let is_ics = |a: &str| a.starts_with("192.168.137.");
-    // 169.254.* (APIPA / link-local): when Windows ICS doesn't assign the soft-AP
-    // its 192.168.137.1 subnet (common - ICS service off/misconfigured), the AP
-    // adapter and every connected client fall back to link-local addressing and
-    // still talk over the AP. Link-local is INHERENTLY non-routable off the
-    // physical link, so advertising it can't leak the mother to the office LAN
-    // (an off-hotspot child on a different link can never reach a 169.254.* addr) -
-    // which is exactly the isolation the LAN lock wants.
     let is_link_local = |a: &str| a.starts_with("169.254.");
     let is_loopback = |a: &str| a.starts_with("127.") || a == "::1";
-    match source {
-        "router" => candidates
-            .iter()
-            .filter(|a| !is_ics(a) && !is_link_local(a) && !is_loopback(a))
-            .cloned()
-            .collect(),
-        // "hotspot" and any unknown/legacy value default to hotspot semantics: the
-        // AP is EITHER the ICS subnet (192.168.137.*) OR a link-local (169.254.*)
-        // address. Both are AP-local; the routable office/upstream IP is excluded.
-        _ => {
-            // Windows ICS always gives its own soft-AP 192.168.137.1. When we
-            // hold it, any OTHER 192.168.137.x is a client lease on somebody
-            // else's same-SSID AP (the old mother's, still on the air) - an
-            // address satellites and regain prompts then picked and never
-            // reached (retours sept. #14/#21). Advertise the AP address alone.
-            if candidates.iter().any(|a| a == "192.168.137.1") {
-                return vec!["192.168.137.1".to_string()];
-            }
-            candidates
-                .iter()
-                .filter(|a| is_ics(a) || is_link_local(a))
-                .cloned()
-                .collect()
-        }
-    }
+    candidates
+        .iter()
+        .filter(|a| !is_ics(a) && !is_link_local(a) && !is_loopback(a))
+        .cloned()
+        .collect()
 }
 
-/// Read the mother's LAN source ('hotspot' | 'router') from schema_meta
-/// (`lan_network_source`, authored by services/lanCredentials.ts). Opens a fresh
-/// read connection - safe alongside the running mother server under SQLite WAL,
-/// same pattern as `mother_get_server_info`. Defaults to 'hotspot' when unset or
-/// unreadable (the common case).
-async fn read_lan_network_source(app: &AppHandle) -> String {
-    let Ok(db_path) = resolve_db_path(app) else {
-        return "hotspot".to_string();
-    };
-    let Ok(conn) = DbConnection::open(db_path).await else {
-        return "hotspot".to_string();
-    };
-    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<String> {
-        Ok(c
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'lan_network_source'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .unwrap_or_else(|_| "hotspot".to_string()))
-    })
-    .await
-    .unwrap_or_else(|_| "hotspot".to_string())
-}
-
-/// Read THIS device's own hotspot credentials from schema_meta. Used by
-/// `become_mother` as the fallback when the adopted snapshot carries no `wifi`
-/// block (a mother whose `hotspot_ssid`/`hotspot_password` were never written -
-/// `read_mother_wifi` returns null then, and the promoted device would otherwise
-/// never even ATTEMPT to raise an AP, leaving the venue with no Wi-Fi while the
-/// promotion reported success). Studio-synced creds land in these same keys via
-/// `saveHotspotCreds`, so a satellite that never hosted usually still has them.
-/// Returns None when either key is missing or empty.
-async fn read_local_hotspot_creds(app: &AppHandle) -> Option<(String, String)> {
-    let db_path = resolve_db_path(app).ok()?;
-    let conn = DbConnection::open(db_path).await.ok()?;
-    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<(String, String)>> {
-        let get = |key: &str| -> Option<String> {
-            c.query_row(
-                "SELECT value FROM schema_meta WHERE key = ?",
-                params![key],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .filter(|v| !v.is_empty())
-        };
-        Ok(get("hotspot_ssid").zip(get("hotspot_password")))
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Choose which advertised mother address to talk to. A mother that hosts a
-/// hotspot advertises BOTH its upstream/office LAN IP and its hotspot IP
-/// (192.168.137.1); a satellite on the hotspot subnet can only route to the
-/// latter, and one on the office LAN only to the former. So prefer a mother IPv4
-/// on the SAME /24 as one of our own IPs - otherwise the child caches an
-/// unreachable address and the mother sees it as offline (the exact "connected
-/// on internet but not on the hotspot" bug). Fall back to first IPv4, then any.
+/// Choose which advertised mother address to talk to. A mother with several
+/// interfaces (Wi-Fi + Ethernet, a VPN) advertises one IPv4 per interface; a
+/// satellite can usually route to only one of them. So prefer a mother IPv4 on
+/// the SAME /24 as one of our own IPs - otherwise the child caches an
+/// unreachable address and the mother sees it as offline. Fall back to first
+/// IPv4, then any.
 fn select_address(addresses: &[String]) -> Option<String> {
     let v4: Vec<Ipv4Addr> = addresses
         .iter()
@@ -8018,20 +9385,40 @@ pub async fn client_refresh_mother_endpoints(
 
     // Intersect with the locally-paired set so we don't waste cache slots on
     // strangers' mothers that happen to be broadcasting on the same LAN.
-    let paired: Vec<String> = {
+    let paired: Vec<(String, Option<String>)> = {
         let conn = open_db_for_command(&app).await?;
-        conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<String>> {
-            let mut stmt = c.prepare("SELECT mother_uuid FROM paired_mothers")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(String, Option<String>)>> {
+            let mut stmt = c.prepare("SELECT mother_uuid, manual_addr FROM paired_mothers")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
         .map_err(|e| e.to_string())?
     };
-    let paired_set: std::collections::HashSet<String> = paired.into_iter().collect();
+    let paired_set: std::collections::HashSet<String> = paired.iter().map(|(u, _)| u.clone()).collect();
+
+    // Mothers paired by typed address and NOT seen over mDNS (multicast
+    // filtered): confirm the stored address still answers as that mother.
+    let mut manual_hits: Vec<(String, SocketAddr)> = Vec::new();
+    for (uuid, manual) in &paired {
+        let Some(sock) = manual.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()) else { continue };
+        if discovered.iter().any(|m| &m.mother_uuid == uuid) {
+            continue;
+        }
+        if let Some(hello) = hello_at(sock).await {
+            if vstr(&hello, "mother_uuid").as_deref() == Some(uuid.as_str()) {
+                manual_hits.push((uuid.clone(), sock));
+            }
+        }
+    }
 
     let mut refreshed = Vec::new();
     let mut guard = cache.inner.lock().await;
+    for (uuid, sock) in manual_hits {
+        guard.insert(uuid.clone(), sock);
+        cache.fails.lock().await.remove(&uuid);
+        refreshed.push(uuid);
+    }
     for m in discovered {
         if !paired_set.contains(&m.mother_uuid) {
             continue;
@@ -8160,6 +9547,9 @@ pub enum PingErr {
     WrongUuid { got: String },
     /// Any other HTTP status or malformed JSON.
     BadResponse { message: String },
+    /// The mother speaks another LAN protocol (see LAN_PROTO) - an old mother
+    /// (theirs < ours) or one that refused us with 426 (theirs > ours).
+    ProtoMismatch { theirs: u32, their_app_version: Option<String> },
 }
 
 // Ping a single paired mother by uuid. The renderer's footer hook iterates
@@ -8235,6 +9625,10 @@ pub async fn client_ping_mother(
     };
 
     let has_reader = *reader_presence.inner.lock().await;
+    let operator_only = match app.try_state::<OperatorPresence>() {
+        Some(p) => *p.inner.lock().await,
+        None => false,
+    };
     // Parse the cached screen-state string into a nested object for the ping
     // body (the mother re-serialises it for storage). None when the renderer
     // hasn't reported a state yet.
@@ -8247,7 +9641,7 @@ pub async fn client_ping_mother(
     };
 
     let url = format!("http://{addr}/ping.php");
-    let client = reqwest::Client::builder()
+    let client = lan_client_builder()
         .timeout(Duration::from_secs(2))
         .connect_timeout(Duration::from_millis(700))
         .build()
@@ -8258,6 +9652,7 @@ pub async fn client_ping_mother(
         .header(header::AUTHORIZATION, format!("Bearer {secret}"))
         .json(&serde_json::json!({
             "has_reader": has_reader,
+            "operator_only": operator_only,
             "screen_state": screen_state,
             "known_version": known_version,
             "launched_game_id": launched_game_id,
@@ -8281,6 +9676,13 @@ pub async fn client_ping_mother(
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(PingErr::Unauth);
     }
+    if status == reqwest::StatusCode::UPGRADE_REQUIRED {
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        return Err(PingErr::ProtoMismatch {
+            theirs: body.get("lan_proto").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(LAN_PROTO + 1),
+            their_app_version: vstr(&body, "app_version"),
+        });
+    }
     if !status.is_success() {
         return Err(PingErr::BadResponse {
             message: format!("HTTP {}", status.as_u16()),
@@ -8302,6 +9704,21 @@ pub async fn client_ping_mother(
         cache.fails.lock().await.remove(&mother_uuid);
         return Err(PingErr::WrongUuid { got });
     }
+    // A hotspot-era mother (no lan_proto) must not keep driving this satellite.
+    let theirs = announced_proto(&body);
+    if theirs != LAN_PROTO {
+        return Err(PingErr::ProtoMismatch {
+            theirs,
+            their_app_version: vstr(&body, "app_version"),
+        });
+    }
+
+    // LAN content sync: the mother's content revision. The renderer pulls new
+    // content from the mother when it changes (services/peerContent.ts).
+    if let Some(rev) = body.get("content_rev").and_then(|v| v.as_i64()) {
+        use tauri::Emitter;
+        let _ = app.emit("taghunter://mother-content-rev", rev);
+    }
 
     // A real, authenticated exchange: this is what "Connecté · vu à HH:MM" on the
     // satellite's Network page reflects. last_seen_at used to be written only at
@@ -8317,32 +9734,6 @@ pub async fn client_ping_mother(
                 Ok(())
             })
             .await;
-    }
-
-    // Feature A: remember the mother's Wi-Fi creds for auto-rejoin. Upsert into
-    // wifi_networks (origin='paired'); NEVER touch auto_connect, so the operator's
-    // consent choice survives a refreshed password.
-    if let Some(w) = body.get("mother_wifi").filter(|v| v.is_object()) {
-        let ssid = w.get("ssid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let password = w.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let source = w.get("source").and_then(|v| v.as_str()).unwrap_or("hotspot").to_string();
-        if !ssid.is_empty() && !password.is_empty() {
-            if let Ok(conn) = open_db_for_command(&app).await {
-                let _ = conn
-                    .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
-                        c.execute(
-                            "INSERT INTO wifi_networks (ssid, password, source, origin, updated_at) \
-                             VALUES (?1, ?2, ?3, 'paired', datetime('now')) \
-                             ON CONFLICT(ssid) DO UPDATE SET \
-                               password = excluded.password, source = excluded.source, \
-                               origin = 'paired', updated_at = excluded.updated_at",
-                            params![ssid, password, source],
-                        )?;
-                        Ok(())
-                    })
-                    .await;
-            }
-        }
     }
 
     // Mother-failover slice 2: cache the latest snapshot to our own
@@ -8388,7 +9779,7 @@ pub async fn client_ping_mother(
                 let ack_addr = addr;
                 let ack_secret = secret.clone();
                 tokio::spawn(async move {
-                    let ack_client = reqwest::Client::builder()
+                    let ack_client = lan_client_builder()
                         .timeout(Duration::from_secs(2))
                         .connect_timeout(Duration::from_millis(700))
                         .build();
@@ -8444,21 +9835,22 @@ pub async fn client_set_screen_state(
 
 #[derive(Serialize)]
 pub struct LocalRole {
-    /// Hotspot is currently broadcasting (drives mother_hosting / mother_partial).
-    pub is_mother_hosting: bool,
-    /// The local axum server is up. Together with `is_mother_hosting` this
-    /// distinguishes mother_hosting (both true) from mother_partial (hotspot
-    /// up but server not started).
+    /// The local axum server is up (this device is the mother).
     pub mother_server_running: bool,
     /// Count of non-self paired_devices. Drives the "N clients" count in the
     /// mother_hosting tooltip and the mother_idle state.
     pub paired_devices_count: u32,
     /// Count of paired_mothers (any). Drives the child branch entry condition.
     pub paired_mothers_count: u32,
+    /// Why the running server hosts: "m" (this device is set as the mother) or
+    /// "s" (a substitute). None when no server runs.
+    pub hosting_role: Option<String>,
+    /// The mother a substitute stands in for (its device name), when known.
+    pub substitute_for_label: Option<String>,
 }
 
 // Aggregate the local LAN-mode signals into a single struct the footer can
-// branch on. Cheap: hotspot status is in-memory, the two counts are single
+// branch on. Cheap: the two counts are single
 // SELECT COUNT(*) reads, and mother_server_running comes from the in-process
 // MotherServerState mutex.
 #[tauri::command]
@@ -8466,22 +9858,15 @@ pub async fn client_describe_local_role(
     app: AppHandle,
     server_state: tauri::State<'_, MotherServerState>,
 ) -> Result<LocalRole, String> {
-    let mother_server_running = {
+    let hosting_role = {
         let guard = server_state.inner.lock().await;
-        guard.is_some()
+        guard.as_ref().map(|r| r.role.code().to_string())
     };
-
-    // mother_hotspot_status is best-effort - when Windows can't enumerate
-    // tethering, we treat it as "not hosting" so the footer falls back to the
-    // child / hidden branch instead of erroring.
-    let is_mother_hosting = crate::hotspot::mother_hotspot_status()
-        .await
-        .map(|s| s.running)
-        .unwrap_or(false);
+    let mother_server_running = hosting_role.is_some();
 
     let conn = open_db_for_command(&app).await?;
-    let (paired_devices_count, paired_mothers_count) = conn
-        .call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(u32, u32)> {
+    let (paired_devices_count, paired_mothers_count, substitute_for_label) = conn
+        .call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(u32, u32, Option<String>)> {
             let pd: i64 = c
                 .query_row(
                     "SELECT COUNT(*) FROM paired_devices WHERE is_self = 0",
@@ -8492,17 +9877,377 @@ pub async fn client_describe_local_role(
             let pm: i64 = c
                 .query_row("SELECT COUNT(*) FROM paired_mothers", [], |r| r.get(0))
                 .unwrap_or(0);
-            Ok((pd.max(0) as u32, pm.max(0) as u32))
+            let sub: Option<String> = c
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'substitute_for_label'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            Ok((pd.max(0) as u32, pm.max(0) as u32, sub))
         })
         .await
         .map_err(|e| e.to_string())?;
 
     Ok(LocalRole {
-        is_mother_hosting,
         mother_server_running,
         paired_devices_count,
         paired_mothers_count,
+        hosting_role,
+        substitute_for_label,
     })
+}
+
+/// Forget which mother this device stood in for: it handed the hosting back.
+#[tauri::command]
+pub async fn client_clear_substitute_state(app: AppHandle) -> Result<(), String> {
+    let conn = open_db_for_command(&app).await?;
+    conn.call(|c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+        c.execute(
+            "DELETE FROM schema_meta WHERE key IN ('substitute_for_uuid', 'substitute_for_label')",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// This device's OWN copy of its games, read straight from its database (no
+/// server needed). Same rows as the `list` action. The "Cet appareil" section
+/// uses it on a satellite: asking the routed mother for `mine=1` answered with
+/// the MOTHER's own games.
+#[tauri::command]
+pub async fn client_list_local_games(
+    app: AppHandle,
+    client_id: i64,
+    mine: Option<bool>,
+) -> Result<Vec<Value>, String> {
+    let conn = open_db_for_command(&app).await?;
+    conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+        Ok(list_games_sync(c, client_id, None, mine.unwrap_or(false))?)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// What `client_reconcile_with_mother` did. A refusal is listed, never an
+/// error: this runs on a timer.
+#[derive(Serialize, Default)]
+pub struct ReconcileReport {
+    /// Games this device sent and the mother took.
+    pub pushed: u32,
+    /// Games whose later state this device took from the mother.
+    pub pulled: u32,
+    /// Local copies removed because the mother deleted or archived the game.
+    pub dropped: u32,
+    /// `<summary_uuid>: <reason>` for each push or pull that was refused.
+    pub refused: Vec<String>,
+    /// The mother accepted none of our secrets: pair first, then retry.
+    pub needs_pair: bool,
+    /// The mother runs a build without reconciliation.
+    pub unsupported: bool,
+    /// This device is serving: it reconciles as a mother, not as a client.
+    pub serving: bool,
+}
+
+struct LocalCopy {
+    id: i64,
+    summary_uuid: String,
+    version: GameVersion,
+    hosted: bool,
+}
+
+fn inventory_version(v: &Value) -> GameVersion {
+    GameVersion {
+        epoch: vi64(v, "mother_epoch").unwrap_or(1),
+        ended: vbool(v, "ended"),
+        state_version: vi64(v, "state_version").unwrap_or(0),
+    }
+}
+
+/// Bring this device and the mother at `addr:port` to the same state for every
+/// game of the client: the newer copy wins, whoever holds it.
+///
+/// - A local game more advanced than the mother's is PUSHED. This is how a
+///   substitute hands back what it hosted, ended games included, and how a
+///   mother's frozen copy gets replaced.
+/// - A game the mother has never had is pushed only by the device that hosted
+///   it (no cached snapshot from another mother, or a local epoch above it).
+/// - A cached snapshot with no local row is offered too, as an update only: a
+///   plain satellite can hold the latest state of a game whose host is gone.
+/// - A game more advanced on the mother is PULLED, when this device holds it.
+/// - A local copy the mother deleted or archived at that state is dropped.
+///
+/// Satellites call it when their route to a mother is (re)established and on
+/// the reconcile tick. Satellites run no server, so the transfer always starts
+/// from the satellite.
+#[tauri::command]
+pub async fn client_reconcile_with_mother(
+    app: AppHandle,
+    server_state: tauri::State<'_, MotherServerState>,
+    addr: String,
+    port: u16,
+) -> Result<ReconcileReport, String> {
+    let mut report = ReconcileReport::default();
+    if server_state.inner.lock().await.is_some() {
+        report.serving = true;
+        return Ok(report);
+    }
+
+    let conn = open_db_for_command(&app).await?;
+    let secrets = outbound_secrets(&conn).await;
+    if secrets.is_empty() {
+        report.needs_pair = true;
+        return Ok(report);
+    }
+    let addr_port = format!("{addr}:{port}");
+    // Longer than the 5 s of a snapshot pull: a push carries a whole game.
+    let client = lan_client_builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_millis(1500))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 1. The mother's inventory; the secret it accepts is used for the rest.
+    let mut inventory: Option<(Value, String)> = None;
+    for secret in &secrets {
+        let resp = client
+            .get(format!("http://{addr_port}/launched_games.php?action=inventory"))
+            .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+            .send()
+            .await
+            .map_err(|e| format!("contacting current mother: {e}"))?;
+        let status = resp.status().as_u16();
+        if status == 401 || status == 403 {
+            continue;
+        }
+        if !resp.status().is_success() {
+            report.unsupported = true;
+            return Ok(report);
+        }
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        inventory = Some((body, secret.clone()));
+        break;
+    }
+    let Some((inventory, secret)) = inventory else {
+        report.needs_pair = true;
+        return Ok(report);
+    };
+    let Some(client_id) = vi64(&inventory, "client_id") else {
+        report.unsupported = true;
+        return Ok(report);
+    };
+    let by_uuid = |key: &str| -> HashMap<String, Value> {
+        inventory
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| Some((vstr(g, "summary_uuid")?, g.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mother_games = by_uuid("games");
+    let tombstones = by_uuid("tombstones");
+
+    // 2. What this device holds.
+    let (locals, self_uuid, counter) = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<LocalCopy>, String, i64)> {
+            let locals = c
+                .prepare(
+                    "SELECT g.id, g.summary_uuid, g.mother_epoch, g.ended, g.state_version,
+                            (s.launched_game_id IS NULL OR g.mother_epoch > s.mother_epoch)
+                       FROM lg_launched_games g
+                       LEFT JOIN mother_snapshots s
+                              ON s.launched_game_id = g.id
+                             AND json_extract(s.snapshot_json, '$.game.summary_uuid') = g.summary_uuid
+                      WHERE g.client_id = ?",
+                )?
+                .query_map(params![client_id], |r| {
+                    Ok(LocalCopy {
+                        id: r.get(0)?,
+                        summary_uuid: r.get(1)?,
+                        version: GameVersion {
+                            epoch: r.get(2)?,
+                            ended: r.get::<_, i64>(3)? != 0,
+                            state_version: r.get(4)?,
+                        },
+                        hosted: r.get::<_, i64>(5)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let self_uuid: String = c
+                .query_row("SELECT value FROM schema_meta WHERE key = 'client_device_uuid'", [], |r| r.get(0))
+                .optional()?
+                .unwrap_or_default();
+            let counter: i64 = c
+                .query_row("SELECT value FROM schema_meta WHERE key = 'lg_state_version'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            Ok((locals, self_uuid, counter))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // One push. Ok(Some(epoch)) = taken, at that epoch on the mother.
+    let push = |snapshot: Value, hosted: bool| {
+        let client = client.clone();
+        let url = format!("http://{addr_port}/launched_games.php?action=push_snapshot");
+        let secret = secret.clone();
+        async move {
+            let resp = client
+                .post(url)
+                .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+                .json(&json!({ "snapshot": snapshot, "hosted": hosted }))
+                .send()
+                .await
+                .map_err(|e| format!("contacting current mother: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("current mother returned HTTP {}", resp.status().as_u16()));
+            }
+            let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+            if vbool(&body, "applied") {
+                Ok::<Result<i64, String>, String>(Ok(vi64(&body, "mother_epoch").unwrap_or(1)))
+            } else {
+                Ok(Err(vstr(&body, "reason").unwrap_or_else(|| "refused".into())))
+            }
+        }
+    };
+
+    let mut local_uuids: HashSet<String> = HashSet::new();
+    for g in &locals {
+        local_uuids.insert(g.summary_uuid.clone());
+        let on_mother = mother_games.get(&g.summary_uuid);
+        let tomb = tombstones.get(&g.summary_uuid).map(|t| GameVersion { ended: true, ..inventory_version(t) });
+
+        // What to do with this copy.
+        let (send, fetch, discard) = match (on_mother, tomb) {
+            (Some(m), _) => {
+                let theirs = inventory_version(m);
+                (is_newer(g.version, theirs), is_newer(theirs, g.version), false)
+            }
+            (None, Some(t)) if !is_newer(g.version, t) => (false, false, true),
+            (None, _) => (g.hosted, false, false),
+        };
+
+        if send {
+            let (gid, uuid) = (g.id, self_uuid.clone());
+            let bundle = conn
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<Value>> {
+                    Ok(build_snapshot_sync(c, &uuid, gid, counter)?)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let Some(bundle) = bundle else { continue };
+            match push(bundle.clone(), g.hosted).await? {
+                Ok(mother_epoch) => {
+                    report.pushed += 1;
+                    // The mother holds it now: remember that as a snapshot at
+                    // its epoch, so this game no longer counts as hosted here.
+                    let (gid, epoch) = (g.id, mother_epoch.max(g.version.epoch));
+                    let _ = conn
+                        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                            c.execute(
+                                "INSERT OR REPLACE INTO mother_snapshots
+                                   (launched_game_id, state_version, mother_epoch, snapshot_json, updated_at)
+                                 VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+                                params![gid, counter, epoch, bundle.to_string()],
+                            )?;
+                            Ok(())
+                        })
+                        .await;
+                }
+                Err(reason) => report.refused.push(format!("{}: {reason}", g.summary_uuid)),
+            }
+        } else if fetch {
+            let mother_gid = on_mother.and_then(|m| vi64(m, "id")).unwrap_or(0);
+            let Some(snap) = pull_snapshot_over_http(&addr_port, &secret, mother_gid).await? else { continue };
+            if let (Some(ver), Some(epoch)) = (vi64(&snap, "state_version"), vi64(&snap, "mother_epoch")) {
+                let _ = upsert_cached_snapshot(&conn, mother_gid, ver, epoch, snap.to_string()).await;
+            }
+            let outcome = conn
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<AdoptOutcome> {
+                    let tx = c.transaction()?;
+                    let outcome = adopt_peer_snapshot(&tx, &snap, client_id, /* hosted */ false)?;
+                    if outcome.applied {
+                        tx.commit()?;
+                    }
+                    Ok(outcome)
+                })
+                .await
+                .map_err(|e| format!("apply snapshot: {e}"))?;
+            if outcome.applied {
+                report.pulled += 1;
+            } else {
+                report.refused.push(format!("{}: {}", g.summary_uuid, outcome.reason));
+            }
+        } else if discard {
+            let gid = g.id;
+            let _ = conn
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                    c.execute("DELETE FROM lg_launched_games WHERE id = ?", params![gid])?;
+                    Ok(())
+                })
+                .await;
+            report.dropped += 1;
+        }
+    }
+
+    // 3. Cached snapshots of games this device holds no row for.
+    let cached: Vec<(String, GameVersion, String)> = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(String, GameVersion, String)>> {
+            let rows = c
+                .prepare(
+                    "SELECT json_extract(snapshot_json, '$.game.summary_uuid'),
+                            mother_epoch,
+                            COALESCE(json_extract(snapshot_json, '$.game.ended'), 0),
+                            COALESCE(json_extract(snapshot_json, '$.game.state_version'), state_version),
+                            snapshot_json
+                       FROM mother_snapshots
+                      WHERE json_extract(snapshot_json, '$.game.client_id') = ?",
+                )?
+                .query_map(params![client_id], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        GameVersion {
+                            epoch: r.get(1)?,
+                            ended: r.get::<_, i64>(2)? != 0,
+                            state_version: r.get(3)?,
+                        },
+                        r.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap_or_default();
+    for (uuid, version, json_text) in cached {
+        if local_uuids.contains(&uuid) {
+            continue;
+        }
+        let Some(m) = mother_games.get(&uuid) else { continue };
+        if !is_newer(version, inventory_version(m)) {
+            continue;
+        }
+        let Ok(snapshot) = serde_json::from_str::<Value>(&json_text) else { continue };
+        match push(snapshot, /* hosted */ false).await? {
+            Ok(_) => report.pushed += 1,
+            Err(reason) => report.refused.push(format!("{uuid}: {reason}")),
+        }
+    }
+
+    if report.pulled > 0 || report.dropped > 0 {
+        use tauri::Emitter;
+        let _ = app.emit(GAMES_RECONCILED_EVENT, json!({}));
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -8531,7 +10276,16 @@ mod adopt_tests {
             number_of_teams INTEGER NOT NULL, game_type TEXT NOT NULL, duration INTEGER NOT NULL,
             start_time TEXT NULL, started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), mother_epoch INTEGER NOT NULL DEFAULT 1,
-            ended_at INTEGER NULL, launched_by_self INTEGER NOT NULL DEFAULT 0);
+            ended_at INTEGER NULL, launched_by_self INTEGER NOT NULL DEFAULT 0,
+            state_version INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE paired_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_uuid TEXT NOT NULL UNIQUE,
+            peer_label TEXT NOT NULL, peer_os TEXT NULL, peer_app_version TEXT NULL, peer_secret TEXT NOT NULL,
+            is_self INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE revoked_devices (peer_uuid TEXT PRIMARY KEY, peer_label TEXT NULL);
+        CREATE TABLE lg_game_tombstones (summary_uuid TEXT PRIMARY KEY, kind TEXT NOT NULL,
+            mother_epoch INTEGER NOT NULL, state_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
         CREATE TABLE lg_launched_game_meta (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
             meta_name TEXT NOT NULL, meta_value TEXT NULL,
             FOREIGN KEY (launched_game_id) REFERENCES lg_launched_games(id) ON DELETE CASCADE);
@@ -8674,5 +10428,661 @@ mod adopt_tests {
             .query_row("SELECT launched_game_id FROM lg_launched_game_raw_data WHERE id = ?", [moved], |r| r.get(0))
             .unwrap();
         assert_eq!(gid, 1);
+    }
+
+    // ── reconciliation: the newer copy wins ──────────────────────────────────
+
+    fn v(epoch: i64, ended: bool, state_version: i64) -> GameVersion {
+        GameVersion { epoch, ended, state_version }
+    }
+
+    #[test]
+    fn newer_is_epoch_then_ended_then_version() {
+        // A later lineage beats everything, even an ended copy at a high version.
+        assert!(is_newer(v(2, false, 1), v(1, true, 900)));
+        assert!(!is_newer(v(1, true, 900), v(2, false, 1)));
+        // Same epoch: ended beats unfinished, whatever the versions.
+        assert!(is_newer(v(2, true, 1), v(2, false, 50)));
+        // Same epoch, same status: the version decides.
+        assert!(is_newer(v(2, false, 51), v(2, false, 50)));
+        assert!(!is_newer(v(2, false, 50), v(2, false, 51)));
+        // Equal copies never trade places.
+        assert!(!is_newer(v(2, true, 7), v(2, true, 7)));
+    }
+
+    /// The copy a substitute hosted: game 7 "sub-uuid" at epoch 2, ended, one
+    /// team with one quest and one punch recorded by device 4 (uuid "sat").
+    fn substitute_bundle(ended: bool) -> Value {
+        json!({
+            "mother_epoch": 2, "state_version": 40,
+            "game": {"id": 7, "summary_uuid": "sub-uuid", "client_id": 1, "game_uniqid": "g",
+                     "name": "from substitute", "game_type": "quest",
+                     "ended": ended, "ended_at": if ended { json!(1700000000) } else { Value::Null },
+                     "state_version": 38},
+            "devices": [{"device_id": 4, "connected": true}],
+            "raw_data": [{"id": 5, "device_id": 4, "raw_data": "punch"}],
+            "teams": [{"id": 3, "team_number": 1, "team_name": "Midnight", "score": 25}],
+            "completed_quests": [{"id": 9, "team_id": 3, "quest_number": "q", "points_awarded": 25}],
+            "paired_devices": [
+                {"id": 1, "peer_uuid": "sub", "peer_label": "ADMIN", "peer_secret": "s-sub", "is_self": true},
+                {"id": 4, "peer_uuid": "sat", "peer_label": "PC3", "peer_secret": "s-sat"}
+            ],
+        })
+    }
+
+    fn push(c: &mut rusqlite::Connection, snap: &Value, hosted: bool) -> AdoptOutcome {
+        let tx = c.transaction().unwrap();
+        let outcome = adopt_peer_snapshot(&tx, snap, 1, hosted).unwrap();
+        if outcome.applied {
+            tx.commit().unwrap();
+        }
+        outcome
+    }
+
+    /// The mother: self row 1, satellite "sat" known as device 2, and its own
+    /// game 7 "live-uuid" RUNNING with team 3, quest 9 and punch 5.
+    fn seed_mother(c: &rusqlite::Connection) {
+        c.execute_batch(
+            "INSERT INTO schema_meta VALUES ('client_device_uuid', 'mother'), ('lg_state_version', '3');
+             INSERT INTO paired_devices (id, peer_uuid, peer_label, peer_secret, is_self) VALUES
+               (1, 'mother', 'PC2', 's-mother', 1), (2, 'sat', 'PC3', 's-sat-here', 0);
+             INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration)
+               VALUES (7, 'live-uuid', 1, 'g', 'live', 1, 'quest', 0);
+             INSERT INTO lg_launched_game_raw_data (id, launched_game_id, device_id, raw_data) VALUES (5, 7, 2, 'live-raw');
+             INSERT INTO lg_teams (id, launched_game_id, team_number, pattern) VALUES (3, 7, 1, 0);
+             INSERT INTO lg_team_completed_quests (id, launched_game_id, team_id, quest_number) VALUES (9, 7, 3, 'q');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ended_game_from_substitute_lands_without_touching_the_live_game() {
+        let mut c = db();
+        seed_mother(&c);
+        let out = push(&mut c, &substitute_bundle(true), true);
+        assert!(out.applied, "{}", out.reason);
+        assert!(out.ended);
+        assert_eq!(out.mother_epoch, 2);
+        assert_ne!(out.game_id, 7, "the id is taken by the running game");
+
+        // The running game is exactly where satellites address it.
+        assert_eq!(one::<String>(&c, "SELECT summary_uuid FROM lg_launched_games WHERE id = 7"), "live-uuid");
+        assert_eq!(one::<i64>(&c, "SELECT launched_game_id FROM lg_teams WHERE id = 3"), 7);
+        assert_eq!(one::<String>(&c, "SELECT raw_data FROM lg_launched_game_raw_data WHERE id = 5"), "live-raw");
+        assert_eq!(one::<i64>(&c, "SELECT team_id FROM lg_team_completed_quests WHERE id = 9"), 3);
+
+        // The pushed game is complete: status, freeze moment, team, score, quest.
+        let (ended, ended_at, version): (i64, i64, i64) = c
+            .query_row(
+                "SELECT ended, ended_at, state_version FROM lg_launched_games WHERE summary_uuid = 'sub-uuid'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((ended, ended_at, version), (1, 1700000000, 38));
+        let (team, score): (i64, i64) = c
+            .query_row("SELECT id, score FROM lg_teams WHERE launched_game_id = ?", [out.game_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_ne!(team, 3);
+        assert_eq!(score, 25);
+        let quest_team: i64 = c
+            .query_row("SELECT team_id FROM lg_team_completed_quests WHERE launched_game_id = ?", [out.game_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(quest_team, team);
+
+        // The punch is attributed to "sat" under ITS id here (2, not the pusher's 4).
+        let device: i64 = c
+            .query_row("SELECT device_id FROM lg_launched_game_raw_data WHERE launched_game_id = ?", [out.game_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(device, 2);
+        assert_eq!(one::<String>(&c, "SELECT peer_secret FROM paired_devices WHERE id = 2"), "s-sat-here");
+        // The device counter stepped past the bundle's.
+        assert!(one::<String>(&c, "SELECT value FROM schema_meta WHERE key = 'lg_state_version'").parse::<i64>().unwrap() > 40);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    #[test]
+    fn frozen_copy_is_replaced_under_the_local_id() {
+        // The mother's frozen copy of the SAME game: epoch 1, unfinished, id 12.
+        let mut c = db();
+        c.execute_batch(
+            "INSERT INTO schema_meta VALUES ('client_device_uuid', 'mother');
+             INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration, launched_by_self)
+               VALUES (12, 'sub-uuid', 1, 'g', 'frozen', 1, 'quest', 0, 1);
+             INSERT INTO lg_teams (id, launched_game_id, team_number, pattern) VALUES (3, 12, 1, 0);",
+        )
+        .unwrap();
+        // Not flagged hosted: the row exists, so the version alone decides.
+        let out = push(&mut c, &substitute_bundle(true), false);
+        assert!(out.applied, "{}", out.reason);
+        assert_eq!(out.game_id, 12);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_launched_games"), 1);
+        let (name, ended, mine): (String, i64, i64) = c
+            .query_row("SELECT name, ended, launched_by_self FROM lg_launched_games WHERE id = 12", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((name.as_str(), ended, mine), ("from substitute", 1, 1));
+        assert_eq!(one::<i64>(&c, "SELECT score FROM lg_teams WHERE launched_game_id = 12"), 25);
+
+        // The same copy again is not newer: nothing to do.
+        assert_eq!(push(&mut c, &substitute_bundle(true), false).reason, "not_newer");
+    }
+
+    #[test]
+    fn unknown_game_needs_its_host() {
+        let mut c = db();
+        seed_mother(&c);
+        assert_eq!(push(&mut c, &substitute_bundle(true), false).reason, "unknown_game");
+        assert!(push(&mut c, &substitute_bundle(true), true).applied);
+    }
+
+    #[test]
+    fn wrong_client_is_refused() {
+        let mut c = db();
+        let tx = c.transaction().unwrap();
+        let out = adopt_peer_snapshot(&tx, &substitute_bundle(true), 99, true).unwrap();
+        assert_eq!(out.reason, "wrong_client");
+    }
+
+    #[test]
+    fn running_game_is_refused_when_it_would_renumber_a_live_one() {
+        let mut c = db();
+        seed_mother(&c);
+        // Game 7 / team 3 / punch 5 / quest 9 all belong to the mother's running game.
+        assert_eq!(push(&mut c, &substitute_bundle(false), true).reason, "id_collision_active");
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_launched_games"), 1);
+
+        // Once that game is over, the pushed one comes in under its own ids
+        // (satellites still address it by them) and at its own epoch.
+        c.execute("UPDATE lg_launched_games SET ended = 1 WHERE id = 7", []).unwrap();
+        let out = push(&mut c, &substitute_bundle(false), true);
+        assert!(out.applied, "{}", out.reason);
+        assert_eq!((out.game_id, out.mother_epoch), (7, 2));
+        assert_eq!(one::<String>(&c, "SELECT summary_uuid FROM lg_launched_games WHERE id = 7"), "sub-uuid");
+        assert_eq!(one::<i64>(&c, "SELECT mother_epoch FROM lg_launched_games WHERE id = 7"), 2);
+        assert_ne!(one::<i64>(&c, "SELECT id FROM lg_launched_games WHERE summary_uuid = 'live-uuid'"), 7);
+    }
+
+    #[test]
+    fn the_real_end_of_a_game_beats_a_cached_copy_adopted_earlier() {
+        // The mother's frozen copy (epoch 1). A plain satellite arrives first
+        // and offers the last state IT cached from the substitute: epoch 2,
+        // still running. The mother takes it.
+        let mut c = db();
+        c.execute_batch(
+            "INSERT INTO schema_meta VALUES ('client_device_uuid', 'mother');
+             INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration)
+               VALUES (7, 'sub-uuid', 1, 'g', 'frozen', 1, 'quest', 0);",
+        )
+        .unwrap();
+        assert!(push(&mut c, &substitute_bundle(false), false).applied);
+        assert_eq!(one::<i64>(&c, "SELECT ended FROM lg_launched_games WHERE id = 7"), 0);
+
+        // The mother then changes the game (its counter is past the copy's).
+        let stamped = bump_state_version_sync(&c, Some(7)).unwrap();
+        assert!(stamped > 38);
+
+        // The substitute comes back later with the game as it really ended.
+        // Same epoch, lower version - and it still wins: it is ended.
+        let out = push(&mut c, &substitute_bundle(true), true);
+        assert!(out.applied, "{}", out.reason);
+        assert_eq!(one::<i64>(&c, "SELECT ended FROM lg_launched_games WHERE id = 7"), 1);
+        assert_eq!(one::<i64>(&c, "SELECT score FROM lg_teams WHERE launched_game_id = 7"), 25);
+    }
+
+    #[test]
+    fn tombstone_blocks_an_older_copy_only() {
+        let mut c = db();
+        seed_mother(&c);
+        // The mother deleted this game at epoch 2 / version 38: the same copy
+        // must not come back.
+        c.execute(
+            "INSERT INTO lg_game_tombstones (summary_uuid, kind, mother_epoch, state_version) VALUES ('sub-uuid', 'deleted', 2, 38)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(push(&mut c, &substitute_bundle(true), true).reason, "tombstoned");
+
+        // It dropped its FROZEN copy (epoch 1); the substitute's later one returns.
+        c.execute("UPDATE lg_game_tombstones SET mother_epoch = 1", []).unwrap();
+        assert!(push(&mut c, &substitute_bundle(true), true).applied);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_game_tombstones"), 0);
+    }
+
+    #[test]
+    fn tombstone_records_the_version_thrown_away() {
+        let c = db();
+        seed_mother(&c);
+        c.execute("UPDATE lg_launched_games SET mother_epoch = 4, state_version = 17 WHERE id = 7", []).unwrap();
+        write_tombstone(&c, 7, "archived").unwrap();
+        let (kind, epoch, version): (String, i64, i64) = c
+            .query_row(
+                "SELECT kind, mother_epoch, state_version FROM lg_game_tombstones WHERE summary_uuid = 'live-uuid'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), epoch, version), ("archived", 4, 17));
+    }
+
+    #[test]
+    fn a_device_never_seen_gets_a_row_and_self_is_recognised() {
+        // The puller is "sat" itself, with an empty pairing table.
+        let mut c = db();
+        c.execute("INSERT INTO schema_meta VALUES ('client_device_uuid', 'sat')", []).unwrap();
+        let out = push(&mut c, &substitute_bundle(true), true);
+        assert!(out.applied, "{}", out.reason);
+        let (id, is_self): (i64, i64) = c
+            .query_row("SELECT id, is_self FROM paired_devices WHERE peer_uuid = 'sat'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(is_self, 1);
+        assert_eq!(one::<i64>(&c, "SELECT device_id FROM lg_launched_game_devices"), id);
+        // "sub" is referenced by nothing in the game: no row for it.
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM paired_devices"), 1);
+    }
+
+    #[test]
+    fn version_stamp_follows_the_game_an_action_touches() {
+        let c = db();
+        seed_mother(&c);
+        assert_eq!(bump_state_version_sync(&c, Some(7)).unwrap(), 4);
+        assert_eq!(one::<i64>(&c, "SELECT state_version FROM lg_launched_games WHERE id = 7"), 4);
+        // No game (a pairing change): the counter moves, no game is stamped.
+        assert_eq!(bump_state_version_sync(&c, None).unwrap(), 5);
+        assert_eq!(one::<i64>(&c, "SELECT state_version FROM lg_launched_games WHERE id = 7"), 4);
+
+        assert_eq!(stamp_field("end_game"), Some("id"));
+        assert_eq!(stamp_field("delete_team"), Some("team_id"));
+        assert_eq!(stamp_field("record_punch"), Some("launched_game_id"));
+        // The row is gone after these two; `create` reads the id from its reply.
+        assert_eq!(stamp_field("delete_game"), None);
+        assert_eq!(stamp_field("archive_game"), None);
+        assert_eq!(stamp_field("create"), None);
+    }
+
+    #[test]
+    fn built_bundle_round_trips() {
+        let c = db();
+        seed_mother(&c);
+        c.execute(
+            "UPDATE lg_launched_games SET ended = 1, ended_at = 1700000123, mother_epoch = 2, state_version = 9 WHERE id = 7",
+            [],
+        )
+        .unwrap();
+        c.execute("UPDATE lg_teams SET score = 25, team_name = 'Midnight' WHERE id = 3", []).unwrap();
+        let bundle = build_snapshot_sync(&c, "mother", 7, 11).unwrap().expect("game exists");
+        let rows = parse_snapshot_rows(&bundle).unwrap();
+        assert_eq!((rows.mother_epoch, rows.game.ended, rows.game.ended_at), (2, true, Some(1700000123)));
+        // The game's own version travels apart from the device counter.
+        assert_eq!((rows.game.state_version, rows.state_version), (9, 11));
+        assert_eq!(rows.teams[0].score, 25);
+
+        // Into an empty device: it comes out identical.
+        let mut other = db();
+        assert!(push(&mut other, &bundle, true).applied);
+        assert_eq!(one::<i64>(&other, "SELECT score FROM lg_teams"), 25);
+        assert_eq!(one::<i64>(&other, "SELECT ended_at FROM lg_launched_games"), 1700000123);
+    }
+
+    #[test]
+    fn sqlite_reads_json_inside_cached_snapshots() {
+        // `client_reconcile_with_mother` identifies a cached snapshot's game with
+        // json_extract: it must be compiled into the SQLite this build links.
+        let c = db();
+        c.execute_batch(
+            "CREATE TABLE mother_snapshots (launched_game_id INTEGER PRIMARY KEY, state_version INTEGER NOT NULL,
+               mother_epoch INTEGER NOT NULL, snapshot_json TEXT NOT NULL);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO mother_snapshots VALUES (7, 40, 2, ?1)",
+            params![substitute_bundle(true).to_string()],
+        )
+        .unwrap();
+        let (uuid, ended, version): (String, i64, i64) = c
+            .query_row(
+                "SELECT json_extract(snapshot_json, '$.game.summary_uuid'),
+                        COALESCE(json_extract(snapshot_json, '$.game.ended'), 0),
+                        COALESCE(json_extract(snapshot_json, '$.game.state_version'), state_version)
+                   FROM mother_snapshots WHERE json_extract(snapshot_json, '$.game.client_id') = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((uuid.as_str(), ended, version), ("sub-uuid", 1, 38));
+    }
+
+    #[test]
+    fn role_decides_who_stands_down() {
+        use HostRole::{Mother, Substitute};
+        // A substitute never competes with a server already up.
+        assert!(must_stand_down(Substitute, 0, "a", Some("s"), None, "b"));
+        assert!(must_stand_down(Substitute, 0, "a", Some("m"), Some(5), "b"));
+        // The mother starts over a substitute, whatever the boot order.
+        assert!(!must_stand_down(Mother, 0, "b", Some("s"), None, "a"));
+        // Two mothers: the later designation keeps the role.
+        assert!(must_stand_down(Mother, 100, "a", Some("m"), Some(200), "b"));
+        assert!(!must_stand_down(Mother, 200, "b", Some("m"), Some(100), "a"));
+        // No date on either side: exactly one of the two serves.
+        assert!(must_stand_down(Mother, 0, "b", Some("m"), Some(0), "a"));
+        assert!(!must_stand_down(Mother, 0, "a", Some("m"), Some(0), "b"));
+        // A build without roles: first one up wins, as before.
+        assert!(must_stand_down(Mother, 100, "a", None, None, "b"));
+    }
+}
+
+#[cfg(test)]
+mod lan_proto_tests {
+    use super::*;
+
+    #[test]
+    fn designated_addrs_keep_only_routable_lan() {
+        let got = designated_lan_addrs(&[
+            "192.168.1.20".into(),
+            "169.254.3.4".into(),
+            "127.0.0.1".into(),
+            "192.168.137.1".into(),
+            "10.0.0.5".into(),
+        ]);
+        assert_eq!(got, vec!["192.168.1.20".to_string(), "10.0.0.5".to_string()]);
+    }
+
+    #[test]
+    fn missing_lan_proto_means_hotspot_era() {
+        assert_eq!(announced_proto(&json!({ "mother_uuid": "x" })), 1);
+        assert_eq!(announced_proto(&json!({ "lan_proto": LAN_PROTO })), LAN_PROTO);
+    }
+}
+
+/// Pushes this device's "Operator only device" setting (see OperatorPresence).
+#[tauri::command]
+pub async fn client_set_operator_only(
+    presence: tauri::State<'_, OperatorPresence>,
+    operator_only: bool,
+) -> Result<(), String> {
+    *presence.inner.lock().await = operator_only;
+    Ok(())
+}
+
+#[cfg(test)]
+mod clash_purge_tests {
+    use super::*;
+
+    fn terr(index: i64, points: i64) -> ClashTerr {
+        ClashTerr { index, points, balises: vec![], balise_numbers: vec![] }
+    }
+
+    #[test]
+    fn order_is_leader_count_then_points_and_skips_unvalidated() {
+        let ts = [terr(0, 2), terr(1, 4), terr(2, 6), terr(3, 8)];
+        // Leader counts: t0=3, t1=1, t2=3, t3=0.
+        let counts = |i: i64| [3, 1, 3, 0][i as usize];
+        // t0 and t2 tie on count; t2 pays more ⇒ first. t3 has no validation ⇒ out.
+        assert_eq!(clash_purge_order(&ts, 1, counts), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn full_tie_pick_is_stable_and_keeps_every_candidate() {
+        let ts = [terr(0, 5), terr(1, 5), terr(2, 5)];
+        let a = clash_purge_order(&ts, 42, |_| 2);
+        assert_eq!(a, clash_purge_order(&ts, 42, |_| 2));
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2]);
+        // The ones after the deterministic lead stay in index order.
+        assert!(a[1] < a[2]);
+    }
+
+    #[test]
+    fn purge_never_hits_the_purgers_own_territory() {
+        let order = [2, 0, 1];
+        let owner = |i: i64| match i {
+            2 => Some(7),
+            0 => Some(9),
+            _ => None,
+        };
+        // Clan 7 owns the displayed target (2): it is retargeted to 0.
+        assert_eq!(clash_purge_pick(&order, owner, 7), Ok(0));
+        // Clan 9 does not own 2: it hits the displayed target.
+        assert_eq!(clash_purge_pick(&order, owner, 9), Ok(2));
+        // Only own territories left: refused (quota kept).
+        assert_eq!(clash_purge_pick(&[2], owner, 7), Err("own_territory"));
+        assert_eq!(clash_purge_pick(&[], owner, 7), Err("no_target"));
+    }
+}
+
+#[cfg(test)]
+mod customer_tests {
+    use super::*;
+
+    const SCHEMA: &str = r#"
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE lg_launched_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, summary_uuid TEXT NOT NULL UNIQUE,
+            client_id INTEGER NOT NULL, game_uniqid TEXT NOT NULL, name TEXT NOT NULL,
+            number_of_teams INTEGER NOT NULL, game_type TEXT NOT NULL, duration INTEGER NOT NULL DEFAULT 0,
+            start_time TEXT NULL, started INTEGER NOT NULL DEFAULT 0, ended INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), state_version INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE lg_launched_game_meta (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            meta_name TEXT NOT NULL, meta_value TEXT NULL);
+        CREATE TABLE lg_teams (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_number INTEGER NOT NULL, pattern INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0,
+            start_time INTEGER NULL, end_time INTEGER NULL);
+        CREATE TABLE lg_team_completed_quests (id INTEGER PRIMARY KEY AUTOINCREMENT, launched_game_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL, teammate_chip_id INTEGER NULL, quest_number TEXT NOT NULL DEFAULT 'q');
+        CREATE TABLE lg_game_summaries (id INTEGER PRIMARY KEY AUTOINCREMENT, summary_uuid TEXT NOT NULL UNIQUE,
+            launched_game_id INTEGER NULL, client_id INTEGER NOT NULL, game_uniqid TEXT NOT NULL, name TEXT NOT NULL,
+            game_type TEXT NOT NULL, played_at TEXT NULL, teams_launched INTEGER NULL, teams_played INTEGER NOT NULL,
+            players_played INTEGER NOT NULL, content_hash TEXT NULL, pushed_at TEXT NULL, archived_at TEXT NULL,
+            created_at TEXT NULL, updated_at TEXT NULL, customer_id TEXT NULL, customer_name TEXT NULL,
+            customer_assigned_at TEXT NULL, customer_dirty INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE customers (id TEXT PRIMARY KEY, client_id INTEGER NOT NULL, name TEXT NOT NULL, type TEXT NULL,
+            city TEXT NULL, archived INTEGER NOT NULL DEFAULT 0, merged_into_id TEXT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0, origin TEXT NOT NULL DEFAULT 'studio', pushed_at TEXT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE customer_games (summary_uuid TEXT PRIMARY KEY, client_id INTEGER NOT NULL, customer_id TEXT NULL,
+            game_uniqid TEXT NULL, played_at TEXT NULL, customer_assigned_at TEXT NULL);
+        CREATE TABLE customers_state (client_id INTEGER PRIMARY KEY, remote_version REAL, local_version REAL,
+            fetched_at TEXT, failed_attempts INTEGER NOT NULL DEFAULT 0);
+    "#;
+
+    const ACME: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const BETA: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+    const NOW: &str = "2026-10-15 10:00:00";
+
+    fn db() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute(
+            "INSERT INTO customers (id, client_id, name) VALUES (?1, 1, 'Acme'), (?2, 1, 'Beta')",
+            params![ACME, BETA],
+        )
+        .unwrap();
+        c
+    }
+
+    /// An ended, played game (one team with start/end/score) on scenario `uniqid`.
+    fn played_game(c: &rusqlite::Connection, uuid: &str, uniqid: &str) -> i64 {
+        c.execute(
+            "INSERT INTO lg_launched_games (summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, start_time, started, ended)
+             VALUES (?1, 1, ?2, 'g', 1, 'quest', '2026-10-01 14:00:00', 1, 1)",
+            params![uuid, uniqid],
+        )
+        .unwrap();
+        let id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO lg_teams (launched_game_id, team_number, score, start_time, end_time) VALUES (?1, 1, 10, 1, 2)",
+            params![id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn summarise(c: &rusqlite::Connection, id: i64) {
+        let s = compute_summary(c, id).unwrap().expect("eligible");
+        upsert_summary(c, id, &s, NOW).unwrap();
+    }
+
+    fn one<T: rusqlite::types::FromSql>(c: &rusqlite::Connection, sql: &str) -> T {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn meta_customer_reaches_summary_and_reassign_marks_dirty() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        assert_eq!(meta_customer(&c, id).unwrap().1.as_deref(), Some("Acme"));
+        summarise(&c, id);
+        assert_eq!(one::<String>(&c, "SELECT customer_id FROM lg_game_summaries"), ACME);
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 0);
+        // Reassign after the summary exists: summary updated + dirty for re-push.
+        assign_customer_sync(&c, 1, "g1", Some(BETA), None, "2026-10-15T09:05:00.000Z").unwrap();
+        assert_eq!(one::<String>(&c, "SELECT customer_name FROM lg_game_summaries"), "Beta");
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 1);
+        // A recompute with the same meta changes nothing.
+        c.execute("UPDATE lg_game_summaries SET customer_dirty = 0", []).unwrap();
+        summarise(&c, id);
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 0);
+    }
+
+    #[test]
+    fn detach_is_timestamped() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        assign_customer_sync(&c, 1, "g1", None, None, "2026-10-15T09:01:00.000Z").unwrap();
+        let (cid, _, at) = meta_customer(&c, id).unwrap();
+        assert_eq!(cid, None);
+        assert_eq!(at.as_deref(), Some("2026-10-15T09:01:00.000Z"));
+    }
+
+    #[test]
+    fn update_meta_style_rewrite_keeps_customer() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        assert!(is_customer_meta_key("customerId") && !is_customer_meta_key("teamsConfig"));
+        // What update_meta does: wipe everything but the customer keys.
+        c.execute(
+            "DELETE FROM lg_launched_game_meta WHERE launched_game_id = ?1
+               AND meta_name NOT IN ('customerId', 'customerName', 'customerAssignedAt')",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(meta_customer(&c, id).unwrap().0.as_deref(), Some(ACME));
+    }
+
+    #[test]
+    fn flow_back_adopts_newer_studio_value_without_dirty() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        summarise(&c, id);
+        c.execute("UPDATE lg_game_summaries SET pushed_at = 'x', customer_dirty = 0", []).unwrap();
+        c.execute(
+            "INSERT INTO customer_games VALUES ('g1', 1, ?1, 'scn', '2026-10-01 14:00:00', '2026-10-15T09:30:00.000Z')",
+            params![BETA],
+        )
+        .unwrap();
+        assert_eq!(flow_back_customer_assignments(&c, 1).unwrap(), 1);
+        assert_eq!(one::<String>(&c, "SELECT customer_id FROM lg_game_summaries"), BETA);
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 0);
+        assert_eq!(one::<String>(&c, "SELECT pushed_at FROM lg_game_summaries"), "x");
+        assert_eq!(meta_customer(&c, id).unwrap().0.as_deref(), Some(BETA));
+        // Recompute after flow-back: no dirty (no echo to studio).
+        summarise(&c, id);
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 0);
+        // Idempotent.
+        assert_eq!(flow_back_customer_assignments(&c, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn flow_back_ignores_older_studio_value() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        summarise(&c, id);
+        c.execute(
+            "INSERT INTO customer_games VALUES ('g1', 1, ?1, 'scn', NULL, '2026-10-15T08:00:00.000Z')",
+            params![BETA],
+        )
+        .unwrap();
+        assert_eq!(flow_back_customer_assignments(&c, 1).unwrap(), 0);
+        assert_eq!(one::<String>(&c, "SELECT customer_id FROM lg_game_summaries"), ACME);
+    }
+
+    #[test]
+    fn assign_on_archived_summary_marks_dirty() {
+        let c = db();
+        let id = played_game(&c, "g1", "scn");
+        summarise(&c, id);
+        c.execute("UPDATE lg_game_summaries SET pushed_at = 'x', archived_at = 'y'", []).unwrap();
+        c.execute("DELETE FROM lg_launched_games", []).unwrap();
+        assert!(assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap());
+        assert_eq!(one::<i64>(&c, "SELECT customer_dirty FROM lg_game_summaries"), 1);
+        assert!(!assign_customer_sync(&c, 1, "nope", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap());
+    }
+
+    #[test]
+    fn played_dedupes_by_game_and_follows_merges() {
+        let c = db();
+        // g1: local summary (Acme) AND studio view (newer, Beta) -> counts once, for Beta.
+        let g1 = played_game(&c, "g1", "scn1");
+        assign_customer_sync(&c, 1, "g1", Some(ACME), None, "2026-10-15T09:00:00.000Z").unwrap();
+        summarise(&c, g1);
+        c.execute(
+            "INSERT INTO customer_games VALUES ('g1', 1, ?1, 'scn1', '2026-10-01 14:00:00', '2026-10-15T09:30:00.000Z')",
+            params![BETA],
+        )
+        .unwrap();
+        // g2: studio-only game on scn1 for Acme, which studio since merged into Beta.
+        c.execute(
+            "INSERT INTO customer_games VALUES ('g2', 1, ?1, 'scn1', '2026-09-01 10:00:00', '2026-09-01T10:00:00.000Z')",
+            params![ACME],
+        )
+        .unwrap();
+        c.execute("UPDATE customers SET merged_into_id = ?1 WHERE id = ?2", params![BETA, ACME]).unwrap();
+        // g3: running game for Beta on scn2; g4: running TEST game - ignored.
+        c.execute(
+            "INSERT INTO lg_launched_games (summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, start_time, started, ended)
+             VALUES ('g3', 1, 'scn2', 'g', 1, 'quest', '2026-10-15 09:00:00', 1, 0),
+                    ('g4', 1, 'scn3', 'g', 1, 'quest', '2026-10-15 09:00:00', 1, 0)",
+            [],
+        )
+        .unwrap();
+        assign_customer_sync(&c, 1, "g3", Some(BETA), None, "2026-10-15T09:10:00.000Z").unwrap();
+        assign_customer_sync(&c, 1, "g4", Some(BETA), None, "2026-10-15T09:10:00.000Z").unwrap();
+        let g4: i64 = one(&c, "SELECT id FROM lg_launched_games WHERE summary_uuid = 'g4'");
+        c.execute(
+            "INSERT INTO lg_launched_game_meta (launched_game_id, meta_name, meta_value) VALUES (?1, 'testMode', 'true')",
+            params![g4],
+        )
+        .unwrap();
+
+        let v = customers_list_sync(&c, 1).unwrap();
+        let ids: Vec<&str> = v["customers"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![BETA], "merged Acme is not listed");
+        assert_eq!(v["redirects"][ACME], json!(BETA));
+        let mut played: Vec<(String, i64)> = v["played"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                assert_eq!(p["customer_id"], json!(BETA));
+                (p["game_uniqid"].as_str().unwrap().to_string(), p["count"].as_i64().unwrap())
+            })
+            .collect();
+        played.sort();
+        assert_eq!(played, vec![("scn1".to_string(), 2), ("scn2".to_string(), 1)]);
+        assert_eq!(v["cloud_supported"], json!(false));
+    }
+
+    #[test]
+    fn uuid_check() {
+        assert!(looks_like_uuid(ACME));
+        assert!(!looks_like_uuid("aaaaaaaa-0000-4000-8000-00000000000"));
+        assert!(!looks_like_uuid("zaaaaaaa-0000-4000-8000-000000000001"));
     }
 }

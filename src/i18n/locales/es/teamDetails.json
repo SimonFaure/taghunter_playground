@@ -62,5 +62,11 @@
   "editSaveChanges": "Guardar cambios",
   "editSaveFailed": "No se pudo actualizar el equipo.",
   "summaryLateMalus": "Penalización por retraso",
-  "lateMalusRevert": "Volver a la penalización por retraso calculada automáticamente ({{value}})"
+  "lateMalusRevert": "Volver a la penalización por retraso calculada automáticamente ({{value}})",
+  "stalePunchesLabel_one": "Tarjeta no vacía al inicio: {{count}} marcaje ignorado",
+  "stalePunchesLabel_other": "Tarjeta no vacía al inicio: {{count}} marcajes ignorados",
+  "stalePunchesCount": "Tener en cuenta estos marcajes",
+  "stalePunchesIgnore": "Volver a ignorar estos marcajes",
+  "stalePunchesCounted": "Marcajes iniciales contados",
+  "stalePunchesHint": "El jugador jugó antes de registrar la salida: contar los marcajes ya presentes en la tarjeta en el primer bip. Si la partida ha terminado, se recalcula la puntuación."
 }

@@ -221,6 +221,21 @@ export async function upsertFromManifest(rows: ScenarioManifestRow[], seenAt: st
   }
 }
 
+// A scenario fetched from the LAN mother that this device's manifest doesn't
+// list yet. Creates the row only (never touches an existing one): remote_* come
+// from the mother's own cloud manifest, local_* stay NULL until the fetched
+// files are committed. Our next cloud cycle corrects or tombstones it.
+export async function insertFromPeerIfMissing(r: ScenarioManifestRow): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `INSERT OR IGNORE INTO scenarios (
+       uniqid, title, game_type, is_product, remote_version, local_version,
+       remote_content_hash, local_content_hash, last_manifest_seen_at, failed_attempts
+     ) VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, $7, 0)`,
+    [r.uniqid, r.title, r.game_type, r.is_product ? 1 : 0, parseScenarioVersion(r.version), r.content_hash ?? null, new Date().toISOString()]
+  );
+}
+
 // Atomically swap a scenario's active manifest to `files` and mark it
 // reconciled at `remoteContentHash`. Called once all the scenario's target
 // blobs are present in the pool.
@@ -303,6 +318,36 @@ export async function commitPartialManifest(
   ]);
 }
 
+// Full file list of the scenario's REMOTE content hash, as the studio sent it
+// (game-data.json included). Kept apart from scenario_files, which only holds
+// what this device committed (a subset on operator-only devices): a LAN peer
+// rebuilds get_scenario_game_data from it. Replaced wholesale per scenario.
+export async function recordRemoteFiles(
+  uniqid: string,
+  remoteContentHash: string,
+  files: Array<{ rel_path: string; hash: string; size?: number | null }>
+): Promise<void> {
+  const db = await getDb();
+  await db.execute('DELETE FROM scenario_remote_files WHERE uniqid = $1', [uniqid]);
+  for (const f of files) {
+    await db.execute(
+      'INSERT OR REPLACE INTO scenario_remote_files (uniqid, content_hash, rel_path, hash, size) VALUES ($1, $2, $3, $4, $5)',
+      [uniqid, remoteContentHash, f.rel_path, f.hash, f.size ?? null]
+    );
+  }
+}
+
+export async function listRemoteFiles(
+  uniqid: string,
+  contentHash: string
+): Promise<Array<{ rel_path: string; hash: string; size: number | null }>> {
+  const db = await getDb();
+  return db.select<Array<{ rel_path: string; hash: string; size: number | null }>>(
+    'SELECT rel_path, hash, size FROM scenario_remote_files WHERE uniqid = $1 AND content_hash = $2 ORDER BY rel_path',
+    [uniqid, contentHash]
+  );
+}
+
 export async function incrementFailedAttempts(uniqid: string): Promise<void> {
   const db = await getDb();
   await db.execute(
@@ -322,6 +367,7 @@ export async function tombstoneMissing(keepUniqids: string[]): Promise<string[]>
     if (keep.has(e.uniqid)) continue;
     await db.execute('DELETE FROM scenarios WHERE uniqid = $1', [e.uniqid]);
     await db.execute('DELETE FROM scenario_files WHERE uniqid = $1', [e.uniqid]);
+    await db.execute('DELETE FROM scenario_remote_files WHERE uniqid = $1', [e.uniqid]);
     // Legacy per-scenario media dir (pre-CAS); now a no-op for fresh installs.
     // The scenario's blobs become orphans reclaimed by pruneOrphanBlobs at boot.
     await removeRecursive(scenarioRootDirRel(e.uniqid));
@@ -392,5 +438,6 @@ export async function deleteScenario(uniqid: string): Promise<void> {
   const db = await getDb();
   await db.execute('DELETE FROM scenarios WHERE uniqid = $1', [uniqid]);
   await db.execute('DELETE FROM scenario_files WHERE uniqid = $1', [uniqid]);
+  await db.execute('DELETE FROM scenario_remote_files WHERE uniqid = $1', [uniqid]);
   await removeRecursive(scenarioRootDirRel(uniqid));
 }

@@ -43,10 +43,10 @@ export function syncItemKey(item: WorkItem): string {
       return `team_names:${item.clientId}`;
     case 'recovery_codes':
       return `recovery_codes:${item.clientId}`;
+    case 'customers':
+      return `customers:${item.clientId}`;
     case 'report_layouts':
       return 'report_layouts';
-    case 'lan_networks':
-      return 'lan_networks';
     case 'pattern':
       return `pattern:${item.uniqid}`;
     case 'scenario_meta':
@@ -57,6 +57,10 @@ export function syncItemKey(item: WorkItem): string {
       return `gt_admin:${item.code}`;
     case 'game_type_override_video':
       return `gt_override:${item.code}`;
+    case 'game_type_admin_subtitles':
+      return `gt_admin_subs:${item.code}`;
+    case 'game_type_override_subtitles':
+      return `gt_override_subs:${item.code}`;
   }
 }
 

@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.3",
+  "name": "taghunter-playground",
+  "display_name": "Tag Hunter Playground simulations",
+  "version": "1.4.0",
+  "description": "Run game-simulator campaigns in the Tag Hunter Playground tester build on this PC and record a verdict for each run.",
+  "long_description": "Say \"Launch the Playground simulations\": Claude checks which launch configurations are untested, starts a campaign that plays each one on the visible game page (mock teams, real game screens), then proposes a Pass/Partial/Fail verdict per run for the tester to confirm. Needs the Playground TESTER build running on the same PC.",
+  "author": { "name": "Tag Hunter" },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"]
+    }
+  },
+  "tools": [
+    { "name": "playground_info", "description": "App version, devices and the current campaign." },
+    { "name": "list_scenarios", "description": "Downloaded scenarios the simulator can play." },
+    { "name": "coverage", "description": "Which launch configurations have passed, and the gaps." },
+    { "name": "estimate_campaign", "description": "Run count and rough duration of a campaign." },
+    { "name": "start_campaign", "description": "Start a series of simulated sessions." },
+    { "name": "retry_candidates", "description": "Failed / partial runs to retry." },
+    { "name": "campaign_status", "description": "The current campaign and its runs." },
+    { "name": "wait_next_result", "description": "Wait until a run ends." },
+    { "name": "run_result", "description": "One run in detail." },
+    { "name": "record_verdict", "description": "Save a confirmed verdict to Studio." },
+    { "name": "control_campaign", "description": "Pause, resume, skip or stop." },
+    { "name": "list_presets", "description": "Saved lists of configurations." },
+    { "name": "save_preset", "description": "Save a list of configurations." }
+  ],
+  "prompts": [
+    {
+      "name": "launch_playground_simulations",
+      "description": "Check what is untested, run a campaign and judge each run.",
+      "text": "Launch the Playground simulations. Start with playground_info and coverage, summarise what is untested, ask me which series to run unless it is obvious, then run it and propose a verdict for each finished run for me to confirm."
+    }
+  ],
+  "compatibility": { "platforms": ["win32"], "runtimes": { "node": ">=18.0.0" } },
+  "license": "UNLICENSED"
+}

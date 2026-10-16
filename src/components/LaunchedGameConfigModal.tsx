@@ -22,7 +22,11 @@ import {
   TRACKS_SCORE_TYPE_LABELS,
 } from './LaunchGameModal';
 import { HelpDot } from '../help';
+import { ScoreWeightingFormula } from './ScoreWeightingFormula';
 import { formatDbDateTime } from '../utils/dbTime';
+import { assignCustomer } from '../services/customersStore';
+import { useCustomers } from './customers/useCustomers';
+import { CustomerCombobox, type CustomerValue } from './customers/CustomerCombobox';
 
 interface LaunchedGameConfigModalProps {
   gameId: number;
@@ -45,6 +49,7 @@ const TRACKS_SECTION_KEYS = new Set([
   'scoreType',
   'malusPerMinute',
   'cluesPage',
+  'tracksShowLegend',
 ]);
 
 // Internal / derived meta keys that are never user-editable in this modal,
@@ -61,6 +66,10 @@ const INTERNAL_KEYS = new Set([
   'useNamePool',
   'addRandomNameOption',
   'allowPlayerLanguageChoice',
+  // Licensee customer: its own section below (assign_customer, never update_meta).
+  'customerId',
+  'customerName',
+  'customerAssignedAt',
 ]);
 
 // Editable keys shared by every "playable" game type. Mirrors the launch
@@ -87,6 +96,7 @@ const KEYS_BY_TYPE: Record<string, string[]> = {
     'reuseCards',
     'reuseDelayMinutes',
     'enterToReset',
+    'noRevealAnimation',
     'autoResetTeam',
     'delayBeforeReset',
     'showIdleLayout',
@@ -130,6 +140,7 @@ interface CluesPageConfig {
   show_title?: boolean;
   show_text?: boolean;
   show_image?: boolean;
+  duration_sec?: number;
 }
 
 interface MetaField {
@@ -165,6 +176,23 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
   // (same source the launch modal uses, so the pickers match exactly).
   const [tracksOptions, setTracksOptions] = useState<TracksLaunchOptions>(EMPTY_TRACKS_OPTIONS);
   const isTracks = (gameType ?? '').toLowerCase() === 'tracks';
+  // Licensee customer (project_licensee_customers) - applied at once, on its own.
+  const { snapshot: customersSnapshot } = useCustomers();
+  const [customer, setCustomer] = useState<CustomerValue | null>(null);
+  const [customerError, setCustomerError] = useState<string | null>(null);
+
+  const changeCustomer = async (c: CustomerValue | null) => {
+    const prev = customer;
+    setCustomer(c);
+    setCustomerError(null);
+    try {
+      await assignCustomer({ gameId, customerId: c?.id ?? null, customerName: c?.name ?? null });
+    } catch (err) {
+      console.error('[LaunchedGameConfigModal] customer assign failed:', err);
+      setCustomer(prev);
+      setCustomerError(t('customers:assignFailed'));
+    }
+  };
 
   useEffect(() => {
     loadMetaFields();
@@ -189,6 +217,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
     setLoading(true);
     try {
       const meta = await getLaunchedGameMeta(gameId);
+      setCustomer(meta.customerId ? { id: meta.customerId, name: meta.customerName ?? '' } : null);
       const fields: MetaField[] = Object.entries(meta)
         .filter(([k]) => k !== 'firstChipIndex')
         .map(([k, v]) => ({ meta_name: k, meta_value: v ?? null }));
@@ -281,6 +310,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
       autoResetTeam: t('launchedGameConfig:fieldAutoResetTeam'),
       delayBeforeReset: t('launchedGameConfig:fieldDelayBeforeReset'),
       enterToReset: t('launchedGameConfig:fieldEnterToReset'),
+      noRevealAnimation: t('launchedGameConfig:fieldNoRevealAnimation'),
       showIdleLayout: t('launchedGameConfig:fieldShowIdleLayout'),
       idleSubtitle: t('launchedGameConfig:fieldIdleSubtitle'),
       autoRegisterTeam: t('launchedGameConfig:fieldAutoRegisterTeam'),
@@ -303,6 +333,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
     if (metaName === 'colorblindMode' || metaName === 'autoResetTeam' ||
         metaName === 'autoRegisterTeam' || metaName === 'reuseCards' ||
         metaName === 'selfRegisterTeam' || metaName === 'enterToReset' ||
+        metaName === 'noRevealAnimation' ||
         metaName === 'showIdleLayout' || metaName === 'testMode' ||
         metaName === 'tagquestShowQuestPreview' ||
         metaName === 'tagquestShowMissingStations' ||
@@ -428,6 +459,13 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
         </div>
 
         <div className="p-6 space-y-6">
+        {!loading && customersSnapshot.supported && (
+          <div className="space-y-2 max-w-md">
+            <label className="pg-label">{t('customers:label')}</label>
+            <CustomerCombobox snapshot={customersSnapshot} value={customer} onChange={(c) => void changeCustomer(c)} />
+            {customerError && <p className="text-sm text-red-400">{customerError}</p>}
+          </div>
+        )}
         {loading ? (
           <div className="text-center py-12 text-[var(--pg-text-dim)]">{t('launchedGameConfig:loading')}</div>
         ) : !hasVisibleFields ? (
@@ -491,6 +529,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                       checked={!!cluesConfig.enabled}
                       onChange={(e) =>
                         setCluesConfig({
+                          ...cluesConfig,
                           enabled: e.target.checked,
                           show_title: cluesConfig.show_title ?? true,
                           show_text: cluesConfig.show_text ?? true,
@@ -519,6 +558,7 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                             checked={cluesConfig[key] !== false}
                             onChange={(e) =>
                               setCluesConfig({
+                                ...cluesConfig,
                                 enabled: cluesConfig.enabled ?? true,
                                 show_title: cluesConfig.show_title ?? true,
                                 show_text: cluesConfig.show_text ?? true,
@@ -531,9 +571,46 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                           <span>{t(`launchModal:${i18nKey}`)}</span>
                         </label>
                       ))}
+                      <div className="space-y-2 pt-1">
+                        <label htmlFor="cfg-tracksCluesDuration" className="pg-label">
+                          {t('launchModal:tracksCluesDuration')}
+                        </label>
+                        <input
+                          id="cfg-tracksCluesDuration"
+                          type="number"
+                          min={1}
+                          value={cluesConfig.duration_sec ?? 10}
+                          onChange={(e) =>
+                            setCluesConfig({
+                              ...cluesConfig,
+                              duration_sec: Math.max(1, parseInt(e.target.value) || 1),
+                            })
+                          }
+                          className="pg-input !w-32"
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
+                {/* Feedback-image legend (mirrors the launch modal's Advanced
+                    toggle). No saved value - a game launched before the option
+                    existed - shows the scenario's own setting. */}
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={
+                      editedValues.tracksShowLegend
+                        ? editedValues.tracksShowLegend === 'true'
+                        : tracksOptions.showLegend
+                    }
+                    onChange={(e) => handleValueChange('tracksShowLegend', String(e.target.checked))}
+                    className="mt-0.5 w-4 h-4 accent-[var(--pg-accent)]"
+                  />
+                  <span>
+                    <span className="font-medium text-[var(--pg-text)]">{t('launchModal:tracksShowLegend')}</span>
+                    <span className="block text-xs text-[var(--pg-text-dim)]">{t('launchModal:tracksShowLegendHint')}</span>
+                  </span>
+                </label>
               </div>
             )}
 
@@ -653,6 +730,14 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                     );
                   })}
                 </div>
+                {toggleFields.some((f) => f.meta_name === 'tagquestScoreWeighting') && (
+                  <div className="space-y-1">
+                    <div className="text-xs font-semibold text-[var(--pg-text-muted)]">
+                      {t('launchedGameConfig:fieldTagquestScoreWeighting')}
+                    </div>
+                    <ScoreWeightingFormula />
+                  </div>
+                )}
               </div>
             )}
           </>

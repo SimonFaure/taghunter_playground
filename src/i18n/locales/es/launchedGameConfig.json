@@ -16,6 +16,7 @@
   "fieldAutoResetTeam": "Reinicio automático de la página",
   "fieldDelayBeforeReset": "Retardo antes del reinicio (segundos)",
   "fieldEnterToReset": "Usar Intro para actualizar la página",
+  "fieldNoRevealAnimation": "Sin animación",
   "fieldShowIdleLayout": "Mostrar el diseño de espera",
   "fieldIdleSubtitle": "Subtítulo de la pantalla de espera",
   "fieldAutoRegisterTeam": "Registro automático del equipo",

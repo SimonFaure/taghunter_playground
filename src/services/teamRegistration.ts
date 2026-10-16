@@ -7,6 +7,7 @@
 // card's reader id resolves directly via cardsRepo.getById.
 
 import * as cardsRepo from './cardsRepo';
+import { simChipRow } from './simChips';
 import {
   addTeamToLaunchedGame,
   getLaunchedGameState,
@@ -28,7 +29,8 @@ export async function ensureTeamForCard(
   state: LaunchedGameStatePayload,
   preferPoolName = false,
 ): Promise<TeamRow | null> {
-  const cardRow = await cardsRepo.getById(cardId);
+  // Game-simulator virtual chips are recognised by ID (tester builds only).
+  const cardRow = (await cardsRepo.getById(cardId)) ?? simChipRow(cardId);
   if (!cardRow) return null;
 
   const priorForCard = state.teams.filter((t) => t.key_id === cardId);

@@ -117,6 +117,7 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
           {phase === 'choose' ? (
             <OtpInput
               length={4}
+              masked
               value={first}
               onChange={setFirst}
               onComplete={handleFirstComplete}
@@ -125,6 +126,7 @@ function SetPinModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
           ) : (
             <OtpInput
               length={4}
+              masked
               value={second}
               onChange={setSecond}
               onComplete={handleSecondComplete}

@@ -98,6 +98,14 @@ export interface AuthStateBlock {
   // Optional so older payloads persist cleanly.
   brand_logo_url?: string | null;
   report_use_brand_logo?: boolean;
+  // The calling device, when the token is bound to one. `is_default_mother` /
+  // `mother_since` say which device Studio holds as the licensee's mother
+  // (see deviceRole.alignRoleWithStudio). Absent on an older server.
+  device?: {
+    id: number;
+    is_default_mother?: boolean;
+    mother_since?: string | null;
+  };
   server_time: string;
 }
 
@@ -121,6 +129,13 @@ export async function persistAuthState(
 ): Promise<void> {
   const db = await getDb();
   const existing = await getAuthUser();
+  // Studio holds one mother per licensee: a device that lost the role there
+  // gives it up here. Imported lazily (deviceRole reaches back into api.ts).
+  if (state.device) {
+    void import('./deviceRole')
+      .then((m) => m.alignRoleWithStudio(state.device))
+      .catch(() => {});
+  }
   const currentDeviceId =
     options.current_device_id ?? existing?.current_device_id ?? null;
   const deviceLabel =

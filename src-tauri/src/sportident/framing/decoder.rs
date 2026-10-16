@@ -31,6 +31,10 @@ pub enum ResyncReason {
     /// Frame ended with a byte other than ETX. Almost always means the
     /// LEN byte was wrong - i.e. the STX we picked was a false positive.
     BadEtx,
+    /// A candidate frame sat incomplete for too long (see `drop_stale`).
+    /// The leading STX was a stray byte whose bogus LEN made us wait for
+    /// bytes that will never come.
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +65,26 @@ impl Decoder {
     pub fn push(&mut self, bytes: &[u8], out: &mut Vec<DecodeEvent>) {
         self.buf.extend(bytes.iter().copied());
         self.try_decode(out);
+    }
+
+    /// True when bytes are held waiting for the rest of a candidate frame.
+    pub fn has_pending(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    /// Give up on the candidate frame at the head of the buffer: drop its
+    /// STX and rescan. The caller decides when a partial frame is stale
+    /// (line silent for `STALE_PARTIAL_FRAME_MS`). Without this, a stray
+    /// 0x02 followed by a large LEN byte held every real frame behind it
+    /// until up to 261 bytes had arrived - minutes of idle traffic.
+    pub fn drop_stale(&mut self, out: &mut Vec<DecodeEvent>) {
+        if let Some(dropped) = self.buf.pop_front() {
+            out.push(DecodeEvent::Resync {
+                dropped,
+                reason: ResyncReason::Stale,
+            });
+            self.try_decode(out);
+        }
     }
 
     /// Drain as many frames / resync events as possible from the work
@@ -320,6 +344,45 @@ mod tests {
         d.push(&[ETX], &mut out);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], DecodeEvent::Frame(_)));
+    }
+
+    #[test]
+    fn drop_stale_releases_frames_held_behind_false_stx() {
+        // Stray STX + huge LEN (0xEF = 239 → waits for 245 bytes), then a
+        // real frame that gets swallowed as "payload" of the bogus one.
+        let mut wire = vec![STX, 0xEF, 0xEF];
+        wire.extend(build_frame(0xF0, &[0x4D]));
+        let mut d = Decoder::new();
+        let mut out = Vec::new();
+        d.push(&wire, &mut out);
+        assert!(out.is_empty(), "frame must be held behind the false STX");
+        assert!(d.has_pending());
+
+        d.drop_stale(&mut out);
+        assert!(matches!(
+            out[0],
+            DecodeEvent::Resync {
+                dropped: STX,
+                reason: ResyncReason::Stale
+            }
+        ));
+        let frames: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                DecodeEvent::Frame(f) => Some(f.cmd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![0xF0], "real frame must come out at once");
+        assert!(!d.has_pending());
+    }
+
+    #[test]
+    fn drop_stale_on_empty_buffer_is_noop() {
+        let mut d = Decoder::new();
+        let mut out = Vec::new();
+        d.drop_stale(&mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -9,9 +9,18 @@
 // is sourced from the authenticated token on the server, never trusted from
 // the client.
 
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { apiCall, getLanOverride, getLocalLaunchedGamesRoute } from './api';
 import { withRetry } from './apiRetry';
-import { captureGameSummary, type GameSummaryPayload } from './telemetry';
+import { motherNow } from './motherTime';
+import {
+  captureCustomerUpsert,
+  captureGameSummary,
+  type CustomerUpsertPayload,
+  type GameSummaryPayload,
+} from './telemetry';
+import { studioSupportsCustomers } from './customersStore';
 import type { ScreenState } from './screenState';
 
 // ---------- types ----------
@@ -30,6 +39,13 @@ export interface LaunchedGameRow {
   updated_at?: string;
   /** True when launched with testMode - excluded from statistics; deletable. */
   is_test?: boolean;
+  /** Game simulator session (meta simulated='true'); also counted in is_test. */
+  is_simulated?: boolean;
+  /** The game's identity across devices (the integer id is per device). */
+  summary_uuid?: string;
+  /** Licensee customer the game was played for (project_licensee_customers). */
+  customer_id?: string | null;
+  customer_name?: string | null;
 }
 
 export interface TeamRow {
@@ -122,6 +138,33 @@ export async function createLaunchedGame(input: CreateLaunchedGameInput): Promis
       body: { ...input, meta, started: input.started ? 1 : 0, idempotency_key: idempotencyKey },
     })
   );
+}
+
+/**
+ * THIS device's own copy of the games it launched or took part in, read from
+ * its database - no server needed. The "Cet appareil" section used to ask
+ * `forceLocal` for it, which on a device with no local server (every satellite)
+ * fell through to the mother and listed the MOTHER's own games.
+ */
+export async function listOwnLocalGames(clientId: number): Promise<LaunchedGameRow[]> {
+  return invoke<LaunchedGameRow[]>('client_list_local_games', { clientId, mine: true });
+}
+
+/**
+ * Fires when game copies were reconciled with another device (a peer's newer
+ * copy replaced ours, or ours was dropped): lists should reload.
+ */
+export function onGamesReconciled(fn: () => void): () => void {
+  let stop: (() => void) | null = null;
+  let cancelled = false;
+  void listen('taghunter://games-reconciled', () => fn()).then((unlisten) => {
+    if (cancelled) unlisten();
+    else stop = unlisten;
+  });
+  return () => {
+    cancelled = true;
+    stop?.();
+  };
 }
 
 export async function listLaunchedGames(
@@ -280,7 +323,14 @@ export async function updateTeam(
     apiCall('launched_games', 'update_team', {
       method: 'POST',
       bearer: true,
-      body: { team_id: teamId, ...fields },
+      // Scores are stored as integers. Round here too so a fractional score
+      // (Tracks percentage) is saved even by a mother running an older build,
+      // whose update_team ignores a non-integer score altogether.
+      body: {
+        team_id: teamId,
+        ...fields,
+        ...(typeof fields.score === 'number' ? { score: Math.round(fields.score) } : {}),
+      },
     })
   );
 }
@@ -423,20 +473,42 @@ export async function syncGameSummaries(): Promise<void> {
   if (summarySyncInFlight) return;
   summarySyncInFlight = true;
   try {
-    const res = await apiCall<{ summaries: GameSummaryPayload[] }>(
+    const res = await apiCall<{ summaries: GameSummaryPayload[]; customers?: CustomerUpsertPayload[] }>(
       'launched_games',
       'sync_summaries',
       { method: 'POST', bearer: true }
     );
     const summaries = res.summaries ?? [];
-    if (summaries.length === 0) return;
+    // Customers quick-created on the LAN go first, and only to a studio that
+    // knows customers (an older one would reject and drop them). A game that
+    // reaches studio before its customer still carries the name, so studio
+    // creates it from that (project_licensee_customers).
+    const customers = (await studioSupportsCustomers()) ? (res.customers ?? []) : [];
+    const pushedCustomerIds: string[] = [];
+    for (const c of customers) {
+      try {
+        await captureCustomerUpsert(c);
+        pushedCustomerIds.push(c.customer_id);
+      } catch (err) {
+        console.warn('[summaries] customer_upsert enqueue failed:', err);
+      }
+    }
+    if (summaries.length === 0 && pushedCustomerIds.length === 0) return;
     for (const s of summaries) {
       await captureGameSummary(s);
     }
     await apiCall('launched_games', 'mark_summaries_pushed', {
       method: 'POST',
       bearer: true,
-      body: { summary_uuids: summaries.map((s) => s.summary_uuid) },
+      body: {
+        summary_uuids: summaries.map((s) => s.summary_uuid),
+        customer_ids: pushedCustomerIds,
+        // The assignment each summary was pushed with: a reassignment made
+        // meanwhile stays dirty and goes out next cycle.
+        customer_assigned: Object.fromEntries(
+          summaries.filter((s) => s.customer_assigned_at).map((s) => [s.summary_uuid, s.customer_assigned_at])
+        ),
+      },
     });
   } catch (err) {
     console.warn('[summaries] syncGameSummaries skipped:', err);
@@ -530,6 +602,8 @@ export interface PairedDeviceStatusRow {
   // a pill for online rows - see GameDevicesModal. The self row uses the local
   // screenState store instead (the mother never pings itself).
   screen_state?: ScreenState | null;
+  /** The device is operator-only (every Android tablet): it never joins a game. */
+  operator_only?: boolean;
 }
 
 export interface ListPairedWithStatusResp {
@@ -616,7 +690,17 @@ export interface QueueCommandBulkResp {
 
 async function queueCommandBulk(
   targets: number[],
-  kind: 'join_game' | 'play_video' | 'stop_video' | 'open_ranking' | 'show_team_summary' | 'disconnect_device' | 'become_mother' | 'reload_config',
+  kind:
+    | 'join_game'
+    | 'play_video'
+    | 'stop_video'
+    | 'open_ranking'
+    | 'show_team_summary'
+    | 'disconnect_device'
+    | 'reload_config'
+    | 'lock_device'
+    | 'show_logo'
+    | 'sim_control',
   payload: Record<string, unknown>
 ): Promise<QueueCommandBulkResp> {
   return withRetry(() =>
@@ -626,6 +710,23 @@ async function queueCommandBulk(
       body: { targets, kind, payload },
     })
   );
+}
+
+// Game simulator remote control (tester builds): drive the simulator executor
+// on another device - the mother included. `cmd` is a SimCommand; `sent_at`
+// lets the target drop a command that sat in the queue too long.
+export async function queueSimControl(
+  targetDeviceId: number,
+  launchedGameId: number,
+  cmd: Record<string, unknown>
+): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk([targetDeviceId], 'sim_control', {
+    launched_game_id: launchedGameId,
+    device_id: targetDeviceId,
+    // Mother time: the target compares it with its own view of the mother clock.
+    sent_at: motherNow(),
+    cmd,
+  });
 }
 
 export async function queueJoinGameCommandBulk(
@@ -645,12 +746,16 @@ export async function queuePlayVideoBulk(
   targets: number[],
   launchedGameId: number,
   kinds: Array<'intro' | 'tutorial'>,
-  language: string
+  language: string,
+  // Operator's subtitle pick ('off' | '<lang>'); omitted = each target keeps
+  // its own default. See SubtitleChoice in videoResolution.
+  subtitleLang?: string
 ): Promise<QueueCommandBulkResp> {
   return queueCommandBulk(targets, 'play_video', {
     launched_game_id: launchedGameId,
     kinds,
     language,
+    ...(subtitleLang ? { subtitle_lang: subtitleLang } : {}),
   });
 }
 
@@ -720,16 +825,52 @@ export async function broadcastConfigReload(launchedGameId: number): Promise<voi
   }
 }
 
-// Planned handover: tell a paired device to take over as the mother for this
-// game. The target adopts its latest cached snapshot and promotes (epoch+1);
-// the current mother then yields. Delivery is via /ping.php pickup.
-export async function queueBecomeMotherCommand(
-  targetDeviceId: number,
-  launchedGameId: number
-): Promise<QueueCommandBulkResp> {
-  return queueCommandBulk([targetDeviceId], 'become_mother', {
-    launched_game_id: launchedGameId,
+// ---------- top-bar Devices modal (whole fleet, not tied to one game) ----------
+
+// One paired device as the top-bar Devices modal shows it. `games` lists the
+// ACTIVE launched games it is registered in (newest first) - a device can be
+// registered yet showing something else, having left the game page without
+// leaving the game.
+export interface FleetDeviceRow {
+  id: number;
+  device_label: string;
+  peer_os: string | null;
+  // The hosting mother's own row (the DB owner), whoever asks.
+  is_self: boolean;
+  online: boolean;
+  last_seen_at: string | null;
+  has_reader: boolean;
+  screen_state: ScreenState | null;
+  /** Operator-only device: never pushed into a game. */
+  operator_only?: boolean;
+  games: Array<{ launched_game_id: number; name: string }>;
+}
+
+export interface ListFleetResp {
+  devices: FleetDeviceRow[];
+  // paired_devices.id of the CALLER - see ListPairedWithStatusResp.
+  caller_device_id?: number;
+}
+
+export async function listFleet(): Promise<ListFleetResp> {
+  return apiCall<ListFleetResp>('launched_games', 'list_fleet', {
+    method: 'GET',
+    bearer: true,
   });
+}
+
+// Raise the PIN lock overlay on paired device(s). Unlocking still needs the
+// device's own PIN. Delivered on the target's next ping (~10s), or in-process
+// when the target is the mother.
+export async function queueLockDeviceBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'lock_device', {});
+}
+
+// Raise the idle logo screen on paired device(s). Like the local nav button it
+// replaces the app; a device in a game stays registered and can be pulled back
+// with join_game `rejoin`.
+export async function queueShowLogoBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'show_logo', {});
 }
 
 // ---------- team_completed_quests (tagquest scoring) ----------

@@ -9,6 +9,7 @@
   "exitAdmin": "Salir de admin",
   "logoScreen": "Pantalla de logo",
   "lock": "Bloquear",
+  "devices": "Dispositivos",
   "motherThisDevice": "Este dispositivo es la madre",
   "motherConnected": "Este dispositivo está conectado a la madre",
   "motherConnectedTo": "Este dispositivo está conectado a la madre: {{label}}",
@@ -17,5 +18,6 @@
   "readerKo": "Lector SI no detectado",
   "readerChecking": "Comprobando el lector…",
   "testChannelBadge": "TEST",
-  "testChannelHint": "Este dispositivo es un probador: descarga las actualizaciones desde el canal de prueba."
+  "testChannelHint": "Este dispositivo es un probador: descarga las actualizaciones desde el canal de prueba.",
+  "motherSubstituteThisDevice": "Este equipo aloja las partidas en sustitución del puesto madre"
 }

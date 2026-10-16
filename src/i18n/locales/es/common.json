@@ -14,5 +14,7 @@
   "no": "No",
   "dismiss": "Descartar",
   "pinResetBanner": "El PIN del dispositivo se restableció con un código de recuperación. Establece un nuevo PIN para que las protecciones vuelvan a funcionar.",
-  "setNewPin": "Establecer un nuevo PIN"
+  "setNewPin": "Establecer un nuevo PIN",
+  "showPin": "Mostrar el código",
+  "hidePin": "Ocultar el código"
 }

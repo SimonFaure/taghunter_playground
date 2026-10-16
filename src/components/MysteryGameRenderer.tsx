@@ -188,6 +188,9 @@ export interface MysteryGameRendererProps {
    *  whose threshold `score` has passed - i.e. only teams that beat
    *  `score_full_game` ever see anything here. */
   bonuses?: readonly MysteryBonusTier[];
+  /** Launch "No animation": the final board appears as-is, so the bonus plate
+   *  skips its pop-in. */
+  noAnimation?: boolean;
 }
 
 const DEFAULT_CANONICAL_WIDTH = 1920;
@@ -369,6 +372,7 @@ export function MysteryGameRenderer({
   idleTextHidden,
   idleSubtitle,
   bonuses,
+  noAnimation,
 }: MysteryGameRendererProps) {
   const fitWrapperRef = useRef<HTMLDivElement>(null);
   const [stage, setStage] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
@@ -931,6 +935,7 @@ export function MysteryGameRenderer({
                       key={`bonus-${activeBonus.index}`}
                       className="mystery-game-bonus"
                       style={{
+                        ...(noAnimation ? { animation: 'none' } : {}),
                         position: 'absolute',
                         inset: 0,
                         display: 'flex',
@@ -1220,6 +1225,7 @@ export function MysteryGameRenderer({
                     text={textByRole[role.key]}
                     fontFamily={overlayFont}
                     color={overlayColor}
+                    isTeamName={role.key === 'team_name'}
                   />
                 ));
               })()}

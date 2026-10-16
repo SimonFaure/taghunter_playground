@@ -1,43 +1,28 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Loader2, Trash2, Monitor, Smartphone, Tablet } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { listActiveLaunchedGames, queueBecomeMotherCommand } from '../../services/launchedGames';
 import {
   listPairedDevices, revokePairedDevice,
   formatLanTime, isRecent, displayDeviceLabel,
   type PairedDeviceRow,
 } from '../../services/lanPairing';
 import { parseDbTs } from '../../utils/dbTime';
-import { ErrorDetails } from '../ErrorDetails';
 
 const POLL_MS = 4000;
 
-// The mother's satellites, in two modes (retours sept. #10):
-//  - `list`: the "Mes satellites" card of the Network page - name, online pill,
-//    last exchange, and the (sticky, retours sept. #8) revoke button. Nothing else.
-//  - `handover`: Avancé → Changer de rôle - pick an online satellite and hand it
-//    the mother role for the active game. Red, two-step confirmation.
-export function PairedDevicesPanel({ mode = 'list' }: { mode?: 'list' | 'handover' }) {
+// The "Mes satellites" card of the Network page (retours sept. #10): name,
+// online pill, last exchange, and the (sticky, retours sept. #8) revoke button.
+// Nothing else. Handing the mother role to a satellite from here is gone: there
+// is one mother, the PC set as such in "Rôle de ce poste".
+export function PairedDevicesPanel() {
   const { t } = useTranslation('devicesLan');
 
   const [paired, setPaired] = useState<PairedDeviceRow[]>([]);
   const [revokingId, setRevokingId] = useState<number | null>(null);
   const [confirmRevokeId, setConfirmRevokeId] = useState<number | null>(null);
-  // Active launched game: the handover target's game.
-  const [activeGameId, setActiveGameId] = useState<number | null>(null);
-  const [handoverTo, setHandoverTo] = useState<number | null>(null);
-  const [confirmHandover, setConfirmHandover] = useState(false);
-  const [handoverBusy, setHandoverBusy] = useState(false);
-  const [handoverDone, setHandoverDone] = useState(false);
-  const [handoverErr, setHandoverErr] = useState<unknown>(null);
 
   const refresh = useCallback(async () => {
-    const [dev, games] = await Promise.all([
-      listPairedDevices().catch(() => [] as PairedDeviceRow[]),
-      listActiveLaunchedGames().catch(() => []),
-    ]);
-    setPaired(dev);
-    setActiveGameId(games[0]?.id ?? null);
+    setPaired(await listPairedDevices().catch(() => [] as PairedDeviceRow[]));
   }, []);
 
   useEffect(() => {
@@ -52,78 +37,7 @@ export function PairedDevicesPanel({ mode = 'list' }: { mode?: 'list' | 'handove
     finally { setRevokingId(null); setConfirmRevokeId(null); }
   }
 
-  // Planned handover: tell a paired device to take over as the mother for the
-  // active game. It adopts its cached snapshot and promotes; this device yields.
-  async function handover() {
-    if (activeGameId == null || handoverTo == null) return;
-    setHandoverBusy(true);
-    setHandoverErr(null);
-    try {
-      await queueBecomeMotherCommand(handoverTo, activeGameId);
-      setHandoverDone(true);
-      setConfirmHandover(false);
-    } catch (e) {
-      setHandoverErr(e);
-    } finally {
-      setHandoverBusy(false);
-    }
-  }
-
   const satellites = paired.filter((d) => !d.is_self);
-
-  if (mode === 'handover') {
-    const online = satellites.filter((d) => isRecent(d.last_seen_at));
-    if (activeGameId == null) {
-      return <p className="text-sm text-[var(--pg-text-dim)]">{t('handoverNoGame')}</p>;
-    }
-    if (online.length === 0) {
-      return <p className="text-sm text-[var(--pg-text-dim)]">{t('handoverNoSatellite')}</p>;
-    }
-    if (handoverDone) {
-      return <p className="text-sm text-[var(--pg-text)]">{t('handoverQueued')}</p>;
-    }
-    const picked = handoverTo != null && online.some((d) => d.id === handoverTo) ? handoverTo : null;
-    return (
-      <div className="space-y-3">
-        <p className="text-sm text-[var(--pg-text-muted)]">{t('handoverIntro')}</p>
-        <select
-          className="pg-input w-full"
-          value={picked ?? ''}
-          disabled={handoverBusy}
-          onChange={(e) => {
-            setHandoverTo(e.target.value ? Number(e.target.value) : null);
-            setConfirmHandover(false);
-          }}
-        >
-          <option value="">{t('handoverPick')}</option>
-          {online.map((d) => (
-            <option key={d.id} value={d.id}>
-              {displayDeviceLabel(d.peer_label) || t('unknownDevice')}
-            </option>
-          ))}
-        </select>
-        {handoverErr != null && <ErrorDetails error={handoverErr} />}
-        {confirmHandover ? (
-          <div className="p-3 rounded-lg border border-[var(--pg-line)] bg-[var(--pg-surface-2)] space-y-2">
-            <p className="text-sm text-[var(--pg-text)]">{t('makeMotherConfirm')}</p>
-            <div className="flex gap-2">
-              <button className="pg-btn" disabled={handoverBusy} onClick={() => setConfirmHandover(false)}>
-                {t('notMotherCancel')}
-              </button>
-              <button className="pg-btn pg-btn--danger" disabled={handoverBusy} onClick={() => void handover()}>
-                {handoverBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                {t('handoverConfirmBtn')}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <button className="pg-btn pg-btn--danger" disabled={picked == null} onClick={() => setConfirmHandover(true)}>
-            {t('handoverBtn')}
-          </button>
-        )}
-      </div>
-    );
-  }
 
   return (
     <div className="pg-panel">

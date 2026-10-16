@@ -18,8 +18,10 @@ import { pointLaunchedGamesAtMother, restoreLocalLaunchedGames, autoJoinSameClie
 import { setLanReauthHandler, setLanNoRouteHandler } from './api';
 import {
   reportMotherRouteState, rejoinMotherNow, onMotherReachState, findTakeoverMother, noteMotherTakeover,
+  notifyPromotedToMother,
 } from './motherFailover';
 import { getAuthUser } from './authStore';
+import { reconcileWithMotherNow } from './motherStateReconcile';
 
 interface MotherLink {
   base_url: string;
@@ -28,7 +30,6 @@ interface MotherLink {
 }
 
 interface LocalRole {
-  is_mother_hosting: boolean;
   mother_server_running: boolean;
   paired_devices_count: number;
   paired_mothers_count: number;
@@ -61,6 +62,9 @@ function emitRoute(route: LaunchedGamesRoute, motherBase: string | null): void {
   if (route === lastRoute && motherBase === lastMotherBase) return;
   lastRoute = route;
   lastMotherBase = motherBase;
+  // A device arriving on the mother's network: exchange game copies right away
+  // (the newer one wins), instead of waiting for the periodic reconcile.
+  if (route === 'mother') void reconcileWithMotherNow();
   for (const l of routeListeners) {
     try {
       l(route);
@@ -70,7 +74,7 @@ function emitRoute(route: LaunchedGamesRoute, motherBase: string | null): void {
   }
 }
 
-// Mother/hotspot role rework: a non-hosting device that isn't paired to a mother
+// Mother role rework: a non-hosting device that isn't paired to a mother
 // yet discovers + auto-pairs a same-client mother on the LAN (the mother
 // auto-approves by client_id - no operator tap). Throttle the mDNS browse this
 // needs so we don't multicast-storm while no mother is up yet.
@@ -96,15 +100,26 @@ function autoJoinThrottleOk(): boolean {
  */
 export async function refreshLaunchedGamesRoute(): Promise<LaunchedGamesRoute> {
   try {
+    const role = await invoke<LocalRole>('client_describe_local_role').catch(
+      () => null,
+    );
+    const hosting = !!role && role.mother_server_running;
+    if (hosting) {
+      // We ARE the mother: there is no mother to resolve, follow or lose. Any
+      // paired_mothers row is a leftover from a time this device followed
+      // another one - resolving it would route our own games at that device,
+      // and failing to would report 'mother_offline' and raise the "lost the
+      // mother" banner on the mother itself. Also clears a banner raised while
+      // this device was still a satellite.
+      restoreLocalLaunchedGames();
+      notifyPromotedToMother();
+      emitRoute('local', null);
+      return 'local';
+    }
     let link = await invoke<MotherLink | null>('client_resolve_mother_link');
     let hasPairedMother = false;
     if (!link) {
-      const role = await invoke<LocalRole>('client_describe_local_role').catch(
-        () => null,
-      );
-      hasPairedMother =
-        !!role && !role.is_mother_hosting && role.paired_mothers_count > 0;
-      const hosting = !!role && (role.mother_server_running || role.is_mother_hosting);
+      hasPairedMother = !!role && role.paired_mothers_count > 0;
       if (hasPairedMother) {
         // Cold cache (e.g. just after boot): warm it once, then retry.
         await invoke('client_refresh_mother_endpoints', { timeoutMs: 2500 }).catch(
@@ -125,7 +140,7 @@ export async function refreshLaunchedGamesRoute(): Promise<LaunchedGamesRoute> {
       // - which intersects mDNS with that table - can never cache it either).
       // That was a permanent dead end. An unresolvable link is exactly the signal
       // that our paired set is stale, so re-discovery is the right response.
-      if (!link && role && !hosting && autoJoinThrottleOk()) {
+      if (!link && role && autoJoinThrottleOk()) {
         const me = await getAuthUser().catch(() => null);
         if (me?.client_id != null) {
           const joined = await autoJoinSameClientMother(me.client_id).catch(() => false);

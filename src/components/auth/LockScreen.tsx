@@ -10,6 +10,7 @@ import { ApiError } from '../../services/api';
 import { signalPinReset } from '../../services/pinResetSignal';
 import { RecoveryCodePrompt } from '../RecoveryCodePrompt';
 import type { AuthUser } from '../../services/authStore';
+import { pushOverlay, popOverlay } from '../../services/screenState';
 
 // Manual-lock PIN gate. Rendered as a full-screen overlay when the user
 // taps "Lock" in the nav bar - the app shell stays mounted and live
@@ -52,6 +53,12 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
   const [otp, setOtp] = useState('');
   const [newPin, setNewPin] = useState('');
   const [confirmNewPin, setConfirmNewPin] = useState('');
+
+  // Report "locked" to the mother so the top-bar Devices modal shows it.
+  useEffect(() => {
+    pushOverlay('locked');
+    return () => popOverlay('locked');
+  }, []);
 
   // Initial lockout-end read so a relaunch during a backoff window still
   // shows the countdown without forcing a wrong attempt first.
@@ -236,6 +243,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
             <>
               <OtpInput
                 length={4}
+                masked
                 value={pin}
                 onChange={setPin}
                 onComplete={handlePinComplete}
@@ -336,6 +344,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
               {newPin === '' ? (
                 <OtpInput
                   length={4}
+                  masked
                   value={newPin}
                   onChange={setNewPin}
                   onComplete={handleNewPinComplete}
@@ -344,6 +353,7 @@ export function LockScreen({ user, onUnlocked }: LockScreenProps) {
               ) : (
                 <OtpInput
                   length={4}
+                  masked
                   value={confirmNewPin}
                   onChange={setConfirmNewPin}
                   onComplete={handleConfirmNewPinComplete}

@@ -56,6 +56,10 @@ interface AuthContextValue {
   refresh: () => Promise<void>;
   signOut: () => Promise<void>;
   lock: () => void;
+  // Manual lock overlay state + a PIN-less lift, used ONLY by a remote
+  // join_game push: an operator pulling a locked device into a game.
+  locked: boolean;
+  unlock: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -93,7 +97,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // First-launch onboarding gate (per-device, hard gate). `onboardingComplete`
   // is null until the schema_meta flag is read. The pre-auth steps (language,
   // internet) only matter while unauthenticated; the post-PIN steps (name,
-  // hotspot, mother, appearance) gate the app shell once authenticated.
+  // mother, operator-only, appearance) gate the app shell once authenticated.
   // Design: plans/playground-first-launch-onboarding.md.
   const [onboardingComplete, setOnboardingComplete] = useState<boolean | null>(null);
   const [langAnswered, setLangAnswered] = useState(false);
@@ -249,7 +253,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   // Authenticated but onboarding never finished (fresh install OR an existing
   // JWT+PIN install that predates the wizard - the migration case). Run the
-  // post-PIN steps (name → hotspot → mother → appearance) before the app shell.
+  // post-PIN steps (name → mother → operator-only → appearance) before the app shell.
   if (!onboardingComplete) {
     return (
       <PostPinOnboarding user={state.user} onComplete={() => setOnboardingComplete(true)} />
@@ -262,6 +266,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     refresh: runServerBootstrap,
     signOut: handleSignOut,
     lock,
+    locked,
+    unlock: handleUnlocked,
   };
 
   // Only nag with the offline banner once the runway is short. While offline

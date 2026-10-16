@@ -1,6 +1,9 @@
 // Signed Android release build (design: project_android_operator_tablet).
 //
 //   npm run android:release
+//   npm run android:release:test   (Tester build: VITE_QA_HARNESS=1 + the Rust
+//                                    `devtools` feature - game simulator, QA
+//                                    harnesses; output name gets a -tester suffix)
 //
 // Builds ONE universal APK carrying arm64-v8a + armeabi-v7a, signed with the
 // release key from src-tauri/gen/android/keystore.properties, then copies it to
@@ -30,7 +33,12 @@ if (!storeFile || !existsSync(storeFile)) {
 
 const { version } = JSON.parse(readFileSync(join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
 
-execSync('npx tauri android build --apk --target aarch64 armv7', { cwd: root, stdio: 'inherit' });
+const tester = process.argv.includes('--tester');
+execSync(`npx tauri android build --apk --target aarch64 armv7${tester ? ' --features devtools' : ''}`, {
+  cwd: root,
+  stdio: 'inherit',
+  env: tester ? { ...process.env, VITE_QA_HARNESS: '1' } : process.env,
+});
 
 const apk = join(androidDir, 'app', 'build', 'outputs', 'apk', 'universal', 'release', 'app-universal-release.apk');
 if (!existsSync(apk)) {
@@ -40,7 +48,7 @@ if (!existsSync(apk)) {
 
 const outDir = join(root, 'release-android');
 mkdirSync(outDir, { recursive: true });
-const outName = `TagHunterPlayground_${version}.apk`;
+const outName = `TagHunterPlayground_${version}${tester ? '-tester' : ''}.apk`;
 const outPath = join(outDir, outName);
 copyFileSync(apk, outPath);
 

@@ -25,7 +25,6 @@
   "launchOnStartupLabel": "Launch on startup",
   "launchOnStartupDesc": "Start automatically when your computer boots.",
   "beMotherLabel": "Be the mother on this device",
-  "beMotherDesc": "Host the games on this device when the app starts. If no other mother is already running, this device takes the role and (in hotspot mode) raises the Wi-Fi hotspot so satellites can reconnect. Several devices can have this on - whichever starts first becomes the mother; the rest join it. Takes effect next launch.",
   "sectionDeviceRole": "Device role",
   "operatorOnlyLabel": "Operator-only device",
   "operatorOnlyDesc": "Manage and launch games from this device without ever playing on it.",

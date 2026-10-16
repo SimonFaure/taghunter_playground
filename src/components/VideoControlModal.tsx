@@ -7,10 +7,17 @@
 // <OperatorVideoOverlay> picks it up and mounts the FirstBipVideoOverlay
 // presentation on top of whatever's currently showing.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Film, Play, StopCircle, Loader2, X } from 'lucide-react';
-import { resolveVideosByKind } from '../services/videoResolution';
+import {
+  resolveVideosByKind,
+  declaredSubtitleLangs,
+  applySubtitleChoice,
+  SUBTITLE_AUTO,
+  subtitlePickOf,
+} from '../services/videoResolution';
+import { VideoSubtitlePicker } from './VideoSubtitlePicker';
 import { emitLocalPlayVideo, emitLocalStopVideo } from '../services/localVideoStore';
 
 interface VideoControlModalProps {
@@ -33,6 +40,21 @@ export function VideoControlModal({
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Subtitle languages this game's videos declare + the pick for the next play
+  // ('auto' = this device's own default).
+  const [subtitleLangs, setSubtitleLangs] = useState<string[]>([]);
+  const [subtitleChoice, setSubtitleChoice] = useState<string>(SUBTITLE_AUTO);
+  useEffect(() => {
+    let cancelled = false;
+    void declaredSubtitleLangs(gameUniqid, gameType)
+      .then((langs) => {
+        if (!cancelled) setSubtitleLangs(langs);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [gameUniqid, gameType]);
 
   async function play(kinds: Array<'intro' | 'tutorial'>) {
     setBusy(true);
@@ -43,7 +65,7 @@ export function VideoControlModal({
         setError(t('videoControl:noVideoAvailable', { kinds: kinds.join(' / ') }));
         return;
       }
-      emitLocalPlayVideo(videos);
+      emitLocalPlayVideo(applySubtitleChoice(videos, subtitlePickOf(subtitleChoice)));
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -84,6 +106,14 @@ export function VideoControlModal({
         <p className="text-sm text-[var(--pg-text-dim)] mb-4">
           {t('videoControl:pickVideoPrefix')} <span className="text-[var(--pg-text-muted)] font-medium">{t('videoControl:thisDevice')}</span>{t('videoControl:pickVideoSuffix')}
         </p>
+
+        <VideoSubtitlePicker
+          langs={subtitleLangs}
+          value={subtitleChoice}
+          onChange={setSubtitleChoice}
+          singleDevice
+          className="mb-4"
+        />
 
         <div className="grid grid-cols-1 gap-2">
           <ActionButton

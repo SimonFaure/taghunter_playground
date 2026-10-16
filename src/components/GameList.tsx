@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Clock, Search, Play, LogIn, Eye, Zap, ChevronDown, LayoutGrid, List } from 'lucide-react';
 import { Alert } from './Alert';
@@ -51,12 +51,20 @@ import {
 } from '../services/regAssignments';
 import { getClashState, clashRegister, DEFAULT_CLASH_PURGE_STATION } from '../services/clash';
 import { useAuth } from './auth/AuthProvider';
+import { pickGameVisual } from '../utils/coverVisual';
 import { isOperatorOnly } from '../services/operatorMode';
 import { refreshLaunchedGamesRoute } from '../services/childControlLink';
-import { ensureMotherServer, raiseMotherHotspotIfConfigured } from '../services/lanMotherBoot';
+import { ensureMotherServer } from '../services/lanMotherBoot';
 import { getLanOverride } from '../services/api';
-import { loadConfig, saveConfig } from '../utils/config';
 import gamesData from '../../data/games.json';
+import { gameClock } from '../services/gameClock';
+import { onPresetLaunch, takePresetLaunch, type WizardAutopilot } from '../services/launchPresetStore';
+import { simChipPool } from '../services/simChips';
+import { resolveCustomerId } from '../services/customersStore';
+import { getSelectedCustomer, useSelectedCustomer } from '../services/selectedCustomerStore';
+import { useCustomers } from './customers/useCustomers';
+import { CustomerSelectBar } from './customers/CustomerSelectBar';
+import { CustomerPlayedBadge, type PlayedInfo } from './customers/CustomerPlayedBadge';
 
 interface GameType {
   id: string;
@@ -138,6 +146,19 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   const [scenarios, setScenarios] = useState<ScenarioWithType[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  // Licensee customers (project_licensee_customers): the select above the list
+  // and the scenarios the selected customer already played.
+  const { snapshot: customersSnapshot } = useCustomers();
+  const selectedCustomer = useSelectedCustomer();
+  const playedByScenario = useMemo(() => {
+    const m = new Map<string, PlayedInfo>();
+    if (!selectedCustomer) return m;
+    const id = resolveCustomerId(customersSnapshot, selectedCustomer.id);
+    for (const p of customersSnapshot.played) {
+      if (p.customer_id === id) m.set(p.game_uniqid, { last: p.last_played_at, count: p.count });
+    }
+    return m;
+  }, [customersSnapshot, selectedCustomer]);
   const [selectedGameType, setSelectedGameType] = useState<string>('all');
   const [selectedDifficulty, setSelectedDifficulty] = useState<string>('all');
   const [selectedAudience, setSelectedAudience] = useState<string>('all');
@@ -169,10 +190,12 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   // Operator-only devices never play, so the "Join" (enter the running game on
   // this device) action is hidden.
   const [operatorOnly, setOperatorOnly] = useState(false);
-  // F1 (mother/hotspot role rework): when "Launch" is tapped and no mother is
+  // F1 (mother role rework): when "Launch" is tapped and no mother is
   // reachable, this device must host. We surface a heads-up confirm first; the
   // resolver bridges the dialog buttons back to the awaiting launchGame call.
   const [motherPrompt, setMotherPrompt] = useState<{ resolve: (ok: boolean) => void } | null>(null);
+  // Simulator campaign: the open wizard launches by itself (settles once).
+  const [autopilot, setAutopilot] = useState<WizardAutopilot | null>(null);
   const confirmBecomeMother = () =>
     new Promise<boolean>((resolve) => setMotherPrompt({ resolve }));
 
@@ -291,6 +314,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       autoResetTeam: meta.autoResetTeam !== 'false',
       delayBeforeReset: parseInt(meta.delayBeforeReset ?? '3'),
       enterToReset: meta.enterToReset === 'true',
+      noRevealAnimation: meta.noRevealAnimation === 'true',
       showIdleLayout: meta.showIdleLayout !== 'false',
       idleSubtitle: meta.idleSubtitle ?? undefined,
       malusPerMinute: meta.malusPerMinute != null ? parseInt(meta.malusPerMinute) : undefined,
@@ -313,8 +337,11 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       tagquestScoreWeighting: meta.tagquestScoreWeighting === 'true',
       teammatesPerTeam: meta.teammatesPerTeam ? parseInt(meta.teammatesPerTeam) : undefined,
       testMode: meta.testMode === 'true' ? true : undefined,
+      simulated: meta.simulated === 'true' ? true : undefined,
       teams: meta.teamsConfig ? JSON.parse(meta.teamsConfig) : undefined,
       cluesPage: meta.cluesPage ? JSON.parse(meta.cluesPage) : undefined,
+      // Missing key ⇒ undefined: the runtime keeps the scenario's own setting.
+      tracksShowLegend: meta.tracksShowLegend != null ? meta.tracksShowLegend === 'true' : undefined,
       // First-bip videos (mystery/tracks): a joining device must resolve and
       // play them locally too, not just the launcher.
       playTutorialOnBip: meta.playTutorialOnBip === 'true',
@@ -325,8 +352,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   };
 
   // Load thumbnail URLs from the local SQLite/FS store. Resolves
-  // game-data.json's `game_media_images.game_visual` (or background_image) for
-  // each downloaded scenario and turns it into a webview-loadable URL.
+  // game-data.json's `game_media_images.game_visual` - the licensee-language
+  // version when the scenario has one - (or background_image) for each
+  // downloaded scenario and turns it into a webview-loadable URL.
   // The orchestrator writes the API's `game_data` payload to disk unwrapped,
   // so the map sits at the root (not under a `.game_data` key).
   const loadLocalImages = async (gameIds: string[]) => {
@@ -335,9 +363,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       try {
         const gameData = await scenarioStore.getGameData(uniqid);
         const mediaImages =
-          (gameData as { game_media_images?: { game_visual?: string; background_image?: string } } | null)
+          (gameData as { game_media_images?: { background_image?: string } } | null)
             ?.game_media_images;
-        const raw = mediaImages?.game_visual ?? mediaImages?.background_image;
+        const raw = pickGameVisual(mediaImages, user?.language) ?? mediaImages?.background_image;
         if (!raw) continue;
         const fileName = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
         // Resolve to a `scenario://` URL - the custom protocol is the only one
@@ -498,8 +526,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
   const launchGame = async (
     game: LaunchTarget,
     config: GameConfig,
-    deviceSelection: LaunchDeviceSelection
-  ) => {
+    deviceSelection: LaunchDeviceSelection,
+    opts: { unattended?: boolean } = {}
+  ): Promise<number | null> => {
     // F1: a launched game must live on a mother. If none is reachable and we're
     // not already hosting, become the mother on THIS device (after a heads-up
     // confirm) before creating the game - otherwise the create call has nowhere
@@ -509,21 +538,16 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       const override = getLanOverride();
       const alreadyHosting = !!override && override.baseUrl.includes('127.0.0.1');
       if (route !== 'mother' && !alreadyHosting) {
-        const ok = await confirmBecomeMother();
-        if (!ok) return;
+        // A simulator campaign has nobody to answer the heads-up: host here.
+        const ok = opts.unattended || (await confirmBecomeMother());
+        if (!ok) return null;
         const cid = user?.client_id;
         if (cid != null) {
+          // Hosts in the role this device is SET to: the mother, or a substitute
+          // that hands back when the mother returns. Launching here never
+          // changes "Rôle de ce poste".
           const info = await ensureMotherServer(cid);
-          if (info) {
-            await raiseMotherHotspotIfConfigured();
-            // Keep the role across restarts now that this device is the mother.
-            try {
-              const cfg = await loadConfig();
-              await saveConfig({ ...cfg, beMotherWhenAvailable: true });
-            } catch {
-              /* best-effort */
-            }
-          } else {
+          if (!info) {
             // Stood down - a mother actually exists (fence caught it). Re-point
             // at it and launch there instead.
             await refreshLaunchedGamesRoute().catch(() => {});
@@ -550,6 +574,8 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       autoResetTeam: config.autoResetTeam.toString(),
       delayBeforeReset: config.delayBeforeReset.toString(),
       enterToReset: (config.enterToReset ?? false) ? 'true' : 'false',
+      // Mystery "No animation": the finishing bip skips the reveal walk.
+      noRevealAnimation: config.noRevealAnimation ? 'true' : 'false',
       autoRegisterTeam: config.autoRegisterTeam ? 'true' : 'false',
       reuseCards: config.reuseCards ? 'true' : 'false',
       selfRegisterTeam: config.selfRegisterTeam ? 'true' : 'false',
@@ -598,6 +624,14 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     }
     if (config.victoryType) meta.victoryType = config.victoryType;
     if (config.testMode) meta.testMode = 'true';
+    if (config.simulated) meta.simulated = 'true';
+    // Licensee customer (project_licensee_customers); the mother stamps
+    // customerAssignedAt. Never on a simulator run.
+    if (config.customerId && !config.simulated) {
+      meta.customerId = config.customerId;
+      if (config.customerName) meta.customerName = config.customerName;
+    }
+    if (config.rosterImported) meta.rosterImported = 'true';
     if (config.playMode) meta.playMode = config.playMode;
     if (config.teammatesPerTeam !== undefined) meta.teammatesPerTeam = config.teammatesPerTeam.toString();
     if (config.teams && config.teams.length > 0) meta.teamsConfig = JSON.stringify(config.teams);
@@ -621,6 +655,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     // Clues page on team return - now a per-launch option (was a studio scenario
     // setting). Persisted as JSON so it survives reload and reaches satellites.
     if (config.cluesPage) meta.cluesPage = JSON.stringify(config.cluesPage);
+    // Tracks legend - per-launch override of the scenario's show_legend. Left
+    // out when undefined so the runtime falls back to the scenario setting.
+    if (config.tracksShowLegend !== undefined) meta.tracksShowLegend = String(config.tracksShowLegend);
 
     const teamRows = (config.teams ?? []).map((team, index) => ({
       team_number: index + 1,
@@ -763,7 +800,11 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         // Excel chip→clan import uses. A manual import wins if the operator set one.
         if ((config.clashRegistrationMode ?? 'self') === 'bulk' && (config.clashChipAssignments?.length ?? 0) === 0) {
           try {
-            const [cards, used] = await Promise.all([cardsRepo.list(), collectUsedChipIds()]);
+            // A Simulated session deals virtual chips, never the real stock.
+            const [cards, used] = await Promise.all([
+              config.simulated ? Promise.resolve(simChipPool(1000)) : cardsRepo.list(),
+              collectUsedChipIds(),
+            ]);
             const free = cards.filter((c) => !used.has(c.id));
             clashPredeterminedAssignments = buildClashContiguousAssignments(
               free,
@@ -852,6 +893,30 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       if (serialized !== '{}') meta[REG_ASSIGNMENTS_META_KEY] = serialized;
     }
 
+    // Simulated session (tester builds): the simulation starts by itself once the
+    // game page opens on the host - this device when it plays, else the first
+    // device the game is pushed to. The executor reads these two keys.
+    if (config.simulated && config.simAutoStart !== false) {
+      meta.simAutoStart = JSON.stringify({
+        seed: config.simSeed ?? Math.floor(Math.random() * 1_000_000),
+        speed: config.simSpeed ?? 10,
+        dynamicTeamCount: config.simTeams ?? 10,
+        arrivalWindowMin: 10,
+        ...(config.simPurgeAtMin ? { clashPurgeAtMin: config.simPurgeAtMin } : {}),
+      });
+      // "Retry this run" (Coverage tab): the verdict is recorded as its child.
+      if (config.simRetryOf) meta.simRetryOf = String(config.simRetryOf);
+      // The director waits for this many devices before dealing the mock teams.
+      meta.simDevices = String((deviceSelection.include_self ? 1 : 0) + deviceSelection.satellite_targets.length);
+      try {
+        const { selfId } = await listLaunchDevices();
+        const host = deviceSelection.include_self ? selfId : (deviceSelection.satellite_targets[0] ?? null);
+        if (host !== null) meta.simHost = String(host);
+      } catch (err) {
+        console.error('[GameList] could not resolve the simulation host:', err);
+      }
+    }
+
     try {
       const res = await createLaunchedGame({
         game_uniqid: game.uniqid,
@@ -882,7 +947,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       ) {
         try {
           const state = await getLaunchedGameState(launchedGameId, 0);
-          const startSec = Math.floor(Date.now() / 1000);
+          const startSec = Math.floor(gameClock.now() / 1000);
           await Promise.all(
             state.teams
               .filter((t) => t.start_time == null)
@@ -985,6 +1050,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       // selected satellites get into the game via their join_game push.
       onShowLaunchedGames?.();
     }
+    return launchedGameId;
   };
 
   // Wizard launch - the modal's onLaunch. Targets the scenario the modal was
@@ -994,7 +1060,13 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     deviceSelection: LaunchDeviceSelection
   ) => {
     if (!selectedGame) return;
-    await launchGame(selectedGame, config, deviceSelection);
+    const ap = autopilot;
+    const gid = await launchGame(selectedGame, config, deviceSelection, { unattended: !!ap });
+    if (ap) {
+      setAutopilot(null);
+      if (gid !== null) ap.onLaunched(gid);
+      else ap.onFail('the game could not be created');
+    }
   };
 
   // ---- Quick Launch + saved-config orchestration ----
@@ -1041,6 +1113,48 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
     setLaunchModalOpen(true);
   };
 
+  // "Launch this config" from the game simulator's Coverage tab: open the
+  // pre-filled wizard (now, or as soon as this page mounts).
+  useEffect(() => {
+    const consume = () => {
+      const p = takePresetLaunch();
+      if (!p) return;
+      if (p.autopilot) {
+        // A campaign moves on from the previous game's page to the wizard.
+        const ap = p.autopilot;
+        let settled = false;
+        setLaunchedGame(null);
+        setAutopilot({
+          setup: ap.setup,
+          onLaunched: (gid) => {
+            if (settled) return;
+            settled = true;
+            ap.onLaunched(gid);
+          },
+          onFail: (reason) => {
+            if (settled) return;
+            settled = true;
+            setAutopilot(null);
+            setLaunchModalOpen(false);
+            setPrefill(null);
+            ap.onFail(reason);
+          },
+        });
+      } else {
+        setAutopilot(null);
+      }
+      openPrefilledWizard(
+        { uniqid: p.scenarioUniqid, title: p.scenarioTitle, gameTypeName: p.gameTypeName },
+        p.config,
+        undefined,
+        p.notice,
+      );
+    };
+    consume();
+    return onPresetLaunch(consume);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Headless launch: validate the saved config against the current world; on
   // critical drift fall back to the pre-filled wizard, otherwise build the
   // roster + default device selection and launch straight into the GamePage.
@@ -1082,13 +1196,34 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       const teams = resolved.autoRegisterTeam || resolved.selfRegisterTeam ? [] : buildRoster(resolved, freeChips, scenario.gameTypeName);
       const deviceSelection = await resolveDefaultDeviceSelection();
       setConfigModal(null);
-      await launchGame(scenario, { ...resolved, name: `${cfgRow.name} - ${frenchStamp()}`, teams }, deviceSelection);
+      await launchGame(
+        scenario,
+        { ...resolved, ...launchCustomer(cfgRow.config), name: `${cfgRow.name} - ${frenchStamp()}`, teams },
+        deviceSelection
+      );
     } catch (err) {
       console.error('[GameList] headlessLaunch failed:', err);
       // Last-resort fallback: open the pre-filled wizard so the operator can
       // launch manually rather than silently doing nothing.
       openPrefilledWizard(scenario, cfgRow.config, cfgRow.name, t('home:quickLaunchPrepareFailed'));
     }
+  };
+
+  // Customer of a Quick Launch: the one selected above the scenario list wins;
+  // otherwise a preset saved with "Remember client" (followed through merges,
+  // dropped once archived / gone).
+  const launchCustomer = (preset: Partial<GameConfig>): Pick<GameConfig, 'customerId' | 'customerName'> => {
+    const sel = getSelectedCustomer();
+    if (sel) return { customerId: sel.id, customerName: sel.name };
+    if (!preset.rememberCustomer || !preset.customerId || !customersSnapshot.supported) {
+      return { customerId: null, customerName: null };
+    }
+    const target = customersSnapshot.customers.find(
+      (c) => c.id === resolveCustomerId(customersSnapshot, preset.customerId as string)
+    );
+    return target && !target.archived
+      ? { customerId: target.id, customerName: target.name }
+      : { customerId: null, customerName: null };
   };
 
   const openConfigModal = async (scenario: LaunchTarget) => {
@@ -1307,6 +1442,11 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             {t('home:durationMinutes', { count: scenario.duration_minutes })} ·
             <DifficultyMeter level={difficultyLevel} />
           </div>
+          {scenario.uniqid && playedByScenario.has(scenario.uniqid) && (
+            <div className="mb-1">
+              <CustomerPlayedBadge played={playedByScenario.get(scenario.uniqid)!} />
+            </div>
+          )}
           <div className="pg-card-title">{scenario.title || t('home:untitledScenario')}</div>
           <div className="pg-card-desc">{scenario.description}</div>
           {(scenario.audienceBands.length > 0 || scenario.univers.length > 0) && (
@@ -1349,6 +1489,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
             <h3 className="pg-card-title" style={{ marginBottom: 0 }}>
               {scenario.title || t('home:untitledScenario')}
             </h3>
+            {scenario.uniqid && playedByScenario.has(scenario.uniqid) && (
+              <CustomerPlayedBadge played={playedByScenario.get(scenario.uniqid)!} />
+            )}
           </div>
           <div className="pg-card-meta" style={{ marginBottom: 0, gap: 12 }}>
             <span className="inline-flex items-center gap-1.5">
@@ -1395,6 +1538,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       )}
 
       <main className="flex-1 container mx-auto px-6 py-8">
+        {/* Licensee customer the next games are for (project_licensee_customers). */}
+        <CustomerSelectBar snapshot={customersSnapshot} />
+
         {/* Filters: search + view toggle */}
         <div className="pg-filters mb-3">
           <label className="pg-search">
@@ -1524,6 +1670,7 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
       <LaunchGameModal
         isOpen={launchModalOpen}
         onClose={() => {
+          if (autopilot) autopilot.onFail('the wizard was closed');
           setLaunchModalOpen(false);
           setPrefill(null);
         }}
@@ -1533,7 +1680,9 @@ export function GameList({ onShowLaunchedGames }: GameListProps = {}) {
         onLaunch={handleGameLaunch}
         prefillConfig={prefill?.config}
         prefillConfigName={prefill?.name}
+        initialCustomer={selectedCustomer}
         noticeText={prefill?.notice}
+        autopilot={autopilot ?? undefined}
         onConfigSaved={(name) => {
           void loadConfigCounts();
           showAlert('success', t('home:configSaved', { name }));

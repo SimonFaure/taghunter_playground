@@ -121,6 +121,15 @@ export function usePresentationQueue(): PresentationQueueApi {
           endGate();
           return;
         }
+        // The page was left (quit / rankings) while this team was still
+        // waiting: nobody is watching, so its reveal - and its sounds - must
+        // not start behind the next screen.
+        if (!mountedRef.current) {
+          queueRef.current = queueRef.current.filter((p) => p.id !== id);
+          settle();
+          endGate();
+          return;
+        }
         // This item is starting: remove from the not-yet-started list and
         // promote it to `current`.
         queueRef.current = queueRef.current.filter((p) => p.id !== id);

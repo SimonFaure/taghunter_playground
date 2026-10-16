@@ -62,5 +62,11 @@
   "editSaveChanges": "Save changes",
   "editSaveFailed": "Failed to update the team.",
   "summaryLateMalus": "Late malus",
-  "lateMalusRevert": "Revert to the auto-computed late malus ({{value}})"
+  "lateMalusRevert": "Revert to the auto-computed late malus ({{value}})",
+  "stalePunchesLabel_one": "Card not empty at start: {{count}} punch ignored",
+  "stalePunchesLabel_other": "Card not empty at start: {{count}} punches ignored",
+  "stalePunchesCount": "Count these punches",
+  "stalePunchesIgnore": "Ignore these punches again",
+  "stalePunchesCounted": "Start punches counted",
+  "stalePunchesHint": "The player played before bipping in: count the punches already on the card at the first bip. If the run is finished, the score is recomputed."
 }

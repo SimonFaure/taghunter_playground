@@ -1,5 +1,4 @@
-// "Réglages Windows" for the mother (retours sept. #20): hotspot power saving,
-// sleep on mains, Wi-Fi card power management, Public network profile. Checked
+// "Réglages Windows" on every PC (retours sept. #20; satellites too since help v7): sleep on mains, Wi-Fi card power management, Public network profile. Checked
 // when shown; one "Corriger" button fixes all of them under a single UAC prompt.
 // `compact` renders only when something needs fixing (the status card uses it).
 
@@ -45,7 +44,6 @@ export function WindowsHealthPanel({ compact = false }: { compact?: boolean }) {
   if (compact && !health.needs_fix) return null;
 
   const issues: string[] = [];
-  if (health.hotspot_power_saving) issues.push(t('winHealthHotspotSaving'));
   if (health.sleep_ac_minutes != null && health.sleep_ac_minutes !== 0) {
     issues.push(t('winHealthSleep', { minutes: health.sleep_ac_minutes }));
   }

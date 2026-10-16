@@ -30,6 +30,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { isAndroid } from '../utils/platform';
+import { gameClock } from './gameClock';
 
 // ─── Public types (single source of truth post-step-7) ──────────────
 
@@ -160,6 +161,8 @@ const SERIES_BY_TYPE: Record<CardPayload['cardType'], number> = {
 
 class SportIdentService {
   private unlisteners: UnlistenFn[] = [];
+  /** Simulator-only `si://card-read` listener (see setSimulatedReads). */
+  private simUnlisten: UnlistenFn | null = null;
   private isStarted = false;
   private currentPort: string | null = null;
   /**
@@ -176,12 +179,14 @@ class SportIdentService {
   private onCardDetected?: (card: CardData) => void;
   private onStationsDetected?: (stations: StationData[]) => void;
   /**
-   * Per-card-id last-seen-at timestamps. Same card scanned within
-   * `CARD_DEBOUNCE_MS` is silently coalesced - matches the legacy
-   * behaviour where a child tapping their card three times in a row
-   * was treated as one read.
+   * Per-card-id last read: when, and a signature of what the card held.
+   * The same card scanned again within `CARD_DEBOUNCE_MS` with the SAME
+   * content is silently coalesced - matches the legacy behaviour where a
+   * child tapping their card three times in a row was treated as one read.
+   * A read whose content changed (a new punch, a finish record) always
+   * goes through: dropping it lost a team's finish.
    */
-  private lastCardTimestamps = new Map<number, number>();
+  private lastCardTimestamps = new Map<number, { at: number; sig: string }>();
   /**
    * Accumulated station info. We keep one entry per station_number so
    * a multi-station setup eventually populates them all. The legacy
@@ -199,6 +204,11 @@ class SportIdentService {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** True while a reconnect attempt is in flight, so retries don't overlap. */
   private reconnecting = false;
+  /**
+   * `performance.now()` just before the last `si_start`. Field diagnosis only:
+   * the state log shows how long the station took to answer the handshake.
+   */
+  private startedAt = 0;
 
   /** True when running inside the Tauri shell. Never on Android: the tablet is
    *  a locked operator-only device with no SI reader (utils/platform.ts). */
@@ -253,6 +263,7 @@ class SportIdentService {
       this.intentionalStop = false;
       try {
         await this.attachListeners();
+        this.startedAt = performance.now();
         try {
           await invoke('si_start', { deviceId: portPath });
         } catch (err) {
@@ -282,8 +293,13 @@ class SportIdentService {
     });
   }
 
-  setCardDetectedCallback(callback: (card: CardData) => void) {
+  setCardDetectedCallback(callback: ((card: CardData) => void) | undefined) {
     this.onCardDetected = callback;
+  }
+
+  /** True while a game page has bound its card handler (game simulator readiness). */
+  hasCardCallback(): boolean {
+    return this.onCardDetected !== undefined;
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -460,22 +476,15 @@ class SportIdentService {
     await this.detachListeners();
 
     this.unlisteners.push(
-      await listen<CardPayload>('si://card-read', e => {
-        const card = this.toLegacyCard(e.payload);
-        const now = Date.now();
-        const last = this.lastCardTimestamps.get(card.id) ?? 0;
-        if (now - last < CARD_DEBOUNCE_MS) {
-          // Same card within debounce → silently coalesce.
-          return;
-        }
-        this.lastCardTimestamps.set(card.id, now);
-        this.onCardDetected?.(card);
-      }),
+      await listen<CardPayload>('si://card-read', e => this.handleCardRead(e.payload)),
     );
 
     this.unlisteners.push(
       await listen<StationPayload>('si://station-detected', e => {
         const station = this.toLegacyStation(e.payload);
+        if (!this.stations.has(station.stationNumber)) {
+          console.info('[si] station', e.payload);
+        }
         this.stations.set(station.stationNumber, station);
         this.onStationsDetected?.(Array.from(this.stations.values()));
       }),
@@ -495,6 +504,7 @@ class SportIdentService {
     this.unlisteners.push(
       await listen<ReaderStatePayload>('si://reader-state', e => {
         const state = e.payload.state;
+        console.info(`[si] state ${state} +${Math.round(performance.now() - this.startedAt)}ms since si_start`);
         // 'error' = transport blew up (unplug, driver reset).
         // 'stopped' = the reader task wound down; when we didn't ask for
         // it, that means the byte channel closed under us.
@@ -503,6 +513,35 @@ class SportIdentService {
         }
       }),
     );
+  }
+
+  private handleCardRead(payload: CardPayload) {
+    const card = this.toLegacyCard(payload);
+    const now = gameClock.now();
+    const sig = JSON.stringify([card.start ?? null, card.end ?? null, card.check ?? null, card.punches]);
+    const last = this.lastCardTimestamps.get(card.id);
+    if (last && now - last.at < CARD_DEBOUNCE_MS && last.sig === sig) {
+      // Same card, same content, within debounce → silently coalesce.
+      return;
+    }
+    this.lastCardTimestamps.set(card.id, { at: now, sig });
+    this.onCardDetected?.(card);
+  }
+
+  /**
+   * Game simulator (tester builds): listen to `si://card-read` even with no
+   * physical reader, so cards injected by `si_simulate_card` reach the live
+   * game page. When a real reader is also running, its own listener already
+   * handles the event, so this one stands aside.
+   */
+  async setSimulatedReads(on: boolean) {
+    this.simUnlisten?.();
+    this.simUnlisten = null;
+    if (!on) return;
+    this.simUnlisten = await listen<CardPayload>('si://card-read', e => {
+      if (this.unlisteners.length > 0) return;
+      this.handleCardRead(e.payload);
+    });
   }
 
   private async detachListeners() {

@@ -2,11 +2,21 @@
 // EVERYWHERE - including over the in-game renderer, where the footer is hidden.
 //
 // When a satellite loses contact with its mother (slice 5 flips the reachability
-// flag), a red banner slides across the top with a "Become mother" button. The
-// game id is resolved from the active game (if the game page is mounted) or the
-// latest cached snapshot, so promotion works even from the games-list page.
+// flag), a red banner slides across the bottom (the top during a game, where
+// there is no top bar to cover) with a "Become mother" button. The game id is
+// resolved from the active game (if the game page is mounted) or the latest
+// cached snapshot, so promotion works even from the games-list page.
 // Clicking opens the confirmation modal (BecomeMotherModal) - a deliberate
-// manual action, never an auto-prompt (design Q5/Q10).
+// manual action, never an auto-prompt (design Q5/Q10). The device that takes
+// the game hosts it as a SUBSTITUTE: its role does not change, and it hands
+// back when the mother returns.
+//
+// Two additions with the role split:
+//  - the device SET as the mother never shows any of this. It does not look
+//    for a mother: when nobody else hosts, it hosts.
+//  - a device that finds no mother at all at start (nothing was "lost", so the
+//    red banner never armed) gets a bar with "Héberger les parties en
+//    remplacement". Nothing hosts by itself except the mother.
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -14,11 +24,36 @@ import { AlertTriangle, Crown, Link2, Loader2, X } from 'lucide-react';
 import {
   onMotherReachState, onMotherTakeover, getPromotableGameId, type ReachState, type TakeoverMother,
 } from '../services/motherFailover';
-import { rejoinCurrentMother } from '../services/childControlLink';
+import { rejoinCurrentMother, refreshLaunchedGamesRoute } from '../services/childControlLink';
+import { useLocalRole } from '../services/motherConnection';
+import { onHostingNotice, canHostAsSubstitute, type HostingNotice } from '../services/hostingRole';
+import { forceBecomeMother } from '../services/lanMotherBoot';
+import { useInGame } from '../services/screenState';
+import { useAuth } from './auth/AuthProvider';
 import { BecomeMotherModal } from './BecomeMotherModal';
+import { ErrorDetails } from './ErrorDetails';
 
 export function MotherFailoverBanner() {
   const { t } = useTranslation();
+  const auth = useAuth();
+  const localRole = useLocalRole();
+  // Bottom so the bar doesn't cover the top bar; top during a game.
+  const edge = useInGame() ? 'top-0' : 'bottom-0';
+  const [notice, setNotice] = useState<HostingNotice>({ kind: 'none' });
+  const [hosting, setHosting] = useState(false);
+  const [hostError, setHostError] = useState<unknown>(null);
+  const [noMotherDismissed, setNoMotherDismissed] = useState(false);
+  useEffect(
+    () =>
+      onHostingNotice((n) => {
+        setNotice(n);
+        if (n.kind !== 'no_mother') {
+          setNoMotherDismissed(false);
+          setHostError(null);
+        }
+      }),
+    []
+  );
   // 'reconnecting': a calm amber bar, no buttons - the device is re-attaching on
   // its own and the operator must not start promoting things (retours sept.
   // #22). 'lost': ~1 min without real contact - the red banner with actions.
@@ -56,16 +91,65 @@ export function MotherFailoverBanner() {
     []
   );
 
-  const showTakeover = taker != null && reach !== 'ok' && promoteGameId == null;
-  const showReconnecting = reach === 'reconnecting' && promoteGameId == null && !showTakeover;
-  const showBanner = reach === 'lost' && !dismissed && promoteGameId == null && !showTakeover;
-  if (!showBanner && !showReconnecting && !showTakeover && promoteGameId == null) return null;
+  // The mother never seeks a mother (and so never loses one).
+  const isMother = localRole?.role === 'mother';
+  const showTakeover = !isMother && taker != null && reach !== 'ok' && promoteGameId == null;
+  const showReconnecting = !isMother && reach === 'reconnecting' && promoteGameId == null && !showTakeover;
+  const showBanner = !isMother && reach === 'lost' && !dismissed && promoteGameId == null && !showTakeover;
+  const showNoMother =
+    !isMother && notice.kind === 'no_mother' && reach === 'ok' && !noMotherDismissed && promoteGameId == null;
+  if (!showBanner && !showReconnecting && !showTakeover && !showNoMother && promoteGameId == null) return null;
+
+  const hostAsSubstitute = async () => {
+    const clientId = auth.user?.client_id;
+    if (clientId == null) return;
+    setHosting(true);
+    setHostError(null);
+    try {
+      await forceBecomeMother(clientId, { allowIdle: true });
+      await refreshLaunchedGamesRoute().catch(() => {});
+    } catch (e) {
+      setHostError(e);
+    } finally {
+      setHosting(false);
+    }
+  };
 
   return (
     <>
+      {showNoMother && (
+        <div
+          className={`fixed ${edge} left-0 right-0 flex flex-wrap items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg`}
+          style={{ zIndex: 6000 }}
+          role="status"
+        >
+          <AlertTriangle size={18} className="shrink-0" />
+          <span className="text-sm font-medium">{t('failover:bannerNoMother')}</span>
+          {canHostAsSubstitute() && (
+            <button
+              type="button"
+              disabled={hosting}
+              onClick={() => void hostAsSubstitute()}
+              className="inline-flex items-center gap-1.5 rounded-md bg-black/15 hover:bg-black/25 disabled:opacity-60 px-3 py-1 text-sm font-semibold transition-colors"
+            >
+              {hosting ? <Loader2 size={15} className="animate-spin" /> : <Crown size={15} />}
+              {hosting ? t('failover:hostAsSubstituteWorking') : t('failover:hostAsSubstitute')}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setNoMotherDismissed(true)}
+            className="p-1 rounded hover:bg-black/20 transition-colors"
+            title={t('failover:dismiss')}
+          >
+            <X size={16} />
+          </button>
+          {hostError != null && <ErrorDetails error={hostError} className="basis-full max-w-xl mx-auto" />}
+        </div>
+      )}
       {showTakeover && (
         <div
-          className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg"
+          className={`fixed ${edge} left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg`}
           style={{ zIndex: 6000 }}
           role="status"
         >
@@ -77,7 +161,7 @@ export function MotherFailoverBanner() {
       )}
       {showReconnecting && (
         <div
-          className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg"
+          className={`fixed ${edge} left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg`}
           style={{ zIndex: 6000 }}
           role="status"
         >
@@ -87,7 +171,7 @@ export function MotherFailoverBanner() {
       )}
       {showBanner && (
         <div
-          className="fixed top-0 left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-red-600/95 text-white shadow-lg"
+          className={`fixed ${edge} left-0 right-0 flex items-center justify-center gap-3 px-4 py-2 bg-red-600/95 text-white shadow-lg`}
           style={{ zIndex: 6000 }}
         >
           <AlertTriangle size={18} className="shrink-0" />
@@ -125,7 +209,8 @@ export function MotherFailoverBanner() {
               ? t('failover:rejoinWorking', { defaultValue: 'Reconnecting…' })
               : t('failover:rejoinBtn', { defaultValue: 'Rejoin the mother' })}
           </button>
-          {!noGame && (
+          {/* A tablet never hosts (Android is operator-only). */}
+          {!noGame && canHostAsSubstitute() && (
             <button
               type="button"
               onClick={async () => {

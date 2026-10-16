@@ -1,28 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Search, Loader2, Trash2, Radio, X, Wifi, Plus } from 'lucide-react';
+import { Search, Loader2, Radio, X, Link2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
-  discoverOtherMothers, listPairedMothers, joinMother,
+  discoverOtherMothers, listPairedMothers, joinMother, pairByAddress, speaksOurLanProto, LAN_PROTO,
   type DiscoveredMother, type PairedMotherRow, type JoinHandle, type JoinOutcome,
 } from '../../services/lanPairing';
-import { runAutoConnect, resolveConsent } from '../../services/wifiAutoConnect';
-import { isStuckOnApipa } from '../../services/wifi';
-import {
-  listJoinable, addManual, remove as removeNetwork,
-  type WifiNetworkRow,
-} from '../../services/wifiNetworksStore';
-import { WifiAutoConnectPrompt } from '../WifiAutoConnectPrompt';
-import { WifiQr } from './WifiQr';
-import { StepByStepConnect } from './StepByStepConnect';
 import { HelpDot } from '../../help';
+import { checkForUpdateFromMother, type UpdateStatus } from '../../services/updateService';
+import { DesktopUpdateInstaller } from '../update/UpdateProgress';
+
+// Pairing by address probes these ports (lan_server.rs PREFERRED_PORTS).
+const MOTHER_PORTS = [47800, 47801, 47802, 47803];
+
+/** Base URLs to try for a mother typed as "a.b.c.d" or "a.b.c.d:port". */
+function motherBasesFor(address: string): string[] {
+  const a = address.trim();
+  return /:\d+$/.test(a) ? [`http://${a}`] : MOTHER_PORTS.map((p) => `http://${a}:${p}`);
+}
 
 type Msg = { kind: 'ok' | 'err'; text: string };
 
-export type SatellitePart = 'wizard' | 'wifi' | 'join';
+export type SatellitePart = 'join' | 'byIp';
 
-/** `parts`: which blocks to render (the rebuilt Network page places them in
- *  separate rows of its Advanced section). Default: all. The "current mother"
- *  row moved to MyMotherCard (retours sept. #7/#10). */
+/** `parts`: which blocks to render (the Network page places them in separate
+ *  rows of its Advanced section). Default: all. The "current mother" row lives
+ *  in NetworkScreen's "Mon poste mère" card. The app no longer manages Wi-Fi:
+ *  the PC joins the venue network through Windows, this only finds and pairs. */
 export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {}) {
   const show = (p: SatellitePart) => !parts || parts.includes(p);
   const { t } = useTranslation('devicesLan');
@@ -33,80 +36,52 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
   const [joiningUuid, setJoiningUuid] = useState<string | null>(null);
   const [msg, setMsg] = useState<Msg | null>(null);
   const joinRef = useRef<JoinHandle | null>(null);
-  // Wi-Fi auto-connect: the first-time consent prompt + a busy flag while we
-  // attempt the join. Reflected into `msg` on success/failure.
-  const [consentSsid, setConsentSsid] = useState<string | null>(null);
-  const [autoBusy, setAutoBusy] = useState(false);
-  // The network(s) this device can join to reach the mother: studio-synced
-  // hotspots plus any the operator typed in by hand. Studio rows are read-only;
-  // manual rows can be deleted.
-  const [motherWifi, setMotherWifi] = useState<WifiNetworkRow[]>([]);
-  // "Add a network" form (shown so a device whose creds never synced can still
-  // be told which Wi-Fi to join).
-  const [addSsid, setAddSsid] = useState('');
-  const [addPassword, setAddPassword] = useState('');
-  const [addBusy, setAddBusy] = useState(false);
+  const [ipAddr, setIpAddr] = useState('');
+  const [ipBusy, setIpBusy] = useState(false);
+  const [ipMsg, setIpMsg] = useState<Msg | null>(null);
+  // A mother on a NEWER LAN protocol refused us: this device must be updated.
+  // Its /update.php still answers (any protocol) - offer the update from it.
+  const [outdatedBases, setOutdatedBases] = useState<{ part: SatellitePart; bases: string[] } | null>(null);
+  const [motherUpdate, setMotherUpdate] = useState<UpdateStatus | null>(null);
+  const [motherUpdateBusy, setMotherUpdateBusy] = useState(false);
+  const [motherUpdateMsg, setMotherUpdateMsg] = useState<Msg | null>(null);
 
-  const refreshWifi = useCallback(async () => {
-    setMotherWifi(await listJoinable().catch(() => []));
-  }, []);
+  const noteOutcome = (outcome: JoinOutcome, part: SatellitePart, bases: string[]) => {
+    const selfOutdated = outcome.kind === 'proto_mismatch' && outcome.theirs > LAN_PROTO;
+    setOutdatedBases(selfOutdated ? { part, bases } : null);
+    setMotherUpdate(null);
+    setMotherUpdateMsg(null);
+  };
+
+  async function checkMotherUpdate() {
+    if (!outdatedBases) return;
+    setMotherUpdateBusy(true);
+    setMotherUpdateMsg(null);
+    try {
+      for (const base of outdatedBases.bases) {
+        const status = await checkForUpdateFromMother(base);
+        if (status.state === 'error') continue;
+        if (status.state === 'up-to-date' || !status.canSelfUpdate) {
+          setMotherUpdateMsg({ kind: 'err', text: t('updateFromMotherNone') });
+        } else {
+          setMotherUpdate(status);
+        }
+        return;
+      }
+      setMotherUpdateMsg({ kind: 'err', text: t('updateFromMotherUnreachable') });
+    } finally {
+      setMotherUpdateBusy(false);
+    }
+  }
 
   const refreshPaired = useCallback(async () => {
     setPaired(await listPairedMothers().catch(() => []));
   }, []);
 
-  const applyAutoResult = useCallback((r: Awaited<ReturnType<typeof runAutoConnect>>) => {
-    if (r.kind === 'connected') setMsg({ kind: 'ok', text: t('autoConnected', { ssid: r.ssid }) });
-    else if (r.kind === 'failed') setMsg({ kind: 'err', text: t('autoConnectFailed', { ssid: r.ssid }) });
-    else if (r.kind === 'needs_consent') setConsentSsid(r.ssid);
-  }, [t]);
-
   useEffect(() => {
     void refreshPaired();
-    void refreshWifi();
-    // No auto-connect on open: the Step-by-step section drives connection by hand
-    // (the operator runs each step). applyAutoResult is still used by the manual
-    // "add a network" action below, which joins the network the operator just typed.
     return () => joinRef.current?.cancel();
-  }, [refreshPaired, refreshWifi]);
-
-  const addNetwork = useCallback(async () => {
-    const ssid = addSsid.trim();
-    const password = addPassword;
-    if (!ssid || password.length < 8) return;
-    setAddBusy(true);
-    setMsg(null);
-    try {
-      await addManual(ssid, password);
-      setAddSsid('');
-      setAddPassword('');
-      await refreshWifi();
-      // Try to join it right away so the operator doesn't have to hunt for it in
-      // the OS Wi-Fi list; the auto-connect engine picks up the freshly-added row.
-      const r = await runAutoConnect({ allowPrompt: true });
-      applyAutoResult(r);
-    } finally {
-      setAddBusy(false);
-    }
-  }, [addSsid, addPassword, refreshWifi, applyAutoResult]);
-
-  const deleteNetwork = useCallback(async (ssid: string) => {
-    await removeNetwork(ssid);
-    await refreshWifi();
-  }, [refreshWifi]);
-
-  const answerConsent = useCallback(async (consent: boolean) => {
-    if (!consentSsid) return;
-    setAutoBusy(true);
-    try {
-      const r = await resolveConsent(consentSsid, consent);
-      if (r.kind === 'connected') { setMsg({ kind: 'ok', text: t('autoConnected', { ssid: r.ssid }) }); await refreshPaired(); }
-      else if (r.kind === 'failed') setMsg({ kind: 'err', text: t('autoConnectFailed', { ssid: r.ssid }) });
-    } finally {
-      setAutoBusy(false);
-      setConsentSsid(null);
-    }
-  }, [consentSsid, refreshPaired, t]);
+  }, [refreshPaired]);
 
   async function discover() {
     setDiscovering(true);
@@ -122,6 +97,32 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
 
   function labelOf(m: DiscoveredMother): string {
     return m.label || m.mother_uuid.slice(0, 8);
+  }
+
+  /** The operator-facing text for a pairing outcome. */
+  function describeOutcome(outcome: JoinOutcome, label: string): Msg {
+    switch (outcome.kind) {
+      case 'approved':
+        return { kind: 'ok', text: t('joinApproved', { label }) };
+      case 'denied':
+        return { kind: 'err', text: t('joinDenied', { label }) };
+      case 'already_paired':
+        return { kind: 'err', text: t('joinAlreadyPaired', { label }) };
+      case 'timeout':
+        return { kind: 'err', text: t('joinTimeout', { label }) };
+      case 'proto_mismatch':
+        return {
+          kind: 'err',
+          text:
+            outcome.theirs < LAN_PROTO
+              ? t('protoMotherOutdated', { label, version: outcome.their_app_version ?? '?' })
+              : t('protoSelfOutdated', { version: outcome.their_app_version ?? '?' }),
+        };
+      case 'unreachable':
+        // Discovery worked (we tapped a mother we could see) but the TCP connect
+        // was refused/timed out: almost always the MOTHER's firewall.
+        return { kind: 'err', text: t('joinUnreachableFirewall', { label }) };
+    }
   }
 
   async function join(m: DiscoveredMother) {
@@ -141,37 +142,9 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
     }
     joinRef.current = null;
     setJoiningUuid(null);
-    const label = labelOf(m);
-    switch (outcome.kind) {
-      case 'approved':
-        setMsg({ kind: 'ok', text: t('joinApproved', { label }) });
-        await refreshPaired();
-        break;
-      case 'denied':
-        setMsg({ kind: 'err', text: t('joinDenied', { label }) });
-        break;
-      case 'already_paired':
-        setMsg({ kind: 'err', text: t('joinAlreadyPaired', { label }) });
-        break;
-      case 'timeout':
-        setMsg({ kind: 'err', text: t('joinTimeout', { label }) });
-        break;
-      case 'unreachable': {
-        // Discovery worked (we tapped a mother we could see) but the TCP connect
-        // was refused/timed out. Diagnose the usual cause instead of dumping the
-        // raw "error sending request" string: a child stuck on APIPA can't route
-        // to the mother's subnet; otherwise it's almost always the MOTHER's
-        // firewall blocking inbound connections.
-        const apipa = await isStuckOnApipa().catch(() => false);
-        setMsg({
-          kind: 'err',
-          text: apipa
-            ? t('joinUnreachableSubnet', { label })
-            : t('joinUnreachableFirewall', { label }),
-        });
-        break;
-      }
-    }
+    setMsg(describeOutcome(outcome, labelOf(m)));
+    noteOutcome(outcome, 'join', m.addresses.map((a) => `http://${a}:${m.port}`));
+    if (outcome.kind === 'approved') await refreshPaired();
   }
 
   function cancelJoin() {
@@ -180,89 +153,53 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
     setJoiningUuid(null);
   }
 
+  async function joinByIp() {
+    const address = ipAddr.trim();
+    if (!address) return;
+    setIpBusy(true);
+    setIpMsg(null);
+    try {
+      const outcome = await pairByAddress(address);
+      noteOutcome(outcome, 'byIp', motherBasesFor(address));
+      setIpMsg(
+        outcome.kind === 'unreachable'
+          ? { kind: 'err', text: t('byIpUnreachable', { address }) }
+          : describeOutcome(outcome, address),
+      );
+      if (outcome.kind === 'approved' || outcome.kind === 'already_paired') await refreshPaired();
+    } finally {
+      setIpBusy(false);
+    }
+  }
+
+  // Below a "update this device" refusal: fetch the update from that mother.
+  const motherUpdateBlock = (part: SatellitePart) => outdatedBases?.part === part && (
+    <div className="mb-3 space-y-3">
+      {motherUpdate ? (
+        <DesktopUpdateInstaller version={motherUpdate.latestVersion} source="mother" />
+      ) : (
+        <button onClick={checkMotherUpdate} disabled={motherUpdateBusy} className="pg-btn pg-btn--primary">
+          {motherUpdateBusy && <Loader2 size={14} className="animate-spin" />}
+          {t('updateFromMother')}
+        </button>
+      )}
+      {motherUpdateMsg && (
+        <div className="text-sm text-[var(--pg-danger-text)]">{motherUpdateMsg.text}</div>
+      )}
+    </div>
+  );
+
+  const msgBox = (m: Msg) => (
+    <div className={`mb-3 text-sm rounded-lg p-2 border ${
+      m.kind === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
+                      : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'}`}>
+      {m.text}
+    </div>
+  );
+
   return (
     <div className="space-y-6">
-      {/* ── Step-by-step manual connection (connect → search → ping). The primary,
-          hand-driven path to reach a mother; nothing here fires automatically. ── */}
-      {show('wizard') && <StepByStepConnect />}
-
-      {/* ── Mother's Wi-Fi (the network this device must be ON to reach the
-          mother). Studio-defined, synced to every device; read-only here so the
-          operator can verify/scan it. ── */}
-      {show('wifi') && (
-      <div className="pg-panel">
-        <div className="flex items-center gap-2 mb-1">
-          <Wifi className="w-5 h-5 text-[var(--pg-accent-bright)]" />
-          <h3 className="pg-panel-title">{t('motherWifiTitle')}</h3>
-        </div>
-        <p className="text-sm text-[var(--pg-text-dim)] mb-4">{t('motherWifiHint')}</p>
-        {motherWifi.length === 0 ? (
-          <div className="text-xs text-[var(--pg-text-dim)] bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-lg p-3">
-            {t('noStudioHotspotAdd')}
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {motherWifi.map((h) => (
-              <div key={h.ssid} className="flex items-center justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="text-xs text-[var(--pg-text-dim)]">{t('ssidLabel')}</div>
-                  <div className="font-mono text-[var(--pg-text)] truncate">{h.ssid}</div>
-                  <div className="text-xs text-[var(--pg-text-dim)] mt-2">{t('passwordLabel')}</div>
-                  <div className="font-mono text-[var(--pg-text)] truncate">{h.password}</div>
-                  {h.origin === 'manual' && (
-                    <div className="text-[10px] uppercase tracking-wide text-[var(--pg-text-dim)] mt-1">
-                      {t('manualBadge')}
-                    </div>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <WifiQr ssid={h.ssid} password={h.password} />
-                  {h.origin === 'manual' && (
-                    <button onClick={() => void deleteNetwork(h.ssid)} title={t('removeNetwork')}
-                      className="p-2 rounded-lg text-[var(--pg-danger-text)] hover:bg-red-500/20">
-                      <Trash2 className="w-5 h-5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* ── Add a network by hand (studio creds not synced, or a different
-            venue Wi-Fi). Saved locally, auto-consented so the device joins it. ── */}
-        <div className="mt-4 pt-4 border-t border-[var(--pg-line)]">
-          <div className="text-xs text-[var(--pg-text-dim)] mb-2">{t('addNetworkTitle')}</div>
-          <div className="flex flex-col sm:flex-row gap-2">
-            <input
-              type="text"
-              value={addSsid}
-              onChange={(e) => setAddSsid(e.target.value)}
-              placeholder={t('ssidLabel')}
-              className="pg-input flex-1"
-            />
-            <input
-              type="text"
-              value={addPassword}
-              onChange={(e) => setAddPassword(e.target.value)}
-              placeholder={t('passwordLabel')}
-              className="pg-input flex-1"
-            />
-            <button
-              onClick={() => void addNetwork()}
-              disabled={addBusy || !addSsid.trim() || addPassword.length < 8}
-              className="pg-btn"
-            >
-              {addBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-              {t('addNetwork')}
-            </button>
-          </div>
-          <div className="text-[11px] text-[var(--pg-text-dim)] mt-1">{t('addNetworkHint')}</div>
-        </div>
-      </div>
-      )}
-
-      {/* ── Join a mother ── */}
+      {/* ── Join a mother found over mDNS ── */}
       {show('join') && (
       <div className="pg-panel">
         <div className="flex items-center gap-1.5">
@@ -271,13 +208,8 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
         </div>
         <p className="text-sm text-[var(--pg-text-dim)] mt-1 mb-4">{t('satelliteHint')}</p>
 
-        {msg && (
-          <div className={`mb-3 text-sm rounded-lg p-2 border ${
-            msg.kind === 'ok' ? 'bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]'
-                              : 'bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]'}`}>
-            {msg.text}
-          </div>
-        )}
+        {msg && msgBox(msg)}
+        {motherUpdateBlock('join')}
 
         <button onClick={discover} disabled={discovering || joiningUuid !== null}
           className="pg-btn">
@@ -296,18 +228,25 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
                     <li>{t('troubleshootSameNetwork')}</li>
                     <li>{t('troubleshootIsolation')}</li>
                     <li>{t('troubleshootMotherOpen')}</li>
+                    <li>{t('troubleshootByIp')}</li>
                   </ul>
                 </div>
               </div>
             ) : (
               discovered.map((m) => {
                 const joining = joiningUuid === m.mother_uuid;
+                const compatible = speaksOurLanProto(m);
                 return (
                   <div key={m.mother_uuid} className="flex items-center gap-3 p-3 rounded-lg bg-[var(--pg-bg)] border border-[var(--pg-line)]">
                     <Radio className="w-5 h-5 text-[var(--pg-text-muted)] shrink-0" />
                     <div className="flex-1 min-w-0">
                       <div className="text-[var(--pg-text)] font-medium truncate">{labelOf(m)}</div>
                       <div className="text-xs text-[var(--pg-text-dim)] truncate">{m.addresses.join(', ')}:{m.port}</div>
+                      {!compatible && (
+                        <div className="text-xs text-[var(--pg-warn-text)] mt-0.5">
+                          {m.lan_proto < LAN_PROTO ? t('protoBadgeMotherOutdated') : t('protoBadgeSelfOutdated')}
+                        </div>
+                      )}
                     </div>
                     {joining ? (
                       <div className="flex items-center gap-2">
@@ -321,7 +260,7 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
                         </button>
                       </div>
                     ) : (
-                      <button onClick={() => join(m)} disabled={joiningUuid !== null}
+                      <button onClick={() => join(m)} disabled={joiningUuid !== null || !compatible}
                         className="px-3 py-1.5 rounded-lg bg-green-600 text-white hover:bg-green-500 text-sm disabled:opacity-50">
                         {t('join')}
                       </button>
@@ -333,13 +272,34 @@ export function SatelliteLanSection({ parts }: { parts?: SatellitePart[] } = {})
           </div>
         )}
       </div>
-
       )}
 
-      {/* Firewall panel lives in the Network page Advanced section (NetworkScreen). */}
-
-      {consentSsid && (
-        <WifiAutoConnectPrompt ssid={consentSsid} busy={autoBusy} onAnswer={answerConsent} />
+      {/* ── Pair by typed IP: the fallback when the network filters mDNS. ── */}
+      {show('byIp') && (
+      <div className="pg-panel">
+        <div className="flex items-center gap-1.5">
+          <h3 className="pg-panel-title">{t('byIpTitle')}</h3>
+          <HelpDot topic="devices.router-pairing" />
+        </div>
+        <p className="text-sm text-[var(--pg-text-dim)] mt-1 mb-4">{t('byIpHint')}</p>
+        {ipMsg && msgBox(ipMsg)}
+        {motherUpdateBlock('byIp')}
+        <div className="flex flex-col sm:flex-row gap-2">
+          <input
+            type="text"
+            inputMode="decimal"
+            value={ipAddr}
+            onChange={(e) => setIpAddr(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void joinByIp(); }}
+            placeholder={t('byIpPlaceholder')}
+            className="pg-input flex-1 font-mono"
+          />
+          <button onClick={() => void joinByIp()} disabled={ipBusy || !ipAddr.trim()} className="pg-btn pg-btn--primary">
+            {ipBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
+            {t('byIpConnect')}
+          </button>
+        </div>
+      </div>
       )}
     </div>
   );

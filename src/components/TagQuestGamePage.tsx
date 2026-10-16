@@ -8,6 +8,7 @@ import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import { useGameSounds } from '../hooks/useGameSounds';
 import { describePunchStatus, localizedStatus, type GameMessageType } from '../services/gameMessages';
 import { PunchAnimationOverlay } from './PunchAnimationOverlay';
 import { TagQuestFinishScreen } from './TagQuestFinishScreen';
@@ -60,6 +61,7 @@ import { onPendingConfigReload } from '../services/pendingJoinStore';
 import { clashRegister, getClashMembers } from '../services/clash';
 import { ensureTeamForCard } from '../services/teamRegistration';
 import { TagQuestRegistrationScreen, type TagQuestRegTeam } from './TagQuestRegistrationScreen';
+import { readMinFontSize, TeamNameFit } from './teamNameFit';
 // Station-based registration assignment: this device may be hard-locked to
 // specific team(s) during registration (meta.regAssignments, keyed by
 // device_id). Design: project_selfregister_team_device_assignment.
@@ -70,6 +72,7 @@ import {
   REG_ASSIGNMENTS_META_KEY,
   type RegAssignmentMap,
 } from '../services/regAssignments';
+import { gameClock } from '../services/gameClock';
 
 type AnimPhase = 'idle' | 'enter' | 'images' | 'main' | 'update' | 'exit';
 
@@ -381,6 +384,10 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   const [selfDeviceId, setSelfDeviceId] = useState<number | null>(null);
   const assignedTeamNumbers = assignedTeamNumbersFor(regAssignMap, selfDeviceId);
   const phaseRef = useRef(phase);
+  // Set when this device's operator presses Start; play bips read while the
+  // launch videos run are held in heldPlayReadsRef until the game starts.
+  const startPressedRef = useRef(false);
+  const heldPlayReadsRef = useRef<CardData[]>([]);
   const selectedRegTeamIdRef = useRef(selectedRegTeamId);
   const playModeRef = useRef(playMode);
   const regTeamsRef = useRef(regTeams);
@@ -490,6 +497,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   // the post-animation hold - waits its turn instead of overlapping, and the
   // waiting teams show in the bottom line. No punch is dropped.
   const queue = usePresentationQueue();
+  // Stops the sounds when the page is left mid-animation (quit / rankings).
+  const playAudio = useGameSounds();
   // Resolver for the slot wrapping the in-flight animation state-machine; called
   // when the exit phase finishes so the queue advances to the next item.
   const animResolveRef = useRef<(() => void) | null>(null);
@@ -557,11 +566,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       eventAudioRef.current.get(metaKey)?.pause();
       const audio = new Audio(scenarioAssetUrl(gameUniqid, filename.replace(/^media\//, '')));
       eventAudioRef.current.set(metaKey, audio);
-      void audio.play().catch((e) => console.error(`[TagQuest] ${metaKey} play error:`, e));
+      void playAudio(audio).catch((e) => console.error(`[TagQuest] ${metaKey} play error:`, e));
     } catch (e) {
       console.error(`[TagQuest] ${metaKey} load error:`, e);
     }
-  }, [gameUniqid]);
+  }, [gameUniqid, playAudio]);
 
   useEffect(() => {
     if (animPhase !== 'main') return;
@@ -577,7 +586,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         questAudioRef.current?.pause();
         const audio = new Audio(scenarioAssetUrl(gameUniqid, soundKey.replace(/^media\//, '')));
         questAudioRef.current = audio;
-        void audio.play().catch((e) => console.error('[TagQuest] quest sound play error:', e));
+        void playAudio(audio).catch((e) => console.error('[TagQuest] quest sound play error:', e));
       } catch (e) {
         console.error('[TagQuest] quest sound load error:', e);
       }
@@ -861,7 +870,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
           const existingStarts = state.teams
             .map((t) => t.start_time)
             .filter((s): s is number => s != null);
-          const startMs = existingStarts.length ? Math.min(...existingStarts) * 1000 : Date.now();
+          const startMs = existingStarts.length ? Math.min(...existingStarts) * 1000 : gameClock.now();
           const startIso = new Date(startMs).toISOString();
           try {
             await startLaunchedGame(launchedGameId, startIso);
@@ -1002,7 +1011,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
     const tick = () => {
       const endMs = timerStartMs + duration * 60 * 1000;
-      const remainingSec = Math.floor((endMs - Date.now()) / 1000);
+      const remainingSec = Math.floor((endMs - gameClock.now()) / 1000);
       if (remainingSec > 0) {
         setCountdown(remainingSec);
         setOvertimeSec(0);
@@ -1010,7 +1019,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         // Clock expired: keep counting the time past the deadline so the HUD
         // shows a red negative overtime timer.
         setCountdown(0);
-        const overSec = Math.max(0, Math.floor((Date.now() - endMs) / 1000));
+        const overSec = Math.max(0, Math.floor((gameClock.now() - endMs) / 1000));
         setOvertimeSec(overSec);
       }
     };
@@ -1274,10 +1283,14 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   // every enrolled team's start_time (mass start), then switch to playing.
   const handleRegistrationStart = useCallback(async () => {
     if (!launchedGameId) return;
+    // From here on a bip is a play bip, even while the launch videos run and
+    // the page is still on the registration screen: hold it (see the card
+    // callback) and score it once the game has started.
+    startPressedRef.current = true;
     try {
       await playStartVideos();
       const state = await getLaunchedGameState(launchedGameId, 0);
-      const startMs = Date.now();
+      const startMs = gameClock.now();
       const startIso = new Date(startMs).toISOString();
       await startLaunchedGame(launchedGameId, startIso);
       await Promise.all(
@@ -1290,7 +1303,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     } catch (err) {
       console.error('[TagQuest] registration start failed:', err);
     } finally {
+      phaseRef.current = 'playing';
       setPhase('playing');
+      const held = heldPlayReadsRef.current;
+      heldPlayReadsRef.current = [];
+      for (const card of held) void saveCardDataRef.current(card);
     }
   }, [launchedGameId, playStartVideos]);
 
@@ -1299,6 +1316,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
   // handleNewBip recognise our own echo (already processed below) and tell it
   // apart from a punch read on another station (which must NOT animate here).
   const processedRawIdsRef = useRef<Set<number>>(new Set());
+  // Tail of this device's read-processing chain (see saveCardData).
+  const localReadChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   const saveCardData = async (card: CardData) => {
     if (!launchedGameId) return;
@@ -1313,7 +1332,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       // TagQuest did no local processing and let the echo drive scoring, so the
       // punch animated (and re-scored) on every device in the game.
       if (typeof id === 'number') processedRawIdsRef.current.add(id);
-      const processing = handleCardPunchLogicRef.current(card);
+      // One read at a time on this device: each read scores the team from a
+      // fresh snapshot and writes the total, so two teammates' reads processed
+      // in parallel let the slower one overwrite the newer score.
+      const processing = localReadChainRef.current.then(() => handleCardPunchLogicRef.current(card));
+      localReadChainRef.current = processing.catch(() => undefined);
       punchesInFlightRef.current = Promise.all([
         punchesInFlightRef.current,
         processing.catch(() => undefined),
@@ -1323,6 +1346,8 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       console.error('Error saving card data:', error);
     }
   };
+  const saveCardDataRef = useRef(saveCardData);
+  useEffect(() => { saveCardDataRef.current = saveCardData; });
 
   const resolveMedia = useCallback((key: string): string => {
     if (!key) return '';
@@ -1624,6 +1649,25 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
 
     const initializeUSB = async () => {
       if (!usbReaderService.isAvailable()) return;
+      // Bound before reader detection so the game simulator's injected reads
+      // (no physical reader) reach the page too; harmless without events.
+      usbReaderService.setCardDetectedCallback((card: CardData) => {
+        console.log('🏷️  CARD DETECTED:', card);
+        // During self-register the bip enrols/binds the chip; during play it
+        // scores. Route by the live phase (ref, so this once-set callback
+        // always sees the current phase).
+        if (phaseRef.current === 'register' && startPressedRef.current) {
+          // Start pressed, launch videos still playing: not a registration.
+          heldPlayReadsRef.current.push(card);
+        } else if (phaseRef.current === 'register') {
+          handleRegisterCardRef.current(card);
+        } else {
+          saveCardData(card);
+        }
+        setLastCardData(card);
+        setShowCardAlert(true);
+        setTimeout(() => setShowCardAlert(false), 5000);
+      });
       const detected = await detectReaderPort();
       if (cancelled || !detected) return;
 
@@ -1632,21 +1676,6 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
         const initialized = await usbReaderService.initializePort(detected.path);
         if (initialized) {
           console.log('✓ USB reader initialized successfully');
-          usbReaderService.setCardDetectedCallback((card: CardData) => {
-            console.log('🏷️  CARD DETECTED:', card);
-            // During self-register the bip enrols/binds the chip; during play it
-            // scores. Route by the live phase (ref, so this once-set callback
-            // always sees the current phase).
-            if (phaseRef.current === 'register') {
-              handleRegisterCardRef.current(card);
-            } else {
-              saveCardData(card);
-            }
-            setLastCardData(card);
-            setShowCardAlert(true);
-            setTimeout(() => setShowCardAlert(false), 5000);
-          });
-
           usbReaderService.setCardRemovedCallback(() => {
             console.log('🏷️  CARD REMOVED');
             setShowCardAlert(false);
@@ -1673,6 +1702,7 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     window.addEventListener('reader:status', onReaderStatus);
 
     return () => {
+      usbReaderService.setCardDetectedCallback(undefined);
       cancelled = true;
       window.removeEventListener('reader:status', onReaderStatus);
       if (usbReaderService.isAvailable()) {
@@ -2315,7 +2345,17 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
                 whiteSpace: 'nowrap',
               }}
             >
-              <span className="vcenter-text">{displayText}</span>
+              {isTeamName ? (
+                // Shrinks to fit the box; under the author's min size the
+                // name goes on two lines (same component as the studio).
+                <TeamNameFit
+                  text={String(displayText ?? '')}
+                  maxPx={styled.fontSize !== undefined ? styled.fontSize * (bgDimensions.width / 1920) : undefined}
+                  minPx={readMinFontSize(styled.minFontSize) * (bgDimensions.width / 1920)}
+                />
+              ) : (
+                <span className="vcenter-text">{displayText}</span>
+              )}
             </div>
           </div>
         );

@@ -3,7 +3,9 @@
 // Responsibilities (per slice 2 plan):
 //   - Trigger cycles: startup, foreground (>=5min), network-up, 30-min timer,
 //     manual. All debounced - at most one cycle in flight; subsequent triggers
-//     within 60s of the last cycle start are dropped.
+//     within 60s of the last cycle start are dropped. With start(..., {askFirst})
+//     (every launch but the first) the startup trigger only checks and the
+//     operator is asked before anything downloads - see LaunchGate.
 //   - On each cycle:
 //       1. Fetch get_user_data_update manifest.
 //       2. Apply manifest in one SQLite transaction: upsert all rows, tombstone
@@ -20,7 +22,7 @@
 // Q9 escape hatch: if mobile profiling shows JS-heap pressure on big media
 // downloads, lift this whole orchestrator into Rust.
 
-import { ApiError, RangeIgnoredError, apiCall, apiDownloadBytesStream, apiDownloadStreamed } from './api';
+import { ApiError, RangeIgnoredError, apiCall, apiDownloadBytesStream } from './api';
 import { withRetry } from './apiRetry';
 import { AuthUser } from './authStore';
 import {
@@ -46,13 +48,13 @@ import * as patternStore from './patternStore';
 import * as cardsStore from './cardsStore';
 import * as namePoolsStore from './namePoolsStore';
 import * as recoveryCodesStore from './recoveryCodesStore';
+import * as customersStore from './customersStore';
 import * as reportLayoutsStore from './reportLayoutsStore';
 import { setSyncedDefaultPrintPrefs } from './printPrefsStore';
 import * as translationsStore from './translationsStore';
 import { hydrateIngameFromStore } from '../i18n/ingame';
 import * as gameTypesStore from './gameTypesStore';
 import * as lanNetworks from './lanNetworks';
-import * as wifiNetworksStore from './wifiNetworksStore';
 import { isGameActive } from './activeSession';
 import * as clientPreferencesStore from './clientPreferencesStore';
 import {
@@ -70,8 +72,17 @@ import {
 import { captureError } from './telemetry';
 import { loadConfig } from '../utils/config';
 import { emit } from './syncEvents';
-import type { CyclePhase, CycleFailureDetail } from './syncEvents';
+import type { CyclePhase, CycleFailureDetail, CycleProgressPayload, UpdatesAvailablePayload } from './syncEvents';
 import { getDb } from './db';
+import * as contentSyncState from './contentSyncState';
+import {
+  cloudSource,
+  type ContentSource,
+  type PeerContentSource,
+  type PeerInventory,
+  type ScenarioMetaResponse,
+  type PatternDownloadResponse,
+} from './contentSource';
 
 // ---------- tunables ----------
 
@@ -131,31 +142,14 @@ interface ManifestResponse {
   team_names_version?: number;
   recovery_codes_version?: number;
   report_layouts_version?: number;
-  lan_networks_version?: number;
+  /** Licensee customers; absent from a studio that predates them. */
+  customers_version?: number;
   translations?: Array<{ key: string; value: unknown; version: number }>;
   game_types?: gameTypesStore.GameTypeManifestRow[];
   client_game_type_overrides?: gameTypesStore.GameTypeOverrideManifestRow[];
   client_preferences?: clientPreferencesStore.ClientPreferences;
-}
-
-interface ScenarioMetaResponse {
-  scenario: { uniqid: string; name: string; scenario_type: string };
-  game_data: unknown;
-  medias: string[] | null;
-  // CAS manifest. `files` is authoritative: per-file content hashes incl. the
-  // game-data.json entry (keyed by data_hash). `data_hash` is also surfaced
-  // top-level. Both present once the studio hash migration has run.
-  data_hash?: string | null;
-  files?: Array<{ rel_path: string; hash: string; size: number }> | null;
-}
-
-interface PatternDownloadResponse {
-  pattern_uniqid: string;
-  pattern_slug: string | null;
-  description: string | null;
-  pattern_data: unknown;
-  stations?: Record<string, string> | null;
-  version: number;
+  /** Studio snapshot time (ms); orders manifests passed between LAN peers. */
+  server_time?: number;
 }
 
 export type WorkItem =
@@ -163,13 +157,17 @@ export type WorkItem =
   | { kind: 'on_demand'; priority: 1; clientId: number; label: string }
   | { kind: 'team_names'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'recovery_codes'; priority: 1; clientId: number; remoteVersion: number; label: string }
+  | { kind: 'customers'; priority: 1; clientId: number; remoteVersion: number; label: string }
   | { kind: 'report_layouts'; priority: 1; remoteVersion: number; label: string }
-  | { kind: 'lan_networks'; priority: 1; remoteVersion: number; label: string }
   | { kind: 'pattern'; priority: 2; uniqid: string; remoteVersion: number; label: string }
   | { kind: 'scenario_meta'; priority: 4; uniqid: string; remoteVersion: number; remoteContentHash: string; label: string }
   | { kind: 'scenario_media'; priority: 5; uniqid: string; filename: string; hash: string; label: string }
-  | { kind: 'game_type_admin_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; label: string }
-  | { kind: 'game_type_override_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; label: string };
+  | { kind: 'game_type_admin_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; subtitlesVersion: number; label: string }
+  | { kind: 'game_type_override_video'; priority: 6; code: string; remoteVersion: number; filename: string; subtitleFilenames: Record<string, string>; subtitlesVersion: number; label: string }
+  // Subtitle tracks alone, for a video that is already current on disk:
+  // `videoVersion` names the version dir they live in (both here and in studio).
+  | { kind: 'game_type_admin_subtitles'; priority: 6; code: string; videoVersion: number; subtitleFilenames: Record<string, string>; subtitlesVersion: number; label: string }
+  | { kind: 'game_type_override_subtitles'; priority: 6; code: string; videoVersion: number; subtitleFilenames: Record<string, string>; subtitlesVersion: number; label: string };
 
 // ---------- module state ----------
 
@@ -185,6 +183,22 @@ let timerHandle: ReturnType<typeof setInterval> | null = null;
 let retryHandle: ReturnType<typeof setTimeout> | null = null;
 let retryStep = 0;
 let lastVisibleAtMs = Date.now();
+
+// Launch gate. With `askFirst`, no download starts on its own at launch: the
+// first trigger only CHECKS (manifest fetch, no downloads, no prunes) and, when
+// something is pending, asks the operator through 'updates:available'.
+//   pending_check   - check not done yet (offline at launch, or it failed); the
+//                     next automatic trigger runs the check instead of a cycle.
+//   awaiting_answer - the prompt is up; automatic triggers are held.
+//   declined        - "Plus tard": automatic cycles stay off for this session.
+//   open            - normal behaviour (nothing was pending, or accepted).
+// A manual sync (Settings → Synchroniser maintenant) always runs and opens the
+// gate.
+type LaunchGate = 'pending_check' | 'awaiting_answer' | 'declined' | 'open';
+let launchGate: LaunchGate = 'open';
+let checkInFlight = false;
+let checkAbort: AbortController | null = null;
+let pendingUpdates: PendingUpdatesSummary | null = null;
 
 // Wall-clock of the last observable forward step in the running cycle: a phase
 // transition, an item starting or finishing, or a single streamed chunk landing.
@@ -220,6 +234,10 @@ interface ScenarioProgress {
   manifest: scenarioStore.ManifestFile[];
   remoteContentHash: string;
   remoteVersion: number;
+  // false: a LAN peer's copy that is not known to match the cloud manifest.
+  // Committed as launchable only (local_content_hash untouched), so the next
+  // cloud cycle still reconciles it.
+  commitFull: boolean;
 }
 const scenarioProgress = new Map<string, ScenarioProgress>();
 
@@ -228,6 +246,36 @@ const scenarioProgress = new Map<string, ScenarioProgress>();
 // two workers fetching the same blob (a file shared by two scenarios) must not
 // both append to it: the second one joins the first one's promise instead.
 const inflightBlobs = new Map<string, Promise<number>>();
+
+// A cycle's completion, so a LAN peer fetch can abort a running cycle and wait
+// for it to unwind before reusing the (module-level) scenarioProgress map.
+let cycleDone: Promise<void> | null = null;
+// A peer fetch (fetchScenarioFromSource) is running: no cycle may start, and
+// progress goes to `peerProgress` instead of the cloud sync UI's cycle:* events.
+let peerFetchInFlight = false;
+// The running cycle was aborted on purpose to let a peer fetch through: it
+// ends quietly (no failure banner, no telemetry) and is re-triggered after.
+let cycleYieldedToPeer = false;
+export interface PeerFetchProgress {
+  label: string;
+  loaded: number;
+  total: number | null;
+  done: boolean;
+}
+let peerProgress: ((p: PeerFetchProgress) => void) | null = null;
+// First error a peer fetch's pool swallowed (the pool never throws per item),
+// so the caller can tell "the mother doesn't have it" from a network failure.
+let peerFirstError: unknown = null;
+// Peer fetches run one at a time (they share scenarioProgress): a second one
+// waits for the first to finish - e.g. React re-running an effect whose first
+// run was just aborted.
+let peerFetchTail: Promise<void> = Promise.resolve();
+// The LAN mother whose content the pending-updates prompt is about (offline
+// launch): accepting syncs from it instead of the unreachable studio.
+let pendingPeerSource: PeerContentSource | null = null;
+// The running background peer sync, so joining a game (fetchScenarioFromSource)
+// can cut it short instead of queueing behind its videos.
+let peerSyncAbort: AbortController | null = null;
 
 // ---------- public API ----------
 
@@ -249,13 +297,50 @@ export function getState(): OrchestratorState {
   };
 }
 
-export async function start(authUser: AuthUser): Promise<void> {
+// What the launch check found, shown in the "synchronise now?" prompt.
+// `on_demand` items are left out: they are re-fetched by every cycle, so they
+// would make the prompt appear on every launch.
+export type PendingUpdatesSummary = UpdatesAvailablePayload;
+
+export function getPendingUpdates(): PendingUpdatesSummary | null {
+  return launchGate === 'awaiting_answer' ? pendingUpdates : null;
+}
+
+// The operator's answer to the launch prompt. Accept runs the cycle now (as a
+// manual sync: it is user-initiated) and resumes automatic cycles; decline
+// keeps them off until the next launch or a manual sync.
+export function answerPendingUpdates(accept: boolean): void {
+  if (launchGate !== 'awaiting_answer') return;
+  pendingUpdates = null;
+  emit('updates:resolved', { accepted: accept });
+  const peer = pendingPeerSource;
+  pendingPeerSource = null;
+  if (accept) {
+    launchGate = 'open';
+    if (peer) {
+      // Back online meanwhile (runPeerSync then defers to the studio): sync
+      // from there instead.
+      void runPeerSync(peer).then((did) => {
+        if (!did) void runCycleNow('manual');
+      });
+    } else {
+      void runCycleNow('manual');
+    }
+  } else {
+    launchGate = 'declined';
+  }
+}
+
+// `askFirst`: check at launch and ask before downloading (see LaunchGate).
+// Off on a first launch - with nothing on disk there is nothing to choose.
+export async function start(authUser: AuthUser, opts: { askFirst?: boolean } = {}): Promise<void> {
   if (started) {
     currentUser = authUser;
     return;
   }
   started = true;
   currentUser = authUser;
+  launchGate = opts.askFirst ? 'pending_check' : 'open';
   startConnectivityMonitor();
 
   // Visibility: track foregrounded duration; trigger after >= threshold offscreen.
@@ -292,13 +377,23 @@ export async function start(authUser: AuthUser): Promise<void> {
     }
   });
 
-  // Initial cycle.
+  // Initial cycle (or, with askFirst, the launch check).
   void fireTrigger('startup');
 }
 
 export function stop(): void {
   if (!started) return;
   started = false;
+  if (launchGate === 'awaiting_answer') {
+    emit('updates:resolved', { accepted: false });
+  }
+  launchGate = 'open';
+  pendingUpdates = null;
+  pendingPeerSource = null;
+  if (checkAbort) {
+    checkAbort.abort();
+    checkAbort = null;
+  }
   for (const d of disposers) {
     try {
       d();
@@ -320,7 +415,262 @@ export function stop(): void {
 }
 
 export async function runCycleNow(trigger: Trigger = 'manual'): Promise<void> {
+  if (trigger === 'manual' && launchGate !== 'open') {
+    // A manual sync answers the launch question too: close the prompt.
+    if (launchGate === 'awaiting_answer') {
+      pendingUpdates = null;
+      emit('updates:resolved', { accepted: true });
+    }
+    launchGate = 'open';
+  }
   await fireTrigger(trigger, { force: trigger === 'manual' });
+}
+
+// After a local card edit: get it to the studio soon. With the launch gate
+// open this is a normal manual cycle; while the operator has not agreed to the
+// launch sync (or said "Plus tard"), it pushes the card changes and pulls the
+// card list only, so a card edit never starts the scenario/video downloads.
+export async function syncCardsNow(): Promise<void> {
+  if (launchGate === 'open') {
+    await runCycleNow('manual');
+    return;
+  }
+  if (!started || !currentUser || cycleInFlight || checkInFlight) return;
+  const clientId = currentUser.client_id;
+  await cardsStore.pushPendingMutations();
+  await withRetry(() => cardsStore.pullCardsFromServer(clientId));
+  emit('content:updated', { kind: 'cards', ids: [clientId] });
+}
+
+// ---------- LAN peer fetch ----------
+
+export type PeerFetchOutcome =
+  // Every file is here.
+  | { status: 'full' }
+  // Launchable, but some videos are missing (not on the mother, or failed).
+  | { status: 'launchable' }
+  // Not launchable; `error` is what went wrong (ApiError from the mother...).
+  | { status: 'missing'; error: unknown };
+
+/**
+ * Fetch one scenario - plus the pattern a Tracks game needs - from a LAN
+ * source: the launch path when a satellite joins a game whose scenario it never
+ * synced, in a venue with no internet. Runs the same download -> verify ->
+ * commit path as a cycle. A running cloud cycle is aborted first (cheap: blob
+ * downloads resume from their .part) and re-triggered afterwards.
+ */
+export async function fetchScenarioFromSource(
+  uniqid: string,
+  source: ContentSource,
+  opts: { patternUniqid?: string | null; signal?: AbortSignal; onProgress?: (p: PeerFetchProgress) => void } = {}
+): Promise<PeerFetchOutcome> {
+  // Joining a game comes first: cut a background peer sync short (its blob
+  // downloads resume from their .part next time).
+  peerSyncAbort?.abort();
+  const previous = peerFetchTail;
+  let release: () => void = () => {};
+  peerFetchTail = new Promise<void>((r) => {
+    release = r;
+  });
+  await previous;
+  if (opts.signal?.aborted) {
+    release();
+    return { status: 'missing', error: new DOMException('aborted', 'AbortError') };
+  }
+  peerFetchInFlight = true;
+  let abortedCycle = false;
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  opts.signal?.addEventListener('abort', onAbort);
+  try {
+    if (cycleInFlight) {
+      abortedCycle = true;
+      cycleYieldedToPeer = true;
+      cycleAbort?.abort();
+      await cycleDone;
+      cycleYieldedToPeer = false;
+    }
+    peerProgress = opts.onProgress ?? null;
+    peerFirstError = null;
+    operatorOnly = await readOperatorOnly();
+    scenarioProgress.clear();
+
+    const items: WorkItem[] = [];
+    if (opts.patternUniqid) {
+      const p = await patternStore.get(opts.patternUniqid);
+      if (!p || p.local_version == null) {
+        items.push({
+          kind: 'pattern',
+          priority: 2,
+          uniqid: opts.patternUniqid,
+          remoteVersion: p?.remote_version ?? 0,
+          label: `Pattern: ${opts.patternUniqid}`,
+        });
+      }
+    }
+    // remoteVersion/remoteContentHash are placeholders: a peer's reply carries
+    // the version and hash its copy is committed at.
+    items.push({
+      kind: 'scenario_meta',
+      priority: 4,
+      uniqid,
+      remoteVersion: 0,
+      remoteContentHash: '',
+      label: `Scenario: ${uniqid}`,
+    });
+    await runDownloadPool(items, ctrl.signal, source, 2);
+    if (ctrl.signal.aborted) return { status: 'missing', error: new DOMException('aborted', 'AbortError') };
+
+    const row = await scenarioStore.get(uniqid);
+    if (!row || row.local_version == null || !(await scenarioStore.getGameData(uniqid))) {
+      return { status: 'missing', error: peerFirstError ?? new Error('scenario not committed') };
+    }
+    const progress = scenarioProgress.get(uniqid);
+    const whole = progress && progress.remaining.size === 0 && progress.failed.size === 0;
+    return whole ? { status: 'full' } : { status: 'launchable' };
+  } finally {
+    opts.signal?.removeEventListener('abort', onAbort);
+    scenarioProgress.clear();
+    peerProgress = null;
+    peerFirstError = null;
+    peerFetchInFlight = false;
+    release();
+    // Give back the cycle we interrupted (fireTrigger still skips it offline).
+    if (abortedCycle) void fireTrigger('retry', { force: true });
+  }
+}
+
+// Can the mother serve this work item? Only what it holds at exactly the
+// version our manifest wants (rule: peer.local == our remote): anything else
+// waits for the cloud, or for the mother to catch up.
+function peerCanServe(item: WorkItem, inv: PeerInventory): boolean {
+  switch (item.kind) {
+    case 'scenario_meta':
+      return inv.scenarios.some((s) => s.uniqid === item.uniqid && s.complete && s.hash === item.remoteContentHash);
+    case 'pattern':
+      return inv.patterns.some((p) => p.uniqid === item.uniqid && p.version === item.remoteVersion);
+    case 'team_names':
+      return inv.team_names !== null && inv.team_names === item.remoteVersion;
+    case 'report_layouts':
+      return inv.report_layouts !== null && inv.report_layouts === item.remoteVersion;
+    case 'game_type_admin_video':
+      return !inv.game_active && inv.game_types.some((g) => g.code === item.code && g.version === item.remoteVersion);
+    case 'game_type_override_video':
+      return !inv.game_active && inv.overrides.some((o) => o.code === item.code && o.version === item.remoteVersion);
+    case 'game_type_admin_subtitles':
+      return inv.game_types.some(
+        (g) => g.code === item.code && g.version === item.videoVersion && g.subtitles_version === item.subtitlesVersion
+      );
+    case 'game_type_override_subtitles':
+      return inv.overrides.some(
+        (o) => o.code === item.code && o.version === item.videoVersion && o.subtitles_version === item.subtitlesVersion
+      );
+    default:
+      // Cards, on-demand cards, recovery codes: never from a peer.
+      return false;
+  }
+}
+
+/**
+ * Background content sync from the LAN mother (offline venue). Adopts the
+ * mother's cloud snapshot when it is strictly newer than ours (its deletions
+ * included - they are real cloud deletions - unless a game is running), then
+ * fetches whatever the mother holds at the exact version our manifest wants.
+ * Runs only when the studio is unreachable or the mother's snapshot is newer:
+ * online, the cloud stays the source. Returns false when it did nothing.
+ */
+export async function runPeerSync(source: PeerContentSource, signal?: AbortSignal): Promise<boolean> {
+  if (!started || !currentUser) return false;
+  if (cycleInFlight || checkInFlight || peerFetchInFlight) return false;
+  // Same consent as cloud downloads (LaunchGate): nothing in the background
+  // until the operator has agreed to this session's sync. Joining a game still
+  // fetches its scenario (fetchScenarioFromSource).
+  if (launchGate === 'declined' || launchGate === 'awaiting_answer') return false;
+  const clientId = currentUser.client_id;
+
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener('abort', onAbort);
+  const previous = peerFetchTail;
+  let release: () => void = () => {};
+  peerFetchTail = new Promise<void>((r) => {
+    release = r;
+  });
+  await previous;
+  // A cycle may have started while we queued: never run two pools at once.
+  if (cycleInFlight || checkInFlight || ctrl.signal.aborted) {
+    signal?.removeEventListener('abort', onAbort);
+    release();
+    return false;
+  }
+  peerFetchInFlight = true;
+  peerSyncAbort = ctrl;
+  try {
+    const inv = await source.getInventory(ctrl.signal);
+    if (inv.client_id !== clientId) return false;
+    const mine = await contentSyncState.get();
+    const mineAsOf = mine && mine.client_id === clientId ? mine.cloud_as_of_ms : null;
+    const peerNewer = inv.cloud_as_of_ms !== null && !inv.approx && (mineAsOf === null || inv.cloud_as_of_ms > mineAsOf);
+    const cloudUsable = isOnline() && (await studioReachableFresh());
+    if (cloudUsable && !peerNewer) return false;
+
+    operatorOnly = await readOperatorOnly();
+    if (launchGate === 'pending_check') {
+      // Online, the cloud launch check asks the operator; let it.
+      if (cloudUsable) return false;
+      // Launched offline: ask about what the mother can bring, like the cloud
+      // launch check would. Upserts only (no prune, snapshot not recorded) -
+      // accepting re-runs this sync, which applies it for real.
+      if (peerNewer) {
+        const pm = await source.getManifest(ctrl.signal);
+        if (pm.client_id !== clientId || pm.approx) return false;
+        await applyManifest(clientId, pm.manifest as ManifestResponse, { prune: false, fromPeer: true });
+      }
+      const pending = (await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) =>
+        peerCanServe(w, inv)
+      );
+      const summary = await summarizeWork(pending);
+      if (summary.total > 0) {
+        launchGate = 'awaiting_answer';
+        pendingUpdates = summary;
+        pendingPeerSource = source;
+        emit('updates:available', summary);
+      }
+      // Nothing the mother can bring: the gate stays closed, so the studio's
+      // own launch check still asks once the internet is back.
+      return false;
+    }
+    if (peerNewer) {
+      const pm = await source.getManifest(ctrl.signal);
+      if (pm.client_id !== clientId || pm.approx || pm.cloud_as_of_ms !== inv.cloud_as_of_ms) return false;
+      const manifest = pm.manifest as ManifestResponse;
+      await applyManifest(clientId, manifest, { prune: true, fromPeer: true });
+      // Keep the snapshot's ORIGIN time, so ordering holds across hops.
+      await contentSyncState.recordSnapshot(clientId, manifest, pm.cloud_as_of_ms, 'peer');
+      emit('content:updated', { kind: 'scenarios', ids: [] });
+    }
+
+    const work = (await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) =>
+      peerCanServe(w, inv)
+    );
+    if (work.length === 0) return peerNewer;
+    scenarioProgress.clear();
+    peerFirstError = null;
+    const deferring: PeerContentSource = inv.game_active ? { ...source, deferVideos: true } : source;
+    await runDownloadPool(work, ctrl.signal, deferring, 2);
+    await contentSyncState.bumpRev();
+    return true;
+  } catch (err) {
+    console.warn('[syncOrchestrator] peer sync failed:', err);
+    return false;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    if (peerSyncAbort === ctrl) peerSyncAbort = null;
+    scenarioProgress.clear();
+    peerFirstError = null;
+    peerFetchInFlight = false;
+    release();
+  }
 }
 
 function clearRetry(): void {
@@ -351,7 +701,8 @@ function scheduleRetry(incomplete: boolean): void {
 
 async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Promise<void> {
   if (!started || !currentUser) return;
-  if (cycleInFlight) return;
+  if (cycleInFlight || checkInFlight || peerFetchInFlight) return;
+  if (trigger !== 'manual' && (launchGate === 'awaiting_answer' || launchGate === 'declined')) return;
   // Offline → don't even attempt a cycle. Every request would just time out
   // and surface as a spurious "Sync failed" banner. The 'network_up' trigger
   // (fired by the connectivity monitor when the radio recovers) is the proper
@@ -360,7 +711,7 @@ async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Pr
   // when navigator.onLine hasn't caught up (captive-portal lag, etc.).
   //
   // navigator.onLine is only trusted as a fast NEGATIVE: on the normal venue
-  // setup (satellite on the mother's internet-less hotspot) it reads TRUE, and
+  // setup (satellites on an internet-less venue router) it reads TRUE, and
   // scheduled cycles used to fire and die at the manifest fetch (up to a 30s
   // timeout each) all event long. The truthful signal is the studio HTTP
   // probe's shared cache - consult it (one live probe at most when stale)
@@ -368,6 +719,10 @@ async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Pr
   if (trigger !== 'manual') {
     if (!isOnline()) return;
     if (!(await studioReachableFresh())) return;
+  }
+  if (launchGate === 'pending_check') {
+    await runLaunchCheck();
+    return;
   }
   if (
     !opts.force &&
@@ -379,20 +734,124 @@ async function fireTrigger(trigger: Trigger, opts: { force?: boolean } = {}): Pr
   await runCycle(trigger);
 }
 
+// ---------- launch check ----------
+
+// The askFirst launch check: phases 1-2 of a cycle (push local card edits,
+// fetch + apply the manifest) WITHOUT the download pool and without pruning
+// content the studio no longer lists - nothing is downloaded or deleted until
+// the operator says yes. Silent: no cycle:* events, so the pill stays hidden.
+// A failure leaves the gate at pending_check for the next automatic trigger.
+async function runLaunchCheck(): Promise<void> {
+  if (!currentUser || checkInFlight || cycleInFlight) return;
+  checkInFlight = true;
+  checkAbort = new AbortController();
+  const signal = checkAbort.signal;
+  let summary: PendingUpdatesSummary | null = null;
+  try {
+    operatorOnly = await readOperatorOnly();
+    if (await cardsStore.hasPendingMutations()) {
+      try {
+        await cardsStore.pushPendingMutations();
+      } catch (err) {
+        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) throw err;
+      }
+    }
+    const work = await fetchManifestAndApply(signal, { prune: false });
+    summary = await summarizeWork(work);
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+      emit('cycle:failed', { reason: 'auth_invalid', recoverable: false });
+    } else if (!signal.aborted) {
+      console.warn('[syncOrchestrator] launch check failed, will retry on the next trigger', err);
+    }
+  } finally {
+    checkInFlight = false;
+    checkAbort = null;
+  }
+  // stop() ran meanwhile (logout, hard-floor update): drop the result.
+  if (signal.aborted || !started) return;
+  // A manual sync was asked for while the check ran (fireTrigger dropped it
+  // because checkInFlight): run it now.
+  if (launchGate === 'open') {
+    await runCycle('manual');
+    return;
+  }
+  if (!summary || launchGate !== 'pending_check') return;
+
+  if (summary.total === 0) {
+    // Nothing to download: open the gate and run a normal cycle, which applies
+    // what the check held back (removed scenarios/patterns) - no downloads.
+    launchGate = 'open';
+    await runCycle('startup');
+    return;
+  }
+  launchGate = 'awaiting_answer';
+  pendingUpdates = summary;
+  emit('updates:available', summary);
+}
+
+async function summarizeWork(work: WorkItem[]): Promise<PendingUpdatesSummary> {
+  const summary: PendingUpdatesSummary = {
+    total: 0,
+    newScenarios: [],
+    updatedScenarios: [],
+    patterns: 0,
+    videos: 0,
+    other: 0,
+  };
+  const pendingScenarios = new Map(
+    (await scenarioStore.listPendingDownloads()).map((s) => [s.uniqid, s])
+  );
+  for (const w of work) {
+    if (w.kind === 'on_demand') continue;
+    summary.total += 1;
+    switch (w.kind) {
+      case 'scenario_meta': {
+        const row = pendingScenarios.get(w.uniqid);
+        const title = row?.title ?? w.label;
+        if (row && row.local_version !== null) summary.updatedScenarios.push(title);
+        else summary.newScenarios.push(title);
+        break;
+      }
+      case 'pattern':
+        summary.patterns += 1;
+        break;
+      case 'game_type_admin_video':
+      case 'game_type_override_video':
+        summary.videos += 1;
+        break;
+      default:
+        summary.other += 1;
+    }
+  }
+  return summary;
+}
+
+async function readOperatorOnly(): Promise<boolean> {
+  return loadConfig()
+    .then((c) => c.operatorOnlyDevice === true)
+    .catch(() => false);
+}
+
 // ---------- cycle ----------
 
 async function runCycle(trigger: Trigger): Promise<void> {
   if (!currentUser) return;
+  // One pool at a time (they share scenarioProgress): a peer fetch/sync that
+  // got in first wins; it re-triggers the cycle when it's done.
+  if (cycleInFlight || peerFetchInFlight) return;
   cycleInFlight = true;
+  let resolveCycleDone: () => void = () => {};
+  cycleDone = new Promise<void>((r) => {
+    resolveCycleDone = r;
+  });
   lastCycleStartedAtMs = Date.now();
   cycleAbort = new AbortController();
   scenarioProgress.clear();
 
   // Operator-only download policy - read once for the whole cycle (cheap FS
   // read). Drives the slim scenario-media filter + tutorial-video skip below.
-  operatorOnly = await loadConfig()
-    .then((c) => c.operatorOnlyDevice === true)
-    .catch(() => false);
+  operatorOnly = await readOperatorOnly();
 
   // Cycle cap (see CYCLE_IDLE_CAP_MS). Firing aborts the cycle: the pool stops
   // dispatch, Promise.all resolves, and the cycle ends as a recoverable
@@ -481,6 +940,9 @@ async function runCycle(trigger: Trigger): Promise<void> {
     failed = result.failed;
     total = result.total;
     emit('cycle:phase', { phase: 'download', status: 'finished' });
+    // New content on disk: satellites routed to us see the revision move on
+    // their next ping and pull it (LAN content sync).
+    if (completed > 0) await contentSyncState.bumpRev().catch(() => {});
     if (result.authError) {
       throw result.authError;
     }
@@ -501,7 +963,10 @@ async function runCycle(trigger: Trigger): Promise<void> {
   } catch (err) {
     lastCycleStats = { total, completed, failed };
     lastCycleFinishedAtIso = new Date().toISOString();
-    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+    if (cycleYieldedToPeer) {
+      const finishedAt = lastCycleFinishedAtIso;
+      emitTerminal = () => emit('cycle:finished', { startedAt: startedAtIso, finishedAt, total, completed, failed });
+    } else if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
       emitTerminal = () => emit('cycle:failed', { reason: 'auth_invalid', recoverable: false });
     } else {
       retryWorthy = true;
@@ -544,6 +1009,7 @@ async function runCycle(trigger: Trigger): Promise<void> {
     // Orchestrator is idle again - now fire the terminal event so any
     // getState() call inside a listener observes the consistent idle state.
     emitTerminal?.();
+    resolveCycleDone();
   }
 }
 
@@ -595,7 +1061,12 @@ function buildFailureDetail(err: unknown): CycleFailureDetail {
 
 // ---------- manifest fetch + apply ----------
 
-async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
+// `prune: false` (the launch check) applies upserts only: content the studio
+// no longer lists stays on disk until a real cycle runs.
+async function fetchManifestAndApply(
+  signal: AbortSignal,
+  opts: { prune?: boolean } = {}
+): Promise<WorkItem[]> {
   if (!currentUser) throw new Error('orchestrator: no current user');
   const clientId = currentUser.client_id;
 
@@ -613,11 +1084,39 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
     })
   );
 
-  // Best-effort replay of any deferred onboarding/Network "default hotspot" /
-  // "default mother" writes (grill Q13). We're guaranteed online + authed here,
+  // Best-effort replay of any deferred onboarding/Network "default mother"
+  // writes (grill Q13). We're guaranteed online + authed here,
   // so this is the natural retry tick. Fire-and-forget - it never blocks sync.
   void lanNetworks.flushPendingLanOps();
 
+  await applyManifest(clientId, manifest, { prune: opts.prune !== false, fromPeer: false });
+
+  // Remember this cloud snapshot (and when the cloud produced it) so LAN peers
+  // can tell whose content is the most recent when the venue has no internet.
+  await contentSyncState.recordSnapshot(clientId, manifest, manifest.server_time, 'cloud');
+
+  const work = await buildWorkList(clientId, { onDemand: manifest.has_on_demand_cards, fromPeer: false });
+
+  // Reconcile the failure tracker against reality: any previously-failing item
+  // that's no longer pending (its content was unassigned/removed in studio)
+  // left the work list without succeeding - resolve-by-removal so the admin's
+  // view doesn't show it stuck forever. Dynamic scenario_media keys aren't in
+  // `work` yet; reconcileObsolete keeps them alive via their parent scenario.
+  await reconcileObsolete(new Set(work.map((w) => syncItemKey(w))));
+
+  return work;
+}
+
+// Apply a manifest's upserts (and, with `prune`, its tombstones) to the local
+// stores. `fromPeer`: the manifest came from a LAN peer (a cloud snapshot it
+// applied, newer than ours) - the device-only parts (client preferences,
+// recovery codes, on-demand cards, cards) are left for our own next cloud
+// cycle; see contentSyncState.
+async function applyManifest(
+  clientId: number,
+  manifest: ManifestResponse,
+  opts: { prune: boolean; fromPeer: boolean }
+): Promise<void> {
   const seenAt = new Date().toISOString();
   // db handle was used here for an explicit BEGIN/COMMIT transaction. That
   // pattern is unsafe with tauri-plugin-sql v2: the plugin's only API is
@@ -646,7 +1145,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   // rows + on-disk media, which would yank a scenario the live game is rendering (e.g.
   // an admin disables its game type mid-event). Upserts above still apply; the prune is
   // deferred until the next cycle after the game ends. See activeSession.isGameActive.
-  const pruneAllowed = !isGameActive();
+  const pruneAllowed = opts.prune && !isGameActive();
 
   if (pruneAllowed) {
     const removedScenarios = await scenarioStore.tombstoneMissing(allScenarioRows.map((s) => s.uniqid));
@@ -682,20 +1181,28 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   // Game types (admin defaults + per-client overrides). Inline manifest +
   // separate video/subtitle downloads queued via the same pool.
   const gameTypes = manifest.game_types ?? [];
+  // (These tombstones delete tutorial videos on disk, so the launch check
+  // holds them back too.)
   await gameTypesStore.upsertGameTypesFromManifest(gameTypes);
-  await gameTypesStore.tombstoneMissingGameTypes(gameTypes.map((g) => g.code));
+  if (opts.prune) {
+    await gameTypesStore.tombstoneMissingGameTypes(gameTypes.map((g) => g.code));
+  }
   const overrides = manifest.client_game_type_overrides ?? [];
   await gameTypesStore.upsertOverridesFromManifest(overrides);
-  await gameTypesStore.tombstoneMissingOverrides(overrides.map((o) => o.game_type_code));
+  if (opts.prune) {
+    await gameTypesStore.tombstoneMissingOverrides(overrides.map((o) => o.game_type_code));
+  }
 
-  // Client preferences (inline JSON only - no version, just last-write-wins).
-  await clientPreferencesStore.setFromManifest(clientId, manifest.client_preferences ?? {});
+  if (!opts.fromPeer) {
+    // Client preferences (inline JSON only - no version, just last-write-wins).
+    await clientPreferencesStore.setFromManifest(clientId, manifest.client_preferences ?? {});
 
-  // Cards (single-row state).
-  await cardsStore.upsertFromManifest(clientId, {
-    cards_version: manifest.cards_version,
-    has_on_demand_cards: manifest.has_on_demand_cards,
-  });
+    // Cards (single-row state).
+    await cardsStore.upsertFromManifest(clientId, {
+      cards_version: manifest.cards_version,
+      has_on_demand_cards: manifest.has_on_demand_cards,
+    });
+  }
 
   // Team-name pools (single-row state, incremental version compare).
   await namePoolsStore.upsertFromManifest(clientId, {
@@ -703,19 +1210,30 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
   });
 
   // Offline PIN-recovery codes (single-row state, incremental version compare).
-  await recoveryCodesStore.upsertFromManifest(clientId, {
-    recovery_codes_version: manifest.recovery_codes_version ?? null,
-  });
+  if (!opts.fromPeer) {
+    await recoveryCodesStore.upsertFromManifest(clientId, {
+      recovery_codes_version: manifest.recovery_codes_version ?? null,
+    });
+    // Licensee customers (cloud only: contact-free cache, see customersStore).
+    await customersStore.upsertFromManifest(clientId, {
+      customers_version: manifest.customers_version ?? null,
+    });
+  }
 
   // Mission-report PDF layout defaults (global, single-row state).
   await reportLayoutsStore.upsertFromManifest({
     report_layouts_version: manifest.report_layouts_version ?? null,
   });
 
-  // Build the work list from each store's pending-downloads view.
+}
+
+// Pending downloads across all stores, after a manifest apply. A peer-sourced
+// list leaves out what a LAN peer never serves (cards, on-demand cards,
+// recovery codes).
+async function buildWorkList(clientId: number, opts: { onDemand: boolean; fromPeer: boolean }): Promise<WorkItem[]> {
   const work: WorkItem[] = [];
 
-  if (await cardsStore.needsCardsDownload(clientId)) {
+  if (!opts.fromPeer && (await cardsStore.needsCardsDownload(clientId))) {
     const row = await cardsStore.get(clientId);
     if (row && row.remote_version !== null) {
       work.push({
@@ -727,7 +1245,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       });
     }
   }
-  if (manifest.has_on_demand_cards) {
+  if (opts.onDemand && !opts.fromPeer) {
     work.push({ kind: 'on_demand', priority: 1, clientId, label: 'On-demand cards' });
   }
   if (await namePoolsStore.needsTeamNamesDownload(clientId)) {
@@ -742,7 +1260,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       });
     }
   }
-  if (await recoveryCodesStore.needsRecoveryCodesDownload(clientId)) {
+  if (!opts.fromPeer && (await recoveryCodesStore.needsRecoveryCodesDownload(clientId))) {
     const row = await recoveryCodesStore.getState(clientId);
     if (row && row.remote_version !== null) {
       work.push({
@@ -754,6 +1272,18 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
       });
     }
   }
+  if (!opts.fromPeer && (await customersStore.needsDownload(clientId))) {
+    const row = await customersStore.getState(clientId);
+    if (row && row.remote_version !== null) {
+      work.push({
+        kind: 'customers',
+        priority: 1,
+        clientId,
+        remoteVersion: row.remote_version,
+        label: `Customers v${row.remote_version}`,
+      });
+    }
+  }
   if (await reportLayoutsStore.needsDownload()) {
     const row = await reportLayoutsStore.getState();
     if (row && row.remote_version !== null) {
@@ -762,31 +1292,6 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
         priority: 1,
         remoteVersion: row.remote_version,
         label: `Report layouts v${row.remote_version}`,
-      });
-    }
-  }
-
-  // Relayed default-hotspot networks (Feature B download side). Pulled when the
-  // studio's lan_networks_version differs from the local cursor, and once per
-  // app launch regardless, so the local mirror is reconciled to studio's
-  // authoritative set: that drops stale rows (e.g. an old auto-generated hotspot
-  // SSID a device learned via a past ping) even when the version hasn't moved.
-  // An unchanged set is NOT re-pulled on every sync any more, so a sync with
-  // nothing new reads "à jour". When studio has nothing (remoteVersion 0 /
-  // table not migrated) we skip and leave the mirror alone.
-  {
-    const remoteVersion = manifest.lan_networks_version ?? 0;
-    const clientId = currentUser?.client_id ?? 0;
-    const localVersion = await lanNetworks.getLanNetworksCursor(clientId).catch(() => null);
-    if (
-      remoteVersion > 0 &&
-      (remoteVersion !== localVersion || !lanNetworks.lanNetworksReconciledThisSession())
-    ) {
-      work.push({
-        kind: 'lan_networks',
-        priority: 1,
-        remoteVersion,
-        label: 'Wi-Fi networks',
       });
     }
   }
@@ -827,6 +1332,7 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
         remoteVersion: g.remote_version,
         filename: g.tutorial_video_filename,
         subtitleFilenames: g.tutorial_subtitles,
+        subtitlesVersion: g.subtitles_remote_version,
         label: `Tutorial video (${g.name})`,
       });
     }
@@ -839,21 +1345,40 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
         remoteVersion: o.remote_version,
         filename: o.tutorial_video_filename,
         subtitleFilenames: o.tutorial_subtitles,
+        subtitlesVersion: o.subtitles_remote_version,
         label: `Tutorial override (${o.game_type_code})`,
+      });
+    }
+    // Subtitle-only changes: the video is already on disk at the right
+    // version, so fetch just the .vtt tracks (a few KB) instead of the video.
+    for (const g of await gameTypesStore.listPendingAdminSubtitleDownloads()) {
+      if (g.local_version === null) continue;
+      work.push({
+        kind: 'game_type_admin_subtitles',
+        priority: 6,
+        code: g.code,
+        videoVersion: g.local_version,
+        subtitleFilenames: g.tutorial_subtitles,
+        subtitlesVersion: g.subtitles_remote_version,
+        label: `Tutorial subtitles (${g.name})`,
+      });
+    }
+    for (const o of await gameTypesStore.listPendingOverrideSubtitleDownloads()) {
+      if (o.local_version === null) continue;
+      work.push({
+        kind: 'game_type_override_subtitles',
+        priority: 6,
+        code: o.game_type_code,
+        videoVersion: o.local_version,
+        subtitleFilenames: o.tutorial_subtitles,
+        subtitlesVersion: o.subtitles_remote_version,
+        label: `Tutorial override subtitles (${o.game_type_code})`,
       });
     }
   }
 
   // Stable priority sort.
   work.sort((a, b) => a.priority - b.priority);
-
-  // Reconcile the failure tracker against reality: any previously-failing item
-  // that's no longer pending (its content was unassigned/removed in studio)
-  // left the work list without succeeding - resolve-by-removal so the admin's
-  // view doesn't show it stuck forever. Dynamic scenario_media keys aren't in
-  // `work` yet; reconcileObsolete keeps them alive via their parent scenario.
-  await reconcileObsolete(new Set(work.map((w) => syncItemKey(w))));
-
   return work;
 }
 
@@ -861,8 +1386,16 @@ async function fetchManifestAndApply(signal: AbortSignal): Promise<WorkItem[]> {
 
 async function runDownloadPool(
   initial: WorkItem[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource,
+  poolSize: number = POOL_SIZE
 ): Promise<{ completed: number; failed: number; total: number; authError: ApiError | null }> {
+  const cloud = source.kind === 'cloud';
+  // Cycle counters go to the sync UI for cloud cycles only; a peer fetch has
+  // its own progress sink (peerProgress) and no cycle around it.
+  const emitCycleProgress = (p: CycleProgressPayload) => {
+    if (cloud) emit('cycle:progress', p);
+  };
   // Dynamic queue - scenario_meta tasks enqueue scenario_media items mid-cycle.
   const queue: WorkItem[] = [...initial];
   let completed = 0;
@@ -877,7 +1410,7 @@ async function runDownloadPool(
   let authInvalid = false;
   let authError: ApiError | null = null;
 
-  const workers = Array.from({ length: POOL_SIZE }, async () => {
+  const workers = Array.from({ length: poolSize }, async () => {
     while (queue.length > 0) {
       if (signal.aborted) return;
       if (authInvalid) return;
@@ -888,7 +1421,7 @@ async function runDownloadPool(
       // (patterns, cards, ...) also hold the idle cap open while they run.
       bumpCycleProgress();
       try {
-        const { enqueued, bytes } = await downloadOne(item, signal);
+        const { enqueued, bytes } = await downloadOne(item, signal, source);
         if (enqueued && enqueued.length) {
           queue.push(...enqueued);
           total += enqueued.length;
@@ -896,8 +1429,8 @@ async function runDownloadPool(
         completed += 1;
         // Item downloaded OK - if it was being tracked as failing, clear the
         // row (and report resolved to studio if it had been promoted).
-        await recordSuccess(item).catch(() => {});
-        emit('cycle:progress', {
+        if (cloud) await recordSuccess(item).catch(() => {});
+        emitCycleProgress({
           total,
           completed,
           failed,
@@ -932,7 +1465,7 @@ async function runDownloadPool(
           return;
         }
         failed += 1;
-        emit('cycle:progress', {
+        emitCycleProgress({
           total,
           completed,
           failed,
@@ -944,12 +1477,18 @@ async function runDownloadPool(
         // doesn't show a half-finished bar forever. Harmless for kinds that
         // never streamed (the listener just removes a key it didn't know).
         emitItemProgress(item.label, item.kind, 0, null, true);
-        await markFailed(item).catch(() => {});
+        await markFailed(item, cloud).catch(() => {});
         // Persistent per-item failure tracker: records the file/label + error
         // for the operator panel, and promotes to a studio report after 2
         // consecutive failing cycles. 403 (un-owned resource) lands here too,
-        // which is intentional - the admin wants to see those.
-        await recordFailure(item, err).catch(() => {});
+        // which is intentional - the admin wants to see those. A LAN peer's
+        // failure says nothing about the studio, so it is not recorded.
+        if (cloud) {
+          await recordFailure(item, err).catch(() => {});
+        } else {
+          console.warn(`[syncOrchestrator] ${source.label}: ${item.label} failed`, err);
+          if (peerFirstError === null) peerFirstError = err;
+        }
       }
     }
   });
@@ -962,7 +1501,12 @@ async function runDownloadPool(
   // committed. Without this, an auth-interrupted cycle leaves the DB at
   // 0-downloaded even though bytes are already on disk.
   for (const [uniqid, progress] of scenarioProgress) {
-    if (progress.remaining.size === 0 && progress.failed.size === 0) {
+    if (progress.remaining.size === 0 && progress.failed.size === 0 && !progress.commitFull) {
+      // A LAN peer's whole copy is here, but it isn't known to match our cloud
+      // manifest: launchable now, still pending for the next cloud cycle.
+      await scenarioStore.commitPartialManifest(uniqid, progress.manifest, progress.manifest, progress.remoteVersion);
+      emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
+    } else if (progress.remaining.size === 0 && progress.failed.size === 0) {
       // All target blobs are in the pool - atomically swap in the new manifest
       // and mark the scenario reconciled at the remote content hash.
       await scenarioStore.commitManifest(
@@ -973,7 +1517,7 @@ async function runDownloadPool(
       );
       emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
       // Scenario fully downloaded - clear any stale media failure rows for it.
-      await recordScenarioComplete(uniqid).catch(() => {});
+      if (cloud) await recordScenarioComplete(uniqid).catch(() => {});
     } else if (isPartiallyReady(progress)) {
       // Everything except one or more VIDEOS is on disk. Commit a partial
       // manifest so the scenario is launchable now instead of being held back -
@@ -990,10 +1534,10 @@ async function runDownloadPool(
         progress.remoteVersion
       );
       emit('content:updated', { kind: 'scenarios', ids: [uniqid] });
-      if (progress.failed.size > 0) {
+      if (cloud && progress.failed.size > 0) {
         await scenarioStore.incrementFailedAttempts(uniqid).catch(() => {});
       }
-    } else if (progress.failed.size > 0) {
+    } else if (cloud && progress.failed.size > 0) {
       await scenarioStore.incrementFailedAttempts(uniqid).catch(() => {});
     }
   }
@@ -1015,6 +1559,10 @@ function emitItemProgress(
   // Called once per streamed chunk - the finest-grained proof of life we have,
   // and what keeps the cycle's idle cap from firing on a long download.
   bumpCycleProgress();
+  if (peerFetchInFlight) {
+    peerProgress?.({ label, loaded, total, done });
+    return;
+  }
   emit('cycle:item_progress', {
     key: label,
     label,
@@ -1050,7 +1598,10 @@ function groupKeyOf(item: WorkItem): string | undefined {
   return undefined;
 }
 
-async function markFailed(item: WorkItem): Promise<void> {
+async function markFailed(item: WorkItem, cloud = true): Promise<void> {
+  // A LAN peer failing tells us nothing about the studio copy: only the
+  // in-cycle media bookkeeping applies, never the persisted failure counters.
+  if (!cloud && item.kind !== 'scenario_media') return;
   switch (item.kind) {
     case 'cards':
     case 'on_demand':
@@ -1062,12 +1613,11 @@ async function markFailed(item: WorkItem): Promise<void> {
     case 'recovery_codes':
       await recoveryCodesStore.incrementFailedAttempts(item.clientId);
       break;
+    case 'customers':
+      await customersStore.incrementFailedAttempts(item.clientId);
+      break;
     case 'report_layouts':
       await reportLayoutsStore.incrementFailedAttempts();
-      break;
-    case 'lan_networks':
-      // No retry-counter store; a failed pull simply leaves the local version
-      // behind, so the next cycle re-enqueues it. Nothing to mark.
       break;
     case 'pattern':
       await patternStore.incrementFailedAttempts(item.uniqid);
@@ -1084,9 +1634,11 @@ async function markFailed(item: WorkItem): Promise<void> {
       break;
     }
     case 'game_type_admin_video':
+    case 'game_type_admin_subtitles':
       await gameTypesStore.incrementAdminFailedAttempts(item.code);
       break;
     case 'game_type_override_video':
+    case 'game_type_override_subtitles':
       await gameTypesStore.incrementOverrideFailedAttempts(item.code);
       break;
   }
@@ -1099,30 +1651,33 @@ async function markFailed(item: WorkItem): Promise<void> {
 // it into the cycle-wide total shown in the sync UI.
 type DownloadOutcome = { enqueued: WorkItem[] | null; bytes: number };
 
-async function downloadOne(item: WorkItem, signal: AbortSignal): Promise<DownloadOutcome> {
+async function downloadOne(item: WorkItem, signal: AbortSignal, source: ContentSource = cloudSource): Promise<DownloadOutcome> {
   switch (item.kind) {
     case 'cards':
       return downloadCards(item, signal);
     case 'on_demand':
       return downloadOnDemand(item, signal);
     case 'team_names':
-      return downloadTeamNames(item, signal);
+      return downloadTeamNames(item, signal, source);
     case 'recovery_codes':
       return downloadRecoveryCodes(item, signal);
+    case 'customers':
+      return downloadCustomers(item, signal);
     case 'report_layouts':
-      return downloadReportLayouts(item, signal);
-    case 'lan_networks':
-      return downloadLanNetworks(item, signal);
+      return downloadReportLayouts(item, signal, source);
     case 'pattern':
-      return downloadPattern(item, signal);
+      return downloadPattern(item, signal, source);
     case 'scenario_meta':
-      return downloadScenarioMeta(item, signal);
+      return downloadScenarioMeta(item, signal, source);
     case 'scenario_media':
-      return downloadScenarioMedia(item, signal);
+      return downloadScenarioMedia(item, signal, source);
     case 'game_type_admin_video':
-      return downloadGameTypeAdminVideo(item, signal);
+      return downloadGameTypeAdminVideo(item, signal, source);
     case 'game_type_override_video':
-      return downloadGameTypeOverrideVideo(item, signal);
+      return downloadGameTypeOverrideVideo(item, signal, source);
+    case 'game_type_admin_subtitles':
+    case 'game_type_override_subtitles':
+      return downloadGameTypeSubtitlesOnly(item, signal, source);
   }
 }
 
@@ -1175,21 +1730,19 @@ async function downloadOnDemand(
 // cards (only runs when remote_version changed).
 async function downloadTeamNames(
   item: Extract<WorkItem, { kind: 'team_names' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
-  const bytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_team_names', {
-      bearer: true,
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
+  const text = await withRetry(() =>
+    source.getTeamNames(signal, (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total))
   );
-  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+  const size = new TextEncoder().encode(text).byteLength;
+  emitItemProgress(item.label, item.kind, size, size, true);
   await ensureDir('media/name_pools');
-  await writeText(teamNamesFileRel(), new TextDecoder().decode(bytes));
+  await writeText(teamNamesFileRel(), text);
   await namePoolsStore.markDownloaded(item.clientId, item.remoteVersion);
   emit('content:updated', { kind: 'team_names', ids: [item.clientId] });
-  return { enqueued: null, bytes: bytes.byteLength };
+  return { enqueued: null, bytes: size };
 }
 
 // Offline PIN-recovery codes: download the client's plaintext pool and hash it
@@ -1231,6 +1784,28 @@ async function downloadRecoveryCodes(
   return { enqueued: null, bytes: bytes.byteLength };
 }
 
+// Licensee customers: the contact-free list + studio's game -> customer view
+// (badges, studio-side reassignments). Version-gated like recovery codes.
+async function downloadCustomers(
+  item: Extract<WorkItem, { kind: 'customers' }>,
+  signal: AbortSignal
+): Promise<DownloadOutcome> {
+  const bytes = await withRetry(() =>
+    apiDownloadBytesStream('playground', 'get_customers', {
+      bearer: true,
+      signal,
+      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
+    })
+  );
+  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+  // A parse failure throws: the item fails and is retried, the cache is untouched.
+  const payload = JSON.parse(new TextDecoder().decode(bytes)) as customersStore.CustomersDownload;
+  const version = typeof payload.version === 'number' ? payload.version : item.remoteVersion;
+  await customersStore.applyDownload(item.clientId, payload);
+  await customersStore.markDownloaded(item.clientId, version);
+  return { enqueued: null, bytes: bytes.byteLength };
+}
+
 // Mission-report PDF layouts: download the per-game-type set (studio merges the
 // client's own overrides over the admin defaults server-side) and cache it
 // locally (replaceLayouts). The payload also carries the studio-defined default
@@ -1239,24 +1814,16 @@ async function downloadRecoveryCodes(
 // admin and client-side saves.
 async function downloadReportLayouts(
   item: Extract<WorkItem, { kind: 'report_layouts' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
-  const bytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_report_layouts', {
-      bearer: true,
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
-  );
-  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
-
   // Unparseable payload -> throw to the pool's failure path (markFailed) so
   // the cached layouts survive, instead of replacing them with an empty set.
-  const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
-    version?: number;
-    layouts?: unknown;
-    print_format?: unknown;
-  };
+  const parsed = await withRetry(() =>
+    source.getReportLayouts(signal, (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total))
+  );
+  const bytes = jsonByteLength(parsed);
+  emitItemProgress(item.label, item.kind, bytes, bytes, true);
   let layouts: Record<string, unknown> = {};
   let version = item.remoteVersion;
   if (parsed.layouts && typeof parsed.layouts === 'object') {
@@ -1272,54 +1839,29 @@ async function downloadReportLayouts(
       `report layouts: server returned degraded payload (version ${version}) while manifest advertised v${item.remoteVersion}`
     );
   }
-  setSyncedDefaultPrintPrefs(parsed.print_format ?? null);
+  // A LAN peer can't send the print format (the mother keeps it in browser
+  // storage): keep ours until the next cloud sync.
+  if (source.kind === 'cloud') setSyncedDefaultPrintPrefs(parsed.print_format ?? null);
 
   await reportLayoutsStore.replaceLayouts(layouts, version);
   await reportLayoutsStore.markDownloaded(version);
   emit('content:updated', { kind: 'report_layouts', ids: [] });
-  return { enqueued: null, bytes: bytes.byteLength };
-}
-
-async function downloadLanNetworks(
-  item: Extract<WorkItem, { kind: 'lan_networks' }>,
-  signal: AbortSignal
-): Promise<DownloadOutcome> {
-  const networks = await withRetry(() => lanNetworks.getLanNetworks(signal));
-  for (const n of networks) {
-    // Only hotspot creds are ever relayed; upsert preserves the operator's
-    // auto-connect consent and never resets it.
-    await wifiNetworksStore.upsert({
-      ssid: n.ssid,
-      password: n.password,
-      source: n.source === 'router' ? 'router' : 'hotspot',
-      origin: 'studio',
-      // Admin-defined venue network → auto-consent new rows so satellites join
-      // it silently (no per-device prompt). Existing consent is preserved.
-      autoConnectOnInsert: true,
-    });
-  }
-  // Reconcile the local mirror to studio's authoritative set: keep exactly the
-  // relayed networks (+ manual entries) and drop everything else - stale studio
-  // rows (renamed hotspot) AND stale paired rows (e.g. an old auto-generated
-  // hotspot SSID from a past ping that nothing refreshes). Runs every sync.
-  await wifiNetworksStore.reconcileToStudioSet(networks.map((n) => n.ssid));
-  await lanNetworks.setLanNetworksCursor(currentUser?.client_id ?? 0, item.remoteVersion);
-  return { enqueued: null, bytes: jsonByteLength(networks) };
+  return { enqueued: null, bytes };
 }
 
 async function downloadPattern(
   item: Extract<WorkItem, { kind: 'pattern' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
-  const res = await withRetry(() =>
-    apiCall<PatternDownloadResponse>('playground', 'download_pattern', {
-      method: 'GET',
-      bearer: true,
-      query: { pattern_uniqid: item.uniqid },
-      signal,
-    })
-  );
-  await patternStore.markDownloaded(item.uniqid, item.remoteVersion, {
+  const res: PatternDownloadResponse = await withRetry(() => source.getPattern(item.uniqid, signal));
+  let version = item.remoteVersion;
+  if (source.kind === 'peer') {
+    // Our manifest may predate this pattern: create the row from the mother's.
+    await patternStore.insertFromPeerIfMissing(res);
+    version = res.version;
+  }
+  await patternStore.markDownloaded(item.uniqid, version, {
     pattern_slug: res.pattern_slug,
     description: res.description,
     pattern_data: res.pattern_data,
@@ -1331,35 +1873,51 @@ async function downloadPattern(
 
 // Operator-only media filter: from a scenario's full media filename list, return
 // just the visual the launch UI uses as a thumbnail. Mirrors GameList's
-// resolution: game_media_images.game_visual → background_image. The reference in
-// game-data may carry a leading `media/`, and the medias[] entries may be nested
-// (e.g. `images/foo.png`), so we match on exact path OR basename. Returns [] when
-// no visual is defined (the scenario then keeps only game-data.json).
+// resolution: game_media_images.game_visual → background_image. The "other
+// languages" cover (`game_visual_intl`, see utils/coverVisual) is kept along
+// with the French default, so the thumbnail still resolves if the licensee's
+// language changes between two syncs. The reference in game-data may carry a
+// leading `media/`, and the medias[] entries may be nested (e.g.
+// `images/foo.png`), so we match on exact path OR basename. Returns [] when no
+// visual is defined (the scenario then keeps only game-data.json).
 function operatorVisualKeepSet(gameData: unknown, medias: string[]): string[] {
   const mediaImages = (gameData as {
-    game_media_images?: { game_visual?: string; background_image?: string };
+    game_media_images?: Record<string, unknown>;
   } | null)?.game_media_images;
-  const raw = mediaImages?.game_visual ?? mediaImages?.background_image;
-  if (!raw) return [];
-  const target = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
+  if (!mediaImages || typeof mediaImages !== 'object' || Array.isArray(mediaImages)) return [];
+  const isRef = (v: unknown): v is string => typeof v === 'string' && v.trim() !== '';
+  let refs = Object.entries(mediaImages)
+    .filter(([field, v]) => (field === 'game_visual' || field.startsWith('game_visual_')) && isRef(v))
+    .map(([, v]) => v as string);
+  if (refs.length === 0 && isRef(mediaImages.background_image)) refs = [mediaImages.background_image];
   const base = (p: string): string => p.split('/').pop() ?? p;
-  const targetBase = base(target);
-  const keep = medias.filter((m) => m === target || base(m) === targetBase);
-  return keep;
+  const targets = refs.map((raw) => (raw.startsWith('media/') ? raw.slice('media/'.length) : raw));
+  const targetBases = new Set(targets.map(base));
+  return medias.filter((m) => targets.includes(m) || targetBases.has(base(m)));
 }
 
 async function downloadScenarioMeta(
   item: Extract<WorkItem, { kind: 'scenario_meta' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
-  const res = await withRetry(() =>
-    apiCall<ScenarioMetaResponse>('playground', 'get_scenario_game_data', {
-      method: 'GET',
-      bearer: true,
-      query: { uniqid: item.uniqid },
-      signal,
-    })
-  );
+  const res: ScenarioMetaResponse = await withRetry(() => source.getScenarioMeta(item.uniqid, signal));
+  const peer = source.kind === 'peer';
+  // A LAN peer's copy is committed at ITS content hash, and in full only when
+  // the mother says its copy is complete for its cloud manifest.
+  const commitHash = peer ? (res.complete && res.content_hash) || '' : item.remoteContentHash;
+  const commitVersion = peer ? (res.version ?? item.remoteVersion) : item.remoteVersion;
+  if (peer) {
+    // Our manifest may predate this scenario: create the row from the mother's.
+    await scenarioStore.insertFromPeerIfMissing({
+      uniqid: item.uniqid,
+      title: res.title ?? res.scenario?.name ?? item.uniqid,
+      game_type: res.game_type ?? res.scenario?.scenario_type ?? 'unknown',
+      is_product: Boolean(res.is_product),
+      version: res.remote_version ?? commitVersion,
+      content_hash: res.remote_content_hash ?? null,
+    });
+  }
 
   const files = Array.isArray(res.files) ? res.files : [];
   const dataHash = res.data_hash ?? null;
@@ -1374,8 +1932,14 @@ async function downloadScenarioMeta(
     files.find((f) => f.rel_path === 'game-data.json') ?? { rel_path: 'game-data.json', hash: dataHash, size: 0 };
   const mediaEntries = files.filter((f) => f.rel_path !== 'game-data.json');
 
-  // Operator-only: keep only the single visual image the launch list shows as a
-  // thumbnail (game_media_images.game_visual → background_image). game-data.json
+  // The FULL list, before any operator-only filtering: a LAN peer serves this
+  // scenario from it, whatever subset this device keeps.
+  if (commitHash) {
+    await scenarioStore.recordRemoteFiles(item.uniqid, commitHash, [gameDataEntry, ...mediaEntries]);
+  }
+
+  // Operator-only: keep only the visual the launch list shows as a thumbnail
+  // (game_visual and its language versions → background_image). game-data.json
   // is always kept. Everything else is play-only and skipped to save disk.
   let targetMedia = mediaEntries;
   if (operatorOnly) {
@@ -1412,9 +1976,17 @@ async function downloadScenarioMeta(
   });
 
   const remaining = new Set<string>();
+  const failed = new Set<string>();
   const enqueued: WorkItem[] = [];
   for (const f of ordered) {
     if (await blobExists(f.hash)) continue;
+    // Not on the mother's disk either (or a video while the mother hosts a
+    // running game): nothing to fetch now. Counted as failed so the scenario is
+    // still committed launchable if only videos are missing.
+    if (f.available === false || (source.deferVideos && isVideoFile(f.rel_path))) {
+      failed.add(f.rel_path);
+      continue;
+    }
     remaining.add(f.rel_path);
     enqueued.push({
       kind: 'scenario_media',
@@ -1428,10 +2000,11 @@ async function downloadScenarioMeta(
 
   scenarioProgress.set(item.uniqid, {
     remaining,
-    failed: new Set(),
+    failed,
     manifest,
-    remoteContentHash: item.remoteContentHash,
-    remoteVersion: item.remoteVersion,
+    remoteContentHash: commitHash,
+    remoteVersion: commitVersion,
+    commitFull: Boolean(commitHash),
   });
 
   // The post-pool sweep commits every scenario whose remaining+failed are both
@@ -1442,7 +2015,8 @@ async function downloadScenarioMeta(
 
 async function downloadScenarioMedia(
   item: Extract<WorkItem, { kind: 'scenario_media' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
   // Download to a temp, verify its SHA-256 against the studio hash, then
   // atomically move it into the pool under that hash. Stream straight to disk -
@@ -1460,7 +2034,7 @@ async function downloadScenarioMedia(
     const tmpRel = blobTmpPathRel(`${item.hash}.part`);
     job = (async () => {
       const tmpAbs = await join(await appDataDir(), tmpRel);
-      return withRetry(() => runScenarioMediaAttempt(item, tmpRel, tmpAbs, signal));
+      return withRetry(() => runScenarioMediaAttempt(item, tmpRel, tmpAbs, signal, source));
     })().finally(() => inflightBlobs.delete(item.hash));
     inflightBlobs.set(item.hash, job);
   }
@@ -1480,15 +2054,15 @@ async function runScenarioMediaAttempt(
   item: Extract<WorkItem, { kind: 'scenario_media' }>,
   tmpRel: string,
   tmpAbs: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource
 ): Promise<number> {
   const fetchInto = (sink: (chunk: Uint8Array) => Promise<void>, rangeStart: number) =>
-    apiDownloadStreamed(
-      'playground',
-      'get_media',
+    source.streamScenarioMedia(
       {
-        bearer: true,
-        query: { uniqid: item.uniqid, filename: item.filename },
+        uniqid: item.uniqid,
+        filename: item.filename,
+        hash: item.hash,
         signal,
         rangeStart,
         onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
@@ -1532,7 +2106,8 @@ async function runScenarioMediaAttempt(
 
 async function downloadGameTypeAdminVideo(
   item: Extract<WorkItem, { kind: 'game_type_admin_video' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
   const dirRel = gameTypeAdminVersionDirRel(item.code, item.remoteVersion);
   await ensureDir(dirRel);
@@ -1540,17 +2115,12 @@ async function downloadGameTypeAdminVideo(
   // Video file - stream to disk (can be hundreds of MB; buffering OOMs Android).
   const videoBytesLen = await withRetry(() =>
     streamBinary(`${dirRel}/${item.filename}`, (write) =>
-      apiDownloadStreamed(
-        'playground',
-        'get_game_type_media',
+      source.streamGameTypeVideo(
         {
-          bearer: true,
-          query: {
-            code: item.code,
-            variant: 'admin',
-            version: String(item.remoteVersion),
-            filename: item.filename,
-          },
+          variant: 'admin',
+          code: item.code,
+          version: item.remoteVersion,
+          filename: item.filename,
           signal,
           onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
         },
@@ -1560,59 +2130,38 @@ async function downloadGameTypeAdminVideo(
   );
   emitItemProgress(item.label, item.kind, videoBytesLen, videoBytesLen, true);
 
-  let totalBytes = videoBytesLen;
-
   // Subtitle files (one .vtt per language). Failures are non-fatal - a
-  // missing subtitle just means playback runs without that language.
-  if (Object.keys(item.subtitleFilenames).length > 0) {
-    await ensureDir(`${dirRel}/subtitles`);
-    for (const [lang, fname] of Object.entries(item.subtitleFilenames)) {
-      try {
-        const subBytes = await withRetry(() =>
-          apiDownloadBytesStream('playground', 'get_game_type_media', {
-            bearer: true,
-            query: {
-              code: item.code,
-              variant: 'admin',
-              version: String(item.remoteVersion),
-              subtitle_lang: lang,
-            },
-            signal,
-          })
-        );
-        await writeBinary(`${dirRel}/subtitles/${fname}`, subBytes);
-        totalBytes += subBytes.byteLength;
-      } catch (err) {
-        console.warn(`[sync] subtitle ${item.code}/${lang} failed:`, err);
-      }
-    }
-  }
+  // missing subtitle just means playback runs without that language until the
+  // subtitles-only pass of a later cycle fetches it (SUBTITLES_RETRY).
+  const subs = await downloadGameTypeSubtitleFiles(
+    item.code, 'admin', item.remoteVersion, dirRel, item.subtitleFilenames, signal, source
+  );
 
-  await gameTypesStore.markAdminDownloaded(item.code, item.remoteVersion);
+  await gameTypesStore.markAdminDownloaded(
+    item.code,
+    item.remoteVersion,
+    subs.failed.length === 0 ? item.subtitlesVersion : gameTypesStore.SUBTITLES_RETRY
+  );
   emit('content:updated', { kind: 'game_types', ids: [item.code] });
-  return { enqueued: null, bytes: totalBytes };
+  return { enqueued: null, bytes: videoBytesLen + subs.bytes };
 }
 
 async function downloadGameTypeOverrideVideo(
   item: Extract<WorkItem, { kind: 'game_type_override_video' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
   const dirRel = gameTypeClientVersionDirRel(item.code, item.remoteVersion);
   await ensureDir(dirRel);
 
   const videoBytesLen = await withRetry(() =>
     streamBinary(`${dirRel}/${item.filename}`, (write) =>
-      apiDownloadStreamed(
-        'playground',
-        'get_game_type_media',
+      source.streamGameTypeVideo(
         {
-          bearer: true,
-          query: {
-            code: item.code,
-            variant: 'client',
-            version: String(item.remoteVersion),
-            filename: item.filename,
-          },
+          variant: 'client',
+          code: item.code,
+          version: item.remoteVersion,
+          filename: item.filename,
           signal,
           onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
         },
@@ -1622,35 +2171,78 @@ async function downloadGameTypeOverrideVideo(
   );
   emitItemProgress(item.label, item.kind, videoBytesLen, videoBytesLen, true);
 
-  let totalBytes = videoBytesLen;
+  const subs = await downloadGameTypeSubtitleFiles(
+    item.code, 'client', item.remoteVersion, dirRel, item.subtitleFilenames, signal, source
+  );
 
-  if (Object.keys(item.subtitleFilenames).length > 0) {
-    await ensureDir(`${dirRel}/subtitles`);
-    for (const [lang, fname] of Object.entries(item.subtitleFilenames)) {
-      try {
-        const subBytes = await withRetry(() =>
-          apiDownloadBytesStream('playground', 'get_game_type_media', {
-            bearer: true,
-            query: {
-              code: item.code,
-              variant: 'client',
-              version: String(item.remoteVersion),
-              subtitle_lang: lang,
-            },
-            signal,
-          })
-        );
-        await writeBinary(`${dirRel}/subtitles/${fname}`, subBytes);
-        totalBytes += subBytes.byteLength;
-      } catch (err) {
-        console.warn(`[sync] override subtitle ${item.code}/${lang} failed:`, err);
-      }
+  await gameTypesStore.markOverrideDownloaded(
+    item.code,
+    item.remoteVersion,
+    subs.failed.length === 0 ? item.subtitlesVersion : gameTypesStore.SUBTITLES_RETRY
+  );
+  emit('content:updated', { kind: 'game_type_overrides', ids: [item.code] });
+  return { enqueued: null, bytes: videoBytesLen + subs.bytes };
+}
+
+// Fetch every subtitle track of one tutorial video into `<dirRel>/subtitles/`.
+// Never throws on a single track: returns the languages that failed so the
+// caller decides (the video download tolerates them, the subtitles-only pass
+// reports them). `videoVersion` is the version dir the tracks live in on studio.
+async function downloadGameTypeSubtitleFiles(
+  code: string,
+  variant: 'admin' | 'client',
+  videoVersion: number,
+  dirRel: string,
+  subtitleFilenames: Record<string, string>,
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
+): Promise<{ bytes: number; failed: string[] }> {
+  let bytes = 0;
+  const failed: string[] = [];
+  const entries = Object.entries(subtitleFilenames);
+  if (entries.length === 0) return { bytes, failed };
+  await ensureDir(`${dirRel}/subtitles`);
+  for (const [lang, fname] of entries) {
+    try {
+      const subBytes = await withRetry(() =>
+        source.getGameTypeSubtitle({ variant, code, version: videoVersion, lang, filename: fname, signal })
+      );
+      await writeBinary(`${dirRel}/subtitles/${fname}`, subBytes);
+      bytes += subBytes.byteLength;
+    } catch (err) {
+      console.warn(`[sync] ${variant} subtitle ${code}/${lang} failed:`, err);
+      failed.push(lang);
     }
   }
+  return { bytes, failed };
+}
 
-  await gameTypesStore.markOverrideDownloaded(item.code, item.remoteVersion);
-  emit('content:updated', { kind: 'game_type_overrides', ids: [item.code] });
-  return { enqueued: null, bytes: totalBytes };
+// Subtitle-only refresh: the video is already on disk at `videoVersion`, studio
+// changed just the tracks. A removed track needs no cleanup here - playback
+// only offers the languages the manifest still lists.
+async function downloadGameTypeSubtitlesOnly(
+  item: Extract<WorkItem, { kind: 'game_type_admin_subtitles' | 'game_type_override_subtitles' }>,
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
+): Promise<DownloadOutcome> {
+  const isAdmin = item.kind === 'game_type_admin_subtitles';
+  const dirRel = isAdmin
+    ? gameTypeAdminVersionDirRel(item.code, item.videoVersion)
+    : gameTypeClientVersionDirRel(item.code, item.videoVersion);
+  const subs = await downloadGameTypeSubtitleFiles(
+    item.code, isAdmin ? 'admin' : 'client', item.videoVersion, dirRel, item.subtitleFilenames, signal, source
+  );
+  if (subs.failed.length > 0) {
+    throw new Error(`subtitles ${item.code}: failed for ${subs.failed.join(', ')}`);
+  }
+  if (isAdmin) {
+    await gameTypesStore.markAdminSubtitlesDownloaded(item.code, item.subtitlesVersion);
+    emit('content:updated', { kind: 'game_types', ids: [item.code] });
+  } else {
+    await gameTypesStore.markOverrideSubtitlesDownloaded(item.code, item.subtitlesVersion);
+    emit('content:updated', { kind: 'game_type_overrides', ids: [item.code] });
+  }
+  return { enqueued: null, bytes: subs.bytes };
 }
 
 // Retry helper now lives in services/apiRetry.ts and is shared with the

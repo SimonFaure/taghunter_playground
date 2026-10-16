@@ -120,6 +120,9 @@ export function UpdatesScreen() {
                       {t('update:updateRequiredHint')}
                     </div>
                   )}
+                  {status.source === 'mother' && (
+                    <div className="text-xs text-[var(--pg-text-dim)]">{t('update:fromMotherHint')}</div>
+                  )}
                 </div>
               </div>
 
@@ -133,7 +136,7 @@ export function UpdatesScreen() {
               )}
 
               {status.canSelfUpdate ? (
-                <DesktopUpdateInstaller version={status.latestVersion} />
+                <DesktopUpdateInstaller version={status.latestVersion} source={status.source} />
               ) : status.storeUrl ? (
                 <button
                   onClick={openStore}

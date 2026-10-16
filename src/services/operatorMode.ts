@@ -18,6 +18,21 @@ import * as scenarioStore from './scenarioStore';
 import * as gameTypesStore from './gameTypesStore';
 import { runCycleNow } from './syncOrchestrator';
 import { sendHeartbeat } from './telemetry';
+import { invoke } from '@tauri-apps/api/core';
+
+/**
+ * Tell the LAN layer whether this device is operator-only. It rides every ping
+ * to the mother (and is read directly when this device IS the mother), so no
+ * device can push a game onto an operator-only one. Called at boot and on
+ * every toggle.
+ */
+export async function syncOperatorPresence(): Promise<void> {
+  try {
+    await invoke('client_set_operator_only', { operatorOnly: await isOperatorOnly() });
+  } catch {
+    /* older native build / non-Tauri context - best-effort */
+  }
+}
 
 export async function isOperatorOnly(): Promise<boolean> {
   try {
@@ -46,6 +61,7 @@ export async function applyOperatorModeChange(next: boolean): Promise<void> {
   try {
     window.dispatchEvent(new CustomEvent('operator-mode:changed', { detail: { operatorOnly: next } }));
   } catch { /* non-DOM context - ignore */ }
+  void syncOperatorPresence();
 
   try {
     await scenarioStore.resetAllForRedownload();

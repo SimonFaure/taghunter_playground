@@ -1,15 +1,10 @@
 // Studio LAN integration for the playground.
 //
-// Hotspot creds are now AUTHORED IN STUDIO and pushed down on sync (see
-// plans/studio-authoritative-hotspot-creds.md). The playground only DOWNLOADS
-// them (getLanNetworks → wifi_networks mirror, consumed by lanCredentials /
-// the auto-join engine). The old per-device "announce my creds upward" path
-// (announce_lan_network / withdraw_lan_network) has been retired.
-//
-// What remains here:
-//   - getLanNetworks + the lan_networks_version cursor (download side).
-//   - set_default_mother (inventory bit - which machine is the client's
-//     canonical mother, for the studio dashboard; no secret leaves the device).
+// The studio-authored hotspot creds (get_lan_networks) were retired with the
+// hotspot itself (2026-09-30): devices join the venue network through Windows.
+// What remains is set_default_mother (inventory bit - which machine is the
+// client's canonical mother, for the studio dashboard; no secret leaves the
+// device).
 // Writes are best-effort with a durable retry (the mother bit is enqueued on
 // failure and replayed by flushPendingLanOps on the next online tick).
 
@@ -27,58 +22,6 @@ export async function setDefaultMother(
     bearer: true,
     body: { is_default_mother: on, mother_uuid: motherUuid ?? null },
   });
-}
-
-export interface RelayedNetwork {
-  ssid: string;
-  password: string;
-  source: 'hotspot' | 'router' | string;
-  version: number;
-}
-
-/** Download the client's studio-authored hotspots (orchestrator work-item). */
-export async function getLanNetworks(signal?: AbortSignal): Promise<RelayedNetwork[]> {
-  const res = await apiCall<{ networks?: RelayedNetwork[] }>('playground', 'get_lan_networks', {
-    bearer: true,
-    signal,
-  });
-  return res?.networks ?? [];
-}
-
-// ─── lan_networks_version cursor ─────────────────────────────────────────────
-// The version of the studio set this device last reconciled to, keyed by client
-// so an account switch never matches a stale cursor. The orchestrator pulls
-// get_lan_networks only when the manifest's lan_networks_version differs, plus
-// once per app launch (see reconciledThisSession) to drop stale local rows.
-// Before this the item was pulled on every sync and the status never read
-// "à jour" (retours sept. 2026 #28).
-const LAN_CURSOR_KEY = 'lan_networks_cursor';
-let reconciledThisSession = false;
-
-export async function getLanNetworksCursor(clientId: number): Promise<number | null> {
-  const db = await getDb();
-  const rows = await db.select<{ value: string }[]>(
-    'SELECT value FROM schema_meta WHERE key = $1',
-    [LAN_CURSOR_KEY]
-  );
-  if (!rows.length) return null;
-  const [cid, ver] = rows[0].value.split(':');
-  if (Number(cid) !== clientId) return null;
-  const v = Number(ver);
-  return Number.isFinite(v) ? v : null;
-}
-
-export async function setLanNetworksCursor(clientId: number, version: number): Promise<void> {
-  const db = await getDb();
-  await db.execute(
-    'INSERT INTO schema_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    [LAN_CURSOR_KEY, `${clientId}:${version}`]
-  );
-  reconciledThisSession = true;
-}
-
-export function lanNetworksReconciledThisSession(): boolean {
-  return reconciledThisSession;
 }
 
 // Local mirror of the "default mother" designation so the Network settings
@@ -136,6 +79,11 @@ async function writePending(ops: PendingOp[]): Promise<void> {
     'INSERT INTO schema_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     [PENDING_KEY, JSON.stringify(ops)]
   );
+}
+
+/** A "this device is / is not the mother" write has not reached Studio yet. */
+export async function hasPendingMotherOp(): Promise<boolean> {
+  return (await readPending()).length > 0;
 }
 
 export async function enqueuePendingOp(op: PendingOp): Promise<void> {

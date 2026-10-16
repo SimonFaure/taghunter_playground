@@ -16,6 +16,7 @@ pub const NAK: u8 = 0x15;
 pub const CMD_SET_MS_MODE: u8 = 0xF0; // wakeup payload
 pub const CMD_GET_SYSTEM_DATA: u8 = 0x83; // station config probe
 pub const CMD_CARD_INSERTED: u8 = 0xE8; // master → host notification
+pub const CMD_CARD_REMOVED: u8 = 0xE7; // master → host notification
 pub const CMD_GET_SI9_DATA: u8 = 0xEF; // host → master block read
 // Consumed only by `build_set_time`, which is itself pending the step-5
 // set-station-time control channel.
@@ -31,9 +32,19 @@ pub const DEFAULT_BAUD: u32 = 38400;
 // once the master dozed off).
 pub const REWAKEUP_INTERVAL_MS: u64 = 7_000;
 
-// How long to wait for a station response after wakeup before retrying.
-// Handshake-retry tuning - not yet consumed by the reader state machine.
-#[allow(dead_code)]
-pub const STATION_HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
-#[allow(dead_code)]
-pub const STATION_HANDSHAKE_MAX_RETRIES: u32 = 3;
+// While Awakening, resend wakeup + system-data probe at this cadence until
+// the station answers. Measured from the last handshake WRITE, not from the
+// last received byte: a sleeping master can swallow the first handshake
+// while it wakes, and the player's own 0xE8 notifications must not push the
+// retry back (field bug 2026-10-15: first bips after launch never beeped).
+pub const HANDSHAKE_RETRY_MS: u64 = 500;
+
+// A candidate frame (STX seen, rest still missing) older than this is a
+// false STX. A whole SI frame arrives in one burst (137 bytes ≈ 36 ms at
+// 38400), so anything still incomplete after 250 ms of silence never will be.
+pub const STALE_PARTIAL_FRAME_MS: u64 = 250;
+
+// Abort an in-flight card read when no 0xEF block reply arrives within this
+// window (card pulled out mid-read, NAK, line noise). Without it the reader
+// sat in Reading forever and ignored every later insertion.
+pub const READ_BLOCK_TIMEOUT_MS: u64 = 1_500;

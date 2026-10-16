@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, ChevronRight, ChevronLeft, Usb, Save, Upload, FileDown, Loader2 } from 'lucide-react';
 import type { SiPuce } from '../types/database';
@@ -22,6 +22,7 @@ import {
 } from '../services/launchResolve';
 import { ConfirmDialog } from './ConfirmDialog';
 import { RosterImportModal } from './RosterImportModal';
+import { ScoreWeightingFormula } from './ScoreWeightingFormula';
 import {
   parseRosterFile,
   buildTemplateXlsx,
@@ -44,6 +45,27 @@ import { LANG_NAMES, SUPPORTED_LANGS } from '../services/langFlags';
 import { computeAutoRegAssignments, type RegAssignmentMap } from '../services/regAssignments';
 import { displayDeviceLabel } from '../services/lanPairing';
 import { RegAssignChips, type RegTeamDef } from './RegAssignChips';
+import { IS_TESTER_BUILD, simChipPool } from '../services/simChips';
+import type { WizardAutopilot } from '../services/launchPresetStore';
+import { useCustomers } from './customers/useCustomers';
+import { CustomerCombobox } from './customers/CustomerCombobox';
+
+/** Simulator autopilot: how long each wizard step stays on screen. */
+const AUTOPILOT_STEP_MS = 900;
+
+// Virtual chips offered by a Simulated session (caps it at 1000 chips).
+// Coverage badge under "Simulated session" (tester builds only - inline guard
+// so the stable build drops the chunk).
+const CoverageBadge =
+  import.meta.env.DEV || import.meta.env.VITE_QA_HARNESS === '1'
+    ? lazy(() => import('../simulator/CoveragePanels').then((m) => ({ default: m.CoverageBadge })))
+    : null;
+
+const SIM_CHIP_POOL: SiPuce[] = simChipPool(1000).map((c) => ({
+  ...c,
+  created_at: '',
+  updated_at: '',
+}));
 
 export interface LaunchDeviceSelection {
   /** Whether to register the mother itself as a participating device. */
@@ -286,10 +308,25 @@ interface LaunchGameModalProps {
   noticeText?: string;
   /** Fired after a config is saved so the host can refresh counts / toast. */
   onConfigSaved?: (name: string) => void;
+  /** Simulator campaign (tester builds): walk the steps and launch unattended. */
+  autopilot?: WizardAutopilot;
+  /** Customer selected above the scenario list - wins over a preset's own. */
+  initialCustomer?: { id: string; name: string } | null;
+}
+
+/** Game name suggested for a customer: "Acme SA – Mystery X". */
+function customerGameName(customerName: string, gameTitle: string): string {
+  return gameTitle ? `${customerName} – ${gameTitle}` : customerName;
 }
 
 export interface GameConfig {
   name: string;
+  /** Licensee customer the game is played for (project_licensee_customers).
+   *  Optional; stored as meta customerId / customerName. */
+  customerId?: string | null;
+  customerName?: string | null;
+  /** Saved presets only: keep the customer in the preset. */
+  rememberCustomer?: boolean;
   numberOfTeams: number;
   firstChipIndex: number;
   /** Manual-roster path (all game types): pre-fill the step-2 team names from the
@@ -307,6 +344,9 @@ export interface GameConfig {
   /** Mystery: once a team's results summary is on screen, pressing Enter resets
    *  the display (same as the on-screen refresh button). Defaults to true. */
   enterToReset?: boolean;
+  /** Mystery: skip the enigma-by-enigma reveal walk on the finishing bip and
+   *  show the final board + results summary straight away. Defaults to false. */
+  noRevealAnimation?: boolean;
   /** Seconds the results stay on screen before the auto page-reset (when autoResetTeam). */
   delayBeforeReset: number;
   /** Mystery: show the author-placed idle layout (title + subtitle) on the
@@ -353,6 +393,25 @@ export interface GameConfig {
   playMode?: 'solo' | 'team';
   teammatesPerTeam?: number;
   testMode?: boolean;
+  /** Game simulator session (tester builds only): virtual chip pool, meta
+   *  simulated=true, excluded from stats. Separate from the licensee Test mode. */
+  simulated?: boolean;
+  /** The fixed roster came from an Excel/CSV import (coverage tracking: "import"
+   *  vs a hand-built roster). Persisted as meta.rosterImported. */
+  rosterImported?: boolean;
+  /** Simulated session: start the simulation as soon as the game page opens on
+   *  the first playing device (default on), at this speed, with this many mock
+   *  teams for auto/self-register games. */
+  simAutoStart?: boolean;
+  simSpeed?: number;
+  simTeams?: number;
+  /** Simulator retry: replay this seed (instead of a random one) ... */
+  simSeed?: number;
+  /** ... as a retry of this Studio simulation run (meta simRetryOf). */
+  simRetryOf?: number;
+  /** Simulated Clash with the Purge: minutes after Start of the planned Purge
+   *  attempt (undefined = random between 25 % and 60 % of the game). */
+  simPurgeAtMin?: number;
   teams?: Team[];
   /** Tagquest: seconds to keep the result (full image + score) on screen after
    *  each punch animation completes, before the page resets to its hidden state. */
@@ -385,7 +444,19 @@ export interface GameConfig {
   /** Tracks: "clues page on team return" - on the second bip after a team
    *  returns, show the map with every checkpoint revealed (no per-checkpoint
    *  animation). Was a studio scenario option; now chosen per launch. */
-  cluesPage?: { enabled: boolean; show_title: boolean; show_text: boolean; show_image: boolean };
+  cluesPage?: {
+    enabled: boolean;
+    show_title: boolean;
+    show_text: boolean;
+    show_image: boolean;
+    /** Seconds the clues page stays on screen before it closes itself.
+     *  Missing ⇒ 10 (games launched before the option existed). */
+    duration_sec?: number;
+  };
+  /** Tracks: draw the feedback-image legend box on the reveal / clues page.
+   *  Defaults to the scenario's own setting (`game_meta.show_legend`);
+   *  undefined (games/saved configs from before the toggle) ⇒ that setting. */
+  tracksShowLegend?: boolean;
   /** Clash: number of active clans (2-4). */
   clashNumClans?: number;
   /** Clash: max players per clan; 0/undefined ⇒ unlimited. */
@@ -481,9 +552,13 @@ export function LaunchGameModal({
   prefillConfigName,
   noticeText,
   onConfigSaved,
+  autopilot,
+  initialCustomer,
 }: LaunchGameModalProps) {
   const { t } = useTranslation();
   const { user } = useAuth();
+  // Licensee customers (project_licensee_customers).
+  const { snapshot: customersSnapshot } = useCustomers();
 
   const getDefaultName = () => {
     const now = new Date();
@@ -504,6 +579,7 @@ export function LaunchGameModal({
     autoResetTeam: true,
     delayBeforeReset: 10,
     enterToReset: false,
+    noRevealAnimation: false,
     showIdleLayout: true,
     idleSubtitle: '',
     autoRegisterTeam: false,
@@ -631,6 +707,7 @@ export function LaunchGameModal({
   // the spinner.
   const [launching, setLaunching] = useState(false);
   const launchingRef = useRef(false);
+  const formRef = useRef<HTMLFormElement>(null);
   // Excel/CSV roster import (step 2). The hidden file input is triggered by the
   // Import button; a successful parse opens the preview/confirm modal.
   const rosterFileInputRef = useRef<HTMLInputElement>(null);
@@ -662,7 +739,12 @@ export function LaunchGameModal({
     return () => { cancelled = true; };
   }, [scenarioPublic, config.language, scenarioDefaultLang]);
 
+  // The scenario's data (patterns, languages, tracks/clash options) is loaded:
+  // the autopilot waits for it before touching step 1.
+  const [dataReady, setDataReady] = useState(false);
+
   useEffect(() => {
+    setDataReady(false);
     const loadData = async () => {
       if (!gameTypeName || !gameUniqid) return;
 
@@ -801,6 +883,7 @@ export function LaunchGameModal({
         setPrefTutorialDefault(!!pref.play_tutorial_default);
         setPrefIntroDefault(!!pref.play_intro_default);
       }
+      setDataReady(true);
     };
     loadData();
   }, [gameTypeName, gameUniqid, user?.client_id]);
@@ -825,6 +908,7 @@ export function LaunchGameModal({
         autoResetTeam: true,
         delayBeforeReset: 10,
         enterToReset: false,
+        noRevealAnimation: false,
         showIdleLayout: true,
         idleSubtitle: '',
         // Mystery and Tracks teams both form dynamically on first bip - there is
@@ -855,7 +939,9 @@ export function LaunchGameModal({
         scoreType: defaultScoreType as 'percentage' | 'points' | undefined,
         malusPerMinute: tracksOptions.defaultMalus,
         // Clues page on team return - off by default; the operator opts in per launch.
-        cluesPage: { enabled: false, show_title: true, show_text: true, show_image: true },
+        cluesPage: { enabled: false, show_title: true, show_text: true, show_image: true, duration_sec: 10 },
+        // Legend - pre-set from the scenario; the operator flips it in Advanced.
+        tracksShowLegend: tracksOptions.showLegend,
         // Clash defaults - 2 clans, unlimited per clan, self-registration.
         // Équipes prédéfinies deals 10 chips per clan out of the box (the
         // operator adjusts the number, or edits the blocks chip by chip, on
@@ -899,7 +985,19 @@ export function LaunchGameModal({
         // A saved config can't re-enable the purge on a scenario that (no
         // longer) has a purge image - clamp AFTER the prefill spread.
         ...(clashHasPurgeImage ? {} : { clashPurgeEnabled: false }),
-        name: '',
+        // Customer: the scenario-list selection, else a preset that remembers
+        // one. Its name pre-fills the game name.
+        ...(() => {
+          const c = initialCustomer
+            ?? (prefillConfig?.rememberCustomer && prefillConfig.customerId
+              ? { id: prefillConfig.customerId, name: prefillConfig.customerName ?? '' }
+              : null);
+          return {
+            customerId: c?.id ?? null,
+            customerName: c?.name ?? null,
+            name: c?.name ? customerGameName(c.name, gameTitle) : '',
+          };
+        })(),
       });
       setStep(1);
       setTeams([]);
@@ -918,7 +1016,7 @@ export function LaunchGameModal({
       setOverwriteConfirm(null);
       setSavedFlash(null);
     }
-  }, [isOpen, defaultPattern, patternFolders, scenarioDefaultLang, scenarioPublic, scenarioMessageDisplayTime, scenarioEnigmaDuration, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, clashBalisesSeed, clashHasPurgeImage, clashPurgeStationSeed, prefillConfig, prefillConfigName]);
+  }, [isOpen, defaultPattern, patternFolders, scenarioDefaultLang, scenarioPublic, scenarioMessageDisplayTime, scenarioEnigmaDuration, hasTutorialVideo, hasIntroVideo, prefTutorialDefault, prefIntroDefault, gameTypeName, tracksOptions, clashBalisesSeed, clashHasPurgeImage, clashPurgeStationSeed, prefillConfig, prefillConfigName, initialCustomer, gameTitle]);
 
   // Tracks: warn when the selected pattern's row count doesn't match the
   // course's checkpoint count. The checkpoint↔station binding is positional
@@ -952,9 +1050,16 @@ export function LaunchGameModal({
     };
   }, [gameTypeName, config.pattern, tracksCheckpointCount]);
 
-  const allChips = useOnDemandCards
-    ? [...availableChips, ...onDemandChips]
-    : availableChips;
+  // Simulated session: mock teams use virtual chips, never the real stock.
+  const allChips = config.simulated
+    ? SIM_CHIP_POOL
+    : useOnDemandCards
+      ? [...availableChips, ...onDemandChips]
+      : availableChips;
+
+  // Chips the step-2 roster is dealt from: every real card (on-demand ones
+  // included), or the virtual pool in a Simulated session.
+  const rosterChips = config.simulated ? SIM_CHIP_POOL : [...availableChips, ...onDemandChips];
 
   const isTagQuest = gameTypeName.toLowerCase() === 'tagquest';
   const isTracks = gameTypeName.toLowerCase() === 'tracks';
@@ -1225,8 +1330,7 @@ export function LaunchGameModal({
     }
     // Roster build lives in launchResolve so the headless Quick Launch path
     // produces an identical roster from the same inputs.
-    const combinedChips = [...availableChips, ...onDemandChips];
-    let roster = buildRoster(config, combinedChips, gameTypeName);
+    let roster = buildRoster(config, rosterChips, gameTypeName);
     // Pre-fill pooled names when the operator chose the pool source (mystery/
     // tracks mass-start fixed roster) or the legacy TagQuest fill-from-pool toggle.
     if (config.nameFromPool || ((isMystery || isTracks) && config.useNamePool)) roster = applyPoolNames(roster);
@@ -1249,8 +1353,7 @@ export function LaunchGameModal({
   const rebuildRosterFromCounts = (patch: Partial<GameConfig>) => {
     const next: GameConfig = { ...config, ...patch };
     setConfig(next);
-    const combinedChips = [...availableChips, ...onDemandChips];
-    let roster = buildRoster(next, combinedChips, gameTypeName);
+    let roster = buildRoster(next, rosterChips, gameTypeName);
     if (next.useNamePool || next.nameFromPool) roster = applyPoolNames(roster);
     // Same in-order route pre-assignment handleNextStep does - rebuilding here
     // must not leave a multi-route roster without routes.
@@ -1279,8 +1382,7 @@ export function LaunchGameModal({
   const goToManualRosterStep = () => {
     const next: GameConfig = { ...config, autoRegisterTeam: false, selfRegisterTeam: false };
     setConfig(next);
-    const combinedChips = [...availableChips, ...onDemandChips];
-    let roster = buildRoster(next, combinedChips, gameTypeName);
+    let roster = buildRoster(next, rosterChips, gameTypeName);
     if (next.nameFromPool) roster = applyPoolNames(roster);
     setTeams(roster);
     setStep(2);
@@ -1403,6 +1505,7 @@ export function LaunchGameModal({
       ...prev,
       autoRegisterTeam: false,
       selfRegisterTeam: false,
+      rosterImported: true,
       numberOfTeams: newTeams.length,
       ...(mode === 'team' ? { teammatesPerTeam } : {}),
     }));
@@ -1450,7 +1553,7 @@ export function LaunchGameModal({
   const clashChipById = new Map(allChips.map((c) => [c.id, c]));
   const clashBulkAllocation = (() => {
     if (!isClashBulk) return null;
-    const free = availableChips.filter((c) => !usedChipIds.has(c.id));
+    const free = (config.simulated ? SIM_CHIP_POOL : availableChips).filter((c) => !usedChipIds.has(c.id));
     const numClans = Math.max(2, Math.min(config.clashNumClans ?? 2, 4));
     const perClan = Math.max(0, config.clashChipsPerClan ?? 10);
     const imported = config.clashChipAssignments ?? [];
@@ -1615,7 +1718,7 @@ export function LaunchGameModal({
       setBusyDeviceIds(busy);
       // Pre-check only online, non-self peers that aren't already in a game
       // (on a child this includes the mother, unless it's an older build).
-      setSelectedDeviceIds(new Set(rows.filter(r => r.id !== selfId && r.online && !busy.has(r.id) && !(outdated && r.is_self)).map(r => r.id)));
+      setSelectedDeviceIds(new Set(rows.filter(r => r.id !== selfId && r.online && !r.operator_only && !busy.has(r.id) && !(outdated && r.is_self)).map(r => r.id)));
       // This device participates by default unless it's already running a game.
       // Operator-only devices never participate.
       const selfRow = rows.find(r => r.id === selfId);
@@ -1752,7 +1855,10 @@ export function LaunchGameModal({
     const selfBusy = !!(selfRow && busyDeviceIds.has(selfRow.id));
     const outdatedMotherId = motherOutdated ? pairedDevices.find((r) => r.is_self)?.id : undefined;
     const satellite_targets = Array.from(selectedDeviceIds).filter(
-      (id) => !busyDeviceIds.has(id) && id !== outdatedMotherId
+      (id) =>
+        !busyDeviceIds.has(id) &&
+        id !== outdatedMotherId &&
+        !pairedDevices.find((r) => r.id === id)?.operator_only
     );
     const includeSelf = motherChecked && !selfBusy && !operatorOnly;
     // Station-based self-register: resolve the auto/manual per-device teams
@@ -1786,6 +1892,73 @@ export function LaunchGameModal({
       setLaunching(false);
     }
   };
+
+  // ── Simulator campaign autopilot (tester builds) ──
+  // Walks the wizard like an operator: wait for the scenario, apply the
+  // combination, Next, Next, pick the devices, Launch. Each step stays on
+  // screen a moment so the tester watching can follow it.
+  const autopilotRef = useRef<{
+    phase: 'wait' | 'step1' | 'advancing' | 'devices' | 'launching' | 'failed';
+    severalDevices: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    autopilotRef.current = isOpen && autopilot ? { phase: 'wait', severalDevices: false } : null;
+  }, [isOpen, autopilot]);
+
+  useEffect(() => {
+    const ap = autopilotRef.current;
+    if (!ap || !autopilot || !isOpen) return;
+    const fail = (reason: string) => {
+      ap.phase = 'failed';
+      autopilot.onFail(reason);
+    };
+    const submit = () => formRef.current?.requestSubmit();
+    let timer: number | undefined;
+    const later = (fn: () => void, ms = AUTOPILOT_STEP_MS) => {
+      timer = window.setTimeout(fn, ms);
+    };
+
+    if (ap.phase === 'wait' && dataReady && step === 1) {
+      later(() => {
+        const res = autopilot.setup({ tracksRoutes: tracksOptions.routes, clashHasPurgeImage });
+        if (!res.ok) return fail(res.reason);
+        ap.severalDevices = res.severalDevices;
+        ap.phase = 'step1';
+        setConfig((prev) => ({ ...prev, ...res.patch }));
+      });
+    } else if (ap.phase === 'step1' && step === 1) {
+      later(() => {
+        ap.phase = 'advancing';
+        submit();
+      });
+    } else if (ap.phase === 'advancing' && step === 1) {
+      // Step 1 refused to advance (e.g. a hard gate shown in red).
+      later(() => fail('the wizard refused step 1'), 5000);
+    } else if (ap.phase === 'advancing' && step === 2) {
+      later(() => {
+        ap.phase = 'devices';
+        submit();
+      });
+    } else if ((ap.phase === 'advancing' || ap.phase === 'devices') && step === 3 && !pairedLoading) {
+      ap.phase = 'devices';
+      if (!ap.severalDevices) {
+        if (selectedDeviceIds.size > 0) {
+          setSelectedDeviceIds(new Set());
+          return;
+        }
+        if (!motherChecked) return fail('this device cannot play (operator-only or already in a game)');
+      } else {
+        const count = (motherChecked ? 1 : 0) + selectedDeviceIds.size;
+        if (count < 2) return fail(`needs 2 devices that can play, ${count} available`);
+      }
+      later(() => {
+        ap.phase = 'launching';
+        submit();
+      });
+    }
+    return () => window.clearTimeout(timer);
+  }, [isOpen, autopilot, dataReady, step, pairedLoading, config, motherChecked, selectedDeviceIds, tracksOptions, clashHasPurgeImage]);
 
   // Persist the current step-1 settings as a named, scenario-assigned config.
   // Does NOT launch and does NOT advance the wizard. Strips the per-instance
@@ -1835,7 +2008,7 @@ export function LaunchGameModal({
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-6">
+        <form ref={formRef} onSubmit={handleSubmit} className="p-6 space-y-6">
           {step === 1 && (
           <>
           {noticeText && (
@@ -1843,6 +2016,7 @@ export function LaunchGameModal({
               <span>{noticeText}</span>
             </div>
           )}
+          <div className={`grid grid-cols-1 ${customersSnapshot.supported ? 'md:grid-cols-2' : ''} gap-6`}>
           <div className="space-y-2">
             <label htmlFor="name" className="pg-label">
               {t('launchModal:gameName')}
@@ -1856,6 +2030,28 @@ export function LaunchGameModal({
               className="pg-input"
             />
             <p className="text-xs text-[var(--pg-text-dim)]">{t('launchModal:gameNameHint', { default: getDefaultName() })}</p>
+          </div>
+          {/* Licensee customer the game is for (optional). Picking one fills an
+              empty / still-suggested game name. project_licensee_customers. */}
+          {customersSnapshot.supported && (
+            <div className="space-y-2">
+              <label className="pg-label">{t('customers:label')}</label>
+              <CustomerCombobox
+                snapshot={customersSnapshot}
+                value={config.customerId ? { id: config.customerId, name: config.customerName ?? '' } : null}
+                onChange={(c) => {
+                  const suggested = config.customerName ? customerGameName(config.customerName, gameTitle) : '';
+                  const nameIsAuto = config.name.trim() === '' || config.name === suggested;
+                  setConfig({
+                    ...config,
+                    customerId: c?.id ?? null,
+                    customerName: c?.name ?? null,
+                    name: nameIsAuto ? (c ? customerGameName(c.name, gameTitle) : '') : config.name,
+                  });
+                }}
+              />
+            </div>
+          )}
           </div>
 
           {/* TagQuest: Duration + Language sit directly under the title, on one
@@ -2657,6 +2853,7 @@ export function LaunchGameModal({
                       setConfig({
                         ...config,
                         cluesPage: {
+                          ...config.cluesPage,
                           enabled: e.target.checked,
                           show_title: config.cluesPage?.show_title ?? true,
                           show_text: config.cluesPage?.show_text ?? true,
@@ -2695,6 +2892,7 @@ export function LaunchGameModal({
                             setConfig({
                               ...config,
                               cluesPage: {
+                                ...config.cluesPage,
                                 enabled: config.cluesPage?.enabled ?? true,
                                 show_title: config.cluesPage?.show_title ?? true,
                                 show_text: config.cluesPage?.show_text ?? true,
@@ -2708,6 +2906,30 @@ export function LaunchGameModal({
                         <span>{t(`launchModal:${i18nKey}`)}</span>
                       </label>
                     ))}
+                    <div className="space-y-2 pt-1">
+                      <label htmlFor="tracksCluesDuration" className="pg-label">
+                        {t('launchModal:tracksCluesDuration')}
+                      </label>
+                      <input
+                        type="number"
+                        id="tracksCluesDuration"
+                        min="1"
+                        value={config.cluesPage?.duration_sec ?? 10}
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            cluesPage: {
+                              enabled: config.cluesPage?.enabled ?? true,
+                              show_title: config.cluesPage?.show_title ?? true,
+                              show_text: config.cluesPage?.show_text ?? true,
+                              show_image: config.cluesPage?.show_image ?? true,
+                              duration_sec: Math.max(1, parseInt(e.target.value) || 1),
+                            },
+                          })
+                        }
+                        className="pg-input !w-32"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -2921,6 +3143,23 @@ export function LaunchGameModal({
                     {isMystery && (
                       <div className="text-sm font-semibold text-[var(--pg-text)]">{t('launchModal:advAnimation')}</div>
                     )}
+                    {/* No animation (Mystery) - the finishing bip shows the final
+                        board + results at once instead of walking each enigma. */}
+                    {isMystery && (
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          id="noRevealAnimation"
+                          checked={config.noRevealAnimation ?? false}
+                          onChange={(e) => setConfig({ ...config, noRevealAnimation: e.target.checked })}
+                          className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                        />
+                        <label htmlFor="noRevealAnimation" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                          {t('launchModal:noRevealAnimation')}
+                          <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:noRevealAnimationHint')}</span>
+                        </label>
+                      </div>
+                    )}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       <div className="space-y-2">
                         <label htmlFor="messageDisplayDuration" className="pg-label">
@@ -2945,7 +3184,8 @@ export function LaunchGameModal({
                           min="1"
                           value={config.enigmaImageDisplayDuration}
                           onChange={(e) => setConfig({ ...config, enigmaImageDisplayDuration: parseInt(e.target.value) || 1 })}
-                          className="pg-input"
+                          disabled={isMystery && !!config.noRevealAnimation}
+                          className="pg-input disabled:opacity-50"
                         />
                       </div>
                     </div>
@@ -3122,18 +3362,21 @@ export function LaunchGameModal({
                           victory in team mode (speed ranks by time; solo teams
                           all weigh 1), so it's hidden elsewhere. */}
                       {isTagQuest && config.victoryType === 'score' && config.playMode === 'team' && (
-                        <div className="flex items-center gap-3">
-                          <input
-                            type="checkbox"
-                            id="tagquestScoreWeighting"
-                            checked={config.tagquestScoreWeighting ?? true}
-                            onChange={(e) => setConfig({ ...config, tagquestScoreWeighting: e.target.checked })}
-                            className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
-                          />
-                          <label htmlFor="tagquestScoreWeighting" className="text-sm font-medium text-[var(--pg-text-muted)]">
-                            {t('launchModal:scoreWeighting')}
-                            <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:scoreWeightingHint')}</span>
-                          </label>
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              id="tagquestScoreWeighting"
+                              checked={config.tagquestScoreWeighting ?? true}
+                              onChange={(e) => setConfig({ ...config, tagquestScoreWeighting: e.target.checked })}
+                              className="w-5 h-5 shrink-0 accent-[var(--pg-accent)]"
+                            />
+                            <label htmlFor="tagquestScoreWeighting" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                              {t('launchModal:scoreWeighting')}
+                              <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:scoreWeightingHint')}</span>
+                            </label>
+                          </div>
+                          <ScoreWeightingFormula className="ml-8" />
                         </div>
                       )}
 
@@ -3187,6 +3430,26 @@ export function LaunchGameModal({
                     </>
                   )}
 
+                  {/* Tracks feedback-image legend - pre-set from the scenario
+                      (studio "show the legend"), overridable per launch. */}
+                  {isTracks && (
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        id="tracksShowLegend"
+                        checked={config.tracksShowLegend ?? tracksOptions.showLegend}
+                        onChange={(e) => setConfig({ ...config, tracksShowLegend: e.target.checked })}
+                        className="w-5 h-5 accent-[var(--pg-accent)]"
+                      />
+                      <label htmlFor="tracksShowLegend" className="text-sm font-medium text-[var(--pg-text-muted)]">
+                        {t('launchModal:tracksShowLegend')}
+                        <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">
+                          {t('launchModal:tracksShowLegendHint')}
+                        </span>
+                      </label>
+                    </div>
+                  )}
+
                   <div className="flex items-center gap-3 pt-1 border-t border-[var(--pg-line)]">
                     <input
                       type="checkbox"
@@ -3207,6 +3470,103 @@ export function LaunchGameModal({
                       <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">{t('launchModal:testModeHint')}</span>
                     </label>
                   </div>
+                  {/* Tester builds only: internal tool, not translated. */}
+                  {IS_TESTER_BUILD && (
+                    <div className="flex items-center gap-3 pt-1">
+                      <input
+                        type="checkbox"
+                        id="simulatedSession"
+                        checked={config.simulated ?? false}
+                        onChange={(e) => {
+                          const enabled = e.target.checked;
+                          setConfig(prev => ({
+                            ...prev,
+                            simulated: enabled,
+                            // The simulator never runs under the licensee Test mode.
+                            testMode: enabled ? false : prev.testMode,
+                            firstChipIndex: 1,
+                          }));
+                        }}
+                        className="w-5 h-5 accent-fuchsia-500"
+                      />
+                      <label htmlFor="simulatedSession" className="text-sm font-medium text-fuchsia-400">
+                        Simulated session
+                        <span className="ml-2 text-xs text-[var(--pg-text-dim)] font-normal">
+                          Mock teams on virtual chips, played by the simulator. Excluded from stats.
+                        </span>
+                      </label>
+                    </div>
+                  )}
+                  {IS_TESTER_BUILD && config.simulated && (
+                    <div className="pl-8 flex flex-wrap items-center gap-3 text-sm">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={config.simAutoStart !== false}
+                          onChange={(e) => setConfig((prev) => ({ ...prev, simAutoStart: e.target.checked }))}
+                          className="w-4 h-4 accent-fuchsia-500"
+                        />
+                        Start the simulation when the game opens
+                      </label>
+                      <label className="flex items-center gap-2">
+                        Speed
+                        <select
+                          value={config.simSpeed ?? 10}
+                          onChange={(e) => setConfig((prev) => ({ ...prev, simSpeed: Number(e.target.value) }))}
+                          className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded px-2 py-1"
+                        >
+                          {[1, 2, 5, 10, 20].map((s) => (
+                            <option key={s} value={s}>
+                              ×{s}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {isClash && config.clashPurgeEnabled && (
+                        <label className="flex items-center gap-2" title="Minutes after Start. Empty = random (25-60 % of the game).">
+                          Purge at
+                          <input
+                            type="number"
+                            min={1}
+                            max={600}
+                            placeholder="random"
+                            value={config.simPurgeAtMin ?? ''}
+                            onChange={(e) => {
+                              const v = parseInt(e.target.value, 10);
+                              setConfig((prev) => ({ ...prev, simPurgeAtMin: v > 0 ? Math.min(600, v) : undefined }));
+                            }}
+                            className="w-20 bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded px-2 py-1"
+                          />
+                          min
+                        </label>
+                      )}
+                      {(config.autoRegisterTeam || config.selfRegisterTeam) && (
+                        <label className="flex items-center gap-2">
+                          Mock teams
+                          <input
+                            type="number"
+                            min={1}
+                            max={500}
+                            value={config.simTeams ?? 10}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                simTeams: Math.min(500, Math.max(1, parseInt(e.target.value || '1', 10) || 1)),
+                              }))
+                            }
+                            className="w-20 bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded px-2 py-1"
+                          />
+                        </label>
+                      )}
+                    </div>
+                  )}
+                  {CoverageBadge && config.simulated && (
+                    <div className="pl-8">
+                      <Suspense fallback={null}>
+                        <CoverageBadge gameTypeName={gameTypeName} config={config} />
+                      </Suspense>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -3265,6 +3625,16 @@ export function LaunchGameModal({
                   </button>
                   {savedFlash && (
                     <span className="text-sm text-green-400">{t('launchModal:savedFlash', { name: savedFlash })}</span>
+                  )}
+                  {config.customerId && (
+                    <label className="flex items-center gap-2 text-sm text-[var(--pg-text-muted)] cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={!!config.rememberCustomer}
+                        onChange={(e) => setConfig({ ...config, rememberCustomer: e.target.checked })}
+                      />
+                      {t('customers:remember')}
+                    </label>
                   )}
                 </>
               )}
@@ -3895,23 +4265,26 @@ export function LaunchGameModal({
                         .map(device => {
                           const busy = busyDeviceIds.has(device.id);
                           const outdated = motherOutdated && device.is_self;
-                          const checked = selectedDeviceIds.has(device.id) && !busy && !outdated;
+                          // Operator-only devices control games, never play one.
+                          const opOnly = !!device.operator_only;
+                          const blocked = busy || outdated || opOnly;
+                          const checked = selectedDeviceIds.has(device.id) && !blocked;
                           return (
                             <div
                               key={device.id}
                               className={`bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] ${
-                                busy || outdated || !device.online ? 'opacity-70' : ''
+                                blocked || !device.online ? 'opacity-70' : ''
                               }`}
                             >
                             <label
                               className={`flex items-center gap-3 p-3 ${
-                                busy || outdated ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'
+                                blocked ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--pg-surface-3)]'
                               }`}
                             >
                               <input
                                 type="checkbox"
                                 checked={checked}
-                                disabled={busy || outdated}
+                                disabled={blocked}
                                 onChange={(e) => {
                                   setSelectedDeviceIds(prev => {
                                     const next = new Set(prev);
@@ -3946,6 +4319,14 @@ export function LaunchGameModal({
                                   title={t('launchModal:motherOutdatedHint')}
                                 >
                                   {t('launchModal:motherOutdated')}
+                                </span>
+                              )}
+                              {opOnly && (
+                                <span
+                                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)]"
+                                  title={t('launchModal:operatorOnlyDeviceHint')}
+                                >
+                                  {t('launchModal:operatorOnlyDevice')}
                                 </span>
                               )}
                               {/* Reader state is only knowable while the device

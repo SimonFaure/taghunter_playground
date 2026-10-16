@@ -16,6 +16,7 @@
   "fieldAutoResetTeam": "Réinitialisation automatique de la page",
   "fieldDelayBeforeReset": "Délai avant réinitialisation (secondes)",
   "fieldEnterToReset": "Utiliser Entrée pour rafraîchir la page",
+  "fieldNoRevealAnimation": "Pas d'animation",
   "fieldShowIdleLayout": "Afficher la mise en page d'attente",
   "fieldIdleSubtitle": "Sous-titre de l'écran d'attente",
   "fieldAutoRegisterTeam": "Inscription automatique des équipes",

@@ -16,22 +16,16 @@ export interface AppConfig {
   language: 'english' | 'french' | 'spanish';
   fullscreenOnLaunch?: boolean;
   autoLaunch?: boolean;
-  // Windows-only: start the LAN Wi-Fi hotspot (mother AP) automatically at app
-  // boot so satellite devices reconnect on their own. Uses the stable creds
-  // from lanCredentials (auto-generated on first use). See App.tsx boot wiring.
-  //
-  // DEPRECATED by `beMotherWhenAvailable` (mother/hotspot role rework). Still
-  // read at boot until the new model's boot wiring lands; loadConfig migrates a
-  // `true` value into `beMotherWhenAvailable`. New code should prefer the latter.
-  startHotspotOnLaunch?: boolean;
-  // Mother/hotspot role rework: this device is *willing* to be the mother. When
-  // set, the device runs `becomeMother` at app boot (subject to the LAN fence -
-  // it stands down and follows an already-live mother instead of starting a
-  // second server). Multiple devices may have this on (E1, "preferred mother":
-  // whoever boots first wins, the rest fall in behind). The network-source
-  // sub-choice (hotspot vs external router) is persisted separately in
-  // lanCredentials (`getNetworkSource`). Per-device, default off.
+  // "Rôle de ce poste": this device is SET as the mother. It is the only one
+  // that starts hosting by itself at boot, and the one a substitute hands the
+  // games back to. One per licensee. Written ONLY by the onboarding question and
+  // by Settings → Réseau → Rôle de ce poste - never by a takeover: a device
+  // that takes a game over hosts as a substitute and this flag stays as it is
+  // (see services/deviceRole.ts). Per-device, default off.
   beMotherWhenAvailable?: boolean;
+  // When the flag above was last set (ms since epoch). Two devices both set as
+  // mother on one network: the later designation keeps the role.
+  motherDesignatedAt?: number;
   raspberryHost?: string;
   // Launch logo screen - a branded screen shown instead of the home page
   // at startup. All three are per-device local prefs. `logoScreenLogoFile`
@@ -71,10 +65,6 @@ export interface AppConfig {
   // Settings→Preferences or the first-launch onboarding step. See
   // services/operatorMode.ts for the toggle (reset-and-resync) flow.
   operatorOnlyDevice?: boolean;
-  // Band of this device's hotspot when it is the mother: '2.4' (default) forces
-  // 2.4 GHz, which some field PCs needed to see the AP at all (retours sept.
-  // #19); 'auto' leaves Windows' "any available". Pushed to Rust at boot.
-  hotspotBand?: '2.4' | 'auto';
 }
 
 const CONFIG_REL = 'config.json';
@@ -82,7 +72,6 @@ const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
   fullscreenOnLaunch: false,
   autoLaunch: false,
-  startHotspotOnLaunch: false,
   beMotherWhenAvailable: false,
   raspberryHost: '192.168.129.250',
   logoScreenOnLaunch: false,
@@ -105,7 +94,6 @@ const applyPlatformLocks = (config: AppConfig): AppConfig => {
     ...config,
     operatorOnlyDevice: true,
     beMotherWhenAvailable: false,
-    startHotspotOnLaunch: false,
     autoLaunch: false,
   };
 };
@@ -120,11 +108,14 @@ const loadConfigRaw = async (): Promise<AppConfig> => {
     }
     const text = await readTextFile(CONFIG_REL, { baseDir: BaseDirectory.AppData });
     const parsed = JSON.parse(text);
+    // Retired keys (hotspot removed 2026-09-30) are dropped on load, so the
+    // next save no longer writes them.
     const merged = { ...DEFAULT_CONFIG, ...parsed };
-    // Mother/hotspot role rework migration: a device that opted into
-    // "start hotspot on launch" was effectively a willing hotspot-mode mother,
-    // so carry it into the new preference (only when the new field is absent, so
-    // an explicit later choice is never overwritten).
+    delete merged.startHotspotOnLaunch;
+    delete merged.hotspotBand;
+    // Legacy migration: a device that opted into "start hotspot on launch" was
+    // effectively a willing mother, so carry it into the preference (only when
+    // the field is absent, so an explicit later choice is never overwritten).
     if (parsed.beMotherWhenAvailable === undefined && parsed.startHotspotOnLaunch) {
       merged.beMotherWhenAvailable = true;
     }
@@ -142,7 +133,7 @@ export const saveConfig = async (config: AppConfig): Promise<void> => {
 };
 
 // Window event fired by flows that change the config OUTSIDE a settings panel
-// (e.g. NotMotherPanel flipping beMotherWhenAvailable), so panels holding a
-// copy in state (DefaultRolesPanel) can re-read instead of showing stale
-// toggles. Dispatch with `window.dispatchEvent(new Event(CONFIG_CHANGED_EVENT))`.
+// (e.g. a mother superseded by a later-designated one clearing its own
+// beMotherWhenAvailable), so panels holding a copy in state (DefaultRolesPanel)
+// can re-read instead of showing stale toggles. Dispatch with `window.dispatchEvent(new Event(CONFIG_CHANGED_EVENT))`.
 export const CONFIG_CHANGED_EVENT = 'taghunter:config-changed';

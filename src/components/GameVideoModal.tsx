@@ -27,7 +27,15 @@ import {
   getLaunchedGameState,
   type PairedDeviceStatusRow,
 } from '../services/launchedGames';
-import { resolveVideosByKind, type VideoSource } from '../services/videoResolution';
+import {
+  resolveVideosByKind,
+  declaredVideoKinds,
+  applySubtitleChoice,
+  SUBTITLE_AUTO,
+  subtitlePickOf,
+  type VideoSource,
+} from '../services/videoResolution';
+import { VideoSubtitlePicker } from './VideoSubtitlePicker';
 import { emitLocalPlayVideo, emitLocalStopVideo } from '../services/localVideoStore';
 import { HelpDot } from '../help';
 
@@ -41,11 +49,13 @@ interface GameVideoModalProps {
 
 const POLL_MS = 2000;
 
-// Availability of each video kind, resolved LOCALLY (on the operator's device)
-// against the launched game's scenario + game type. `null` = still resolving.
-// This is the same resolution the target satellite runs, so it's an honest
-// proxy: if the operator's device can't find an asset, there is nothing to
-// push - and the operator now sees that instead of a silent no-op.
+// Availability of each video kind for the launched game's scenario + game
+// type. `null` = still resolving. Read from the synced METADATA (does the
+// scenario declare an intro, does the game type have a tutorial), not from the
+// files on this device: the operator's device may hold none of them (an
+// operator-only tablet skips every video) while the targets do. A game that
+// declares nothing has nothing to push - and the operator sees that instead of
+// a silent no-op.
 interface VideoAvail {
   intro: boolean;
   tutorial: boolean;
@@ -66,6 +76,15 @@ export function GameVideoModal({
   // The resolved sources behind `avail`, kept so a local (this-device) play can
   // hand them straight to <OperatorVideoOverlay> without re-resolving.
   const [videos, setVideos] = useState<VideoSource[]>([]);
+  // Subtitle languages the game's videos declare (intro + tutorial merged), and
+  // the operator's pick: 'auto' leaves each device on its own default, 'off'
+  // forces none, a language code forces that track on every target.
+  const [subtitleLangs, setSubtitleLangs] = useState<string[]>([]);
+  const [subtitleChoice, setSubtitleChoice] = useState<string>(SUBTITLE_AUTO);
+  // Per-device picks (paired_devices.id -> picker value), each overriding
+  // `subtitleChoice` for that one device - a room where the screens face
+  // audiences of different languages. Changing the all-devices pick resets them.
+  const [deviceSubtitle, setDeviceSubtitle] = useState<Map<number, string>>(new Map());
   // paired_devices.id of THIS device, server-resolved from our bearer secret.
   // is_self can't answer "which row am I?" here: the roster comes from the
   // mother's DB, so is_self marks the MOTHER's row even when this modal is
@@ -81,17 +100,35 @@ export function GameVideoModal({
     void (async () => {
       try {
         const state = await getLaunchedGameState(launchedGameId, 0);
-        const vids = await resolveVideosByKind(
-          ['tutorial', 'intro'],
-          state.game_uniqid,
-          state.game_type,
-          gameLanguage || 'fr',
-        );
+        const [vids, declared] = await Promise.all([
+          resolveVideosByKind(
+            ['tutorial', 'intro'],
+            state.game_uniqid,
+            state.game_type,
+            gameLanguage || 'fr',
+          ),
+          declaredVideoKinds(state.game_uniqid, state.game_type),
+        ]);
         if (cancelled) return;
         setVideos(vids);
+        setSubtitleLangs(
+          Array.from(
+            new Set([
+              ...declared.subtitleLangs.tutorial,
+              ...declared.subtitleLangs.intro,
+              // Tracks found on this device but not declared (older data shapes).
+              ...vids.flatMap((v) => Object.keys(v.subtitles)),
+            ]),
+          ).sort(),
+        );
+        // A kind is offered when the game DECLARES it, even with no file on
+        // this device: an operator-only tablet syncs no video at all yet must
+        // still drive the playing devices, which resolve their own copy. The
+        // local hit is OR-ed in for the operator-imported tutorial (Settings >
+        // Videos), which exists on disk without any synced metadata.
         setAvail({
-          intro: vids.some((v) => v.kind === 'intro'),
-          tutorial: vids.some((v) => v.kind === 'tutorial'),
+          intro: declared.intro || vids.some((v) => v.kind === 'intro'),
+          tutorial: declared.tutorial || vids.some((v) => v.kind === 'tutorial'),
         });
       } catch {
         // Couldn't resolve (game state fetch failed / scenario not downloaded)
@@ -152,14 +189,29 @@ export function GameVideoModal({
   // self-targeted play_video/stop_video in-process rather than enqueueing it.
   const selectable = inGame;
 
-  // Dispatch on THIS device via localVideoStore. Returns false when the game
-  // has no source for the requested kinds (nothing to show).
-  function playHere(kinds: Array<'intro' | 'tutorial'>): boolean {
+  // Picker value in force for one device: its own pick, else the all-devices one.
+  function subtitleChoiceFor(deviceId: number): string {
+    return deviceSubtitle.get(deviceId) ?? subtitleChoice;
+  }
+
+  function setAllSubtitles(next: string) {
+    setSubtitleChoice(next);
+    setDeviceSubtitle(new Map());
+  }
+
+  function setOneSubtitle(deviceId: number, next: string) {
+    setDeviceSubtitle((m) => new Map(m).set(deviceId, next));
+  }
+
+  // Dispatch on THIS device via localVideoStore. Returns false when this
+  // device holds no file for the requested kinds (nothing to show here).
+  function playHere(kinds: Array<'intro' | 'tutorial'>, deviceId: number): boolean {
     const sources = kinds
       .map((k) => videos.find((v) => v.kind === k))
       .filter((v): v is VideoSource => v != null);
     if (sources.length === 0) return false;
-    emitLocalPlayVideo(sources);
+    // Nothing rides along for 'auto' (device default).
+    emitLocalPlayVideo(applySubtitleChoice(sources, subtitlePickOf(subtitleChoiceFor(deviceId))));
     return true;
   }
 
@@ -194,35 +246,44 @@ export function GameVideoModal({
       return n;
     });
     let remoteFailed = false;
-    if (remote.length > 0) {
-      try {
-        const res = await queuePlayVideoBulk(remote, launchedGameId, kinds, gameLanguage);
-        // The bulk endpoint reports per-target failures (target_not_in_game,
-        // targeting self, ...) inside a 200 response - surface them, otherwise
-        // a rejected queue looks identical to a successful push.
-        setErrorFor((m) => {
-          const n = new Map(m);
-          for (const r of res.results) {
-            if (r.error) n.set(r.target_device_id, r.error);
-            else n.delete(r.target_device_id);
-          }
-          return n;
-        });
-        remoteFailed = res.results.some((r) => r.error);
-      } catch (e) {
-        const msg = (e as Error).message;
-        setErrorFor((m) => {
-          const n = new Map(m);
-          for (const id of remote) n.set(id, msg);
-          return n;
-        });
-        remoteFailed = true;
-      }
+    // A bulk command carries ONE payload for all its targets, so the remote
+    // devices go out as one bulk per subtitle pick.
+    const bySubtitle = new Map<string, number[]>();
+    for (const id of remote) {
+      const choice = subtitleChoiceFor(id);
+      bySubtitle.set(choice, [...(bySubtitle.get(choice) ?? []), id]);
     }
+    await Promise.all(
+      Array.from(bySubtitle, async ([choice, ids]) => {
+        try {
+          const res = await queuePlayVideoBulk(ids, launchedGameId, kinds, gameLanguage, subtitlePickOf(choice));
+          // The bulk endpoint reports per-target failures (target_not_in_game,
+          // targeting self, ...) inside a 200 response - surface them, otherwise
+          // a rejected queue looks identical to a successful push.
+          setErrorFor((m) => {
+            const n = new Map(m);
+            for (const r of res.results) {
+              if (r.error) n.set(r.target_device_id, r.error);
+              else n.delete(r.target_device_id);
+            }
+            return n;
+          });
+          if (res.results.some((r) => r.error)) remoteFailed = true;
+        } catch (e) {
+          const msg = (e as Error).message;
+          setErrorFor((m) => {
+            const n = new Map(m);
+            for (const id of ids) n.set(id, msg);
+            return n;
+          });
+          remoteFailed = true;
+        }
+      }),
+    );
     clearBusySoon(targets);
     if (localTarget == null) return;
-    if (!playHere(kinds)) {
-      setErrorFor((m) => new Map(m).set(localTarget, t('devicesModal:videoNoneAvailable')));
+    if (!playHere(kinds, localTarget)) {
+      setErrorFor((m) => new Map(m).set(localTarget, t('devicesModal:videoNotOnThisDevice')));
       return;
     }
     setErrorFor((m) => {
@@ -395,6 +456,17 @@ export function GameVideoModal({
             <HelpDot topic="devices.stop" />
           </div>
 
+          {/* Subtitle language pushed with the next "Play": this one sets every
+              device at once, each row below can then differ. Only shown when
+              the game's videos declare at least one track. */}
+          <VideoSubtitlePicker
+            langs={subtitleLangs}
+            value={subtitleChoice}
+            onChange={setAllSubtitles}
+            label={t('devicesModal:subtitlesAllLabel')}
+            className="mb-4"
+          />
+
           {/* Availability notice: resolving spinner, or a warning when this
               game has no intro/tutorial video at all (the usual reason a push
               looks like it "does nothing" - there's simply nothing to play). */}
@@ -424,6 +496,9 @@ export function GameVideoModal({
                     selected={selected.has(row.id)}
                     onToggle={() => toggleOne(row.id)}
                     thisDevice={callerId != null ? row.id === callerId : row.is_self}
+                    subtitleLangs={subtitleLangs}
+                    subtitleChoice={subtitleChoiceFor(row.id)}
+                    onSubtitleChange={(next) => setOneSubtitle(row.id, next)}
                     busy={busy.has(row.id)}
                     error={errorFor.get(row.id)}
                   />
@@ -465,6 +540,9 @@ function VideoDeviceRow({
   selected,
   onToggle,
   thisDevice,
+  subtitleLangs,
+  subtitleChoice,
+  onSubtitleChange,
   busy,
   error,
 }: {
@@ -472,6 +550,9 @@ function VideoDeviceRow({
   selected: boolean;
   onToggle: () => void;
   thisDevice: boolean;
+  subtitleLangs: string[];
+  subtitleChoice: string;
+  onSubtitleChange: (next: string) => void;
   busy: boolean;
   error: string | undefined;
 }) {
@@ -496,6 +577,13 @@ function VideoDeviceRow({
         )}
       </div>
       <div className="flex-1" />
+      <VideoSubtitlePicker
+        langs={subtitleLangs}
+        value={subtitleChoice}
+        onChange={onSubtitleChange}
+        perDevice
+        className="shrink-0"
+      />
       <span
         className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${
           row.has_reader

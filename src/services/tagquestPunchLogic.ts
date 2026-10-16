@@ -20,6 +20,7 @@ import {
 } from './tagquestScoring';
 import type { Team } from '../components/LaunchGameModal';
 import { parseDbTs } from '../utils/dbTime';
+import { gameClock } from './gameClock';
 
 interface GameQuest {
   name: string;
@@ -307,9 +308,18 @@ function deduplicatePunches(
 
 function isCheatDetected(
   currentPunches: CardData['punches'],
-  previousPunches: CardData['punches']
+  previousPunches: CardData['punches'],
+  currentEnd?: CardData['end'],
+  previousEnd?: CardData['end']
 ): boolean {
   if (previousPunches.length === 0 || currentPunches.length === 0) return false;
+  // A finish record the previous read didn't have IS new information: punching
+  // the finish box writes no regular punch, so a team that bips right after it
+  // shows the same punch list. Treating that as a replay rejected the finish and
+  // the team never ended (found by the game simulator).
+  if (currentEnd && (!previousEnd || previousEnd.time !== currentEnd.time || previousEnd.code !== currentEnd.code)) {
+    return false;
+  }
 
   const previousPunchKeys = new Set(previousPunches.map(p => `${p.code}:${p.time}`));
   const newPunches = currentPunches.filter(p => !previousPunchKeys.has(`${p.code}:${p.time}`));
@@ -520,7 +530,7 @@ export async function processTagQuestPunch(
     const previousRecords = await getRawDataForChip(launchedGameId, card.id, 2);
     if (previousRecords.length >= 2) {
       const previousCard = previousRecords[1].raw_data as CardData;
-      if (isCheatDetected(card.punches, previousCard.punches)) {
+      if (isCheatDetected(card.punches, previousCard.punches, card.end, previousCard.end)) {
         console.log('[TagQuest] Cheat detected for chip:', card.id, 'team:', teamName);
         return {
           team_name: teamName,
@@ -799,7 +809,7 @@ export async function processTagQuestPunch(
       const startMs = parseDbTs(state.start_time);
       const durationMs = (state.duration ?? 0) * 60 * 1000;
       const deadline = startMs + durationMs;
-      const now = Date.now();
+      const now = gameClock.now();
       if (now > deadline) {
         const minutesOver = Math.ceil((now - deadline) / 60000);
         malusApplied = minutesOver * lateMalusPoints;
@@ -999,7 +1009,7 @@ export async function processTagQuestPunch(
       // it) left the finish invisible to every other device and to the
       // rankings for over a minute on a busy kiosk. The reading device holds
       // its own game-end until its finish screen is done (TagQuestGamePage).
-      endTimeToCommit = Math.floor(Date.now() / 1000);
+      endTimeToCommit = Math.floor(gameClock.now() / 1000);
       gameEnded = true;
       await updateTeam(team.id, { end_time: endTimeToCommit, score: newScore });
     } else if (scoreNeedsWrite) {

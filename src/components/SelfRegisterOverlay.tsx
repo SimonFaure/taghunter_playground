@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LanguageFlagRadios } from './LanguageFlagRadios';
 import { listPoolNames } from '../services/namePoolsStore';
+import { SIM_ANSWER_DELAY_MS, peekSelfRegisterAnswer, takeSelfRegisterAnswer } from '../services/simBus';
 
 // Fullscreen overlay shown on a team's first bip when "Self-register team names"
 // is enabled. The team types its own name; on submit the caller persists it
@@ -35,6 +36,8 @@ interface SelfRegisterOverlayProps {
   allowLanguageChoice?: boolean;
   /** Show the "Choose my team name for me" button. */
   addRandomName?: boolean;
+  /** The bipped card - the game simulator answers this card's prompt only. */
+  cardId?: number;
   onSubmit: (name: string, language: string) => void;
   onAbort: () => void;
 }
@@ -187,6 +190,7 @@ export function SelfRegisterOverlay({
   scenarioAudience = 'kids',
   allowLanguageChoice = false,
   addRandomName = false,
+  cardId,
   onSubmit,
   onAbort,
 }: SelfRegisterOverlayProps) {
@@ -196,6 +200,36 @@ export function SelfRegisterOverlay({
   // they tap a flag. Drives the live overlay translation + the name-pool draw +
   // what gets persisted on the team.
   const [lang, setLang] = useState(language);
+
+  // Game simulator: a mock team "types" its name (simBus answer queued before
+  // its start bip, matched on the card). Polls while open; submits after a
+  // human-ish pause through the latest onSubmit.
+  const onSubmitRef = useRef(onSubmit);
+  onSubmitRef.current = onSubmit;
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = setInterval(() => {
+      const answer = peekSelfRegisterAnswer(cardId);
+      if (!answer) return;
+      clearInterval(poll);
+      setName(answer.name);
+      const chosen = answer.language && (scenarioLanguages.includes(answer.language) || answer.language === language)
+        ? answer.language
+        : language;
+      setLang(chosen);
+      // Consumed only on submit: if a newer prompt covers this one first, the
+      // answer waits for it to come back.
+      timer = setTimeout(() => {
+        takeSelfRegisterAnswer(cardId);
+        onSubmitRef.current(answer.name, chosen);
+      }, SIM_ANSWER_DELAY_MS);
+    }, 300);
+    return () => {
+      clearInterval(poll);
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Pooled names for the current language (loaded for the random-name button).
   const [poolNames, setPoolNames] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement | null>(null);

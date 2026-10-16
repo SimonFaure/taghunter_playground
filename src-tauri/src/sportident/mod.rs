@@ -31,7 +31,7 @@ pub mod transport;
 
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 
@@ -169,6 +169,7 @@ fn resync_reason_name(r: &ResyncReason) -> &'static str {
         ResyncReason::UnexpectedByteBeforeStx => "unexpected-byte-before-stx",
         ResyncReason::BadCrc => "bad-crc",
         ResyncReason::BadEtx => "bad-etx",
+        ResyncReason::Stale => "stale",
     }
 }
 
@@ -208,6 +209,43 @@ fn emit_reader_event(app: &AppHandle, event: ReaderEvent) {
         ReaderEvent::Error(message) => {
             let _ = app.emit(EVT_ERROR, ErrorPayload { message });
         }
+    }
+}
+
+// ─── Game simulator injection ────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SimPunchPayload {
+    pub code: u16,
+    pub time: String,
+}
+
+/// Same JSON shape as `CardPayload`, but owned + deserializable so the
+/// simulator can hand us a fully-built card.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SimCardPayload {
+    pub card_id: u32,
+    pub card_type: String,
+    pub start: Option<SimPunchPayload>,
+    pub finish: Option<SimPunchPayload>,
+    pub check: Option<SimPunchPayload>,
+    pub punches: Vec<SimPunchPayload>,
+}
+
+/// Game simulator: emit `si://card-read` exactly as a physical reader would,
+/// so the whole frontend path (debounce, live game page, record_punch, LAN)
+/// runs for real. Tester builds only - licensee builds refuse.
+#[tauri::command]
+pub async fn si_simulate_card(app: AppHandle, card: SimCardPayload) -> Result<(), String> {
+    #[cfg(feature = "devtools")]
+    {
+        app.emit(EVT_CARD_READ, card).map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "devtools"))]
+    {
+        let _ = (app, card);
+        Err("simulator unavailable in this build".into())
     }
 }
 

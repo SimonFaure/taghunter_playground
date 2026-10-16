@@ -1,0 +1,5 @@
+{
+  "muted": "Sound muted (Ctrl+M to restore)",
+  "unmuted": "Sound restored",
+  "mutedIndicator": "Sound muted - click or press Ctrl+M to restore"
+}

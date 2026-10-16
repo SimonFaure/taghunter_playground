@@ -7,6 +7,7 @@ import { CardDetectionAlert } from './CardDetectionAlert';
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import { useGameSounds } from '../hooks/useGameSounds';
 import { applyTeamName, localizedStatus } from '../services/gameMessages';
 import { tIngame } from '../i18n/ingame';
 import type { GameMessageType } from '../services/gameMessages';
@@ -27,11 +28,14 @@ import { registerScenarioFonts } from '../fonts/registerScenarioFonts';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { SelfRegisterOverlay } from './SelfRegisterOverlay';
-import { resolveFirstBipVideos, type VideoSource } from '../services/firstBipVideos';
+import { resolveFirstBipVideos } from '../services/firstBipVideos';
+import { usePendingStarts } from '../hooks/usePendingStarts';
+import { useSimBus } from '../services/simBus';
 import { MysteryGameRenderer, type MysteryScreen, type EnigmaStatusKind } from './MysteryGameRenderer';
 import { MYSTERY_STATUS_COLORS } from './mysteryIngameLayout';
 import { resolveMysteryBonuses } from '../services/mysteryBonuses';
 import { wrongAnswerPoints } from '../services/mysteryScoring';
+import { gameClock } from '../services/gameClock';
 import '../mystery.css';
 
 interface MysteryGamePageProps {
@@ -221,6 +225,8 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // previous one has fully finished - never overlapping. The labels of the
   // not-yet-started items feed the bottom waiting-teams line.
   const queue = usePresentationQueue();
+  // Stops the sounds when the page is left mid-reveal (quit / rankings).
+  const playAudio = useGameSounds();
   // Monotonic id of the reveal currently playing. A previous run's pending
   // auto-reset timer checks this before resetting, so it no-ops once a newer
   // reveal has started - otherwise that stale timer wipes the new animation's
@@ -241,18 +247,13 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   // created BEFORE the async audio load finishes - a state value would be
   // captured empty there and the reveal would play no sound.
   const audioElementsRef = useRef<Record<string, HTMLAudioElement>>({});
-  // First-bip video overlay state. Captures the team to finalize once the
-  // overlay completes so the start_time set + start message fire only after
-  // all videos have played.
-  const [firstBipVideos, setFirstBipVideos] = useState<VideoSource[] | null>(null);
-  const pendingFirstBipFinalizeRef = useRef<(() => Promise<void>) | null>(null);
-  // Self-register overlay state. Shown on a team's first bip when enabled, BEFORE
-  // any videos. `finalize(name)` persists the name + proceeds to videos/start;
-  // `abort()` cancels the start (and deletes the team if this bip created it).
-  const [selfReg, setSelfReg] = useState<{
-    finalize: (name: string, language: string) => Promise<void>;
-    abort: () => Promise<void>;
-  } | null>(null);
+  // Pending starts, one queue per overlay, keyed by team. Self-register prompt
+  // first (when enabled): `finalize(name)` persists the name + proceeds to the
+  // videos/start; `abort()` cancels the start (and deletes the team if that bip
+  // created it). Then the first-bip videos: start_time + the start message
+  // fire only after all of that team's videos have played.
+  const pendingStarts = usePendingStarts();
+  const { selfReg, videoStart } = pendingStarts;
   // Banner shown when the SportIdent reader isn't plugged in - the game
   // page autobinds via 'reader:status' once detection flips.
   const detectedReader = useDetectedReaderPort();
@@ -334,11 +335,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   };
 
   const playSound = (soundName: string) => {
-    const audio = audioElementsRef.current[soundName];
-    if (audio) {
-      audio.currentTime = 0;
-      audio.play().catch(err => console.error('Error playing sound:', err));
-    }
+    playAudio(audioElementsRef.current[soundName]).catch(err => console.error('Error playing sound:', err));
   };
 
   // Resolve one of the scenario's authored "UI text strings" (game_meta.text_*)
@@ -510,6 +507,18 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       await updateLaunchedGameMeta(launchedGameId!, { ...meta, late_malus: JSON.stringify(map) });
     } catch (err) {
       console.error('Error persisting late malus:', err);
+    }
+  };
+
+  // Team Details' "count the punches already on the card" switch, stored in
+  // launched-game meta as `stale_punches_allowed` = { "<teamId>": true }.
+  const staleCardPunchesAllowed = async (teamId: number): Promise<boolean> => {
+    try {
+      const meta = await getLaunchedGameMeta(launchedGameId!);
+      const map = JSON.parse(meta.stale_punches_allowed || '{}');
+      return map?.[String(teamId)] === true;
+    } catch {
+      return false;
     }
   };
 
@@ -776,11 +785,11 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           }
           const lastEnd = Math.max(...teamsForCard.map((t) => t.end_time ?? 0));
           const cooldownSec = (config.reuseDelayMinutes ?? 5) * 60;
-          if (Date.now() / 1000 < lastEnd + cooldownSec) {
+          if (gameClock.now() / 1000 < lastEnd + cooldownSec) {
             // Reuse is on but this card is still cooling down (3rd+ bip): re-show
             // the finished team's results board WITHOUT replaying the walk, and
             // carry the cooldown notice as a small footnote at the bottom.
-            const remainingMin = Math.max(1, Math.ceil((lastEnd + cooldownSec - Date.now() / 1000) / 60));
+            const remainingMin = Math.max(1, Math.ceil((lastEnd + cooldownSec - gameClock.now() / 1000) / 60));
             const cooldownNote = `Ce doigt sera remis en jeu dans ${remainingMin} minute${remainingMin > 1 ? 's' : ''}`;
             const finishedTeam = teamsForCard.reduce((a, b) =>
               (b.end_time ?? 0) > (a.end_time ?? 0) ? b : a,
@@ -796,6 +805,14 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       const teamName = team.team_name ?? '';
 
       if (!team.start_time) {
+        // This team's start is already on its way (name prompt or videos
+        // queued/showing): a repeat bip must not open a second one - it only
+        // brings the team's own name prompt back on screen.
+        if (!pendingStarts.claim(team.id)) {
+          if (!pendingStarts.raiseSelfReg(team.id)) console.log('Start already pending for team', team.id, '- bip ignored');
+          return;
+        }
+        const startTeamId = team.id;
         // The start sequence, parameterised by the effective team name: persist
         // a self-registered rename, then gate the clock on any first-bip videos.
         // Runs directly when self-register is off, or from the overlay's submit.
@@ -815,7 +832,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
           }
 
           const finalizeStart = async () => {
-            const startTime = Math.floor(Date.now() / 1000);
+            const startTime = Math.floor(gameClock.now() / 1000);
             try {
               await updateTeam(team.id, { start_time: startTime });
               console.log('✓ Team started:', effectiveName);
@@ -862,26 +879,32 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               showMessage(startMessage, cardNotEmpty ? 'warning' : 'success', 'game_start', effectiveName);
             } catch (err) {
               console.error('Error updating team start time:', err);
+            } finally {
+              pendingStarts.release(startTeamId);
             }
           };
 
           // Decide whether to gate the start on the first-bip video overlay.
           // We only resolve videos here (not at mount) so a launch with both
-          // toggles off skips the whole code path.
+          // toggles off skips the whole code path. A resolve failure starts the
+          // team without videos rather than leaving its start stuck.
           const wantsVideos = !!(config.playTutorialOnBip || config.playIntroOnBip);
           if (wantsVideos) {
-            const gameTypeCode = (currentGameData.game?.type || 'mystery').toLowerCase();
-            const rawForResolve = await scenarioStore.getGameData(gameUniqid);
-            const videos = await resolveFirstBipVideos(
-              { ...config, language: effLang },
-              gameUniqid,
-              gameTypeCode,
-              rawForResolve
-            );
-            if (videos.length > 0) {
-              pendingFirstBipFinalizeRef.current = finalizeStart;
-              setFirstBipVideos(videos);
-              return;
+            try {
+              const gameTypeCode = (currentGameData.game?.type || 'mystery').toLowerCase();
+              const rawForResolve = await scenarioStore.getGameData(gameUniqid);
+              const videos = await resolveFirstBipVideos(
+                { ...config, language: effLang },
+                gameUniqid,
+                gameTypeCode,
+                rawForResolve
+              );
+              if (videos.length > 0) {
+                pendingStarts.enqueueVideoStart({ teamId: startTeamId, videos, finalize: finalizeStart });
+                return;
+              }
+            } catch (err) {
+              console.error('Error resolving first-bip videos:', err);
             }
           }
 
@@ -892,10 +915,13 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         // proceed with the entered name; on abort we cancel the start and delete
         // the team if this bip created it.
         if (config.selfRegisterTeam) {
-          setSelfReg({
+          pendingStarts.enqueueSelfReg({
+            teamId: startTeamId,
+            cardId: card.id,
             finalize: (name: string, language: string) => proceedAfterName(name, language),
             abort: async () => {
-              setSelfReg(null);
+              pendingStarts.dropSelfReg(startTeamId);
+              pendingStarts.release(startTeamId);
               if (createdNow) {
                 try {
                   await deleteTeam(team.id);
@@ -910,8 +936,15 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
 
         await proceedAfterName(teamName);
       } else if (!team.end_time) {
-        const endTime = Math.floor(Date.now() / 1000);
+        const endTime = Math.floor(gameClock.now() / 1000);
         const duration = endTime - team.start_time;
+
+        // The operator may have chosen (Team Details) to count the punches that
+        // were already on the card at the start bip - e.g. a player who played
+        // before bipping in. Drop the baseline so they score like live punches.
+        if (await staleCardPunchesAllowed(team.id)) {
+          preExistingPunchesRef.current.delete(card.id);
+        }
 
         const patternEnigmas = await patternStore.getMysteryEnigmas(config.pattern);
         const { enigmaResults, totalScore: enigmaTotal } = scoreCardEnigmas(card, currentGameData, patternEnigmas);
@@ -976,55 +1009,81 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
             setEnigmaStatusKinds({});
             setRevealEnigmaNumber(null);
 
+            // "No animation": the final board appears at once - no notices, no
+            // tally walk, no end sound. Nothing below awaits on this path, so the
+            // whole board + summary lands in a single render.
+            const noAnimation = !!config.noRevealAnimation;
+
             // Card-empty / late-malus notices (authored UI strings, if any) shown
             // before the walk so the operator sees why the run scored as it did.
-            const cardEmptyTxt = livePunchCount === 0 ? resolveMetaText('text_card_empty', finishLang, teamName) : '';
-            if (cardEmptyTxt) await displayMessage(cardEmptyTxt, 'warning');
-            const lateMalusTxt = lateMalus > 0 ? resolveMetaText('text_late_malus', finishLang, teamName) : '';
-            if (lateMalusTxt) await displayMessage(lateMalusTxt, 'warning');
-
-            // The board elements (team name, timer, blurred enigmas, gauge) are
-            // now on screen - hold a 1s beat before the tally walk begins.
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (!noAnimation) {
+              const cardEmptyTxt = livePunchCount === 0 ? resolveMetaText('text_card_empty', finishLang, teamName) : '';
+              if (cardEmptyTxt) await displayMessage(cardEmptyTxt, 'warning');
+              const lateMalusTxt = lateMalus > 0 ? resolveMetaText('text_late_malus', finishLang, teamName) : '';
+              if (lateMalusTxt) await displayMessage(lateMalusTxt, 'warning');
+            }
 
             let currentScore = 0;
-            for (const enigmaResult of enigmaResults) {
-              const gameEnigma = currentGameData.game_enigmas.find(ge => ge.number === enigmaResult.enigma_id);
-              if (!gameEnigma) continue;
-
-              const backgroundColor = enigmaResultColor(enigmaResult.result);
-              playSound(
-                enigmaResult.result === 'correct'
-                  ? 'enigma_success'
-                  : enigmaResult.result === 'no_answer'
-                    ? 'enigma_no_answer'
-                    : 'enigma_error',
-              );
-
-              setRevealEnigmaNumber(enigmaResult.enigma_id);
-              setEnigmaStatusColors(prev => ({ ...prev, [enigmaResult.enigma_id]: backgroundColor }));
-              setEnigmaStatusKinds(prev => ({ ...prev, [enigmaResult.enigma_id]: enigmaResult.result }));
-              setCompletedEnigmas(prev => {
-                const next = new Set(prev);
-                next.add(parseInt(enigmaResult.enigma_id, 10));
-                return next;
-              });
-
-              currentScore += enigmaResult.points;
+            if (noAnimation) {
+              // Paint every enigma's result and the full tally in one go (same
+              // totals as the walk below).
+              const colors: Record<string, string> = {};
+              const kinds: Record<string, EnigmaStatusKind> = {};
+              const completed = new Set<number>();
+              for (const enigmaResult of enigmaResults) {
+                if (!currentGameData.game_enigmas.some(ge => ge.number === enigmaResult.enigma_id)) continue;
+                colors[enigmaResult.enigma_id] = enigmaResultColor(enigmaResult.result);
+                kinds[enigmaResult.enigma_id] = enigmaResult.result;
+                completed.add(parseInt(enigmaResult.enigma_id, 10));
+                currentScore += enigmaResult.points;
+              }
+              setEnigmaStatusColors(colors);
+              setEnigmaStatusKinds(kinds);
+              setCompletedEnigmas(completed);
               setScore(currentScore);
+            } else {
+              // The board elements (team name, timer, blurred enigmas, gauge) are
+              // now on screen - hold a 1s beat before the tally walk begins.
+              await new Promise(resolve => setTimeout(resolve, 1000));
 
-              // How long each enigma image is held during the reveal walk. The
-              // launch "Enigma Image Display Duration" wins when set; otherwise
-              // fall back to the scenario's authored animation_enigma_duration,
-              // then 1s.
-              const scenarioStepSec = parseInt(
-                (currentGameData.game_meta as unknown as { animation_enigma_duration?: string }).animation_enigma_duration || '1',
-                10,
-              ) || 1;
-              const stepSec = config.enigmaImageDisplayDuration && config.enigmaImageDisplayDuration > 0
-                ? config.enigmaImageDisplayDuration
-                : scenarioStepSec;
-              await new Promise(resolve => setTimeout(resolve, stepSec * 1000));
+              for (const enigmaResult of enigmaResults) {
+                const gameEnigma = currentGameData.game_enigmas.find(ge => ge.number === enigmaResult.enigma_id);
+                if (!gameEnigma) continue;
+
+                const backgroundColor = enigmaResultColor(enigmaResult.result);
+                playSound(
+                  enigmaResult.result === 'correct'
+                    ? 'enigma_success'
+                    : enigmaResult.result === 'no_answer'
+                      ? 'enigma_no_answer'
+                      : 'enigma_error',
+                );
+
+                setRevealEnigmaNumber(enigmaResult.enigma_id);
+                setEnigmaStatusColors(prev => ({ ...prev, [enigmaResult.enigma_id]: backgroundColor }));
+                setEnigmaStatusKinds(prev => ({ ...prev, [enigmaResult.enigma_id]: enigmaResult.result }));
+                setCompletedEnigmas(prev => {
+                  const next = new Set(prev);
+                  next.add(parseInt(enigmaResult.enigma_id, 10));
+                  return next;
+                });
+
+                currentScore += enigmaResult.points;
+                setScore(currentScore);
+
+                // How long each enigma image is held during the reveal walk. The
+                // launch "Enigma Image Display Duration" wins when set; otherwise
+                // fall back to the scenario's authored animation_enigma_duration,
+                // then 1s.
+                const scenarioStepSec = parseInt(
+                  (currentGameData.game_meta as unknown as { animation_enigma_duration?: string }).animation_enigma_duration || '1',
+                  10,
+                ) || 1;
+                const stepSec = config.enigmaImageDisplayDuration && config.enigmaImageDisplayDuration > 0
+                  ? config.enigmaImageDisplayDuration
+                  : scenarioStepSec;
+                await new Promise(resolve => setTimeout(resolve, stepSec * 1000));
+              }
             }
 
             // Apply the late malus to the running tally so the final figure
@@ -1033,7 +1092,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
               currentScore -= lateMalus;
               setScore(currentScore);
             }
-            playSound('game_end');
+            if (!noAnimation) playSound('game_end');
 
             // Replace the centre enigma image with the end-of-run summary:
             // final score, level reached + description, team name, reset button.
@@ -1095,6 +1154,11 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     };
   }, []);
 
+  // Game simulator: the operator clicks the summary's reset button (manual reset).
+  useSimBus((a) => {
+    if (a.kind === 'pressReset' && summaryShowingRef.current) resetToReadyRef.current();
+  });
+
   useEffect(() => {
     let cancelled = false;
 
@@ -1106,6 +1170,35 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       // Don't bind the reader until we know which game we're in - the effect
       // re-runs when launchedGameId lands (join path) and binds then.
       if (!launchedGameId) return;
+      // Bound before reader detection so the game simulator's injected reads
+      // (no physical reader) reach the page too; harmless without events.
+      siReader.setCardDetectedCallback((card: CardData) => {
+        console.log('🏷️  CARD DETECTED');
+        console.log('  Card ID:', card.id);
+        console.log('  Series:', card.series);
+        console.log('  Number of punches:', card.nbPunch);
+        if (card.start) {
+          console.log('  Start:', { code: card.start.code, time: card.start.time });
+        }
+        if (card.check) {
+          console.log('  Check:', { code: card.check.code, time: card.check.time });
+        }
+        if (card.end) {
+          console.log('  End:', { code: card.end.code, time: card.end.time });
+        }
+        console.log('  Punches:', card.punches);
+        console.log('  Full card data:', JSON.stringify(card, null, 2));
+
+        void saveCardDataRef.current(card);
+
+        setLastCardData(card);
+        setShowCardAlert(true);
+
+        setTimeout(() => {
+          setShowCardAlert(false);
+        }, 5000);
+      });
+
       const detected = await detectReaderPort();
       if (cancelled || !detected) {
         if (!detected) console.log('⚠️  No SportIdent reader detected - waiting for hotplug');
@@ -1116,33 +1209,6 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         const initialized = await siReader.initializePort(detected.path);
         if (initialized) {
             console.log('✓ USB reader initialized successfully');
-            siReader.setCardDetectedCallback((card: CardData) => {
-              console.log('🏷️  CARD DETECTED');
-              console.log('  Card ID:', card.id);
-              console.log('  Series:', card.series);
-              console.log('  Number of punches:', card.nbPunch);
-              if (card.start) {
-                console.log('  Start:', { code: card.start.code, time: card.start.time });
-              }
-              if (card.check) {
-                console.log('  Check:', { code: card.check.code, time: card.check.time });
-              }
-              if (card.end) {
-                console.log('  End:', { code: card.end.code, time: card.end.time });
-              }
-              console.log('  Punches:', card.punches);
-              console.log('  Full card data:', JSON.stringify(card, null, 2));
-
-              void saveCardDataRef.current(card);
-
-              setLastCardData(card);
-              setShowCardAlert(true);
-
-              setTimeout(() => {
-                setShowCardAlert(false);
-              }, 5000);
-            });
-
             siReader.setCardRemovedCallback(() => {
               console.log('🏷️  CARD REMOVED');
               setShowCardAlert(false);
@@ -1186,6 +1252,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
       cancelled = true;
       window.removeEventListener('reader:status', onReaderStatus);
       console.log('🚪 Leaving game page - cleaning up USB listener...');
+      siReader.setCardDetectedCallback(undefined);
       if (siReader.isAvailable()) {
         siReader.stop().catch(err => {
           console.error('Error stopping USB reader:', err);
@@ -1315,30 +1382,27 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
     >
       {selfReg && (
         <SelfRegisterOverlay
+          key={selfReg.teamId}
+          cardId={selfReg.cardId}
           language={config.language || 'fr'}
           scenarioLanguages={config.scenarioLanguages ?? []}
           scenarioAudience={config.namePoolAudience ?? 'kids'}
           allowLanguageChoice={!!config.allowPlayerLanguageChoice}
           addRandomName={!!config.addRandomNameOption}
           onSubmit={(name, language) => {
-            const s = selfReg;
-            setSelfReg(null);
-            void s.finalize(name, language);
+            pendingStarts.dropSelfReg(selfReg.teamId);
+            void selfReg.finalize(name, language);
           }}
           onAbort={() => {
             void selfReg.abort();
           }}
         />
       )}
-      {firstBipVideos && (
+      {videoStart && (
         <FirstBipVideoOverlay
-          videos={firstBipVideos}
-          onComplete={async () => {
-            const finalize = pendingFirstBipFinalizeRef.current;
-            pendingFirstBipFinalizeRef.current = null;
-            setFirstBipVideos(null);
-            if (finalize) await finalize();
-          }}
+          key={videoStart.teamId}
+          videos={videoStart.videos}
+          onComplete={pendingStarts.completeVideoStart}
         />
       )}
       {/* Dev-only punch/hardware debug indicator - removed from production builds. */}
@@ -1397,6 +1461,7 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
         idleTextHidden={!!gameMessage}
         idleSubtitle={config.idleSubtitle}
         bonuses={bonusTiers}
+        noAnimation={!!config.noRevealAnimation}
       />
 
       <GameMessageOverlay

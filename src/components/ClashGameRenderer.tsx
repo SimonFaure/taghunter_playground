@@ -16,6 +16,7 @@ import {
   type ClashEventTexts,
   type ClashT,
 } from './clashEventFeed';
+import { gameClock } from '../services/gameClock';
 
 export type { ClashEventTexts };
 
@@ -241,7 +242,7 @@ export function ClashGameRenderer({
   nowMs,
   lang,
 }: ClashGameRendererProps) {
-  const now = nowMs ?? Date.now();
+  const now = nowMs ?? gameClock.now();
   const tc = useCallback<ClashT>(
     (key, vars) => tIngame('ingame_clash', key, lang, vars),
     [lang],

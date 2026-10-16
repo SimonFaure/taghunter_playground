@@ -14,5 +14,7 @@
   "no": "No",
   "dismiss": "Dismiss",
   "pinResetBanner": "The device PIN was reset with a recovery code. Set a new PIN so the security gates work again.",
-  "setNewPin": "Set a new PIN"
+  "setNewPin": "Set a new PIN",
+  "showPin": "Show code",
+  "hidePin": "Hide code"
 }

@@ -31,6 +31,23 @@ export async function getSyncedLayout(gameType: string): Promise<ReportLayout | 
 
 /** Replace the whole synced set (one row per game type). The version is
  * recorded separately in report_layouts_state by the sync caller. */
+// Every synced layout by game type (to push to the LAN mother).
+export async function listAll(): Promise<Record<string, unknown>> {
+  const db = await getDb();
+  const rows = await db.select<Array<{ game_type: string; layout_json: string }>>(
+    'SELECT game_type, layout_json FROM report_layouts'
+  );
+  const out: Record<string, unknown> = {};
+  for (const r of rows) {
+    try {
+      out[r.game_type] = JSON.parse(r.layout_json);
+    } catch {
+      /* skip a corrupt row */
+    }
+  }
+  return out;
+}
+
 export async function replaceLayouts(
   layouts: Record<string, unknown>,
   _version: number,

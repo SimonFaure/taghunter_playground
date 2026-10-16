@@ -9,6 +9,7 @@
   "exitAdmin": "Quitter admin",
   "logoScreen": "Écran logo",
   "lock": "Verrouiller",
+  "devices": "Appareils",
   "motherThisDevice": "Cet appareil est le poste mère",
   "motherConnected": "Cet appareil est connecté au poste mère",
   "motherConnectedTo": "Cet appareil est connecté au poste mère : {{label}}",
@@ -17,5 +18,6 @@
   "readerKo": "Lecteur SI non détecté",
   "readerChecking": "Vérification du lecteur…",
   "testChannelBadge": "TEST",
-  "testChannelHint": "Cet appareil est un testeur : il télécharge les mises à jour depuis le canal de test."
+  "testChannelHint": "Cet appareil est un testeur : il télécharge les mises à jour depuis le canal de test.",
+  "motherSubstituteThisDevice": "Ce poste héberge les parties en remplacement du poste mère"
 }

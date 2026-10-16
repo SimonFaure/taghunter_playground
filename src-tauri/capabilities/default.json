@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities granted to the playground main window and the secondary projector window.",
-  "windows": ["main", "projector"],
+  "windows": ["main", "projector", "simulator"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

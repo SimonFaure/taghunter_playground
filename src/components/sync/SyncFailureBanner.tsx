@@ -27,7 +27,7 @@ export function SyncFailureBanner({ onAuthInvalid, onViewDetails }: SyncFailureB
     let disposed = false;
 
     // Being offline is not a sync failure - it's the normal state of a
-    // playground running on a field hotspot with no internet, and the footer
+    // playground running on a field router with no internet, and the footer
     // already shows it. Only raise the banner when studio is genuinely
     // reachable: navigator.onLine lies on captive portals / LAN-only networks,
     // so confirm with the same active probe the footer indicator uses.

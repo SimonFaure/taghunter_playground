@@ -1,17 +1,17 @@
-// LAN pairing service: typed wrappers around the Rust LAN/hotspot commands plus
+// LAN pairing service: typed wrappers around the Rust LAN commands plus
 // the satellite-side pair handshake (request → poll → persist). This is the
 // production path that the operator "devices" UI drives; the same handshake is
 // exercised by `lanSmokeTest.ts` from DevTools.
 //
-// All command names/structs mirror `src-tauri/src/lan_server.rs` and
-// `src-tauri/src/hotspot.rs` (serde keeps snake_case; invoke args are camelCase
-// and Tauri maps them to snake_case Rust params).
+// All command names/structs mirror `src-tauri/src/lan_server.rs` (serde keeps
+// snake_case; invoke args are camelCase and Tauri maps them to snake_case Rust
+// params).
 
 import { invoke } from '@tauri-apps/api/core';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './device';
 import { getAuthUser } from './authStore';
-import { saveHotspotCreds } from './lanCredentials';
 import { parseDbTs, formatDbDateTime } from '../utils/dbTime';
+import { LAN_PROTO } from './lanProto';
 
 // The Rust side seeds a device's self row with this placeholder before the
 // operator's device name is known (ensure_self_pair replaces it with the real
@@ -26,26 +26,19 @@ export function displayDeviceLabel(label: string | null | undefined): string | n
 
 // ─── types (mirror Rust structs) ─────────────────────────────────────────────
 
-export interface HotspotInfo {
-  ssid: string;
-  password: string;
-  ipv4_addresses: string[];
-  platform: string;
-}
-
-export interface HotspotStatus {
-  running: boolean;
-  ssid: string | null;
-  ipv4_addresses: string[];
-  platform: string;
-}
-
 export interface LocalRole {
-  is_mother_hosting: boolean;
   mother_server_running: boolean;
   paired_devices_count: number;
   paired_mothers_count: number;
+  /** Why the running server hosts: 'm' (this device is set as the mother) or
+   *  's' (a substitute). null when no server runs. */
+  hosting_role: HostRoleCode | null;
+  /** The mother a substitute stands in for (device name), when known. */
+  substitute_for_label: string | null;
 }
+
+/** `role` as advertised by a serving device - see Rust `HostRole`. */
+export type HostRoleCode = 'm' | 's';
 
 export interface PairedDeviceRow {
   id: number;
@@ -76,6 +69,20 @@ export interface DiscoveredMother {
   // serving this client and prefer the highest epoch after a promotion.
   client_id: number | null;
   epoch: number | null;
+  /** LAN protocol from the `lp` TXT key (1 = a hotspot-era build). */
+  lan_proto: number;
+  /** 'm' = the device set as the mother, 's' = a substitute. null for a build
+   *  that predates roles. */
+  role: HostRoleCode | null;
+  /** When that mother was designated (ms since epoch); 0 or null if unknown. */
+  since: number | null;
+}
+
+export { LAN_PROTO };
+
+/** A discovered mother this build can pair with (same LAN protocol). */
+export function speaksOurLanProto(m: Pick<DiscoveredMother, 'lan_proto'>): boolean {
+  return (m.lan_proto ?? 1) === LAN_PROTO;
 }
 
 export interface MotherServerInfo {
@@ -88,38 +95,14 @@ export interface MotherServerInfo {
 
 // ─── mother-side commands ────────────────────────────────────────────────────
 
-export async function startHotspot(ssid: string, password: string): Promise<HotspotInfo> {
-  const info = await invoke<HotspotInfo>('mother_start_hotspot', { ssid, password });
-  // Keep schema_meta (hotspot_ssid/password) in lockstep with the AP now on the
-  // air. `read_mother_wifi` relays THOSE schema_meta creds to satellites over the
-  // ping (which Wi-Fi to join), so they must always match the broadcast SSID -
-  // otherwise a child learns a network that isn't being broadcast. Best-effort.
-  await saveHotspotCreds(ssid, password).catch(() => {});
-  return info;
-}
-
-// The hotspot watchdog (lanMotherBoot.motherHotspotWatchdogTick) must not fight
-// a deliberate stop - record when this app last stopped the AP so the watchdog
-// holds off for a cooldown window instead of instantly re-raising it.
-let lastHotspotStopAt = 0;
-export function getLastHotspotStopAt(): number {
-  return lastHotspotStopAt;
-}
-
-export const stopHotspot = () => {
-  lastHotspotStopAt = Date.now();
-  return invoke<void>('mother_stop_hotspot');
-};
-
-export const hotspotStatus = () => invoke<HotspotStatus>('mother_hotspot_status');
-
 export const getMotherServerInfo = () =>
   invoke<MotherServerInfo | null>('mother_get_server_info');
 
-/** Re-announce this mother over mDNS, advertising `addresses` explicitly (e.g.
- *  the hotspot's IPv4) so satellites resolve a reachable AP-subnet address. */
-export const refreshMdns = (addresses: string[]) =>
-  invoke<void>('mother_refresh_mdns', { addresses });
+/** Re-announce this mother over mDNS with the PC's current LAN addresses. */
+export const refreshMdns = () => invoke<void>('mother_refresh_mdns');
+
+/** This PC's non-loopback IPv4s (shown on the mother so satellites can pair by IP). */
+export const getLocalIpv4s = () => invoke<string[]>('get_local_ipv4s');
 
 // listPendingPairRequests / approvePairRequest / denyPairRequest were retired
 // with the manual-approval ceremony: same-client joins auto-approve, everything
@@ -153,6 +136,12 @@ export interface MotherProbe {
   /** Coarse cause from the real OS error: 'refused' | 'timeout' | 'unreachable' |
    *  'http' | 'other'. null on success. Drives the child's headline. */
   category: string | null;
+  /** From the hello reply, on success: the mother's device name, its role,
+   *  when it was designated, and how many games are running on it right now. */
+  label: string | null;
+  role: HostRoleCode | null;
+  since: number | null;
+  running_games: number | null;
 }
 
 /**
@@ -192,9 +181,8 @@ export const refreshMotherEndpoints = () =>
 
 // ─── pair handshake (satellite side) ─────────────────────────────────────────
 // The handshake runs in RUST (`client_pair_with_mother`) over reqwest, so it is
-// NOT subject to the webview's `http:` capability scope - the LAN AP hands out
-// arbitrary IPs (192.168.137.1, 169.254.x APIPA, …) that the scope matcher
-// can't reliably allowlist. Rust tries each advertised address until one
+// NOT subject to the webview's `http:` capability scope - a router hands out
+// arbitrary LAN IPs that the scope matcher can't reliably allowlist. Rust tries each advertised address until one
 // connects, polls for the operator's decision, and persists the secret +
 // warms the endpoint cache on approval.
 
@@ -203,7 +191,10 @@ export type JoinOutcome =
   | { kind: 'denied' }
   | { kind: 'already_paired' }
   | { kind: 'timeout' }
-  | { kind: 'unreachable'; message: string };
+  | { kind: 'unreachable'; message: string }
+  /** The mother runs another LAN protocol: `theirs` < LAN_PROTO means the
+   *  MOTHER must be updated, otherwise THIS device must. */
+  | { kind: 'proto_mismatch'; theirs: number; their_app_version: string | null };
 
 export interface JoinHandle {
   /** Resolves once the mother approves/denies, times out, or is unreachable. */
@@ -255,6 +246,29 @@ export function joinMother(
     result: Promise.race([run, cancelled]),
     cancel: () => onCancel?.({ kind: 'timeout' }),
   };
+}
+
+/**
+ * Pair with a mother by its typed IP ("a.b.c.d" or "a.b.c.d:port") - the
+ * fallback when the network filters mDNS multicast. The address is remembered
+ * so later reconnects work without discovery.
+ */
+export async function pairByAddress(address: string): Promise<JoinOutcome> {
+  const [meta, displayName, me] = await Promise.all([
+    getDeviceMetadata(),
+    getCachedDeviceDisplayName().catch(() => null),
+    getAuthUser().catch(() => null),
+  ]);
+  return invoke<JoinOutcome>('client_pair_by_address', {
+    address,
+    peerLabel: displayName || meta.device_label,
+    peerOs: meta.os,
+    peerAppVersion: meta.app_version,
+    clientId: me?.client_id ?? null,
+  }).catch((e): JoinOutcome => ({
+    kind: 'unreachable',
+    message: (e as Error).message || String(e),
+  }));
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

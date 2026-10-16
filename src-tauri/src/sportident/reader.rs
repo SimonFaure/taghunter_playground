@@ -10,7 +10,8 @@
 //   5. Re-issues the wakeup every `REWAKEUP_INTERVAL_MS` of idle time -
 //      this is the fix for root cause #2 in the plan (legacy reader
 //      sent wakeup exactly once, so cards silently stopped triggering
-//      after ~10 s of master idle-sleep).
+//      after ~10 s of master idle-sleep). Until the station first
+//      answers, the full handshake is retried every `HANDSHAKE_RETRY_MS`.
 //
 // Notable design choices vs. legacy:
 //   - Writes happen BEFORE the corresponding `StateChanged` event fires.
@@ -29,8 +30,8 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 use super::cards::{Card, CardType};
 use super::commands;
 use super::config::{
-    CMD_CARD_INSERTED, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA, CMD_SET_MS_MODE,
-    REWAKEUP_INTERVAL_MS,
+    CMD_CARD_INSERTED, CMD_CARD_REMOVED, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA, CMD_SET_MS_MODE,
+    HANDSHAKE_RETRY_MS, READ_BLOCK_TIMEOUT_MS, REWAKEUP_INTERVAL_MS, STALE_PARTIAL_FRAME_MS,
 };
 use super::events::{ReaderEvent, ReaderState, StationInfo};
 use super::framing::{DecodeEvent, Decoder, Frame};
@@ -112,6 +113,9 @@ struct CardSession {
     accumulated: Vec<u8>,
     /// Index into `blocks_to_read` of the *next* block to request.
     next_block_idx: usize,
+    /// When the outstanding `0xEF` request was sent. The tick aborts the
+    /// session once it is older than `READ_BLOCK_TIMEOUT_MS`.
+    block_requested_at: Instant,
 }
 
 async fn reader_task(
@@ -128,15 +132,19 @@ async fn reader_task(
     // Boot: send wakeup + system-data probe, then announce Awakening.
     // Writes happen BEFORE the StateChanged event so tests can observe
     // the transition and immediately verify `mock.captured_tx()`.
-    let _ = transport.write(&commands::build_wakeup()).await;
-    let _ = transport.write(&commands::build_get_system_data()).await;
+    send_handshake(&transport).await;
+    let mut last_handshake_tx_at = Instant::now();
     set_state(&mut state, ReaderState::Awakening, &event_tx);
 
-    // Re-wakeup driver. Ticks once a second; only sends a fresh wakeup
-    // when both (a) the state warrants it (Awakening or Listening) and
-    // (b) we've been silent for ≥ REWAKEUP_INTERVAL_MS. The 1 s
-    // granularity gives bounded latency without flooding the bus.
-    let mut tick = interval(Duration::from_millis(1_000));
+    // Housekeeping tick (250 ms):
+    //   - Awakening: resend the handshake every HANDSHAKE_RETRY_MS until
+    //     the station answers. A sleeping master can swallow the boot
+    //     handshake; before this the only retry was the 7 s idle wakeup,
+    //     which every ignored 0xE8 pushed back.
+    //   - Listening: keep-alive wakeup after REWAKEUP_INTERVAL_MS of silence.
+    //   - Reading: abort a card read whose 0xEF reply never came.
+    //   - Any state: drop a partial frame stuck behind a false STX.
+    let mut tick = interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut decode_scratch: Vec<DecodeEvent> = Vec::with_capacity(8);
@@ -183,18 +191,66 @@ async fn reader_task(
             }
 
             _ = tick.tick() => {
-                let should_rewake = matches!(state, ReaderState::Awakening | ReaderState::Listening)
-                    && last_rx_at.elapsed() >= Duration::from_millis(REWAKEUP_INTERVAL_MS);
-                if should_rewake {
-                    let _ = transport.write(&commands::build_wakeup()).await;
-                    // Don't reset last_rx_at - we want to retry on the
-                    // next tick if still silent, and ANY inbound byte
-                    // will reset it anyway.
-                    last_rx_at = Instant::now();
+                if decoder.has_pending()
+                    && last_rx_at.elapsed() >= Duration::from_millis(STALE_PARTIAL_FRAME_MS)
+                {
+                    decode_scratch.clear();
+                    decoder.drop_stale(&mut decode_scratch);
+                    let events_to_process: Vec<DecodeEvent> =
+                        decode_scratch.drain(..).collect();
+                    for ev in events_to_process {
+                        handle_decode_event(ev, &mut state, &mut session, &transport, &event_tx)
+                            .await;
+                    }
+                }
+
+                match state {
+                    ReaderState::Awakening => {
+                        if last_handshake_tx_at.elapsed() >= Duration::from_millis(HANDSHAKE_RETRY_MS) {
+                            send_handshake(&transport).await;
+                            last_handshake_tx_at = Instant::now();
+                        }
+                    }
+                    ReaderState::Listening => {
+                        if last_rx_at.elapsed() >= Duration::from_millis(REWAKEUP_INTERVAL_MS) {
+                            let _ = transport.write(&commands::build_wakeup()).await;
+                            // Re-arm the silence window; ANY inbound byte
+                            // resets it too.
+                            last_rx_at = Instant::now();
+                        }
+                    }
+                    ReaderState::Reading => {
+                        let timed_out = session.as_ref().map_or(true, |s| {
+                            s.block_requested_at.elapsed()
+                                >= Duration::from_millis(READ_BLOCK_TIMEOUT_MS)
+                        });
+                        if timed_out {
+                            abort_read("no block reply", &mut state, &mut session, &event_tx);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
+}
+
+async fn send_handshake(transport: &Arc<dyn SerialTransport>) {
+    let _ = transport.write(&commands::build_wakeup()).await;
+    let _ = transport.write(&commands::build_get_system_data()).await;
+}
+
+/// Drop the in-flight card read and go back to Listening so the next
+/// insertion is read normally. Surfaced as an error event for field logs.
+fn abort_read(
+    reason: &str,
+    state: &mut ReaderState,
+    session: &mut Option<CardSession>,
+    event_tx: &mpsc::UnboundedSender<ReaderEvent>,
+) {
+    *session = None;
+    let _ = event_tx.send(ReaderEvent::Error(format!("card read aborted: {}", reason)));
+    set_state(state, ReaderState::Listening, event_tx);
 }
 
 async fn handle_decode_event(
@@ -266,8 +322,15 @@ async fn handle_frame(
             // Ignore notifications while we're already reading another
             // card - the legacy code's fake "removed" loop ate the next
             // card's bytes precisely because it didn't gate this way.
-            if !matches!(*state, ReaderState::Listening) {
-                return;
+            //
+            // Awakening is accepted: a 0xE8 proves the master is awake and
+            // talking extended protocol, even if it swallowed our handshake
+            // while waking up. Dropping it here was the "first bips after
+            // launch never beep" field bug (2026-10-15).
+            match *state {
+                ReaderState::Listening => {}
+                ReaderState::Awakening => set_state(state, ReaderState::Listening, event_tx),
+                _ => return,
             }
             if frame.payload.len() < 6 {
                 let _ = event_tx.send(ReaderEvent::Error(format!(
@@ -297,8 +360,18 @@ async fn handle_frame(
                 blocks_to_read: blocks,
                 accumulated: Vec::with_capacity(blocks.len() * 128),
                 next_block_idx: 1,
+                block_requested_at: Instant::now(),
             });
             set_state(state, ReaderState::Reading, event_tx);
+        }
+
+        CMD_CARD_REMOVED => {
+            // Card pulled out before the readout finished. The pending
+            // 0xEF will never be answered - give up now rather than wait
+            // for the block timeout.
+            if matches!(*state, ReaderState::Reading) {
+                abort_read("card removed", state, session, event_tx);
+            }
         }
 
         CMD_GET_SI9_DATA => {
@@ -327,6 +400,7 @@ async fn handle_frame(
                 let _ = transport
                     .write(&commands::build_get_card_block(next))
                     .await;
+                s.block_requested_at = Instant::now();
             } else {
                 // All blocks in. Parse, ACK, emit.
                 let card_type = s.card_type;
@@ -399,7 +473,10 @@ fn parse_station_info(payload: &[u8]) -> Option<StationInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sportident::config::{ACK, CMD_CARD_INSERTED, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA};
+    use crate::sportident::config::{
+        ACK, CMD_CARD_INSERTED, CMD_CARD_REMOVED, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA,
+        CMD_SET_MS_MODE,
+    };
     use crate::sportident::framing::build_frame;
     use crate::sportident::transport::mock::MockTransport;
 
@@ -706,6 +783,152 @@ mod tests {
         // No state transition into Reading.
         // (We don't directly assert this - but the next event the test
         // pulls would be the next thing we inject. Implicit by progress.)
+    }
+
+    /// `recv_until` with a deadline, for paused-clock tests: the runtime
+    /// auto-advances time while idle, so a missing transition would
+    /// otherwise spin through handshake retries forever instead of failing.
+    async fn recv_within<F>(
+        rx: &mut mpsc::UnboundedReceiver<ReaderEvent>,
+        ms: u64,
+        pred: F,
+    ) -> ReaderEvent
+    where
+        F: FnMut(&ReaderEvent) -> bool,
+    {
+        tokio::time::timeout(Duration::from_millis(ms), recv_until(rx, pred))
+            .await
+            .expect("expected event did not arrive in time")
+    }
+
+    /// Spawn a reader and drive it to Listening via a station response.
+    async fn spawn_listening() -> (
+        Arc<MockTransport>,
+        ReaderHandle,
+        mpsc::UnboundedReceiver<ReaderEvent>,
+    ) {
+        let (mock, rx_bytes) = MockTransport::new();
+        let transport: Arc<dyn SerialTransport> = mock.clone();
+        let (handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let _ = events.recv().await; // boot Awakening
+        mock.inject_rx(&synth_station_response(1));
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
+        })
+        .await;
+        (mock, handle, events)
+    }
+
+    #[tokio::test]
+    async fn e8_while_awakening_reads_card() {
+        // Field bug 2026-10-15: the sleeping master swallowed the boot
+        // handshake, the reader stayed in Awakening and dropped every 0xE8
+        // - no read, no beep, until players stopped inserting for 7 s.
+        let (mock, rx_bytes) = MockTransport::new();
+        let transport: Arc<dyn SerialTransport> = mock.clone();
+        let (_handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let _ = events.recv().await; // boot Awakening, no station reply
+        mock.clear_tx_log();
+
+        mock.inject_rx(&synth_card_inserted(1_500_000));
+
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
+        })
+        .await;
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Reading))
+        })
+        .await;
+        assert!(
+            mock.captured_tx().ends_with(&commands::build_get_card_block(0)),
+            "expected block-0 request, got {:?}",
+            mock.captured_tx()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn awakening_resends_handshake_every_500ms_despite_rx() {
+        let (mock, rx_bytes) = MockTransport::new();
+        let transport: Arc<dyn SerialTransport> = mock.clone();
+        let (_handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let _ = events.recv().await; // boot Awakening
+        mock.clear_tx_log();
+
+        // Inbound noise mid-window must NOT postpone the retry (the old
+        // idle-based wakeup was reset by every byte, incl. ignored 0xE8s).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        mock.inject_rx(&[0xAB]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut expected = commands::build_wakeup();
+        expected.extend_from_slice(&commands::build_get_system_data());
+        assert_eq!(mock.captured_tx(), expected, "handshake not resent after 500 ms");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_false_stx_is_dropped() {
+        let (mock, rx_bytes) = MockTransport::new();
+        let transport: Arc<dyn SerialTransport> = mock.clone();
+        let (_handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let _ = events.recv().await; // boot Awakening
+
+        // Stray STX + LEN 0xEF: the decoder would wait for 245 bytes and
+        // swallow the real wakeup reply behind it.
+        mock.inject_rx(&[0x02, 0xEF, 0xEF]);
+        mock.inject_rx(&build_frame(CMD_SET_MS_MODE, &[0x00, 0x01, 0x4D]));
+
+        let _ = recv_within(&mut events, 1_000, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn card_removed_mid_read_returns_to_listening() {
+        let (mock, _handle, mut events) = spawn_listening().await;
+
+        mock.inject_rx(&synth_card_inserted(1_500_000));
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Reading))
+        })
+        .await;
+
+        mock.inject_rx(&build_frame(CMD_CARD_REMOVED, &[0x00, 0x01, 0x01, 0x16, 0xE3, 0x60]));
+        let err = recv_until(&mut events, |e| matches!(e, ReaderEvent::Error(_))).await;
+        assert!(matches!(err, ReaderEvent::Error(ref m) if m.contains("card removed")));
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
+        })
+        .await;
+
+        // Next insertion is read normally.
+        mock.clear_tx_log();
+        mock.inject_rx(&synth_card_inserted(1_500_000));
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Reading))
+        })
+        .await;
+        assert_eq!(mock.captured_tx(), commands::build_get_card_block(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_timeout_returns_to_listening() {
+        let (mock, _handle, mut events) = spawn_listening().await;
+
+        mock.inject_rx(&synth_card_inserted(1_500_000));
+        let _ = recv_until(&mut events, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Reading))
+        })
+        .await;
+
+        // No 0xEF reply ever comes.
+        let err = recv_within(&mut events, 3_000, |e| matches!(e, ReaderEvent::Error(_))).await;
+        assert!(matches!(err, ReaderEvent::Error(ref m) if m.contains("no block reply")));
+        let _ = recv_within(&mut events, 100, |e| {
+            matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
+        })
+        .await;
     }
 
     #[tokio::test]

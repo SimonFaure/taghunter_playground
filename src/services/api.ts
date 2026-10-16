@@ -2,6 +2,7 @@ import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { loadJwt } from './strongholdStore';
 import { persistAuthState, AuthStateBlock } from './authStore';
 import { tError } from '../i18n/errors';
+import { LAN_PROTO, LAN_PROTO_HEADER } from './lanProto';
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -266,6 +267,9 @@ export async function apiCall<T = unknown>(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
+  // A mother refuses LAN calls from another protocol (HTTP 426), so every call
+  // routed at a mother announces ours.
+  if (lanRoute) headers[LAN_PROTO_HEADER] = String(LAN_PROTO);
 
   if (options.bearer !== false) {
     if (lanRoute) {
@@ -417,7 +421,7 @@ function buildUrl(endpoint: string, action: string, query?: Record<string, strin
   return buildUrlWithBase(API_BASE, endpoint, action, query);
 }
 
-function buildUrlWithBase(
+export function buildUrlWithBase(
   base: string,
   endpoint: string,
   action: string,
@@ -506,6 +510,21 @@ async function runDownload(
       throw new ApiError(401, null, 'Missing JWT');
     }
   }
+  return runDownloadUrl(url, `${endpoint}?action=${action}`, headers, options, onChunk);
+}
+
+// Same driver against an arbitrary URL with caller-built headers: a LAN peer
+// (the mother's /content.php) gets the Range resume, TTFB and stall watchdogs
+// and RangeIgnoredError exactly like the studio. `options.query`/`bearer` are
+// ignored here - they are folded into `url`/`baseHeaders` by the caller.
+export async function runDownloadUrl(
+  url: string,
+  label: string,
+  baseHeaders: Record<string, string>,
+  options: DownloadStreamOptions,
+  onChunk: (chunk: Uint8Array) => void | Promise<void>,
+): Promise<number> {
+  const headers: Record<string, string> = { ...baseHeaders };
   const rangeStart = options.rangeStart && options.rangeStart > 0 ? options.rangeStart : 0;
   if (rangeStart > 0) headers['Range'] = `bytes=${rangeStart}-`;
 
@@ -513,7 +532,6 @@ async function runDownload(
     options.ttfbTimeoutMs === undefined ? DOWNLOAD_TTFB_TIMEOUT_MS : options.ttfbTimeoutMs;
   const stallMs =
     options.stallTimeoutMs === undefined ? DOWNLOAD_STALL_TIMEOUT_MS : options.stallTimeoutMs;
-  const label = `${endpoint}?action=${action}`;
 
   // Own controller so the stall watchdog can cancel the body stream; fused
   // with the caller signal and a CLEARABLE TTFB timeout for the header phase.

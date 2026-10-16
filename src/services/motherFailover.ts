@@ -12,8 +12,8 @@
 // candidate is asked, over the address that actually answers, whether it serves
 // our game with our token. The old rule - "advertises a higher epoch than the
 // snapshot we cached" - was a guess that could be permanently wrong, and the
-// address was picked blind from the mDNS record, which on a hotspot mother
-// meant installing an APIPA address the probe had never validated.
+// address was picked blind from the mDNS record, which on a multi-address
+// mother meant installing an APIPA address the probe had never validated.
 //
 // It also drives a passive "⚠ Mother unreachable" badge, from two independent
 // signals: a re-point attempt after live contact was lost, and childControlLink
@@ -51,6 +51,14 @@ interface DiscoveredMother {
   label: string | null;
   client_id: number | null;
   epoch: number | null;
+  /** 'm' = the device set as the mother, 's' = a substitute, null = older build. */
+  role: string | null;
+}
+
+/** The device set as the mother first, then the highest epoch. */
+function byRoleThenEpoch(a: DiscoveredMother, b: DiscoveredMother): number {
+  const rank = (m: DiscoveredMother) => (m.role === 'm' ? 1 : 0);
+  return rank(b) - rank(a) || (b.epoch ?? 0) - (a.epoch ?? 0);
 }
 
 // ─── "Mother unreachable" badge pub/sub ──────────────────────────────────────
@@ -77,13 +85,6 @@ let lostTimer: ReturnType<typeof setTimeout> | null = null;
 let successStreak = 0;
 const LOST_AFTER_MS = 60_000;
 const SUCCESSES_TO_RECOVER = 2;
-
-// Hook for "we just lost the mother": the Wi-Fi layer rescans immediately
-// instead of waiting for its 20 s tick (retours sept. #19). Registered by App.
-let onLossHook: (() => void) | null = null;
-export function setMotherLossHook(fn: (() => void) | null): void {
-  onLossHook = fn;
-}
 
 // Has this device actually REACHED a remote mother at least once this session?
 // The LAN override is persisted, so on a cold boot the very first launched_games
@@ -151,11 +152,6 @@ function noteMotherLoss(): void {
     lostTimer = null;
     if (reachState === 'reconnecting') emitState('lost');
   }, LOST_AFTER_MS);
-  try {
-    onLossHook?.();
-  } catch {
-    /* the hook is best-effort */
-  }
 }
 
 /** A success signal. `verified` (a proven re-point / promotion) recovers at once. */
@@ -183,8 +179,8 @@ function setMotherUnreachable(v: boolean): void {
 // NOTE (Ludiom #74): there is deliberately no address picker here any more. We
 // used to take the first IPv4 out of the mDNS record and build the base URL from
 // it, while the liveness probe below went through Rust's `order_pair_candidates`
-// - which sorts same-subnet first and APIPA last. On a hotspot mother, which
-// advertises both `169.254.x` and `192.168.137.1`, the two routinely disagreed:
+// - which sorts same-subnet first and APIPA last. On a mother advertising
+// several addresses (e.g. `169.254.x` next to a LAN IP), the two disagreed:
 // the probe succeeded on the routable address, we installed the link-local one,
 // cleared the "unreachable" badge on that false success, and every later call
 // failed. The address we install is now, always, the one the probe reached.
@@ -196,10 +192,10 @@ function setMotherUnreachable(v: boolean): void {
 //    on epoch alone - see the candidate loop.
 //  - `motherUuid` (null if none/unparseable) identifies the mother that WROTE
 //    that snapshot - i.e. the one that just died. It's the reliable way to tell
-//    "this is the dead mother" apart from "this is its replacement", because in
-//    hotspot mode the replacement inherits the very same address (Windows ICS
-//    pins the AP gateway at 192.168.137.1 and bind_mother_listener prefers
-//    47800, so the promoted mother advertises a byte-identical base URL).
+//    "this is the dead mother" apart from "this is its replacement": the
+//    address proves nothing (a router's DHCP can hand the replacement the dead
+//    mother's IP, and bind_mother_listener prefers 47800, so the promoted mother
+//    may advertise a byte-identical base URL).
 async function getCachedMotherIdentity(): Promise<{ epoch: number; motherUuid: string | null }> {
   const parse = (row?: { mother_epoch: number; snapshot_json: string }) => {
     if (!row) return null;
@@ -301,11 +297,10 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
       // verification below; the epoch only orders the candidates.
       //
       // We deliberately do NOT reject a candidate for reusing the dead mother's
-      // base URL: in hotspot mode the promoted device raises the same-SSID AP,
-      // so Windows ICS hands it the very same 192.168.137.1 and it binds the
-      // same preferred port 47800. Comparing base URLs there discarded the ONLY
-      // correct candidate and made failover structurally impossible - uuid +
-      // epoch are the identity, the address is not.
+      // base URL: the promoted device can get the very same IP (DHCP reuse)
+      // and binds the same preferred port 47800. Comparing base URLs there
+      // discarded the ONLY correct candidate and made failover structurally
+      // impossible - uuid + epoch are the identity, the address is not.
       const { epoch: cachedEpoch, motherUuid: deadUuid } = await getCachedMotherIdentity();
       const selfUuid = await getSelfUuid();
       // Which game we're trying to get back into. The active one if a game page
@@ -325,7 +320,14 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
         // satellite cached a snapshot FROM the promoted mother, `deadUuid` named
         // the LIVE mother, so a single slow call made us refuse it and the
         // "lost the mother" banner kept popping up on a working connection.
-        .filter((m) => gameId != null || deadUuid == null || m.mother_uuid !== deadUuid)
+        //
+        // The device SET as the mother passes every guess below: it is the one
+        // everybody follows once it is back. It returns idle, at a low epoch and
+        // without the game a satellite still has on screen (the substitute
+        // pushes it a moment later), so the epoch floor and the "serves our
+        // game" check would both reject the only right answer - and leave the
+        // red banner inviting a second substitute.
+        .filter((m) => m.role === 'm' || gameId != null || deadUuid == null || m.mother_uuid !== deadUuid)
         // Never our own idle server (discovery includes self).
         .filter((m) => selfUuid == null || m.mother_uuid !== selfUuid)
         // Epoch is a PREFERENCE, not a gate, whenever we can verify a candidate
@@ -333,17 +335,18 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
         // is inference about who was promoted - and it locked satellites out
         // permanently whenever the cached epoch was wrong (Ludiom #74). We
         // still fall back to it when there's no game to verify against.
-        .filter((m) => gameId != null || (m.epoch ?? 0) > cachedEpoch)
-        // Highest epoch first - most likely the most recently promoted mother.
-        .sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0));
+        .filter((m) => m.role === 'm' || gameId != null || (m.epoch ?? 0) > cachedEpoch)
+        // The mother first, then the highest epoch - most likely the most
+        // recently promoted substitute.
+        .sort(byRoleThenEpoch);
 
       // Ask each candidate directly: are you reachable, do you honour our
       // token, and do you serve OUR game? `client_verify_mother_candidate`
       // answers all three in one round trip and hands back the address that
       // actually answered - which is the address we install, never one picked
-      // blind from the mDNS record. This also settles the stale-record case: in
-      // hotspot mode a promoted mother legitimately inherits the dead one's
-      // address, so only the live uuid can tell them apart.
+      // blind from the mDNS record. This also settles the stale-record case: a
+      // promoted mother can legitimately inherit the dead one's address, so
+      // only the live uuid can tell them apart.
       let best: { base: string; uuid: string; label: string | null } | null = null;
       for (const c of candidates.slice(0, 3)) {
         const check = await invoke<CandidateCheck>('client_verify_mother_candidate', {
@@ -357,10 +360,12 @@ async function repointToNewMother(opts?: { force?: boolean }): Promise<boolean> 
         // not be the corpse or ourselves.
         if (check.mother_uuid !== c.mother_uuid) continue;
         if (check.mother_uuid === selfUuid) continue;
-        if (gameId == null && check.mother_uuid === deadUuid) continue;
-        // With a game to check against, serving it is the whole point. Without
-        // one, the epoch filter above already did the (weaker) selection.
-        if (gameId != null && !check.serves_game) continue;
+        if (c.role !== 'm') {
+          if (gameId == null && check.mother_uuid === deadUuid) continue;
+          // With a game to check against, serving it is the whole point. Without
+          // one, the epoch filter above already did the (weaker) selection.
+          if (gameId != null && !check.serves_game) continue;
+        }
         best = {
           base: check.base_url,
           uuid: check.mother_uuid ?? c.mother_uuid,
@@ -506,7 +511,10 @@ export interface TakeoverMother {
   epoch: number;
 }
 
-/** A same-client mother whose epoch beats our cached snapshot - i.e. one that took over. */
+/**
+ * A same-client mother whose epoch beats our cached snapshot - i.e. one that
+ * took over - or the device set as the mother, back on the network.
+ */
 export async function findTakeoverMother(timeoutMs = 2000): Promise<TakeoverMother | null> {
   try {
     const [mothers, me, cached, selfUuid] = await Promise.all([
@@ -520,8 +528,8 @@ export async function findTakeoverMother(timeoutMs = 2000): Promise<TakeoverMoth
       .filter((m) => m.addresses.length > 0 && m.port > 0)
       .filter((m) => myClientId == null || m.client_id == null || m.client_id === myClientId)
       .filter((m) => selfUuid == null || m.mother_uuid !== selfUuid)
-      .filter((m) => (m.epoch ?? 0) > cached.epoch)
-      .sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0))[0];
+      .filter((m) => m.role === 'm' || (m.epoch ?? 0) > cached.epoch)
+      .sort(byRoleThenEpoch)[0];
     return hit ? { mother_uuid: hit.mother_uuid, label: hit.label, epoch: hit.epoch ?? 0 } : null;
   } catch {
     return null;

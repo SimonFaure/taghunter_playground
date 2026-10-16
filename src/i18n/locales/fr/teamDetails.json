@@ -62,5 +62,11 @@
   "editSaveChanges": "Enregistrer les modifications",
   "editSaveFailed": "Échec de la mise à jour de l'équipe.",
   "summaryLateMalus": "Malus de retard",
-  "lateMalusRevert": "Revenir au malus de retard calculé automatiquement ({{value}})"
+  "lateMalusRevert": "Revenir au malus de retard calculé automatiquement ({{value}})",
+  "stalePunchesLabel_one": "Puce non vide au départ : {{count}} pointage ignoré",
+  "stalePunchesLabel_other": "Puce non vide au départ : {{count}} pointages ignorés",
+  "stalePunchesCount": "Prendre en compte ces pointages",
+  "stalePunchesIgnore": "Ignorer à nouveau ces pointages",
+  "stalePunchesCounted": "Pointages de départ comptés",
+  "stalePunchesHint": "Le joueur a joué avant de biper le départ : compter les pointages déjà présents sur la puce au premier bip. Si la partie est terminée, le score est recalculé."
 }

@@ -18,8 +18,23 @@
 // It NEVER overwrites a row whose sync_state='pending' - those are local
 // mutations awaiting push. Use `acceptServerOverwrite` explicitly when a
 // 409 conflict tells the server's data should win.
+//
+// Every local edit is stamped (edited_at_ms in mother time, edited_by = this
+// device, a fresh mutation_id): devices share their unpushed edits over the
+// LAN when offline and the later edit of a chip wins (src-tauri cards_sync.rs).
 
+import { invoke } from '@tauri-apps/api/core';
 import { getDb } from './db';
+import { motherNow } from './motherTime';
+
+let deviceUuid: string | null = null;
+async function editStamp(): Promise<[number, string, string]> {
+  if (deviceUuid === null) {
+    deviceUuid =
+      (await invoke<{ device_uuid: string }>('client_get_device_identity').catch(() => null))?.device_uuid ?? '';
+  }
+  return [Math.round(motherNow()), deviceUuid, crypto.randomUUID()];
+}
 
 export interface CardRow {
   id: number;
@@ -32,6 +47,7 @@ export type CardOperation = 'create' | 'update' | 'delete';
 
 export interface PendingCardRow extends CardRow {
   operation: CardOperation;
+  mutation_id: string | null;
 }
 
 interface CardDbRow {
@@ -41,6 +57,7 @@ interface CardDbRow {
   color: string | null;
   sync_state: 'synced' | 'pending';
   operation: CardOperation | null;
+  mutation_id?: string | null;
 }
 
 function toCard(row: CardDbRow): CardRow {
@@ -90,13 +107,26 @@ export async function suggestNextKeyNumber(): Promise<number> {
 }
 
 // Local insert. Marked pending-create so the next sync cycle pushes it.
+// Re-registering a chip whose delete hasn't been pushed yet revives its
+// tombstone (pushed as a create; the push falls back to an update if the
+// studio still has it). A visible row with that id is still an error.
 export async function create(card: CardRow): Promise<void> {
   const db = await getDb();
-  await db.execute(
-    `INSERT INTO cards (id, key_number, key_name, color, sync_state, operation, updated_at)
-     VALUES ($1, $2, $3, $4, 'pending', 'create', CURRENT_TIMESTAMP)`,
-    [card.id, card.key_number, card.key_name, card.color]
+  const [at, by, mid] = await editStamp();
+  const res = await db.execute(
+    `INSERT INTO cards (id, key_number, key_name, color, sync_state, operation, updated_at,
+                        edited_at_ms, edited_by, mutation_id)
+     VALUES ($1, $2, $3, $4, 'pending', 'create', CURRENT_TIMESTAMP, $5, $6, $7)
+     ON CONFLICT(id) DO UPDATE SET
+       key_number = excluded.key_number, key_name = excluded.key_name, color = excluded.color,
+       sync_state = 'pending', operation = 'create', updated_at = CURRENT_TIMESTAMP,
+       edited_at_ms = excluded.edited_at_ms, edited_by = excluded.edited_by, mutation_id = excluded.mutation_id
+     WHERE cards.sync_state = 'pending' AND cards.operation = 'delete'`,
+    [card.id, card.key_number, card.key_name, card.color, at, by, mid]
   );
+  if (res.rowsAffected === 0) {
+    throw new Error(`cardsRepo.create: card ${card.id} already exists`);
+  }
 }
 
 // Local edit. If the row is still 'pending'/'create' (never synced), keep
@@ -135,6 +165,9 @@ export async function update(id: number, fields: Partial<Omit<CardRow, 'id'>>): 
   sets.push(`operation = $${i++}`);
   params.push(nextOperation);
   sets.push(`updated_at = CURRENT_TIMESTAMP`);
+  const [at, by, mid] = await editStamp();
+  sets.push(`edited_at_ms = $${i++}`, `edited_by = $${i++}`, `mutation_id = $${i++}`);
+  params.push(at, by, mid);
 
   params.push(id);
   await db.execute(
@@ -143,9 +176,10 @@ export async function update(id: number, fields: Partial<Omit<CardRow, 'id'>>): 
   );
 }
 
-// Local delete. If the row was a never-synced pending-create, just remove
-// the row outright (studio doesn't know about it). Otherwise leave it in
-// place with operation='delete' so the next push tells studio.
+// Local delete: left in place with operation='delete' so the next push tells
+// studio. Even a never-synced pending-create becomes a tombstone (studio
+// accepts deleting a card it doesn't have): its create may already have been
+// shared with another device over the LAN, which must learn it's gone.
 export async function remove(id: number): Promise<void> {
   const db = await getDb();
   const existing = await db.select<Pick<CardDbRow, 'sync_state' | 'operation'>[]>(
@@ -153,15 +187,12 @@ export async function remove(id: number): Promise<void> {
     [id]
   );
   if (existing.length === 0) return;
-
-  if (existing[0].sync_state === 'pending' && existing[0].operation === 'create') {
-    await db.execute('DELETE FROM cards WHERE id = $1', [id]);
-    return;
-  }
+  const [at, by, mid] = await editStamp();
   await db.execute(
-    `UPDATE cards SET sync_state = 'pending', operation = 'delete', updated_at = CURRENT_TIMESTAMP
+    `UPDATE cards SET sync_state = 'pending', operation = 'delete', updated_at = CURRENT_TIMESTAMP,
+       edited_at_ms = $2, edited_by = $3, mutation_id = $4
      WHERE id = $1`,
-    [id]
+    [id, at, by, mid]
   );
 }
 
@@ -171,29 +202,41 @@ export async function remove(id: number): Promise<void> {
 export async function listPending(): Promise<PendingCardRow[]> {
   const db = await getDb();
   const rows = await db.select<CardDbRow[]>(
-    `SELECT id, key_number, key_name, color, sync_state, operation
+    `SELECT id, key_number, key_name, color, sync_state, operation, mutation_id
      FROM cards
      WHERE sync_state = 'pending'
      ORDER BY updated_at ASC, id ASC`
   );
   return rows
     .filter((r): r is CardDbRow & { operation: CardOperation } => r.operation !== null)
-    .map((r) => ({ ...toCard(r), operation: r.operation }));
+    .map((r) => ({ ...toCard(r), operation: r.operation, mutation_id: r.mutation_id ?? null }));
 }
 
 // Mark a pending row as synced. For 'delete' operations, the row is removed
 // outright (the studio confirmation means the local tombstone has done its
 // job).
-export async function markSynced(id: number, operation: CardOperation): Promise<void> {
+//
+// `mutationId`: the edit that was pushed. A newer edit merged in from a LAN
+// peer meanwhile stays pending; the pushed one is recorded as acked so the
+// other devices of the fleet mark it synced instead of pushing it again.
+export async function markSynced(id: number, operation: CardOperation, mutationId: string | null = null): Promise<void> {
   const db = await getDb();
+  if (mutationId) {
+    await db.execute('INSERT OR IGNORE INTO card_mutation_acks (mutation_id, acked_at) VALUES ($1, $2)', [
+      mutationId,
+      Date.now(),
+    ]);
+  }
+  const same = mutationId ? ' AND mutation_id = $2' : '';
+  const args = mutationId ? [id, mutationId] : [id];
   if (operation === 'delete') {
-    await db.execute('DELETE FROM cards WHERE id = $1', [id]);
+    await db.execute(`DELETE FROM cards WHERE id = $1${same}`, args);
     return;
   }
   await db.execute(
     `UPDATE cards SET sync_state = 'synced', operation = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = $1`,
-    [id]
+     WHERE id = $1${same}`,
+    args
   );
 }
 

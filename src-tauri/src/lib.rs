@@ -10,10 +10,14 @@
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod app_uninstall;
+mod cards_sync;
+mod content_server;
 mod cp210x_driver;
-mod hotspot;
 mod lan_server;
+mod legacy_net_cleanup;
 mod scenario_protocol;
+mod update_cache;
+mod sim_control_server;
 mod sportident;
 mod telemetry;
 mod win_health;
@@ -48,6 +52,7 @@ pub fn run() {
         .manage(lan_server::MotherEndpointCache::default())
         .manage(lan_server::ReaderPresence::default())
         .manage(lan_server::ScreenPresence::default())
+        .manage(lan_server::OperatorPresence::default())
         .manage(sportident::SportIdentState::default())
         .setup(|app| {
         // Install the Rust panic hook now that an AppHandle exists, so
@@ -67,6 +72,8 @@ pub fn run() {
                 window.open_devtools();
             }
         }
+        // Game simulator: local control API for campaigns (tester builds only).
+        sim_control_server::start(app.handle().clone());
 
         Ok(())
     });
@@ -91,19 +98,12 @@ pub fn run() {
             android_device_model,
             android_install_apk,
             sha256_file,
-            scan_wifi,
-            wifi_scan_fresh,
-            wifi_disconnect,
-            connect_wifi,
             telemetry::take_pending_panic,
             lan_server::mother_start_local_server,
             lan_server::mother_open_firewall_elevated,
             lan_server::mother_firewall_rule_status,
             lan_server::lan_diag,
-            lan_server::wifi_renew_dhcp,
             lan_server::get_local_ipv4s,
-            lan_server::wifi_assign_static_ip,
-            lan_server::wifi_restore_dhcp,
             lan_server::mother_ensure_mdns_live,
             lan_server::mother_refresh_mdns,
             lan_server::mother_stop_local_server,
@@ -129,22 +129,35 @@ pub fn run() {
             lan_server::client_refresh_mother_endpoints,
             lan_server::client_resolve_mother_link,
             lan_server::client_ping_mother,
+            content_server::client_push_blob,
+            cards_sync::client_cards_exchange,
+            update_cache::update_cache_status,
+            update_cache::update_cache_commit_apk,
+            update_cache::update_cache_prune,
+            update_cache::client_push_installer,
+            #[cfg(desktop)]
+            update_cache::update_fetch_to_cache,
+            #[cfg(desktop)]
+            update_cache::update_install_from_cache,
             lan_server::client_set_reader_presence,
+            lan_server::client_set_operator_only,
             lan_server::client_set_screen_state,
             lan_server::client_describe_local_role,
-            hotspot::mother_start_hotspot,
-            hotspot::mother_set_hotspot_band,
-            hotspot::open_windows_hotspot_settings,
+            lan_server::client_clear_substitute_state,
+            lan_server::client_list_local_games,
+            lan_server::client_reconcile_with_mother,
             win_health::mother_windows_health,
             win_health::mother_fix_windows_health,
-            hotspot::mother_stop_hotspot,
-            hotspot::mother_hotspot_status,
+            legacy_net_cleanup::legacy_hotspot_cleanup,
+            lan_server::client_pair_by_address,
             sportident::si_list_ports,
             sportident::si_start,
             sportident::si_stop,
             sportident::si_send_beep,
             sportident::si_set_station_time,
             sportident::si_read_station_config,
+            sportident::si_simulate_card,
+            sim_control_server::sim_control_reply,
             cp210x_driver::check_cp210x_driver_state,
             cp210x_driver::install_cp210x_driver,
             app_uninstall::uninstall_app,
@@ -1212,6 +1225,195 @@ fn playground_migrations() -> Vec<Migration> {
             "#,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 35,
+            description: "satellite: mother paired by typed address",
+            sql: r#"
+                -- "host:port" of a mother the operator paired by typing its IP
+                -- (the hotspot is gone; venue networks often filter the mDNS
+                -- multicast). client_refresh_mother_endpoints falls back to it
+                -- when the mother is not found over mDNS. NULL = mDNS-paired.
+                ALTER TABLE paired_mothers ADD COLUMN manual_addr TEXT NULL;
+
+                UPDATE schema_meta SET value = '35' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 36,
+            description: "tutorial-video subtitles versioned apart from the video",
+            sql: r#"
+                -- Studio now bumps a separate subtitles version when a .vtt is
+                -- added, replaced or removed, so a subtitle edit re-pulls only
+                -- the tracks instead of the whole tutorial video. remote = what
+                -- the manifest advertises, local = what is on disk; -1 marks a
+                -- track that failed to download and must be retried.
+                ALTER TABLE game_types ADD COLUMN subtitles_remote_version INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE game_types ADD COLUMN subtitles_local_version INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE game_type_overrides ADD COLUMN subtitles_remote_version INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE game_type_overrides ADD COLUMN subtitles_local_version INTEGER NOT NULL DEFAULT 0;
+
+                UPDATE schema_meta SET value = '36' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 37,
+            description: "game reconciliation: per-game version + tombstones",
+            sql: r#"
+                -- Per-GAME version, so two devices can tell which copy of a game
+                -- is the more advanced one. It takes the device counter
+                -- (schema_meta.lg_state_version) at each change of that game and
+                -- travels in the snapshot. Ordering between copies is
+                -- (mother_epoch, ended, state_version) - see `is_newer`.
+                ALTER TABLE lg_launched_games ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0;
+
+                -- A game deleted or archived on a mother. Without it, a device
+                -- that once hosted the game would push it back at every
+                -- reconciliation. A copy NEWER than the tombstone still wins (a
+                -- substitute ended the game after the mother dropped its frozen
+                -- copy).
+                CREATE TABLE IF NOT EXISTS lg_game_tombstones (
+                    summary_uuid  TEXT PRIMARY KEY,
+                    kind          TEXT NOT NULL,
+                    mother_epoch  INTEGER NOT NULL,
+                    state_version INTEGER NOT NULL,
+                    created_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                );
+
+                UPDATE schema_meta SET value = '37' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 38,
+            description: "paired_devices.operator_only (operator-only devices never join a game)",
+            sql: r#"
+                -- The peer's "Operator only device" setting (Android tablets are
+                -- always operator-only), reported on every /ping.php heartbeat.
+                -- The mother refuses join_game to such a device and the launch /
+                -- Devices pickers grey it out: it controls games, never plays one.
+                ALTER TABLE paired_devices ADD COLUMN operator_only INTEGER NOT NULL DEFAULT 0;
+
+                UPDATE schema_meta SET value = '38' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 39,
+            description: "LAN content sync: cloud snapshot state, full remote file lists, card edit stamps",
+            sql: r#"
+                -- The last cloud manifest this device applied, and WHEN the cloud
+                -- produced it (studio server_time, ms). Peers compare
+                -- cloud_as_of_ms so only a strictly newer snapshot can delete
+                -- content. A snapshot adopted from a peer keeps the ORIGIN time.
+                -- approx = 1: old studio without server_time (device clock used).
+                -- inbox_*: a newer manifest offered by a child, staged on the mother.
+                -- content_rev: bumped after every apply; children watch it on ping.
+                CREATE TABLE IF NOT EXISTS content_sync_state (
+                    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+                    client_id           INTEGER,
+                    cloud_as_of_ms      INTEGER,
+                    manifest_json       TEXT,
+                    source              TEXT,
+                    approx              INTEGER NOT NULL DEFAULT 0,
+                    applied_at          TEXT,
+                    inbox_manifest_json TEXT,
+                    inbox_as_of_ms      INTEGER,
+                    content_rev         INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO content_sync_state (id) VALUES (1);
+
+                -- Full file list of each scenario's REMOTE content hash. Operator-
+                -- only devices commit only a subset into scenario_files, so this
+                -- is what a peer needs to rebuild get_scenario_game_data.
+                CREATE TABLE IF NOT EXISTS scenario_remote_files (
+                    uniqid       TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    rel_path     TEXT NOT NULL,
+                    hash         TEXT NOT NULL,
+                    size         INTEGER,
+                    PRIMARY KEY (uniqid, rel_path)
+                );
+
+                -- Card edits made on THIS device, stamped so two devices that
+                -- edited the same chip offline can keep the latest edit.
+                -- edited_at_ms is mother-time; mutation_id is new on every edit.
+                ALTER TABLE cards ADD COLUMN edited_at_ms INTEGER;
+                ALTER TABLE cards ADD COLUMN edited_by TEXT;
+                ALTER TABLE cards ADD COLUMN mutation_id TEXT;
+
+                -- Card edits some device already pushed to the cloud; travels
+                -- between devices so nobody pushes the same edit twice.
+                CREATE TABLE IF NOT EXISTS card_mutation_acks (
+                    mutation_id TEXT PRIMARY KEY,
+                    acked_at    INTEGER NOT NULL
+                );
+
+                UPDATE schema_meta SET value = '39' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 40,
+            description: "Licensee customers: cache, studio game view, summary assignment",
+            sql: r#"
+                -- The licensee's OWN customers (project_licensee_customers) - NOT
+                -- the licensee (`client_id`). origin='studio': cached from
+                -- studio get_customers. origin='local': quick-created on this
+                -- device (offline-capable, UUID), pushed as `customer_upsert`
+                -- (pushed_at). merged_into_id / deleted mirror studio tombstones.
+                CREATE TABLE IF NOT EXISTS customers (
+                    id             TEXT PRIMARY KEY,
+                    client_id      INTEGER NOT NULL,
+                    name           TEXT NOT NULL,
+                    type           TEXT NULL,
+                    city           TEXT NULL,
+                    archived       INTEGER NOT NULL DEFAULT 0,
+                    merged_into_id TEXT NULL,
+                    deleted        INTEGER NOT NULL DEFAULT 0,
+                    origin         TEXT NOT NULL DEFAULT 'studio',
+                    pushed_at      TEXT NULL,
+                    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_customers_client ON customers(client_id, archived, deleted);
+
+                -- Studio's game -> customer view (get_customers.games): the
+                -- "already played" badges, and studio-side reassignments flowing
+                -- back to this device's summaries.
+                CREATE TABLE IF NOT EXISTS customer_games (
+                    summary_uuid         TEXT PRIMARY KEY,
+                    client_id            INTEGER NOT NULL,
+                    customer_id          TEXT NULL,
+                    game_uniqid          TEXT NULL,
+                    played_at            TEXT NULL,
+                    customer_assigned_at TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_customer_games_cust ON customer_games(client_id, customer_id, game_uniqid);
+
+                CREATE TABLE IF NOT EXISTS customers_state (
+                    client_id       INTEGER PRIMARY KEY,
+                    remote_version  REAL,
+                    local_version   REAL,
+                    fetched_at      TEXT,
+                    failed_attempts INTEGER NOT NULL DEFAULT 0
+                );
+
+                -- A game's customer. Live games carry it as meta (customerId /
+                -- customerName / customerAssignedAt) so snapshots + failover need
+                -- no change; the summary keeps it past Archive. customer_dirty:
+                -- reassigned since the last push (content_hash is left alone so
+                -- existing summaries are not all re-pushed).
+                ALTER TABLE lg_game_summaries ADD COLUMN customer_id TEXT NULL;
+                ALTER TABLE lg_game_summaries ADD COLUMN customer_name TEXT NULL;
+                ALTER TABLE lg_game_summaries ADD COLUMN customer_assigned_at TEXT NULL;
+                ALTER TABLE lg_game_summaries ADD COLUMN customer_dirty INTEGER NOT NULL DEFAULT 0;
+
+                UPDATE schema_meta SET value = '40' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -1406,328 +1608,4 @@ async fn parse_ssid_from_platform() -> Result<Option<String>, String> {
 #[cfg(any(target_os = "android", target_os = "ios"))]
 async fn parse_ssid_from_platform() -> Result<Option<String>, String> {
     Err("SSID detection not implemented on mobile".to_string())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Wi-Fi auto-join primitives (satellite side).
-// `scan_wifi` lists currently-visible SSIDs so the JS engine only attempts a
-// join when the target AP is in range (avoids needlessly dropping the current
-// connection). `connect_wifi` joins an SSID with a WPA2 passphrase. Windows is
-// the flagship (netsh); mac/Linux are best-effort; Android joins natively via a
-// WifiNetworkSuggestion (separate slice) so the desktop command errors there.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-async fn scan_wifi() -> Result<Vec<String>, String> {
-    scan_wifi_platform().await
-}
-
-#[tauri::command]
-async fn connect_wifi(ssid: String, password: String) -> Result<(), String> {
-    if ssid.is_empty() {
-        return Err("ssid is empty".into());
-    }
-    connect_wifi_platform(&ssid, &password).await
-}
-
-/// Like `scan_wifi`, but first asks every Wi-Fi adapter for a REAL radio scan
-/// (WlanScan) and waits for it to settle. `netsh wlan show networks` only reads
-/// Windows' cached list, which can miss a hotspot that appeared a minute ago -
-/// exactly the "the satellites don't see the new mother's Wi-Fi" case (retours
-/// sept. #19), and the returning mother that must look for the network before
-/// raising its own (#1/#13). Falls back to the cached list on any error.
-#[tauri::command]
-async fn wifi_scan_fresh() -> Result<Vec<String>, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let requested = tauri::async_runtime::spawn_blocking(request_wlan_scan)
-            .await
-            .unwrap_or(false);
-        if requested {
-            // Windows drivers must finish a scan within 4 s.
-            tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        }
-    }
-    scan_wifi_platform().await
-}
-
-#[cfg(target_os = "windows")]
-fn request_wlan_scan() -> bool {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::NetworkManagement::WiFi::{
-        WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanScan,
-        WLAN_INTERFACE_INFO_LIST,
-    };
-    unsafe {
-        let mut negotiated = 0u32;
-        let mut handle = HANDLE::default();
-        if WlanOpenHandle(2, None, &mut negotiated, &mut handle) != 0 {
-            return false;
-        }
-        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
-        let mut any = false;
-        if WlanEnumInterfaces(handle, None, &mut list) == 0 && !list.is_null() {
-            let count = (*list).dwNumberOfItems as usize;
-            let first = (*list).InterfaceInfo.as_ptr();
-            for i in 0..count {
-                let info = &*first.add(i);
-                if WlanScan(handle, &info.InterfaceGuid, None, None, None) == 0 {
-                    any = true;
-                }
-            }
-            WlanFreeMemory(list as *const std::ffi::c_void);
-        }
-        let _ = WlanCloseHandle(handle, None);
-        any
-    }
-}
-
-/// Drop the current Wi-Fi client association. Used by a device that becomes the
-/// mother in hotspot mode while still connected to the old mother's same-SSID
-/// AP: it otherwise keeps a 192.168.137.x lease next to its own 192.168.137.1
-/// (retours sept. #21), and by a returning mother that probed for an existing
-/// Tag Hunter network and found no mother behind it.
-///
-/// `ssid`: the profile to switch to MANUAL connection first. Satellite profiles
-/// are written as auto-connect (so Windows rejoins a returning AP by itself);
-/// a device that now owns that SSID as a mother must not have Windows re-join
-/// the old AP behind its back.
-#[tauri::command]
-async fn wifi_disconnect(ssid: Option<String>) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if let Some(name) = ssid.filter(|s| !s.is_empty()) {
-            let _ = tokio::process::Command::new("netsh")
-                .args(["wlan", "set", "profileparameter"])
-                .arg(format!("name={name}"))
-                .arg("connectionmode=manual")
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .await;
-        }
-        let out = tokio::process::Command::new("netsh")
-            .args(["wlan", "disconnect"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stdout).trim().to_string());
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = ssid;
-        Err("wifi_disconnect is only implemented on Windows".into())
-    }
-}
-
-/// If this device is currently a Wi-Fi CLIENT of `ssid`, disconnect and make
-/// that profile manual-connect, so a device about to host `ssid` itself does not
-/// keep (or regain) a lease on another AP of the same name. Best-effort.
-pub(crate) async fn leave_ssid_as_client(ssid: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(Some(current)) = parse_ssid_from_platform().await {
-            if current == ssid {
-                let _ = wifi_disconnect(Some(ssid.to_string())).await;
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = ssid;
-    }
-}
-
-#[cfg(target_os = "windows")]
-async fn scan_wifi_platform() -> Result<Vec<String>, String> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = tokio::process::Command::new("netsh")
-        .args(["wlan", "show", "networks", "mode=ssid"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Lines look like: "SSID 1 : TagHunter-3f9a1c2b". Capture the value after
-    // the first colon; skip the empty "broadcast hidden" entries.
-    let re = regex::Regex::new(r"(?m)^\s*SSID\s+\d+\s*:\s*(.*)$").map_err(|e| e.to_string())?;
-    let mut out_ssids = Vec::new();
-    for c in re.captures_iter(&text) {
-        let s = c[1].trim().to_string();
-        if !s.is_empty() && !out_ssids.contains(&s) {
-            out_ssids.push(s);
-        }
-    }
-    Ok(out_ssids)
-}
-
-#[cfg(target_os = "windows")]
-async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // netsh can only `connect` to a network it has a profile for, so add (or
-    // refresh) a WPA2PSK profile from an XML file first. SSIDs/passwords here
-    // are app-generated and XML-escaped; we still escape defensively.
-    let esc = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
-    let profile = format!(
-        r#"<?xml version="1.0"?>
-<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
-  <name>{ssid}</name>
-  <SSIDConfig><SSID><name>{ssid}</name></SSID></SSIDConfig>
-  <connectionType>ESS</connectionType>
-  <connectionMode>auto</connectionMode>
-  <MSM><security>
-    <authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption><useOneX>false</useOneX></authEncryption>
-    <sharedKey><keyType>passPhrase</keyType><protected>false</protected><keyMaterial>{pw}</keyMaterial></sharedKey>
-  </security></MSM>
-</WLANProfile>"#,
-        ssid = esc(ssid),
-        pw = esc(password),
-    );
-    let mut path = std::env::temp_dir();
-    path.push(format!("taghunter-wlan-{}.xml", ssid.replace(|c: char| !c.is_alphanumeric(), "_")));
-    std::fs::write(&path, profile.as_bytes()).map_err(|e| e.to_string())?;
-
-    // A WLAN profile for this SSID may already exist - from a previous connect on
-    // this device, or pushed via Group Policy. `netsh add profile` REFUSES to
-    // overwrite such a profile ("Un profil portant ce nom existe déjà ... et ne
-    // peut pas être remplacé"), which used to abort the whole connect. Delete our
-    // own copy first so the fresh add (carrying the CURRENT password) takes; a
-    // group-policy profile can't be deleted, but then we simply connect using it.
-    // Best-effort: a "profile not found" delete is a harmless no-op.
-    let _ = tokio::process::Command::new("netsh")
-        .args(["wlan", "delete", "profile"])
-        .arg(format!("name={ssid}"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .await;
-
-    let add = tokio::process::Command::new("netsh")
-        .args(["wlan", "add", "profile"])
-        .arg(format!("filename={}", path.display()))
-        .arg("user=current")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&path);
-    // Don't fail on an add error: if the profile already existed (Group Policy),
-    // the connect below uses THAT profile. Keep the add error only to enrich a
-    // subsequent connect failure.
-    let add_err = if add.status.success() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&add.stdout).trim().to_string())
-    };
-
-    let conn = tokio::process::Command::new("netsh")
-        .args(["wlan", "connect"])
-        .arg(format!("name={ssid}"))
-        .arg(format!("ssid={ssid}"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    if conn.status.success() {
-        return Ok(());
-    }
-
-    // Connect failed. A failed add (no usable profile) is the more actionable root
-    // cause than the generic connect error, so surface it when present.
-    let conn_err = String::from_utf8_lossy(&conn.stdout).trim().to_string();
-    Err(match add_err {
-        Some(a) => format!("netsh connect failed: {conn_err} (add profile: {a})"),
-        None => format!("netsh connect failed: {conn_err}"),
-    })
-}
-
-#[cfg(target_os = "macos")]
-async fn scan_wifi_platform() -> Result<Vec<String>, String> {
-    let out = tokio::process::Command::new(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
-    )
-    .arg("-s")
-    .output()
-    .await
-    .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // First column (whitespace-delimited) of each line after the header is the SSID.
-    let mut ssids = Vec::new();
-    for line in text.lines().skip(1) {
-        if let Some(s) = line.trim().split("  ").next() {
-            let s = s.trim().to_string();
-            if !s.is_empty() && !ssids.contains(&s) {
-                ssids.push(s);
-            }
-        }
-    }
-    Ok(ssids)
-}
-
-#[cfg(target_os = "macos")]
-async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String> {
-    let out = tokio::process::Command::new("networksetup")
-        .args(["-setairportnetwork", "en0", ssid, password])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn scan_wifi_platform() -> Result<Vec<String>, String> {
-    let out = tokio::process::Command::new("nmcli")
-        .args(["-t", "-f", "SSID", "dev", "wifi"])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut ssids = Vec::new();
-    for line in text.lines() {
-        let s = line.trim().to_string();
-        if !s.is_empty() && !ssids.contains(&s) {
-            ssids.push(s);
-        }
-    }
-    Ok(ssids)
-}
-
-#[cfg(target_os = "linux")]
-async fn connect_wifi_platform(ssid: &str, password: &str) -> Result<(), String> {
-    let out = tokio::process::Command::new("nmcli")
-        .args(["dev", "wifi", "connect", ssid, "password", password])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-async fn scan_wifi_platform() -> Result<Vec<String>, String> {
-    // Android auto-join is system-mediated (WifiNetworkSuggestion); a separate
-    // native slice will handle it. Returning empty makes the JS engine skip the
-    // "in range?" gate without erroring the whole flow.
-    Ok(Vec::new())
-}
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-async fn connect_wifi_platform(_ssid: &str, _password: &str) -> Result<(), String> {
-    Err("connect_wifi not implemented on mobile (use the native suggestion path)".to_string())
 }

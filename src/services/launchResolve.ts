@@ -83,6 +83,8 @@ export interface TracksLaunchOptions {
   scoreTypes: Array<{ key: string; isDefault: boolean }>;
   defaultTime: number;
   defaultMalus: number;
+  /** The scenario's own "show the legend" choice - the launch toggle's default. */
+  showLegend: boolean;
 }
 
 export const EMPTY_TRACKS_OPTIONS: TracksLaunchOptions = {
@@ -92,7 +94,38 @@ export const EMPTY_TRACKS_OPTIONS: TracksLaunchOptions = {
   scoreTypes: [],
   defaultTime: 60,
   defaultMalus: 1,
+  showLegend: false,
 };
+
+/** Layout element id of the tracks feedback-image legend box. */
+const TRACKS_LEGEND_LAYOUT_ID = 'legend';
+
+/**
+ * Whether the scenario itself shows the feedback-image legend: the studio
+ * option (`game_meta.show_legend`) is on AND the author did not hide the box
+ * in the layout editor. This is the default of the per-launch toggle
+ * (`GameConfig.tracksShowLegend`), and what a game launched before that toggle
+ * existed keeps doing. Accepts every distribution shape of the layout (cloud
+ * `scenario_layout`, ZIP `layout`, enveloped `game_data.scenario_layout`).
+ */
+export function tracksLegendDefaultOn(rawGameData: unknown): boolean {
+  const gm = extractGameMeta(rawGameData);
+  if (!gm || gm.show_legend !== true) return false;
+  const root = rawGameData as Record<string, unknown>;
+  const elementsOf = (holder: unknown): unknown[] | null => {
+    const els = (holder as { elements?: unknown } | undefined)?.elements;
+    return Array.isArray(els) ? els : null;
+  };
+  const elements =
+    elementsOf(root.scenario_layout) ??
+    elementsOf(root.layout) ??
+    elementsOf((root.game_data as { scenario_layout?: unknown } | undefined)?.scenario_layout) ??
+    [];
+  return !elements.some((el) => {
+    const le = el as { id?: unknown; hidden?: unknown } | null;
+    return !!le && le.id === TRACKS_LEGEND_LAYOUT_ID && le.hidden === true;
+  });
+}
 
 /** Find game_meta in either the raw blob or the {game_data:{game_meta}} envelope. */
 function extractGameMeta(rawGameData: unknown): Record<string, unknown> | null {
@@ -133,6 +166,7 @@ export function extractTracksOptions(rawGameData: unknown): TracksLaunchOptions 
     scoreTypes,
     defaultTime: num(gm.default_time, 60),
     defaultMalus: num(gm.default_time_malus, 1),
+    showLegend: tracksLegendDefaultOn(rawGameData),
   };
 }
 
@@ -248,12 +282,19 @@ export async function resolveDefaultDeviceSelection(): Promise<LaunchDeviceSelec
       // at most one game at a time). On a child this includes the mother -
       // unless it runs an older build, which refuses a join_game to itself.
       satellite_targets: rows
-        .filter((r) => r.id !== selfId && r.online && !busy.has(r.id) && !(motherOutdated && r.is_self))
+        .filter(
+          (r) =>
+            r.id !== selfId &&
+            r.online &&
+            !r.operator_only &&
+            !busy.has(r.id) &&
+            !(motherOutdated && r.is_self),
+        )
         .map((r) => r.id),
     };
   } catch (err) {
     console.error('[launchResolve] resolveDefaultDeviceSelection failed:', err);
-    return { include_self: true, satellite_targets: [] };
+    return { include_self: !(await isOperatorOnly()), satellite_targets: [] };
   }
 }
 

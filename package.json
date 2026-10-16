@@ -23,6 +23,7 @@
     "android:dev": "tauri android dev",
     "android:build": "tauri android build",
     "android:release": "node scripts/android-release.mjs",
+    "android:release:test": "node scripts/android-release.mjs --tester",
     "ios:dev": "tauri ios dev",
     "ios:build": "tauri ios build"
   },

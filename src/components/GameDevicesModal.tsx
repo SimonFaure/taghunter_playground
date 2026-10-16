@@ -17,7 +17,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Monitor, X, Play, StopCircle, Loader2, Usb, Trophy, Gamepad2, Moon, RefreshCw, LogOut } from 'lucide-react';
+import { Monitor, X, Play, StopCircle, Loader2, Usb, Trophy, Gamepad2, Moon, RefreshCw, LogOut, Image as ImageIcon, Lock } from 'lucide-react';
 import {
   listPairedWithStatus,
   queueJoinGameCommandBulk,
@@ -51,7 +51,9 @@ import {
 import { HelpDot } from '../help';
 import { GameLockGate } from './GameLockGate';
 import { getDeviceLockState, type LockReason } from '../services/deviceLock';
-import { parseDbTs } from '../utils/dbTime';
+import { formatStaleness } from '../utils/staleness';
+import { declaredSubtitleLangs, SUBTITLE_AUTO, subtitlePickOf } from '../services/videoResolution';
+import { VideoSubtitlePicker } from './VideoSubtitlePicker';
 
 interface GameDevicesModalProps {
   launchedGameId: number;
@@ -105,6 +107,26 @@ export function GameDevicesModal({
   const [selectedForVideo, setSelectedForVideo] = useState<Set<number>>(new Set());
   const [videoBusy, setVideoBusy] = useState<Set<number>>(new Set());
   const [playMenuOpen, setPlayMenuOpen] = useState(false);
+  // Subtitle languages the game's videos declare + the operator's pick for the
+  // next "Play" ('auto' = each device keeps its own default).
+  const [subtitleLangs, setSubtitleLangs] = useState<string[]>([]);
+  const [subtitleChoice, setSubtitleChoice] = useState<string>(SUBTITLE_AUTO);
+  useEffect(() => {
+    if (!isMother || !showVideoControls) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const state = await getLaunchedGameState(launchedGameId, 0);
+        const langs = await declaredSubtitleLangs(state.game_uniqid, state.game_type);
+        if (!cancelled) setSubtitleLangs(langs);
+      } catch {
+        /* no picker - devices fall back to their own subtitle default */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [launchedGameId, isMother, showVideoControls]);
   const launchTimers = useRef<Map<number, number>>(new Map());
   // Device-lock gate (emergency-disabled / past billing grace): launching a game
   // on another device is a privileged action, so a locked device must clear the
@@ -194,10 +216,21 @@ export function GameDevicesModal({
     }
   }
 
-  // Resolve the screen state to render for a row: the local store for the self
-  // row, the server-reported value for every peer.
+  // The row that is THIS device. Not `is_self`: the list comes from the
+  // mother's db, so `is_self` marks the MOTHER whoever asks - on a child that
+  // hid Reconnect on the mother's row (and showed the child's own screen on
+  // it). Falls back to `is_self` for an older mother that doesn't report the
+  // caller, which is right when we ARE the mother.
+  const meId =
+    buckets.caller_device_id ??
+    [...buckets.in_game, ...buckets.available_online, ...buckets.offline].find((r) => r.is_self)?.id ??
+    null;
+
+  // Resolve the screen state to render for a row: the local store for this
+  // device's row, the server-reported value for every other one (the mother's
+  // own row included - the server fills it from its live presence).
   const stateForRow = (row: PairedDeviceStatusRow): ScreenState | null =>
-    row.is_self ? selfState : row.screen_state ?? null;
+    row.id === meId ? selfState : row.screen_state ?? null;
 
   // Poll loop - fetch every 2s; on each fetch, devices that crossed into
   // section A get their launching-spinner cleared (and their 30s timer).
@@ -382,7 +415,7 @@ export function GameDevicesModal({
       return n;
     });
     try {
-      await queuePlayVideoBulk(targets, launchedGameId, kinds, gameLanguage);
+      await queuePlayVideoBulk(targets, launchedGameId, kinds, gameLanguage, subtitlePickOf(subtitleChoice));
     } catch (e) {
       const msg = (e as Error).message;
       setErrorFor((m) => {
@@ -566,6 +599,14 @@ export function GameDevicesModal({
               <HelpDot topic="devices.stop" />
             </div>
           )}
+          {isMother && showVideoControls && buckets.in_game.length > 0 && (
+            <VideoSubtitlePicker
+              langs={subtitleLangs}
+              value={subtitleChoice}
+              onChange={setSubtitleChoice}
+              className="mb-3 px-1"
+            />
+          )}
           {buckets.in_game.length === 0 ? (
             <EmptyHint text={t('devicesModal:emptyInGame')} />
           ) : (
@@ -579,10 +620,14 @@ export function GameDevicesModal({
                     selected={selectedForVideo.has(row.id)}
                     onToggle={() => toggleOne(row.id)}
                     canSelect={isMother && showVideoControls}
-                    canReconnect={isMother && !row.is_self}
+                    // Any device but this one - the mother included: the
+                    // server dispatches a join_game aimed at itself in-process.
+                    canReconnect={isMother && row.id !== meId && !row.operator_only}
                     reconnecting={reconnecting.has(row.id)}
                     onReconnect={() => onReconnect(row.id)}
-                    canDisconnect={isMother && !row.is_self}
+                    // Never the mother (the server refuses a self-targeted
+                    // disconnect) nor this device (use the game page's Back).
+                    canDisconnect={isMother && !row.is_self && row.id !== meId}
                     disconnecting={disconnecting.has(row.id)}
                     onDisconnect={() => onDisconnect(row.id)}
                     busy={videoBusy.has(row.id)}
@@ -632,7 +677,7 @@ export function GameDevicesModal({
                     row={row}
                     state={stateForRow(row)}
                     thisGameId={launchedGameId}
-                    canLaunch={isMother && !row.is_self}
+                    canLaunch={isMother && !row.is_self && !row.operator_only}
                     launching={launching.has(row.id)}
                     error={errorFor.get(row.id)}
                     onLaunch={() => onLaunchHere(row.id)}
@@ -925,6 +970,16 @@ function StatePill({
       cls = 'bg-blue-500/10 text-blue-400';
       icon = <Play size={12} />;
       break;
+    case 'logo':
+      label = t('devicesModal:stateLogo');
+      cls = 'bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)]';
+      icon = <ImageIcon size={12} />;
+      break;
+    case 'locked':
+      label = t('devicesModal:stateLocked');
+      cls = 'bg-red-500/10 text-red-400';
+      icon = <Lock size={12} />;
+      break;
     case 'home':
       label = t('devicesModal:stateIdle');
       cls = 'bg-[var(--pg-surface-3)] text-[var(--pg-text-dim)]';
@@ -966,7 +1021,7 @@ function StatePill({
   );
 }
 
-function ReaderBadge({ has }: { has: boolean }) {
+export function ReaderBadge({ has }: { has: boolean }) {
   const { t } = useTranslation();
   return (
     <span
@@ -997,16 +1052,4 @@ function OnlineBadge({ online }: { online: boolean }) {
       {online ? t('devicesModal:online') : t('devicesModal:offline')}
     </span>
   );
-}
-
-function formatStaleness(iso: string | null, t: (key: string, opts?: Record<string, unknown>) => string): string {
-  if (!iso) return t('devicesModal:stalenessNever');
-  // The server returns 'YYYY-MM-DD HH:MM:SS' in UTC; parse with a trailing 'Z'.
-  const parsed = parseDbTs(iso);
-  if (Number.isNaN(parsed)) return t('devicesModal:stalenessNever');
-  const diff = Date.now() - parsed;
-  if (diff < 60_000) return t('devicesModal:stalenessJustNow');
-  if (diff < 3_600_000) return t('devicesModal:stalenessMinutes', { n: Math.floor(diff / 60_000) });
-  if (diff < 86_400_000) return t('devicesModal:stalenessHours', { n: Math.floor(diff / 3_600_000) });
-  return t('devicesModal:stalenessDays', { n: Math.floor(diff / 86_400_000) });
 }

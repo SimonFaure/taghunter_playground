@@ -25,7 +25,6 @@
   "launchOnStartupLabel": "Lancer au démarrage",
   "launchOnStartupDesc": "Démarrer automatiquement au démarrage de votre ordinateur.",
   "beMotherLabel": "Faire de cet appareil le poste mère",
-  "beMotherDesc": "Héberger les parties sur cet appareil au démarrage de l'application. Si aucun autre poste mère n'est déjà actif, cet appareil prend le rôle et (en mode point d'accès) démarre le point d'accès Wi-Fi pour que les postes satellites se reconnectent. Plusieurs appareils peuvent activer cette option - le premier démarré devient le poste mère, les autres le rejoignent. Prend effet au prochain démarrage.",
   "sectionDeviceRole": "Rôle de l'appareil",
   "operatorOnlyLabel": "Poste opérateur",
   "operatorOnlyDesc": "Gérer et lancer des jeux depuis cet appareil sans jamais y jouer.",

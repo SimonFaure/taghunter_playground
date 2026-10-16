@@ -1,8 +1,8 @@
 // Windows Firewall opening for the mother's inbound LAN port.
 //
 // On a normal (unelevated) install, the app can't add the firewall rule the
-// mother's axum server needs, so satellites on the hotspot's "Public" network
-// profile can't open a TCP connection to it - the mother is *discoverable* over
+// mother's axum server needs, so satellites on a "Public" network profile
+// can't open a TCP connection to it - the mother is *discoverable* over
 // mDNS (multicast is allowed) but *unreachable* over HTTP (custom inbound TCP is
 // blocked). This module escalates via a single one-time UAC prompt.
 //

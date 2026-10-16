@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Loader2, Stethoscope, RefreshCw, Pin, Undo2 } from 'lucide-react';
+import { Loader2, Stethoscope } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { renewDhcp, assignStaticIp, restoreDhcpFromStatic, staticIpSsid } from '../../services/wifi';
+import { LAN_PROTO } from '../../services/lanPairing';
 
 // One-shot LAN discovery diagnostics. Surfaces exactly why a child can't see the
 // mother (inert mDNS / empty designated addresses / raw browse result) so we don't
@@ -16,13 +16,13 @@ interface DiscoveredMother {
   label: string | null;
   client_id: number | null;
   epoch: number | null;
+  lan_proto: number;
 }
 
 interface LanDiag {
   server_running: boolean;
   port: number;
   mdns_full_name: string;
-  source: string;
   local_ipv4s: string[];
   designated_addrs: string[];
   discovered: DiscoveredMother[];
@@ -34,17 +34,7 @@ export function LanDiagnostics() {
   const { t } = useTranslation('devicesLan');
   const [diag, setDiag] = useState<LanDiag | null>(null);
   const [busy, setBusy] = useState(false);
-  const [renewing, setRenewing] = useState(false);
-  const [staticBusy, setStaticBusy] = useState(false);
-  const [restoreBusy, setRestoreBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-  const [hasStatic, setHasStatic] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-
-  const refreshStatic = useCallback(async () => {
-    setHasStatic(!!(await staticIpSsid().catch(() => null)));
-  }, []);
-  useEffect(() => { void refreshStatic(); }, [refreshStatic]);
 
   const run = useCallback(async () => {
     setBusy(true);
@@ -58,70 +48,15 @@ export function LanDiagnostics() {
     }
   }, []);
 
-  const renew = useCallback(async () => {
-    setRenewing(true);
-    setErr(null);
-    try {
-      await renewDhcp();
-      setDiag(await invoke<LanDiag>('lan_diag'));
-    } catch (e) {
-      setErr((e as Error)?.message || String(e));
-    } finally {
-      setRenewing(false);
-    }
-  }, []);
-
   const inert = diag?.server_running && diag.mdns_full_name === '';
   const noDesignated = diag?.server_running && diag.designated_addrs.length === 0;
-  // "Connected but wrong subnet": has an APIPA address and no 192.168.137.x lease.
+  // "Connected but no lease": only APIPA addresses - the router's DHCP didn't
+  // answer (or the PC isn't really on the venue network).
   const stuckApipa =
     !!diag &&
-    diag.local_ipv4s.some((ip) => ip.startsWith('169.254.')) &&
-    !diag.local_ipv4s.some((ip) => ip.startsWith('192.168.137.'));
-  // The mother's advertised 192.168.x address → the /24 for the static-IP fallback.
-  const gateway =
-    diag?.discovered
-      .flatMap((m) => m.addresses)
-      .find((a) => a.startsWith('192.168.')) ?? null;
-
-  const forceStatic = useCallback(async () => {
-    setStaticBusy(true);
-    setErr(null);
-    setMsg(null);
-    try {
-      // Prefer a discovered mother's 192.168.x address; otherwise fall back to the
-      // hotspot's ICS gateway (always 192.168.137.1) so the button works even when
-      // no mother address was captured. The /24 is derived from this.
-      const gw = gateway ?? '192.168.137.1';
-      const ip = await assignStaticIp(gw);
-      setMsg(t('diagStaticAssigned', { ip }));
-      await refreshStatic();
-      // Give Windows a moment to apply, then re-diagnose.
-      setDiag(await invoke<LanDiag>('lan_diag'));
-    } catch (e) {
-      setErr((e as Error)?.message || String(e));
-    } finally {
-      setStaticBusy(false);
-    }
-  }, [gateway, refreshStatic, t]);
-
-  const restore = useCallback(async () => {
-    setRestoreBusy(true);
-    setErr(null);
-    setMsg(null);
-    try {
-      await restoreDhcpFromStatic();
-      setMsg(t('diagDhcpRestored'));
-      await refreshStatic();
-      setDiag(await invoke<LanDiag>('lan_diag'));
-    } catch (e) {
-      setErr((e as Error)?.message || String(e));
-    } finally {
-      setRestoreBusy(false);
-    }
-  }, [refreshStatic, t]);
-
-  const anyBusy = busy || renewing || staticBusy || restoreBusy;
+    diag.local_ipv4s.length > 0 &&
+    diag.local_ipv4s.every((ip) => ip.startsWith('169.254.'));
+  const anyBusy = busy;
 
   return (
     <div className="pg-panel">
@@ -135,45 +70,26 @@ export function LanDiagnostics() {
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Stethoscope className="w-4 h-4" />}
           {t('diagRun')}
         </button>
-        {stuckApipa && (
-          <button onClick={() => void renew()} disabled={anyBusy} className="pg-btn">
-            {renewing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-            {t('diagRepairIp')}
-          </button>
-        )}
-        {/* Always visible: the static-IP fallback is the reliable way to reach the
-            mother in hotspot mode when Windows ICS DHCP won't lease. */}
-        <button onClick={() => void forceStatic()} disabled={anyBusy} className="pg-btn">
-          {staticBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Pin className="w-4 h-4" />}
-          {t('diagForceStatic')}
-        </button>
-        {hasStatic && (
-          <button onClick={() => void restore()} disabled={anyBusy} className="pg-btn">
-            {restoreBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Undo2 className="w-4 h-4" />}
-            {t('diagRestoreDhcp')}
-          </button>
-        )}
       </div>
 
       {stuckApipa && (
         <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-warn-bg)] border-[var(--pg-warn-line)] text-[var(--pg-warn-text)]">
-          {t('diagApipaWarning', {
-            range: gateway ? gateway.split('.').slice(0, 3).join('.') + '.x' : '192.168.137.x',
-          })}
+          {t('diagApipaWarning')}
         </div>
       )}
 
-      {hasStatic && !stuckApipa && (
-        <div className="mt-3 text-sm rounded-lg p-2 border bg-blue-500/15 border-blue-500/40 text-blue-200">
-          {t('diagStaticActive')}
-        </div>
-      )}
-
-      {msg && (
-        <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-ok-bg)] border-[var(--pg-ok-line)] text-[var(--pg-ok-text)]">
-          {msg}
-        </div>
-      )}
+      {/* Router settings to check when devices can't see each other. The
+          supplied router ships configured; this is for support, not for the
+          licensee's everyday screen. */}
+      <div className="mt-3 text-xs text-[var(--pg-text-muted)] border border-[var(--pg-line)] rounded-lg p-3 space-y-1">
+        <p className="font-medium text-[var(--pg-text)]">{t('routerChecklistTitle')}</p>
+        <ul className="list-disc pl-4 space-y-0.5">
+          <li>{t('routerChecklistSameNetwork')}</li>
+          <li>{t('routerChecklistIsolation')}</li>
+          <li>{t('routerChecklistMulticast')}</li>
+          <li>{t('routerChecklistBand')}</li>
+        </ul>
+      </div>
 
       {err && (
         <div className="mt-3 text-sm rounded-lg p-2 border bg-[var(--pg-danger-bg)] border-[var(--pg-danger-line)] text-[var(--pg-danger-text)]">
@@ -185,7 +101,6 @@ export function LanDiagnostics() {
         <div className="mt-3 space-y-1 text-xs font-mono bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-lg p-3 overflow-x-auto">
           <Row label={t('diagRowServer')} value={diag.server_running ? t('diagYes') : t('diagNo')} />
           {diag.server_running && <Row label={t('diagRowPort')} value={String(diag.port)} />}
-          <Row label={t('diagRowSource')} value={diag.source} />
           <Row
             label={t('diagRowMdns')}
             value={diag.server_running ? (inert ? t('diagInert') : diag.mdns_full_name) : '—'}
@@ -218,6 +133,9 @@ export function LanDiagnostics() {
             <div key={m.mother_uuid} className="pl-2 text-[var(--pg-text-muted)]">
               • {m.label || m.mother_uuid.slice(0, 8)} @ {m.addresses.join(', ') || t('diagNoAddress')}:{m.port}
               {' '}{t('diagMotherLine', { client: m.client_id ?? '?', epoch: m.epoch ?? '?' })}
+              {(m.lan_proto ?? 1) !== LAN_PROTO && (
+                <span className="text-[var(--pg-danger-text)]"> {t('diagMotherOtherProto', { proto: m.lan_proto ?? 1 })}</span>
+              )}
             </div>
           ))}
         </div>

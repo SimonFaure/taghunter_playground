@@ -59,7 +59,7 @@ import {
 } from '../utils/logoEffect';
 import * as cardsRepo from '../services/cardsRepo';
 import { on } from '../services/syncEvents';
-import { runCycleNow } from '../services/syncOrchestrator';
+import { syncCardsNow } from '../services/syncOrchestrator';
 import { applyOperatorModeChange } from '../services/operatorMode';
 import { listActiveLaunchedGames } from '../services/launchedGames';
 import * as scenarioStore from '../services/scenarioStore';
@@ -79,7 +79,6 @@ const DEFAULT_CONFIG: AppConfig = {
   language: 'english',
   fullscreenOnLaunch: false,
   autoLaunch: false,
-  startHotspotOnLaunch: false,
   beMotherWhenAvailable: false,
   logoScreenOnLaunch: false,
   logoScreenBgColor: '#000000',
@@ -252,6 +251,15 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
         await removeLaunchLogo(savedConfig.logoScreenLogoFile);
       }
 
+      // The role of this device is not edited on this page (Réseau → Rôle de ce
+      // poste owns it). This page holds a copy of the config from when it was
+      // opened: save the role as it is on disk NOW, not as it was then.
+      const onDisk = await loadConfig();
+      finalConfig = {
+        ...finalConfig,
+        beMotherWhenAvailable: onDisk.beMotherWhenAvailable,
+        motherDesignatedAt: onDisk.motherDesignatedAt,
+      };
       await saveConfig(finalConfig);
 
       // Reconcile the OS autostart registration on every Save, not only when
@@ -1250,7 +1258,7 @@ function CardRow({ entry }: { entry: CardWithReceivedAt }) {
       });
       setShowRegister(false);
       await lookup();
-      void runCycleNow('manual').catch(() => undefined);
+      void syncCardsNow().catch(() => undefined);
     } catch {
       // surfaced as no UI change - user can retry
     } finally {

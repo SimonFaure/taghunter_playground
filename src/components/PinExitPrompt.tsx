@@ -101,6 +101,7 @@ export function PinExitPrompt({
           <div className="bg-[var(--pg-surface-2)] border border-[var(--pg-line)] rounded-2xl p-6 space-y-4">
             <OtpInput
               length={4}
+              masked
               value={pin}
               onChange={setPin}
               onComplete={handleComplete}

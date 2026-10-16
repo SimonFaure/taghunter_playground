@@ -24,6 +24,12 @@ import {
 // independently - sync downloads each freshly when its own
 // `remote_version != local_version`.
 //
+// Subtitle tracks carry their OWN version pair (`subtitles_remote_version` /
+// `subtitles_local_version`): studio bumps it when a .vtt is added, replaced or
+// removed, without touching the video version. A subtitle-only change therefore
+// re-pulls just the tracks into the video's existing version dir, never the
+// video itself. `subtitles_local_version = -1` means "a track failed, retry".
+//
 // A third, purely LOCAL source sits on top of those two:
 //   - local_game_type_videos: a file the operator imported on THIS device from
 //     Settings > Videos. It never leaves the device (no upload to studio, no
@@ -38,6 +44,8 @@ export interface GameTypeRow {
   tutorial_video_filename: string | null;
   remote_version: number;
   local_version: number | null;
+  subtitles_remote_version: number;
+  subtitles_local_version: number;
   tutorial_subtitles: Record<string, string>;
   failed_attempts: number;
 }
@@ -47,6 +55,8 @@ export interface GameTypeOverrideRow {
   tutorial_video_filename: string | null;
   remote_version: number;
   local_version: number | null;
+  subtitles_remote_version: number;
+  subtitles_local_version: number;
   tutorial_subtitles: Record<string, string>;
   failed_attempts: number;
 }
@@ -66,6 +76,8 @@ export interface GameTypeManifestRow {
   supports_intro_video: boolean;
   tutorial_video_filename: string | null;
   tutorial_video_version: number;
+  // Absent from a studio that predates subtitle versioning -> treated as 0.
+  tutorial_subtitles_version?: number;
   tutorial_subtitles: Record<string, string>;
 }
 
@@ -73,6 +85,8 @@ export interface GameTypeOverrideManifestRow {
   game_type_code: string;
   tutorial_video_filename: string | null;
   tutorial_video_version: number;
+  // Absent from a studio that predates subtitle versioning -> treated as 0.
+  tutorial_subtitles_version?: number;
   tutorial_subtitles: Record<string, string>;
 }
 
@@ -94,6 +108,8 @@ function rowOut(row: {
   tutorial_video_filename: string | null;
   remote_version: number;
   local_version: number | null;
+  subtitles_remote_version: number;
+  subtitles_local_version: number;
   tutorial_subtitles_json: string | null;
   failed_attempts: number;
 }): GameTypeRow {
@@ -105,6 +121,8 @@ function rowOut(row: {
     tutorial_video_filename: row.tutorial_video_filename,
     remote_version: row.remote_version,
     local_version: row.local_version,
+    subtitles_remote_version: row.subtitles_remote_version,
+    subtitles_local_version: row.subtitles_local_version,
     tutorial_subtitles: parseSubtitles(row.tutorial_subtitles_json),
     failed_attempts: row.failed_attempts,
   };
@@ -115,6 +133,8 @@ function overrideRowOut(row: {
   tutorial_video_filename: string | null;
   remote_version: number;
   local_version: number | null;
+  subtitles_remote_version: number;
+  subtitles_local_version: number;
   tutorial_subtitles_json: string | null;
   failed_attempts: number;
 }): GameTypeOverrideRow {
@@ -123,6 +143,8 @@ function overrideRowOut(row: {
     tutorial_video_filename: row.tutorial_video_filename,
     remote_version: row.remote_version,
     local_version: row.local_version,
+    subtitles_remote_version: row.subtitles_remote_version,
+    subtitles_local_version: row.subtitles_local_version,
     tutorial_subtitles: parseSubtitles(row.tutorial_subtitles_json),
     failed_attempts: row.failed_attempts,
   };
@@ -163,15 +185,16 @@ export async function upsertGameTypesFromManifest(
       `INSERT INTO game_types (
          code, name, supports_tutorial_video, supports_intro_video,
          tutorial_video_filename, remote_version, local_version,
-         tutorial_subtitles_json, failed_attempts
-       ) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, 0)
+         tutorial_subtitles_json, failed_attempts, subtitles_remote_version
+       ) VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, 0, $8)
        ON CONFLICT(code) DO UPDATE SET
          name = excluded.name,
          supports_tutorial_video = excluded.supports_tutorial_video,
          supports_intro_video = excluded.supports_intro_video,
          tutorial_video_filename = excluded.tutorial_video_filename,
          remote_version = excluded.remote_version,
-         tutorial_subtitles_json = excluded.tutorial_subtitles_json`,
+         tutorial_subtitles_json = excluded.tutorial_subtitles_json,
+         subtitles_remote_version = excluded.subtitles_remote_version`,
       [
         r.code,
         r.name,
@@ -180,6 +203,7 @@ export async function upsertGameTypesFromManifest(
         r.tutorial_video_filename,
         r.tutorial_video_version,
         JSON.stringify(r.tutorial_subtitles || {}),
+        r.tutorial_subtitles_version ?? 0,
       ]
     );
   }
@@ -193,17 +217,19 @@ export async function upsertOverridesFromManifest(
     await db.execute(
       `INSERT INTO game_type_overrides (
          game_type_code, tutorial_video_filename, remote_version, local_version,
-         tutorial_subtitles_json, failed_attempts
-       ) VALUES ($1, $2, $3, NULL, $4, 0)
+         tutorial_subtitles_json, failed_attempts, subtitles_remote_version
+       ) VALUES ($1, $2, $3, NULL, $4, 0, $5)
        ON CONFLICT(game_type_code) DO UPDATE SET
          tutorial_video_filename = excluded.tutorial_video_filename,
          remote_version = excluded.remote_version,
-         tutorial_subtitles_json = excluded.tutorial_subtitles_json`,
+         tutorial_subtitles_json = excluded.tutorial_subtitles_json,
+         subtitles_remote_version = excluded.subtitles_remote_version`,
       [
         r.game_type_code,
         r.tutorial_video_filename,
         r.tutorial_video_version,
         JSON.stringify(r.tutorial_subtitles || {}),
+        r.tutorial_subtitles_version ?? 0,
       ]
     );
   }
@@ -235,19 +261,48 @@ export async function tombstoneMissingOverrides(keepCodes: string[]): Promise<vo
   }
 }
 
-export async function markAdminDownloaded(code: string, version: number): Promise<void> {
+// `subtitlesVersion` is the subtitles version the tracks fetched alongside the
+// video belong to, or SUBTITLES_RETRY when one of them failed - the video is
+// still marked done, and the subtitles-only pass picks the tracks up again.
+export const SUBTITLES_RETRY = -1;
+
+export async function markAdminDownloaded(
+  code: string,
+  version: number,
+  subtitlesVersion: number
+): Promise<void> {
   const db = await getDb();
   await db.execute(
-    'UPDATE game_types SET local_version = $1, failed_attempts = 0 WHERE code = $2',
-    [version, code]
+    'UPDATE game_types SET local_version = $1, subtitles_local_version = $2, failed_attempts = 0 WHERE code = $3',
+    [version, subtitlesVersion, code]
   );
 }
 
-export async function markOverrideDownloaded(code: string, version: number): Promise<void> {
+export async function markOverrideDownloaded(
+  code: string,
+  version: number,
+  subtitlesVersion: number
+): Promise<void> {
   const db = await getDb();
   await db.execute(
-    'UPDATE game_type_overrides SET local_version = $1, failed_attempts = 0 WHERE game_type_code = $2',
-    [version, code]
+    'UPDATE game_type_overrides SET local_version = $1, subtitles_local_version = $2, failed_attempts = 0 WHERE game_type_code = $3',
+    [version, subtitlesVersion, code]
+  );
+}
+
+export async function markAdminSubtitlesDownloaded(code: string, subtitlesVersion: number): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    'UPDATE game_types SET subtitles_local_version = $1, failed_attempts = 0 WHERE code = $2',
+    [subtitlesVersion, code]
+  );
+}
+
+export async function markOverrideSubtitlesDownloaded(code: string, subtitlesVersion: number): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    'UPDATE game_type_overrides SET subtitles_local_version = $1, failed_attempts = 0 WHERE game_type_code = $2',
+    [subtitlesVersion, code]
   );
 }
 
@@ -304,6 +359,33 @@ export async function listPendingOverrideDownloads(): Promise<GameTypeOverrideRo
     `SELECT * FROM game_type_overrides
      WHERE tutorial_video_filename IS NOT NULL
        AND (local_version IS NULL OR local_version <> remote_version)
+     ORDER BY game_type_code`
+  );
+  return rows.map(overrideRowOut);
+}
+
+// Rows whose VIDEO is current on disk but whose subtitle tracks are not: only
+// the .vtt files need fetching. A row with a pending video is excluded - the
+// full download brings its tracks along.
+export async function listPendingAdminSubtitleDownloads(): Promise<GameTypeRow[]> {
+  const db = await getDb();
+  const rows = await db.select<Parameters<typeof rowOut>[0][]>(
+    `SELECT * FROM game_types
+     WHERE tutorial_video_filename IS NOT NULL
+       AND local_version IS NOT NULL AND local_version = remote_version
+       AND subtitles_local_version <> subtitles_remote_version
+     ORDER BY code`
+  );
+  return rows.map(rowOut);
+}
+
+export async function listPendingOverrideSubtitleDownloads(): Promise<GameTypeOverrideRow[]> {
+  const db = await getDb();
+  const rows = await db.select<Parameters<typeof overrideRowOut>[0][]>(
+    `SELECT * FROM game_type_overrides
+     WHERE tutorial_video_filename IS NOT NULL
+       AND local_version IS NOT NULL AND local_version = remote_version
+       AND subtitles_local_version <> subtitles_remote_version
      ORDER BY game_type_code`
   );
   return rows.map(overrideRowOut);
@@ -410,6 +492,13 @@ export async function removeLocalVideo(code: string): Promise<void> {
   await removeRecursive(localGameTypeDirRel(code));
 }
 
+// A replaced subtitle keeps its path (same version dir, same `<lang>.vtt`), so
+// the webview would keep serving the cached track. The asset protocol resolves
+// on the URL path only, which leaves the query free to carry the version.
+function subtitleAssetUrl(absPath: string, subtitlesVersion: number): string {
+  return `${assetUrl(absPath)}?v=${subtitlesVersion}`;
+}
+
 // Resolved tutorial video at runtime. Precedence, highest first:
 //   local    - imported by the operator on this device (Settings > Videos)
 //   override - this client's own upload, synced from studio
@@ -449,7 +538,7 @@ export async function resolveTutorialVideoUrl(code: string): Promise<{
     for (const [lang, fname] of Object.entries(override.tutorial_subtitles)) {
       const subAbs = await join(dirAbs, 'subtitles', fname);
       if (await exists(`${gameTypeClientVersionDirRel(code, override.local_version)}/subtitles/${fname}`, { baseDir: BaseDirectory.AppData })) {
-        subtitleUrls[lang] = assetUrl(subAbs);
+        subtitleUrls[lang] = subtitleAssetUrl(subAbs, override.subtitles_local_version);
       }
     }
     return { videoUrl, subtitleUrls, variant: 'override', version: override.local_version };
@@ -464,7 +553,7 @@ export async function resolveTutorialVideoUrl(code: string): Promise<{
     for (const [lang, fname] of Object.entries(admin.tutorial_subtitles)) {
       if (await exists(`${gameTypeAdminVersionDirRel(code, admin.local_version)}/subtitles/${fname}`, { baseDir: BaseDirectory.AppData })) {
         const subAbs = await join(dirAbs, 'subtitles', fname);
-        subtitleUrls[lang] = assetUrl(subAbs);
+        subtitleUrls[lang] = subtitleAssetUrl(subAbs, admin.subtitles_local_version);
       }
     }
     return { videoUrl, subtitleUrls, variant: 'admin', version: admin.local_version };

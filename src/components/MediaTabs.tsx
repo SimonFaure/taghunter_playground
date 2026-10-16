@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Film, Image as ImageIcon, Play, RefreshCw, FolderOpen, X, Subtitles, Upload, Trash2, AlertCircle } from 'lucide-react';
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import * as scenarioStore from '../services/scenarioStore';
+import { getAuthUser } from '../services/authStore';
+import { pickGameVisual } from '../utils/coverVisual';
 import * as gameTypesStore from '../services/gameTypesStore';
 import { resolveVideosByKind } from '../services/videoResolution';
 import { loadConfig, saveConfig } from '../utils/config';
@@ -12,6 +14,8 @@ import { scenarioAssetUrl, mediaRootAbs, ensureDir } from '../services/contentFs
 import { gameTypeLabel } from '../utils/labels';
 import { GameTypeIcon } from './icons/GameTypeIcons';
 import { ScenarioThumbnail } from './ScenarioThumbnail';
+import { useSubtitleBlobUrls } from '../hooks/useSubtitleBlobUrls';
+import { useSubtitleCue } from '../hooks/useSubtitleCue';
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i;
 
@@ -66,14 +70,16 @@ function Loading({ text }: { text: string }) {
   );
 }
 
-// Resolve a scenario's cover image (game_visual, falling back to background)
-// to a webview URL - used as a video poster / thumbnail.
+// Resolve a scenario's cover image (game_visual in the licensee's language,
+// falling back to background) to a webview URL - used as a video poster /
+// thumbnail.
 async function scenarioCoverUrl(uniqid: string): Promise<string | null> {
   const gd = (await scenarioStore.getGameData(uniqid).catch(() => null)) as
     | { game_media_images?: Record<string, unknown> }
     | null;
   const mi = gd?.game_media_images;
-  const raw = mi?.game_visual ?? mi?.background_image;
+  const lang = (await getAuthUser().catch(() => null))?.language;
+  const raw = pickGameVisual(mi, lang) ?? mi?.background_image;
   if (typeof raw !== 'string' || !raw.trim()) return null;
   const fileName = raw.startsWith('media/') ? raw.slice('media/'.length) : raw;
   return scenarioAssetUrl(uniqid, fileName) || null;
@@ -113,6 +119,7 @@ function VideoCard({
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const subtitleLangs = Object.keys(item.subtitles);
+  const trackUrls = useSubtitleBlobUrls(item.subtitles);
   const [selectedLang, setSelectedLang] = useState<string | null>(
     useSubsDefault && item.subtitles[appLang] ? appLang : null
   );
@@ -122,17 +129,14 @@ function VideoCard({
     setSelectedLang(useSubsDefault && item.subtitles[appLang] ? appLang : null);
   }, [appLang, useSubsDefault, item.subtitles]);
 
-  // Show only the chosen subtitle track on the underlying <video>.
-  const applyTrack = useCallback((lang: string | null) => {
-    const el = videoRef.current;
-    if (!el) return;
-    for (let i = 0; i < el.textTracks.length; i++) {
-      const tr = el.textTracks[i];
-      tr.mode = lang && tr.language === lang ? 'showing' : 'disabled';
-    }
-  }, []);
-
-  useEffect(() => { if (playing) applyTrack(selectedLang); }, [playing, selectedLang, applyTrack]);
+  // Subtitles are painted by us, never natively (see useSubtitleCue); a pick
+  // in the native CC menu is mirrored into our selector.
+  const subtitleText = useSubtitleCue(
+    videoRef,
+    playing ? selectedLang : null,
+    `${playing}|${JSON.stringify(trackUrls)}`,
+    setSelectedLang,
+  );
 
   return (
     <div className="rounded-[var(--pg-radius-md)] border border-[var(--pg-line)] bg-[var(--pg-surface-2)] overflow-hidden">
@@ -144,25 +148,37 @@ function VideoCard({
           </div>
         ) : playing ? (
           // preload only happens now (on click), and autoPlay starts it.
+          <>
           <video
             key={item.videoUrl}
             ref={videoRef}
             controls
             autoPlay
             className="w-full h-full bg-black"
-            onLoadedMetadata={() => applyTrack(selectedLang)}
           >
             <source src={item.videoUrl} />
-            {subtitleLangs.map((lang) => (
+            {subtitleLangs.filter((lang) => trackUrls[lang]).map((lang) => (
               <track
-                key={lang}
+                key={trackUrls[lang]}
                 kind="subtitles"
                 srcLang={lang}
                 label={LANG_NAMES[lang] || lang}
-                src={item.subtitles[lang]}
+                src={trackUrls[lang]}
               />
             ))}
           </video>
+          {subtitleText && (
+            // Sits above the native control strip.
+            <div className="absolute inset-x-0 bottom-12 flex justify-center px-4 pointer-events-none">
+              <p
+                className="text-center text-white text-base font-medium leading-snug whitespace-pre-line"
+                style={{ textShadow: '0 0 4px #000, 0 2px 6px #000' }}
+              >
+                {subtitleText}
+              </p>
+            </div>
+          )}
+          </>
         ) : (
           <button
             type="button"

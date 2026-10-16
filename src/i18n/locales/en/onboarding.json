@@ -20,17 +20,6 @@
     "label": "Device name",
     "placeholder": "e.g. Front-desk PC"
   },
-  "hotspot": {
-    "title": "Default Wi-Fi hotspot?",
-    "subtitle": "Use this computer as a default Wi-Fi hotspot that your other devices can join automatically.",
-    "yes": "Yes, use this computer as a hotspot",
-    "no": "No",
-    "note": "The hotspot turns on the next time the app starts - your internet stays connected for the rest of setup.",
-    "conflictTitle": "A default hotspot already exists",
-    "conflictBody": "Your account already has a default hotspot ({{names}}). Add this computer as another default hotspot?",
-    "conflictConfirm": "Add as another default",
-    "conflictCancel": "Don’t add this one"
-  },
   "mother": {
     "title": "Default game server?",
     "subtitle": "Use this computer as the default game server (the “mother”) that runs your games on the local network.",

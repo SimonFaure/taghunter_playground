@@ -16,7 +16,6 @@
 // real error ("open sqlite (C:\...): disk full") be parsed as a namespace.
 
 import type { TFunction } from 'i18next';
-import { describeHotspotError } from './hotspotErrors';
 
 const CODE_RE = /^failover:[A-Za-z][A-Za-z0-9_]*$/;
 
@@ -28,8 +27,7 @@ const PATTERNS: Array<[RegExp, string]> = [
   [/hasn't downloaded the scenario/i, 'failover:errScenarioMissing'],
   [/UNIQUE constraint|adopt snapshot|FOREIGN KEY constraint/i, 'failover:errAdoptFailed'],
   [/bind mother listener|address already in use|only one usage of each socket/i, 'failover:errPortBusy'],
-  [/no Wi-Fi credentials/i, 'failover:errNoWifiCreds'],
-  [/hotspot|tethering|access point/i, 'failover:errHotspot'],
+  [/proto_mismatch|LAN_PROTO_MISMATCH/i, 'failover:errProtoMismatch'],
   [/HTTP 401|HTTP 403|no credentials to authenticate/i, 'failover:errNotAuthorized'],
 ];
 
@@ -49,8 +47,6 @@ function rawMessage(err: unknown): string {
 export function describeFailoverError(err: unknown, t: TFunction): DescribedError {
   const raw = rawMessage(err);
   if (CODE_RE.test(raw)) return { message: t(raw), detail: null };
-  const hotspot = describeHotspotError(raw, t);
-  if (hotspot) return { message: hotspot.message, detail: hotspot.detail };
   const hit = PATTERNS.find(([re]) => re.test(raw));
   return { message: t(hit ? hit[1] : 'failover:errGeneric'), detail: raw || null };
 }

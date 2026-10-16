@@ -5,10 +5,12 @@
 // Two-layer model (overlay wins):
 //   base    - 'home' (not in a game) or 'in_game' (a game page is mounted).
 //             Set by App / GamePage.
-//   overlay - 'ranking' or 'video', a full-screen layer floating over the base.
-//             Pushed/popped by the leaderboard pages and the operator video
-//             overlay. The most-recently-pushed overlay is the effective state;
-//             when none are mounted the base shows through.
+//   overlay - 'ranking' / 'video' / 'logo' / 'locked', a full-screen layer
+//             floating over the base. Pushed/popped by the leaderboard pages,
+//             the operator video overlay, the idle logo screen and the PIN lock
+//             screen. The most-recently-pushed overlay is the effective state -
+//             except 'locked', which always wins (the lock screen covers
+//             everything); when none are mounted the base shows through.
 //
 // On every effective-state change we (1) cache the value in-process via the
 // `client_set_screen_state` Tauri command so the satellite's regular ~10s ping
@@ -17,6 +19,7 @@
 // waiting for the next scheduled heartbeat. The mother reads its OWN row from
 // this store directly (it never pings itself) - see GameDevicesModal.
 
+import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getActiveLaunchedGameId } from './activeGameStore';
 
@@ -32,10 +35,12 @@ export type ScreenState =
       sub?: 'instructions' | 'reveal';
     }
   | { kind: 'ranking' }
-  | { kind: 'video' };
+  | { kind: 'video' }
+  | { kind: 'logo' }
+  | { kind: 'locked' };
 
 type BaseState = Extract<ScreenState, { kind: 'home' | 'in_game' }>;
-type OverlayKind = 'ranking' | 'video';
+type OverlayKind = 'ranking' | 'video' | 'logo' | 'locked';
 
 let base: BaseState = { kind: 'home' };
 // Stack of mounted overlays; the top (last) wins. A stack rather than a single
@@ -46,6 +51,7 @@ let current: ScreenState = { kind: 'home' };
 const listeners = new Set<(s: ScreenState) => void>();
 
 function resolveEffective(): ScreenState {
+  if (overlays.includes('locked')) return { kind: 'locked' };
   if (overlays.length > 0) return { kind: overlays[overlays.length - 1] };
   return base;
 }
@@ -108,16 +114,45 @@ function recompute(): void {
   publish(current);
 }
 
+// ---------- in-game flag (base only, overlays ignored) ----------
+// App-wide banners sit at the bottom so they don't cover the top bar, but go
+// back to the top while a game page is mounted (the kiosk screen has no top
+// bar). A ranking/video overlay over a running game still counts as in game.
+
+const inGameListeners = new Set<(inGame: boolean) => void>();
+let lastInGame = false;
+
+function notifyInGame(): void {
+  const inGame = base.kind === 'in_game';
+  if (inGame === lastInGame) return;
+  lastInGame = inGame;
+  for (const l of inGameListeners) l(inGame);
+}
+
+export function useInGame(): boolean {
+  const [inGame, setInGame] = useState(lastInGame);
+  useEffect(() => {
+    inGameListeners.add(setInGame);
+    setInGame(lastInGame);
+    return () => {
+      inGameListeners.delete(setInGame);
+    };
+  }, []);
+  return inGame;
+}
+
 // ---------- base setters (App / GamePage) ----------
 
 export function setBaseHome(): void {
   base = { kind: 'home' };
   recompute();
+  notifyInGame();
 }
 
 export function setBaseInGame(launchedGameId: number | null, gameName: string | null): void {
   base = { kind: 'in_game', launchedGameId, gameName };
   recompute();
+  notifyInGame();
 }
 
 /** Refine the in-game base with within-game detail (Q11 incremental). No-op
@@ -129,7 +164,7 @@ export function refineInGame(detail: { boardHidden?: boolean; sub?: 'instruction
   recompute();
 }
 
-// ---------- overlay push/pop (leaderboard / video) ----------
+// ---------- overlay push/pop (leaderboard / video / logo / lock) ----------
 
 export function pushOverlay(kind: OverlayKind): void {
   // De-dupe: a re-mount shouldn't stack two copies. Move-to-top so the newest

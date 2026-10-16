@@ -1,13 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Crown, Loader2, Satellite } from 'lucide-react';
-import { loadConfig, saveConfig, CONFIG_CHANGED_EVENT } from '../../utils/config';
-import {
-  setDefaultMother,
-  enqueuePendingOp,
-  getDefaultMotherLocal,
-  setDefaultMotherLocal,
-} from '../../services/lanNetworks';
+import { CONFIG_CHANGED_EVENT } from '../../utils/config';
+import { isConfiguredMother, setConfiguredMother } from '../../services/deviceRole';
 import { demoteFromMother, HostingActiveGameError } from '../../services/lanMotherBoot';
 import { relaunchToApply } from '../../services/appRelaunch';
 import { ErrorDetails } from '../ErrorDetails';
@@ -15,12 +10,13 @@ import { useAuth } from '../auth/AuthProvider';
 
 type Role = 'mother' | 'satellite';
 
-// "Rôle de ce poste" (retours sept. #10). The two underlying flags - the
-// studio-side "default mother" inventory bit and the local
-// `beMotherWhenAvailable` boot flag - used to be two raw switches applied on
-// click. The operator only ever means ONE thing: this PC is the mother, or a
-// satellite. So: one choice, written to both flags, confirmed, and applied
-// through a relaunch (same path as the mode switch and "I'm not a mother").
+// "Rôle de ce poste" (retours sept. #10): this PC is the mother, or a
+// satellite. One choice, confirmed, applied through a relaunch. It is the only
+// place (with the install-time question) that changes the role - a takeover
+// never does - and the role shown is the configured one, nothing else: it used
+// to read "Poste mère" on a PC that had merely taken a game over.
+// Setting a PC as the mother moves the role: Studio keeps one mother per
+// licensee, and the former mother becomes a satellite when it sees this one.
 export function DefaultRolesPanel() {
   const { t } = useTranslation('devicesLan');
   const auth = useAuth();
@@ -31,40 +27,23 @@ export function DefaultRolesPanel() {
 
   useEffect(() => {
     const refresh = async () => {
-      const [motherOn, cfg] = await Promise.all([getDefaultMotherLocal(), loadConfig()]);
-      setCurrent(cfg.beMotherWhenAvailable || motherOn ? 'mother' : 'satellite');
+      setCurrent((await isConfiguredMother()) ? 'mother' : 'satellite');
     };
     void refresh();
-    // Re-read when another flow changes the config (e.g. NotMotherPanel).
+    // Re-read when another flow changes the role (e.g. this PC giving it up to
+    // a mother designated after it).
     const onChanged = () => void refresh();
     window.addEventListener(CONFIG_CHANGED_EVENT, onChanged);
     return () => window.removeEventListener(CONFIG_CHANGED_EVENT, onChanged);
   }, []);
 
-  async function writeDefaultMother(on: boolean) {
-    try {
-      await setDefaultMother(on);
-    } catch (e) {
-      console.error('[network] set_default_mother failed, queued:', e);
-      await enqueuePendingOp({ kind: 'mother', on, motherUuid: null });
-    }
-    await setDefaultMotherLocal(on);
-  }
-
   async function apply(next: Role) {
     setBusy(true);
     setErr(null);
     try {
-      if (next === 'satellite') {
-        // Refuses (HostingActiveGameError) while this PC alone hosts a running game.
-        await demoteFromMother(auth.user?.client_id);
-        await writeDefaultMother(false);
-      } else {
-        const cfg = await loadConfig();
-        await saveConfig({ ...cfg, beMotherWhenAvailable: true });
-        await writeDefaultMother(true);
-      }
-      window.dispatchEvent(new Event(CONFIG_CHANGED_EVENT));
+      // Refuses (HostingActiveGameError) while this PC alone hosts a running game.
+      if (next === 'satellite') await demoteFromMother(auth.user?.client_id);
+      await setConfiguredMother(next === 'mother');
       setCurrent(next);
       await relaunchToApply(1200);
     } catch (e) {

@@ -2,7 +2,6 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export interface WindowsHealth {
-  hotspot_power_saving: boolean | null;
   sleep_ac_minutes: number | null;
   wifi_power_management: boolean | null;
   public_networks: string[];

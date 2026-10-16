@@ -23,6 +23,7 @@ import { resolveFontFamily } from '../fonts/resolveFontFamily';
 import { TracksTextFit } from './TracksTextFit';
 import { TracksLegend, type TracksLegendRow } from './TracksLegend';
 import { TEXT_ELEMENT_DEFAULT_ALIGN } from './trackTextElementStyle';
+import { readMinFontSize, TeamNameFit } from './teamNameFit';
 import {
   resolveTypography,
   type TextCategoryTypography,
@@ -161,6 +162,9 @@ export interface TracksGameRendererProps {
   checkpointsSummary: string;
   language: string;
   clues: TracksRendererCluesConfig;
+  /** Seconds left before the clues page closes itself; null/undefined ⇒ no
+   *  countdown drawn. */
+  cluesCountdownSec?: number | null;
   /** Top-X reveal image URL (when screen === 'topreveal'); '' to skip. */
   topRevealUrl: string;
   fontFamily?: string;
@@ -208,6 +212,9 @@ interface HudBoxPos {
   width: number;
   height: number;
   textScale?: number;
+  /** Team name: below this size (px on a 1920×1080 screen, default 20) the
+   *  name goes on two lines. */
+  minFontSize?: number;
 }
 
 /** Value font size as a % of the box height when the author set none. Mirrors
@@ -261,12 +268,15 @@ function PositionedHudBox({
   frameUrl,
   label,
   value,
+  fitValue,
 }: {
   pos: HudBoxPos;
   imgBounds: { x: number; y: number; width: number; height: number };
   frameUrl: string;
   label?: string;
   value: string;
+  /** Team name: shrink to fit the box, two lines under `pos.minFontSize`. */
+  fitValue?: boolean;
 }) {
   const left = imgBounds.x + (pos.x / 100) * imgBounds.width;
   const top = imgBounds.y + (pos.y / 100) * imgBounds.height;
@@ -301,7 +311,15 @@ function PositionedHudBox({
           : { background: 'rgba(0,0,0,0.45)', borderRadius: 8 }),
       }}
     >
-      {/* One trimmed block: label top + value baseline centre as a pair. */}
+      {fitValue ? (
+        <TeamNameFit
+          text={value}
+          maxPx={valueFontSize}
+          minPx={readMinFontSize(pos.minFontSize) * ((typeof window !== 'undefined' ? window.innerHeight : 1080) / 1080)}
+          textStyle={{ fontWeight: 700 }}
+        />
+      ) : (
+      /* One trimmed block: label top + value baseline centre as a pair. */
       <div className="vcenter-text">
         {label && (
           <div
@@ -315,6 +333,7 @@ function PositionedHudBox({
           {value}
         </div>
       </div>
+      )}
     </div>
   );
 }
@@ -345,6 +364,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
     checkpointsSummary,
     language,
     clues,
+    cluesCountdownSec,
     topRevealUrl,
     fontFamily,
     fontColor,
@@ -608,6 +628,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
                     imgBounds={imgBounds}
                     frameUrl={hud.teamNameFrame}
                     value={teamName}
+                    fitValue
                   />
                 )}
                 {placedScore && showScore && (
@@ -697,7 +718,7 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
           with one dark tile per checkpoint, which hid the map - the numbered
           crosses the players need to read the clues (retours sept. #64). */}
       {isClues && clues.enabled &&
-        routeCheckpoints.map((cp, i) => {
+        routeCheckpoints.map((cp) => {
           const found = !!foundCheckpointIds?.has(cp.id);
           const imgUrl = clues.show_image
             ? (found
@@ -706,9 +727,9 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
                   ? (wrongOrderUrl || '')
                   : (missingCheckpointUrl || ''))
             : '';
-          const title = clues.show_title
-            ? readLocalized(cp.title as Localizedish, language) || `#${i + 1}`
-            : '';
+          // No "#N" fallback for an untitled checkpoint: station numbers are
+          // not shown on this page.
+          const title = clues.show_title ? readLocalized(cp.title as Localizedish, language) : '';
           const text = clues.show_text ? readLocalized(cp.description as Localizedish, language) : '';
           if (!imgUrl && !title && !text) return null;
           const pos = cp.position ?? { top: 50, left: 50 };
@@ -734,6 +755,16 @@ export function TracksGameRenderer(props: TracksGameRendererProps) {
             </div>
           );
         })}
+
+      {/* Clues page countdown - seconds left before the page closes itself.
+          Sits above the pending-teams line pinned to the bottom edge. */}
+      {isClues && cluesCountdownSec != null && cluesCountdownSec > 0 && (
+        <div
+          className="absolute bottom-14 right-6 z-40 px-3 py-1 rounded-full bg-black/60 text-white text-lg font-bold tabular-nums pointer-events-none"
+        >
+          {cluesCountdownSec}
+        </div>
+      )}
     </div>
   );
 }

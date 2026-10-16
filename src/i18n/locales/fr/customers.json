@@ -1,0 +1,22 @@
+{
+  "label": "Client",
+  "none": "Aucun client",
+  "search": "Rechercher ou créer un client…",
+  "newOption": "+ Nouveau client « {{name}} »",
+  "similarTitle": "Des clients au nom proche existent déjà :",
+  "useExisting": "Utiliser « {{name}} »",
+  "createAnyway": "Créer quand même",
+  "playedBadge": "Déjà joué · {{date}}",
+  "playedBadgeCount": "Déjà joué {{count}}× · {{date}}",
+  "selectBarLabel": "Partie pour",
+  "selectBarHint": "Choisissez le client pour voir les scénarios qu'il a déjà joués.",
+  "clear": "Retirer le client",
+  "remember": "Mémoriser le client dans la configuration",
+  "setClient": "Client…",
+  "assignTitle": "Client de la partie",
+  "save": "Enregistrer",
+  "cancel": "Annuler",
+  "assignFailed": "Impossible de changer le client de cette partie.",
+  "createFailed": "Impossible de créer ce client.",
+  "unsupportedMother": "Mettez à jour l'appareil principal pour associer des clients aux parties."
+}

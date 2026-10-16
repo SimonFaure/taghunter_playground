@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { readLaunchLogoUrl } from '../utils/launchLogo';
 import { resolveLogoEffect, type LogoAnimation } from '../utils/logoEffect';
 import { PinExitPrompt } from './PinExitPrompt';
+import { pushOverlay, popOverlay } from '../services/screenState';
 
 // Branded screen shown instead of the home page at launch when
 // `logoScreenOnLaunch` is enabled. Shown once per session, after the
@@ -37,6 +38,12 @@ export function LogoLaunchScreen({
   const { t } = useTranslation();
   const [logoUrl, setLogoUrl] = useState<string>(FALLBACK_LOGO);
   const [showPin, setShowPin] = useState(false);
+
+  // Report "logo screen" to the mother so the top-bar Devices modal shows it.
+  useEffect(() => {
+    pushOverlay('logo');
+    return () => popOverlay('logo');
+  }, []);
 
   // Resolve a custom logo from AppData; fall back to the bundled asset.
   useEffect(() => {

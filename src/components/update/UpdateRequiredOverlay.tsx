@@ -69,7 +69,7 @@ export function UpdateRequiredOverlay({ status }: UpdateRequiredOverlayProps) {
         )}
 
         {status.canSelfUpdate ? (
-          <DesktopUpdateInstaller version={status.latestVersion} />
+          <DesktopUpdateInstaller version={status.latestVersion} source={status.source} />
         ) : status.storeUrl ? (
           <button
             onClick={openStore}

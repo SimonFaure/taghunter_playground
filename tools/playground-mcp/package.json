@@ -1,0 +1,22 @@
+{
+  "name": "taghunter-playground-mcp",
+  "version": "1.4.0",
+  "private": true,
+  "description": "Claude Desktop extension: run Playground game-simulator campaigns (tester builds).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/index.js",
+    "pack": "npm run build && mcpb pack . taghunter-playground.mcpb"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "^2.1.2",
+    "@types/node": "^18.19.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}

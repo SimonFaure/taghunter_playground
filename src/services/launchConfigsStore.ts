@@ -40,6 +40,13 @@ function toSavedConfig(config: GameConfig | SavedLaunchConfig): SavedLaunchConfi
   const clone = { ...(config as GameConfig) } as Partial<GameConfig>;
   delete clone.name;
   delete clone.teams;
+  // The licensee customer is per-game too, unless the preset was saved with
+  // "Remember client" (project_licensee_customers).
+  if (!clone.rememberCustomer) {
+    delete clone.customerId;
+    delete clone.customerName;
+    delete clone.rememberCustomer;
+  }
   return clone as SavedLaunchConfig;
 }
 

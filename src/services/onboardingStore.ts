@@ -18,14 +18,12 @@ const COMPLETED_KEY = 'onboarding_completed';
 const LANG_KEY = 'onboarding_lang';       // step 0 answered
 const LANG_TOUCHED_KEY = 'onboarding_lang_touched'; // operator explicitly picked a language
 const NAMED_KEY = 'onboarding_named';      // step 4 answered
-const HOTSPOT_KEY = 'onboarding_hotspot';  // step 5 answered
 const MOTHER_KEY = 'onboarding_mother';    // step 6 answered
 const OPERATOR_KEY = 'onboarding_operator_only'; // step 7 answered (before appearance)
 
 export type OnboardingStepKey =
   | typeof LANG_KEY
   | typeof NAMED_KEY
-  | typeof HOTSPOT_KEY
   | typeof MOTHER_KEY
   | typeof OPERATOR_KEY;
 
@@ -77,7 +75,6 @@ export async function isLangTouched(): Promise<boolean> {
 export const ONBOARDING_KEYS = {
   lang: LANG_KEY,
   named: NAMED_KEY,
-  hotspot: HOTSPOT_KEY,
   mother: MOTHER_KEY,
   operatorOnly: OPERATOR_KEY,
 } as const;
@@ -85,15 +82,15 @@ export const ONBOARDING_KEYS = {
 // The first post-PIN step (4–7) that hasn't been answered yet. Drives where the
 // post-PIN wizard resumes. Appearance (step 7) is the trailing step and has no
 // marker of its own - reaching it means everything before is done, so 'appearance'
-// is returned once name/hotspot/mother are all answered.
-export type PostPinStep = 'name' | 'hotspot' | 'mother' | 'operatorOnly' | 'appearance';
+// is returned once name/mother/operator-only are all answered. (The former
+// 'hotspot' step was removed with the hotspot, 2026-09-30.)
+export type PostPinStep = 'name' | 'mother' | 'operatorOnly' | 'appearance';
 
 export async function firstUnansweredPostPinStep(): Promise<PostPinStep> {
   if (!(await isStepAnswered(NAMED_KEY))) return 'name';
-  // Android tablets are locked operator-only and never host: no hotspot,
-  // mother or operator-only question to ask.
+  // Android tablets are locked operator-only and never host: no mother or
+  // operator-only question to ask.
   if (isAndroid()) return 'appearance';
-  if (!(await isStepAnswered(HOTSPOT_KEY))) return 'hotspot';
   if (!(await isStepAnswered(MOTHER_KEY))) return 'mother';
   if (!(await isStepAnswered(OPERATOR_KEY))) return 'operatorOnly';
   return 'appearance';

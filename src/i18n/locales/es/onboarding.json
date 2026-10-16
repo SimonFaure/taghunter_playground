@@ -20,17 +20,6 @@
     "label": "Nombre del dispositivo",
     "placeholder": "p. ej. PC de recepción"
   },
-  "hotspot": {
-    "title": "¿Punto de acceso Wi-Fi predeterminado?",
-    "subtitle": "Usar este ordenador como punto de acceso Wi-Fi predeterminado al que tus otros dispositivos se conectarán automáticamente.",
-    "yes": "Sí, usar este ordenador como punto de acceso",
-    "no": "No",
-    "note": "El punto de acceso se activará la próxima vez que se inicie la aplicación - tu conexión a internet sigue activa durante el resto de la configuración.",
-    "conflictTitle": "Ya existe un punto de acceso predeterminado",
-    "conflictBody": "Tu cuenta ya tiene un punto de acceso predeterminado ({{names}}). ¿Añadir este ordenador como otro punto de acceso predeterminado?",
-    "conflictConfirm": "Añadir como otro predeterminado",
-    "conflictCancel": "No añadir este"
-  },
   "mother": {
     "title": "¿Servidor de juego predeterminado?",
     "subtitle": "Usar este ordenador como servidor de juego predeterminado (la «madre») que ejecuta tus juegos en la red local.",

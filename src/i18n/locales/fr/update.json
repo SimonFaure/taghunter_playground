@@ -1,6 +1,7 @@
 {
   "availableDesktop": "La version {{version}} est disponible.",
   "availableStore": "La version {{version}} est disponible sur la boutique d'applications.",
+  "availableFromMother": "La version {{version}} est disponible sur le poste mère.",
   "updateButton": "Mettre à jour",
   "openStoreButton": "Ouvrir la boutique",
   "dismiss": "Fermer",
@@ -23,6 +24,7 @@
   "updateFromDeviceStore": "Veuillez mettre à jour Tag Hunter Playground depuis la boutique d'applications de votre appareil.",
   "downloadConfirmTitle": "Télécharger la mise à jour",
   "downloadConfirmMessage": "Cette mise à jour ({{version}}) sera installée sur cet appareil. Pensez à mettre à jour vos autres appareils (assurez-vous que vous êtes connectés à Internet pour télécharger la mise à jour).",
+  "downloadConfirmMessageMother": "Cette mise à jour ({{version}}) sera copiée depuis le poste mère, puis installée sur cet appareil.",
   "ready": "Mise à jour prête à installer",
   "appUpdatesTitle": "Mises à jour de l'application",
   "currentVersionLabel": "Version actuelle",
@@ -31,6 +33,7 @@
   "upToDate": "Vous utilisez la dernière version.",
   "serverUnreachable": "Impossible de joindre le serveur de mises à jour. Vérifiez votre connexion et réessayez.",
   "versionAvailable": "Version {{version}} disponible",
+  "fromMotherHint": "Pas d'internet : la mise à jour vient du poste mère. Sa signature Tag Hunter est vérifiée avant l'installation.",
   "updateRequiredHint": "Cette mise à jour est requise pour continuer à utiliser l'application.",
   "uninstallTitle": "Désinstaller cette application",
   "uninstallBody": "Supprime Tag Hunter Playground et toutes ses données stockées localement sur cet ordinateur.",

@@ -11,7 +11,6 @@
 import { invoke } from '@tauri-apps/api/core';
 
 interface LocalRole {
-  is_mother_hosting: boolean;
   mother_server_running: boolean;
   paired_devices_count: number;
   paired_mothers_count: number;

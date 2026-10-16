@@ -9,6 +9,7 @@
   "exitAdmin": "Exit admin",
   "logoScreen": "Logo screen",
   "lock": "Lock",
+  "devices": "Devices",
   "motherThisDevice": "This device is the mother",
   "motherConnected": "This device is connected to the mother",
   "motherConnectedTo": "This device is connected to the mother: {{label}}",
@@ -17,5 +18,6 @@
   "readerKo": "SI reader not detected",
   "readerChecking": "Checking the reader…",
   "testChannelBadge": "TEST",
-  "testChannelHint": "This device is a tester: it downloads app updates from the test release channel."
+  "testChannelHint": "This device is a tester: it downloads app updates from the test release channel.",
+  "motherSubstituteThisDevice": "This device hosts the games in place of the mother"
 }

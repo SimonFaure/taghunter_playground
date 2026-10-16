@@ -17,6 +17,7 @@ import {
   mkdir,
   open,
   readDir,
+  readTextFile,
   remove,
   rename,
   stat,
@@ -27,6 +28,7 @@ import {
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { appDataDir, join } from '@tauri-apps/api/path';
 import { getDb } from './db';
+import * as contentSyncState from './contentSyncState';
 
 const APP = BaseDirectory.AppData;
 
@@ -256,6 +258,30 @@ export async function writeText(relPath: string, content: string): Promise<void>
   await writeTextFile(relPath, content, { baseDir: APP });
 }
 
+// Content a satellite pushed to this mother (LAN content sync), staged by the
+// Rust content server until the renderer commits it. See services/peerInbox.
+export const PEER_INBOX_REL = 'media/peer_inbox';
+
+/** A text file under AppData, or null when absent/unreadable. */
+export async function readTextRel(relPath: string): Promise<string | null> {
+  try {
+    if (!(await exists(relPath, { baseDir: APP }))) return null;
+    return await readTextFile(relPath, { baseDir: APP });
+  } catch {
+    return null;
+  }
+}
+
+/** File names directly under a dir (none when it doesn't exist). */
+export async function listFileNames(relPath: string): Promise<string[]> {
+  try {
+    if (!(await exists(relPath, { baseDir: APP }))) return [];
+    return (await readDir(relPath, { baseDir: APP })).filter((e) => e.isFile).map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
 export async function removeRecursive(relPath: string): Promise<void> {
   if (!(await exists(relPath, { baseDir: APP }))) return;
   try {
@@ -397,7 +423,9 @@ async function pruneBlobTmp(): Promise<void> {
   for (const e of entries) {
     const rel = `${BLOBS_TMP_REL}/${e.name}`;
     try {
-      if (e.isFile && e.name.endsWith('.part')) {
+      // `.part`: our own resumable downloads; `.up`: a satellite's resumable
+      // upload into this mother's pool (content_server.rs put_blob).
+      if (e.isFile && (e.name.endsWith('.part') || e.name.endsWith('.up'))) {
         const mtime = (await stat(rel, { baseDir: APP })).mtime?.getTime() ?? 0;
         if (now - mtime < PARTIAL_MAX_AGE_MS) continue;
       }
@@ -439,5 +467,10 @@ export async function wipeAllContent(): Promise<void> {
   // Operator-imported tutorial videos belong to the previous owner too - the
   // files go with `media`, so the rows pointing at them must go as well.
   await db.execute('DELETE FROM local_game_type_videos');
+  // LAN content sync state: the prior owner's snapshot and remote file lists
+  // must never be offered to the new owner's devices.
+  await db.execute('DELETE FROM scenario_remote_files');
+  await db.execute('DELETE FROM card_mutation_acks');
+  await contentSyncState.clear();
   await removeRecursive('media');
 }

@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Play, Users, ArrowLeft, Check, AlertTriangle } from 'lucide-react';
 import { tIngame } from '../i18n/ingame';
+import { useSimBus } from '../services/simBus';
 
 export interface TagQuestRegTeam {
   team_id: number;
@@ -117,6 +118,12 @@ export function TagQuestRegistrationScreen({
   restricted = false,
   language,
 }: TagQuestRegistrationScreenProps) {
+  // Game simulator: pick the team for the next mock player's bip, then press
+  // Start once everyone is registered - the same handlers a tap calls.
+  useSimBus((a) => {
+    if (a.kind === 'selectTeam') onSelectTeam(a.teamId);
+    else if (a.kind === 'pressStart') onStart();
+  });
   const lang = language || 'fr';
   const tq = useCallback<Translate>(
     (key, vars) => tIngame('ingame_tagquest', key, lang, vars),

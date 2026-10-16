@@ -22,6 +22,7 @@ import {
   isProjectorOpenForTarget,
   closeSelfProjectorWindow,
 } from '../services/projectorWindow';
+import { gameClock } from '../services/gameClock';
 
 interface LeaderboardPageProps {
   launchedGameId: number | null;
@@ -150,7 +151,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
     (key: string, vars?: Record<string, string | number>) => tIngame('ingame_clash', key, clashLang, vars),
     [clashLang],
   );
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [nowMs, setNowMs] = useState(() => gameClock.now());
   const [teamsConfig, setTeamsConfig] = useState<ConfigTeam[]>(config.teams || []);
   const [playMode, setPlayMode] = useState<'solo' | 'team'>(config.playMode || 'solo');
   const [loading, setLoading] = useState(true);
@@ -238,6 +239,14 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
       const state = await getLaunchedGameState(launchedGameId, 0);
       setGameEnded(!!state.ended);
       if (state.game_uniqid) setGameUniqid((cur) => (cur === state.game_uniqid ? cur : state.game_uniqid));
+      // From the game TYPE, not the `clash_config` meta: a TagQuest
+      // self-register team launch carries one too (its per-team cap), and
+      // taking the Clash points showed 0 for every TagQuest team.
+      const clash = (state.game_type ?? '').toLowerCase() === 'clash';
+      if (clash !== isClashRef.current) {
+        isClashRef.current = clash;
+        setIsClash(clash);
+      }
       data = state.teams.map((t) => ({
         id: t.id,
         team_number: t.team_number,
@@ -267,7 +276,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
         const st = await getClashState(launchedGameId);
         clashStandingsRef.current = st;
         setClashStandings(st);
-        setNowMs(Date.now());
+        setNowMs(gameClock.now());
         const byId = new Map(st.clans.map((c) => [c.team_id, c]));
         data = data.map((t) => (byId.has(t.id) ? { ...t, score: byId.get(t.id)!.points } : t));
       } catch (err) {
@@ -358,14 +367,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
         if (map.teamsConfig) {
           try { setTeamsConfig(JSON.parse(map.teamsConfig)); } catch { /* swallow */ }
         }
-        // `clash_config` is written by the launch for Clash games only - the
-        // one marker available here without plumbing the game type down from
-        // GamePage (and it reaches the projector window too, which only carries
-        // the launched-game id).
-        if (map.clash_config) {
-          setIsClash(true);
-          isClashRef.current = true;
-        }
+        // Clash is detected in fetchTeams from the state's game_type.
       } catch (err) {
         console.error('[LeaderboardPage] meta load failed:', err);
       }
@@ -422,7 +424,7 @@ export function LeaderboardPage({ launchedGameId, config, gameName, onBack, proj
   // Clash event ages ("il y a 4 min") need to tick between polls.
   useEffect(() => {
     if (!isClash) return;
-    const id = setInterval(() => setNowMs(Date.now()), 30000);
+    const id = setInterval(() => setNowMs(gameClock.now()), 30000);
     return () => clearInterval(id);
   }, [isClash]);
 

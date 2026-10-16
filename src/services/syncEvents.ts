@@ -13,7 +13,8 @@ export type ContentKind =
   | 'recovery_codes'
   | 'report_layouts'
   | 'game_types'
-  | 'game_type_overrides';
+  | 'game_type_overrides'
+  | 'customers';
 
 export type CyclePhase = 'push_pending' | 'manifest' | 'download';
 export type WorkItemKind =
@@ -21,13 +22,16 @@ export type WorkItemKind =
   | 'on_demand'
   | 'team_names'
   | 'recovery_codes'
+  | 'customers'
   | 'report_layouts'
   | 'lan_networks'
   | 'pattern'
   | 'scenario_meta'
   | 'scenario_media'
   | 'game_type_admin_video'
-  | 'game_type_override_video';
+  | 'game_type_override_video'
+  | 'game_type_admin_subtitles'
+  | 'game_type_override_subtitles';
 
 export interface CycleStartedPayload {
   trigger: 'startup' | 'foreground' | 'network_up' | 'timer' | 'retry' | 'manual';
@@ -112,7 +116,25 @@ export interface ContentUpdatedPayload {
   removed?: Array<string | number>;
 }
 
+// Launch check (askFirst) found content to download: the app asks the
+// operator before any download starts. `on_demand` cards are not counted
+// (every cycle re-fetches them).
+export interface UpdatesAvailablePayload {
+  total: number;
+  newScenarios: string[];
+  updatedScenarios: string[];
+  patterns: number;
+  videos: number;
+  other: number;
+}
+
+export interface UpdatesResolvedPayload {
+  accepted: boolean;
+}
+
 export type SyncEventMap = {
+  'updates:available': UpdatesAvailablePayload;
+  'updates:resolved': UpdatesResolvedPayload;
   'cycle:started': CycleStartedPayload;
   'cycle:phase': CyclePhasePayload;
   'cycle:progress': CycleProgressPayload;

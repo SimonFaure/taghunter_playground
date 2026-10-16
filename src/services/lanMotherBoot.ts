@@ -18,21 +18,19 @@
 // (cloud-sync, slice E of the LAN-mode roadmap).
 
 import { invoke } from '@tauri-apps/api/core';
-import { platform } from '@tauri-apps/plugin-os';
 import { setLanOverride, getLanOverride, setLocalLaunchedGamesRoute, LOCAL_ONLY_ENDPOINTS } from './api';
 import {
   notifyPromotedToMother, getPromotableGameId, findTakeoverMother, noteMotherTakeover, rejoinMotherNow,
   type TakeoverMother,
 } from './motherFailover';
-import { discoverOtherMothers, joinMother, hotspotStatus, startHotspot, stopHotspot, refreshMdns, getLastHotspotStopAt } from './lanPairing';
-import { getNetworkSource, getPreferredHotspotCreds, saveHotspotCreds } from './lanCredentials';
+import { discoverOtherMothers, joinMother, speaksOurLanProto } from './lanPairing';
 import { ensureFirewallRuleOnce } from './firewall';
-import { loadConfig, saveConfig } from '../utils/config';
-import { scanWifiFresh, connectWifi, disconnectWifi, getCurrentSsid, localIpv4s, maybeRenewDhcpIfStuck } from './wifi';
 import { getAuthUser } from './authStore';
 import { getDeviceMetadata, getCachedDeviceDisplayName } from './device';
+import { getHostingClaim } from './deviceRole';
+import { reconcileWithMotherNow } from './motherStateReconcile';
 
-interface MotherServerInfo {
+export interface MotherServerInfo {
   port: number;
   bound_addr: string;
   mother_device_uuid: string;
@@ -50,43 +48,6 @@ let localInfo: MotherServerInfo | null = null;
 // can never drift apart.
 const LAUNCHED_GAMES_ENDPOINTS = LOCAL_ONLY_ENDPOINTS;
 
-// ─── hotspot health surface ──────────────────────────────────────────────────
-// A willing hotspot-mode mother that can't get its AP on the air used to fail
-// as a console.warn nobody sees - on an offline site the only symptom was
-// "children can't find the mother". The raise routine now publishes its
-// outcome; HotspotIssueBanner (App root) renders it persistently.
-export type HotspotIssue =
-  | { kind: 'no_creds' }
-  | { kind: 'raise_failed'; message: string };
-
-let hotspotIssue: HotspotIssue | null = null;
-const hotspotIssueListeners = new Set<(issue: HotspotIssue | null) => void>();
-
-function setHotspotIssue(issue: HotspotIssue | null): void {
-  const changed =
-    (issue === null) !== (hotspotIssue === null) ||
-    issue?.kind !== hotspotIssue?.kind ||
-    (issue?.kind === 'raise_failed' &&
-      hotspotIssue?.kind === 'raise_failed' &&
-      issue.message !== hotspotIssue.message);
-  hotspotIssue = issue;
-  if (!changed) return; // the watchdog re-reports every 10s - don't spam
-  for (const fn of hotspotIssueListeners) {
-    try {
-      fn(issue);
-    } catch {
-      /* listener errors must not break the raise path */
-    }
-  }
-}
-
-/** Subscribe to hotspot-raise health; fires immediately with the current state. */
-export function onHotspotIssue(fn: (issue: HotspotIssue | null) => void): () => void {
-  hotspotIssueListeners.add(fn);
-  fn(hotspotIssue);
-  return () => hotspotIssueListeners.delete(fn);
-}
-
 // Record this device's OWN local server as the force-local route in api.ts, so
 // the "This device" section can read local history even while the main override
 // is pointed at a mother. Called whenever `localInfo` is (re)established.
@@ -101,7 +62,7 @@ function publishLocalRoute(info: MotherServerInfo): void {
  * Repoint `launched_games` traffic at a MOTHER device (used when this device is
  * a satellite joining the mother's launched game). Reads/writes - game state,
  * register_device, punches - then hit the mother's SQLite instead of our own
- * empty local server. `baseUrl` like `http://192.168.137.1:52202`.
+ * empty local server. `baseUrl` like `http://192.168.1.20:47800`.
  */
 export function pointLaunchedGamesAtMother(baseUrl: string, token: string): void {
   setLanOverride({ baseUrl, token, endpoints: LAUNCHED_GAMES_ENDPOINTS });
@@ -134,26 +95,31 @@ export async function defaultMotherLabel(): Promise<string | undefined> {
 
 export interface BecomeMotherInfo extends MotherServerInfo {
   epoch: number;
-  hotspot_started: boolean;
-  hotspot_error: string | null;
 }
 
 /**
  * Mother-failover slice 4: promote THIS device into the new mother for
  * `launchedGameId`, adopting its cached snapshot (game state + pairing table),
- * bumping the epoch, and best-effort raising the same-named hotspot. On success
+ * bumping the epoch and announcing itself over mDNS on the LAN. On success
  * this device's `launched_games` traffic is routed at its own freshly-started
  * server. Throws with a human-readable message on the guards (no cached
  * snapshot on this device / scenario content not synced).
+ *
+ * The device hosts in the role it is SET to: the mother when "Rôle de ce
+ * poste" says so (it takes a running game back from a substitute), a
+ * substitute otherwise. Taking a game over never changes that setting.
  */
 export async function becomeMother(
   launchedGameId: number,
   mdnsLabel?: string
 ): Promise<BecomeMotherInfo> {
+  const claim = await getHostingClaim();
   const info = await invoke<BecomeMotherInfo>('become_mother', {
     launchedGameId,
     port: 0, // 0 = OS picks; the command returns the actual port
     mdnsLabel: mdnsLabel ?? (await defaultMotherLabel()) ?? null,
+    configured: claim.configured,
+    designatedAt: claim.designatedAt,
   });
   // We are the mother now - route launched_games at our own server and let
   // ensureMotherServer pick this up on subsequent calls without restarting.
@@ -166,34 +132,13 @@ export async function becomeMother(
     endpoints: LAUNCHED_GAMES_ENDPOINTS,
   });
   // First time this device hosts, make sure satellites can actually reach it
-  // over the hotspot's Public profile (one-time UAC). Fire-and-forget so the
-  // promotion isn't blocked on the prompt.
+  // (one-time UAC for the firewall rule). Fire-and-forget so the promotion isn't
+  // blocked on the prompt.
   void ensureFirewallRuleOnce();
-  // A promoted device becomes a WILLING mother. Two things gate on this flag and
-  // both matter now: the boot path (so a restart mid-game re-hosts instead of
-  // going satellite) and - critically - motherHotspotWatchdogTick, which bails
-  // on `!beMotherWhenAvailable`. Without this, a promoted device whose AP failed
-  // to come up, or whose AP Windows later idles off, has NOTHING that re-raises
-  // it. GameList's "become mother and launch" path already does the same.
-  await loadConfig()
-    .then((cfg) => (cfg.beMotherWhenAvailable ? null : saveConfig({ ...cfg, beMotherWhenAvailable: true })))
-    .catch(() => null);
-  // Rust raises the AP once, inline. That single attempt is fragile precisely
-  // here: the Wi-Fi adapter is still reassociating to the SSID that just
-  // vanished, and Windows answers OperationInProgress / NetworkLimitedConnectivity.
-  // Retry through the idempotent raise routine, which also re-syncs the creds and
-  // re-announces mDNS on the AP subnet (start_mdns is INERT until an AP address
-  // exists, so without this the new mother stays undiscoverable).
-  let effective = info;
-  if (!info.hotspot_started && (await getNetworkSource().catch(() => 'hotspot')) === 'hotspot') {
-    await raiseMotherHotspotIfConfigured();
-    const st = await hotspotStatus().catch(() => null);
-    if (st?.running) effective = { ...info, hotspot_started: true, hotspot_error: null };
-  }
   // We're the mother now - clear the "unreachable" banner.
   lastPromotedAt = Date.now();
   notifyPromotedToMother();
-  return effective;
+  return info;
 }
 
 // When this device last promoted itself. For two minutes after, the App's
@@ -205,7 +150,7 @@ export function msSincePromotion(): number {
 }
 
 export type PromoteOutcome =
-  | { kind: 'promoted'; info: BecomeMotherInfo }
+  | { kind: 'promoted'; info: MotherServerInfo }
   | { kind: 'joined'; taker: TakeoverMother };
 
 /**
@@ -224,7 +169,28 @@ export async function promoteUnlessTakenOver(launchedGameId: number, clientId?: 
     }
     return { kind: 'joined', taker };
   }
-  return { kind: 'promoted', info: await becomeMother(launchedGameId) };
+  return { kind: 'promoted', info: await becomeMotherOrServeOwn(launchedGameId, clientId) };
+}
+
+/**
+ * `becomeMother`, for the case where this device's OWN rows are newer than the
+ * snapshot it cached (it hosted the game after that snapshot was taken, e.g. a
+ * substitute restarted mid-game). Adopting the cache would roll the game back,
+ * so Rust refuses with `stale_snapshot`; the right move is then simply to serve
+ * the rows this device already holds. That refusal used to reach the operator
+ * as an error with nothing to do about it.
+ */
+async function becomeMotherOrServeOwn(launchedGameId: number, clientId?: number): Promise<MotherServerInfo> {
+  try {
+    return await becomeMother(launchedGameId);
+  } catch (e) {
+    const msg = String((e as { message?: string })?.message ?? e);
+    if (!msg.includes('stale_snapshot') || clientId == null) throw e;
+    const info = await ensureMotherServer(clientId);
+    if (!info) throw e;
+    lastPromotedAt = Date.now();
+    return info;
+  }
 }
 
 export interface TakeoverTarget {
@@ -234,6 +200,15 @@ export interface TakeoverTarget {
   port: number;
   mother_uuid: string;
   epoch: number;
+  label: string | null;
+}
+
+/** Where a serving mother answers, and who it is. */
+export interface MotherEndpoint {
+  addr: string;
+  port: number;
+  mother_uuid: string;
+  label: string | null;
 }
 
 /**
@@ -260,58 +235,50 @@ export async function takeoverMother(target: TakeoverTarget): Promise<BecomeMoth
 }
 
 /**
- * The inverse of takeover: a LIVE mother that's been superseded (another device
- * took control at a higher epoch) yields. It stops its own server + hotspot and
- * becomes a satellite of the winner - pointing launched_games at it (our self
- * secret authenticates, since the winner adopted our row) and tracking it as a
- * paired mother so the footer reflects it. Without this, the old mother keeps
- * its server up and its "Mother" footer icon stays green (visible split-brain).
+ * Stop hosting and follow `target` instead. Two cases end here:
+ *  - a substitute sees the device set as the mother back on the network: it
+ *    hands the hosting back, silently;
+ *  - a serving device is superseded on the game it hosts (another device took
+ *    it over at a higher epoch).
+ * It stops its own server and becomes a satellite of `target` - pointing
+ * launched_games at it (our self secret authenticates when it adopted our row;
+ * otherwise the route tick re-pairs) and tracking it as a paired mother so the
+ * top bar reflects it. Then it reconciles: everything this device hosted that
+ * the mother lacks or holds in an older state is pushed to it, ended games
+ * included, and the mother's later states come back.
  */
-export async function yieldToMother(target: TakeoverTarget): Promise<void> {
+export async function yieldToMother(target: MotherEndpoint): Promise<void> {
   await invoke('mother_stop_local_server').catch(() => {});
-  // Drop our own AP too - the winner raises its own (same SSID in hotspot mode),
-  // and two same-SSID APs is exactly what we want to avoid.
-  await invoke('mother_stop_hotspot').catch(() => {});
 
   // Forget that we were hosting, the way demoteFromMother does. Our server is
   // stopped, so a remembered local route is a route to a dead port - and
   // childControlLink's `restoreLocalLaunchedGames()` would happily reinstall it
   // every 15s, dragging the games list back onto our own stale rows. That was
   // half of "the game still showed as running on the old mother" (Ludiom #76).
-  // NOT touched: `beMotherWhenAvailable`. Being superseded is a temporary
-  // supersession, not the operator declaring this device a satellite.
+  // NOT touched: "Rôle de ce poste". Standing down for a game is not the
+  // operator changing this device's role.
   bootPromise = null;
   localInfo = null;
   setLocalLaunchedGamesRoute(null);
+  // We no longer stand in for anyone.
+  await invoke('client_clear_substitute_state').catch(() => {});
 
   const secret = await invoke<string | null>('get_self_peer_secret').catch(() => null);
   if (secret) {
     pointLaunchedGamesAtMother(`http://${target.addr}:${target.port}`, secret);
     await invoke('client_save_paired_mother', {
       motherUuid: target.mother_uuid,
-      motherLabel: null,
+      motherLabel: target.label,
       peerSecret: secret,
     }).catch(() => {});
     await invoke('client_refresh_mother_endpoints', { timeoutMs: 2500 }).catch(() => {});
     await invoke('client_prune_paired_mothers', { keepUuid: target.mother_uuid, staleMinutes: 10 }).catch(() => {});
   }
 
-  // The other half of #76: our local rows still describe the game as WE last
-  // knew it. Pull the winner's current state and mirror it, so this device's
-  // own list, archive and statistics tell the truth - including "ended" once
-  // the operator closes the game over there. Best-effort: if the fetch fails,
-  // the periodic reconcile retries.
-  try {
-    await invoke('fetch_snapshot_from_mother', {
-      launchedGameId: target.launched_game_id,
-      addr: target.addr,
-      port: target.port,
-    });
-    const outcome = await applyMotherSnapshot(target.launched_game_id);
-    console.log('[yieldToMother] mirrored game state →', outcome.reason);
-  } catch (e) {
-    console.warn('[yieldToMother] could not mirror the new mother state:', e);
-  }
+  // Best-effort: the reconcile tick retries, and re-pairs first if the mother
+  // did not honour our secret.
+  const report = await reconcileWithMotherNow();
+  console.log('[yieldToMother] reconciled with the mother →', report);
 }
 
 /** Outcome of the Rust `apply_mother_snapshot` mirror - see its doc comment. */
@@ -342,17 +309,23 @@ export async function applyMotherSnapshot(launchedGameId: number): Promise<Apply
 export type ForceMotherOutcome = 'takeover' | 'adopted' | 'restarted';
 
 /**
- * Operator-forced "make THIS device the mother", from the Network settings
- * button. Handles every situation, in order of preference:
+ * Operator-forced "host the games on THIS device", from the Network page. On a
+ * device that is not set as the mother this is how it becomes a substitute.
+ * Handles every situation, in order of preference:
  *  1. A live, higher-epoch mother is on the LAN → pull its CURRENT state and
  *     promote (no data loss) - same as the startup prompt.
  *  2. No live competitor, but this device cached a snapshot → adopt that.
- *  3. Neither → (re)start this device's own local server (e.g. the original
- *     mother whose game lives locally and which stood down at boot; with no
- *     higher epoch advertised now, the fence lets it serve).
+ *  3. Neither → (re)start this device's own local server, serving its own rows.
+ *     Refused when the device holds no running game - unless `allowIdle`: the
+ *     "Héberger les parties en remplacement" button, pressed when no mother is
+ *     on the network, must work on a PC with nothing in progress too (it is
+ *     how the venue gets a host to launch from).
  * Throws with a readable message if none apply.
  */
-export async function forceBecomeMother(clientId: number): Promise<ForceMotherOutcome> {
+export async function forceBecomeMother(
+  clientId: number,
+  opts?: { allowIdle?: boolean }
+): Promise<ForceMotherOutcome> {
   console.log('[forceBecomeMother] start clientId=', clientId);
   // 1. Live higher-epoch mother present.
   const target = await invoke<TakeoverTarget | null>('get_takeover_target', { clientId }).catch(
@@ -367,7 +340,10 @@ export async function forceBecomeMother(clientId: number): Promise<ForceMotherOu
     return 'takeover';
   }
   // 2. Competitor gone, but we hold a cached snapshot.
-  const gid = await getPromotableGameId();
+  // `mother_snapshots` is never pruned: without a game on screen, only adopt a
+  // cached one that is plausibly the game of the day.
+  const candidate = await getPromotableGameId();
+  const gid = candidate != null && (!opts?.allowIdle || (await isReclaimableGame(candidate))) ? candidate : null;
   console.log('[forceBecomeMother] promotable game id=', gid);
   if (gid != null) {
     try {
@@ -387,7 +363,7 @@ export async function forceBecomeMother(clientId: number): Promise<ForceMotherOu
   // 3. Restart our own local server - ONLY if our game actually lives here
   //    (the original mother). Otherwise there's nothing to take control of:
   //    don't start an empty server and falsely report success.
-  const hasLocalGame = await deviceHasLocalActiveGame();
+  const hasLocalGame = opts?.allowIdle || (await deviceHasLocalActiveGame());
   console.log('[forceBecomeMother] hasLocalActiveGame=', hasLocalGame);
   if (!hasLocalGame) {
     throw new Error('failover:errNotInGame');
@@ -402,16 +378,12 @@ export async function forceBecomeMother(clientId: number): Promise<ForceMotherOu
 }
 
 /**
- * The inverse of forceBecomeMother, for the Network-settings "I'm not a mother"
- * button: demote THIS device to a plain satellite right now, and stop it
- * volunteering at future boots.
- *  - `beMotherWhenAvailable` → false: both the App boot wiring and the hotspot
- *    watchdog gate on it, so nothing re-hosts or re-raises the AP afterwards.
+ * Stop hosting on THIS device right now, for "Rôle de ce poste → Satellite"
+ * and for a mother superseded by a later-designated one. The caller changes
+ * the configured role (`setConfiguredMother(false)`); this only takes the
+ * server down safely.
  *  - Stop the local axum server: unregisters mDNS, so satellites stop
  *    resolving this device as a mother.
- *  - Drop our own hotspot: a satellite must never own 192.168.137.1 (see the
- *    watchdog's subnet-collision note). Uses lanPairing.stopHotspot so the
- *    deliberate-stop timestamp holds the watchdog off during its cooldown too.
  *  - Reset the module boot state and routing to a pure satellite's boot shape:
  *    no LAN override (the fail-closed gate re-arms) and no local route, so
  *    nothing keeps pointing at the now-dead 127.0.0.1 server.
@@ -444,230 +416,31 @@ export async function demoteFromMother(clientId?: number): Promise<void> {
       throw new HostingActiveGameError(hosted.name);
     }
   }
-  const cfg = await loadConfig();
-  if (cfg.beMotherWhenAvailable) {
-    // Write only when the flag is actually set, so a failed loadConfig (which
-    // returns defaults) can never overwrite a good config file with defaults.
-    await saveConfig({ ...cfg, beMotherWhenAvailable: false }).catch(() => {});
-  }
   await invoke('mother_stop_local_server').catch(() => {});
-  await stopHotspot().catch(() => {});
   bootPromise = null;
   localInfo = null;
   setLocalLaunchedGamesRoute(null);
   setLanOverride(null);
-  setHotspotIssue(null); // a non-mother expects no AP - clear any raise banner
   if (handover) await yieldToMother(handover).catch(() => {});
 }
 
-// ─── "regain control?" re-check requests ─────────────────────────────────────
-// RegainControlPrompt checks once shortly after boot. A returning mother that
-// first had to find and join the venue's existing Wi-Fi only sees the live
-// mother ~15 s later, so it asks the prompt to look again.
-const regainCheckListeners = new Set<() => void>();
-export function onRegainCheckRequested(fn: () => void): () => void {
-  regainCheckListeners.add(fn);
-  return () => regainCheckListeners.delete(fn);
-}
-export function requestRegainCheck(): void {
-  for (const fn of regainCheckListeners) {
-    try {
-      fn();
-    } catch {
-      /* listener errors must not break the caller */
-    }
-  }
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/**
- * Hotspot mode, BEFORE this device raises its own AP: is the venue's Tag Hunter
- * Wi-Fi already on the air, with a mother behind it?
- *
- * Retours sept. #1/#13 (blocker): the original mother, restarted after a
- * satellite took over, used to raise its own same-SSID AP straight away. Its
- * boot fence only browses mDNS - which cannot see a mother on a Wi-Fi this
- * device isn't on - so it hosted its stale copy of the game on a second,
- * separate network and the punches of the two halves never met. With a router
- * everything already worked, because both mothers sat on the same network.
- *
- * So: force a real scan; if our SSID is visible, join it as a client, get a
- * lease, and browse for a same-client mother. Found → we stay a client of that
- * network (the boot fence then stands down and the "Take back control?" prompt
- * is asked to re-check - regaining pulls the live mother's state, so nothing
- * is lost). Not found → the AP was someone's leftover; disconnect and let the
- * caller raise ours. Returns true when a live mother was found.
- */
-let lastProbe: { at: number; found: boolean } | null = null;
-const PROBE_REUSE_MS = 2 * 60_000;
-
-export async function joinExistingMotherNetworkIfPresent(clientId?: number): Promise<boolean> {
-  // The watchdog calls through here every 10 s while our AP is down: a positive
-  // answer is reused for a while instead of re-scanning and re-joining each tick.
-  if (lastProbe?.found && Date.now() - lastProbe.at < PROBE_REUSE_MS) return true;
-  const found = await probeExistingMotherNetwork(clientId);
-  lastProbe = { at: Date.now(), found };
-  return found;
-}
-
-async function probeExistingMotherNetwork(clientId?: number): Promise<boolean> {
-  try {
-    if (platform() !== 'windows') return false;
-    if ((await getNetworkSource().catch(() => 'hotspot')) !== 'hotspot') return false;
-    const st = await hotspotStatus().catch(() => null);
-    if (st?.running) return false; // we already broadcast it ourselves
-    const creds = await getPreferredHotspotCreds().catch(() => null);
-    if (!creds) return false;
-    const visible = await scanWifiFresh();
-    if (!visible.includes(creds.ssid)) return false;
-
-    console.warn(`[lanMotherBoot] "${creds.ssid}" is already on the air - joining it before raising our own AP.`);
-    if ((await getCurrentSsid()) !== creds.ssid) {
-      try {
-        await connectWifi(creds.ssid, creds.password);
-      } catch (e) {
-        console.warn('[lanMotherBoot] could not join the existing network:', e);
-        return false;
-      }
-    }
-    // Wait for a real lease on the AP subnet (not our own .1, not APIPA).
-    for (let i = 0; i < 10; i += 1) {
-      const ips = await localIpv4s();
-      if (ips.some((ip) => ip.startsWith('192.168.137.') && ip !== '192.168.137.1')) break;
-      await maybeRenewDhcpIfStuck();
-      await sleep(1000);
-    }
-    const cid = clientId ?? (await getAuthUser().catch(() => null))?.client_id ?? null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const mothers = await discoverOtherMothers(3000).catch(() => []);
-      const live = mothers.some(
-        (m) => m.port > 0 && m.addresses.length > 0 && (cid == null || m.client_id == null || m.client_id === cid)
-      );
-      if (live) {
-        console.warn('[lanMotherBoot] a mother is already serving on that network - not raising a second AP.');
-        requestRegainCheck();
-        return true;
-      }
-    }
-    console.warn('[lanMotherBoot] no mother behind the existing network - leaving it and raising ours.');
-    await disconnectWifi();
-    return false;
-  } catch (e) {
-    console.warn('[lanMotherBoot] existing-network probe failed (non-fatal):', e);
-    return false;
-  }
+/** Order discovered mothers: the device set as the mother first, then by epoch. */
+export function byRoleThenEpoch(
+  a: { role: string | null; epoch: number | null },
+  b: { role: string | null; epoch: number | null }
+): number {
+  const rank = (m: { role: string | null }) => (m.role === 'm' ? 1 : 0);
+  return rank(b) - rank(a) || (b.epoch ?? 0) - (a.epoch ?? 0);
 }
 
 /**
- * Retours sept. #21: a device that becomes the mother in hotspot mode while it
- * is still a CLIENT of the old mother's same-SSID AP kept a 192.168.137.x lease
- * next to its own 192.168.137.1 - two addresses on one subnet, advertised both,
- * and satellites/regain prompts picked the dead one. Leave that AP first (and
- * make Windows stop auto-rejoining it) before raising ours.
- */
-async function leaveOwnSsidAsClient(): Promise<void> {
-  try {
-    if (platform() !== 'windows') return;
-    if ((await getNetworkSource().catch(() => 'hotspot')) !== 'hotspot') return;
-    const creds = await getPreferredHotspotCreds().catch(() => null);
-    if (!creds) return;
-    if ((await getCurrentSsid()) === creds.ssid) {
-      console.warn('[lanMotherBoot] still a client of the old mother AP - disconnecting before raising ours.');
-      await disconnectWifi(creds.ssid);
-      await sleep(1500);
-    }
-  } catch {
-    /* best-effort */
-  }
-}
-
-/** Push the operator's hotspot band choice to Rust (read on every AP start). */
-export async function applyHotspotBandPreference(band?: '2.4' | 'auto'): Promise<void> {
-  const value = band ?? (await loadConfig().catch(() => null))?.hotspotBand ?? '2.4';
-  await invoke('mother_set_hotspot_band', { band: value }).catch(() => {});
-}
-
-/**
- * B1 (fused mother+hotspot): raise this mother's Wi-Fi hotspot when the network
- * source is `hotspot` (Windows-only; router-mode mothers ride an external AP and
- * raise none). Idempotent - never restarts a running AP, since that would
- * briefly drop connected satellites. The creds come from studio (the sole
- * author), mirrored locally on sync; `getPreferredHotspotCreds` returns the
- * operator's preferred hotspot, or null when studio hasn't defined one yet (then
- * we skip raising). Best-effort: never throws. Shared by the App boot path and
- * the launch auto-promote (F1).
- */
-export async function raiseMotherHotspotIfConfigured(
-  opts: { probeExisting?: boolean } = {}
-): Promise<void> {
-  try {
-    if (platform() !== 'windows') return;
-    if ((await getNetworkSource()) !== 'hotspot') {
-      setHotspotIssue(null); // router mode - an AP is not expected here
-      return;
-    }
-    // Automatic raises (boot retry, reclaim, watchdog) first look for the venue's
-    // existing network (#1/#13). An explicit promotion never does: the operator
-    // chose this device, and it leaves the old AP instead (#21).
-    if (opts.probeExisting) {
-      if (await joinExistingMotherNetworkIfPresent()) return;
-    } else {
-      await leaveOwnSsidAsClient();
-    }
-    const creds = await getPreferredHotspotCreds();
-    if (!creds) {
-      console.warn('[lanMotherBoot] no hotspot creds (studio never synced, none typed) - skipping AP raise');
-      setHotspotIssue({ kind: 'no_creds' });
-      return;
-    }
-    // Keep schema_meta (hotspot_ssid/password) in lockstep with the studio creds.
-    // That schema_meta pair is what the ping-relay + read_mother_wifi advertise to
-    // satellites (which Wi-Fi to join). The studio sync only writes wifi_networks
-    // (origin='studio'), so without this the mother keeps relaying a STALE
-    // auto-generated SSID from a pre-studio-creds build - children then try to
-    // join a network the AP isn't broadcasting ("pas à portée").
-    await saveHotspotCreds(creds.ssid, creds.password).catch(() => {});
-    let st = await hotspotStatus().catch(() => null);
-    if (st?.running && st.ssid !== creds.ssid) {
-      // Broadcasting a STALE SSID: stop it so we re-raise with the studio creds and
-      // the AP + relayed creds agree. (Only restarts on an actual mismatch, so a
-      // correct AP is never bounced.)
-      console.warn(
-        `[lanMotherBoot] hotspot SSID mismatch (broadcasting "${st.ssid}", studio "${creds.ssid}") - restarting AP`
-      );
-      await stopHotspot().catch(() => {});
-      st = null;
-    }
-    // Raise the AP if it isn't up already; capture its IPv4(s) either way.
-    const ipv4s = st?.running
-      ? st.ipv4_addresses
-      : (await startHotspot(creds.ssid, creds.password)).ipv4_addresses;
-    // ALWAYS (re)announce mDNS on the AP subnet. With the mother-side LAN lock the
-    // boot start_mdns is INERT until the AP has an IP; if the AP was already up (so
-    // we skipped startHotspot) the announcement would otherwise never carry the AP
-    // address and satellites could not DISCOVER the mother. refreshMdns re-runs
-    // start_mdns, which merges these with the live interface IPs (192.168.137.1).
-    await refreshMdns(ipv4s).catch(() => {});
-    setHotspotIssue(null);
-  } catch (err) {
-    console.error('[lanMotherBoot] raise hotspot failed:', err);
-    setHotspotIssue({
-      kind: 'raise_failed',
-      message: String((err as { message?: string })?.message ?? err),
-    });
-  }
-}
-
-/**
- * Mother/hotspot role rework (E1 stand-down → auto-pair): a willing device that
- * stood down at boot (the LAN fence found another live mother of this client)
- * joins that mother instead of competing. Browses mDNS for the highest-epoch
- * same-client mother and pairs with it - the mother auto-approves us on the LAN
+ * A device that is not hosting joins the mother that is. Browses mDNS for a
+ * same-client mother - the device set as the mother when there is one, else
+ * the highest epoch - and pairs with it. The mother auto-approves us on the LAN
  * (same client_id), so this is silent. Once paired, the periodic
  * `refreshLaunchedGamesRoute` tick points our launched_games traffic at it.
  * Returns true if we joined (or were already paired). Best-effort: a venue with
- * no other mother yet (we were simply first) returns false and we stay idle.
+ * no mother yet returns false and we stay idle.
  */
 let autoJoinInFlight: Promise<boolean> | null = null;
 
@@ -679,9 +452,12 @@ export async function autoJoinSameClientMother(clientId: number): Promise<boolea
     const mothers = await discoverOtherMothers().catch(() => []);
     const candidate = mothers
       .filter((m) => m.addresses.length > 0 && m.port > 0)
+      // Never a mother on another LAN protocol (an outdated build): pairing
+      // would be refused anyway.
+      .filter(speaksOurLanProto)
       // Same client when advertised; tolerate older mothers that don't advertise it.
       .filter((m) => m.client_id == null || m.client_id === clientId)
-      .sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0))[0];
+      .sort(byRoleThenEpoch)[0];
     if (!candidate) return false;
     try {
       const outcome = await joinMother(candidate, { timeoutMs: 8000 }).result;
@@ -697,75 +473,9 @@ export async function autoJoinSameClientMother(clientId: number): Promise<boolea
   }
 }
 
-/**
- * A WILLING mother ("Be the mother" on) that is not serving takes the role back
- * once the venue has had NO mother for a sustained stretch.
- *
- * Field case (Ludiom): the real mother A drops, B takes control, A restarts and
- * stands down behind B (the boot fence). The operator then taps "I'm not a
- * mother" on B - and the venue is left with no mother at all: A's only retry
- * (the one-shot stand-down re-check) bails as soon as A is paired, which it
- * always is by then. Every device spun on an empty games list and found no
- * mother to connect to.
- *
- * Called from the 20s App tick on devices that are NOT serving. Three
- * consecutive ticks (~1 min) with no same-client mother on mDNS before acting,
- * so a Wi-Fi blip never spawns a second mother. The freshest state wins: the
- * reconcile tick keeps this device's snapshot cache current while another
- * device serves, so we adopt that (becomeMother bumps the epoch, and the device
- * that stepped down converges on us) and only fall back to serving our own rows.
- */
-const RECLAIM_NO_MOTHER_TICKS = 3;
-let noMotherTicks = 0;
-let reclaimInFlight = false;
-
-export async function reclaimWillingMotherTick(clientId: number, mdnsLabel?: string): Promise<boolean> {
-  if (reclaimInFlight) return false;
-  const cfg = await loadConfig().catch(() => null);
-  if (!cfg?.beMotherWhenAvailable) {
-    noMotherTicks = 0;
-    return false;
-  }
-  // A browse that ERRORS is no evidence of absence - only an answered, empty one.
-  const mothers = await discoverOtherMothers().catch(() => null);
-  if (mothers === null) return false;
-  const live = mothers.some(
-    (m) => m.port > 0 && m.addresses.length > 0 && (m.client_id == null || m.client_id === clientId)
-  );
-  if (live) {
-    noMotherTicks = 0;
-    return false;
-  }
-  noMotherTicks += 1;
-  if (noMotherTicks < RECLAIM_NO_MOTHER_TICKS) return false;
-  noMotherTicks = 0;
-
-  reclaimInFlight = true;
-  try {
-    console.warn('[lanMotherBoot] no mother on the network for ~1 min - this willing device takes the role back.');
-    const gid = await getPromotableGameId();
-    if (gid != null && (await isReclaimableGame(gid))) {
-      try {
-        await becomeMother(gid, mdnsLabel);
-        return true;
-      } catch (e) {
-        // Nothing (fresh enough) cached, or content missing: serve our own rows.
-        console.warn('[lanMotherBoot] reclaim: adopting the cached game failed, serving local state:', e);
-      }
-    }
-    const info = await ensureMotherServer(clientId, mdnsLabel);
-    if (!info) return false;
-    await raiseMotherHotspotIfConfigured({ probeExisting: true });
-    notifyPromotedToMother();
-    return true;
-  } finally {
-    reclaimInFlight = false;
-  }
-}
-
-// Only adopt a cached game on reclaim if it is plausibly THE game of the day:
-// still unfinished in our own rows, or cached within the last half hour.
-// `mother_snapshots` is never pruned, and an unattended reclaim must not
+// Only adopt a cached game if it is plausibly THE game of the day: still
+// unfinished in our own rows, or cached within the last half hour.
+// `mother_snapshots` is never pruned, and hosting from an idle screen must not
 // resurrect last week's unfinished session.
 async function isReclaimableGame(gameId: number): Promise<boolean> {
   try {
@@ -812,45 +522,6 @@ export async function deviceHasLocalActiveGame(): Promise<boolean> {
   return (await getLocallyHostedActiveGame()) != null;
 }
 
-// Hotspot watchdog: Windows Mobile Hotspot can idle itself off (no clients /
-// power saving) and nothing used to re-raise it - the mother kept serving a
-// clientless subnet until an operator noticed the gray pill and tapped start
-// in Settings. Called from the same 10s App tick as the mDNS keepalive: if
-// this device is serving, is in hotspot mode, and its AP is down - and the
-// operator didn't deliberately stop it just now - re-run the idempotent raise
-// routine (which also re-announces mDNS on the AP subnet).
-const HOTSPOT_WATCHDOG_COOLDOWN_MS = 5 * 60_000;
-export async function motherHotspotWatchdogTick(): Promise<void> {
-  try {
-    if (platform() !== 'windows') return;
-    if (Date.now() - getLastHotspotStopAt() < HOTSPOT_WATCHDOG_COOLDOWN_MS) return;
-    // Cheap in-memory read - null on every non-mother, which ends the tick.
-    const info = await invoke<MotherServerInfo | null>('mother_get_server_info');
-    if (!info) return;
-    // NEVER auto-raise an AP on a device that is a SATELLITE of another mother:
-    // it would own 192.168.137.1 on its hosted adapter - the SAME subnet as the
-    // mother's hotspot - which collides and breaks its own DHCP lease (→ APIPA)
-    // and its route to the mother. A satellite can still be running a local server
-    // (stale local-game rows / it booted first), so `info != null` is not enough.
-    const role = await invoke<{ paired_mothers_count: number } | null>(
-      'client_describe_local_role',
-    ).catch(() => null);
-    if (role && role.paired_mothers_count > 0) return;
-    // Mirror the BOOT raise rule (App.tsx): only a WILLING mother owns the AP. A
-    // device hosting only because it holds a local game leaves the AP to the
-    // configured mother, so the watchdog must not raise one for it either.
-    const cfg = await loadConfig().catch(() => null);
-    if (!cfg?.beMotherWhenAvailable) return;
-    const status = await hotspotStatus().catch(() => null);
-    if (!status || status.running) return;
-    if ((await getNetworkSource()) !== 'hotspot') return;
-    console.warn('[lanMotherBoot] hotspot watchdog: AP is down while serving - re-raising.');
-    await raiseMotherHotspotIfConfigured({ probeExisting: true });
-  } catch {
-    // Best-effort - the watchdog must never disturb the tick.
-  }
-}
-
 /**
  * Pickup-only companion to ensureMotherServer for contexts that must NEVER
  * start a server - the audience projector window. It installs the local
@@ -895,11 +566,17 @@ export async function ensureMotherServer(
       // Server may already be running (e.g. smoke test left it up, or this
       // is a React re-mount). Pick it up rather than restarting.
       const existing = await invoke<MotherServerInfo | null>('mother_get_server_info');
+      // The role the server starts in decides the boot fence: the device set
+      // as the mother starts even while a substitute serves; a substitute
+      // stands down for anyone already serving.
+      const claim = await getHostingClaim();
       const info = existing
         ?? (await invoke<MotherServerInfo>('mother_start_local_server', {
           clientId,
           port: 0, // 0 = OS picks; the command returns the actual port
           mdnsLabel: mdnsLabel ?? (await defaultMotherLabel()) ?? null,
+          configured: claim.configured,
+          designatedAt: claim.designatedAt,
         }));
 
       // Install the LAN override unless someone else (the smoke test) set one
@@ -922,12 +599,15 @@ export async function ensureMotherServer(
       // if `existing` was null (we actually started a server) is not required -
       // the helper self-gates on a persisted flag, so a re-mount pickup no-ops.
       void ensureFirewallRuleOnce();
+      // Serving: a "lost the mother" banner raised while this device was still
+      // a satellite has nothing left to say.
+      notifyPromotedToMother();
       return info;
     } catch (err) {
       // Slice 6: a deliberate stand-down (another device is the current mother
       // at a higher epoch) comes back as the `mother_superseded` sentinel - log
-      // it calmly, not as a failure. Returning null makes App.tsx skip raising
-      // our hotspot, so we don't recreate the split-brain the fence prevented.
+      // it calmly, not as a failure. Returning null makes App.tsx join the live
+      // mother instead, so we don't recreate the split-brain the fence prevented.
       const msg = String((err as { message?: string })?.message ?? err);
       if (msg.includes('mother_superseded')) {
         console.warn('[lanMotherBoot] standing down - another device is the current mother (higher epoch).');

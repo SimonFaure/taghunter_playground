@@ -1,0 +1,22 @@
+{
+  "label": "Customer",
+  "none": "No customer",
+  "search": "Search or create a customer…",
+  "newOption": "+ New customer \"{{name}}\"",
+  "similarTitle": "Customers with a similar name already exist:",
+  "useExisting": "Use \"{{name}}\"",
+  "createAnyway": "Create anyway",
+  "playedBadge": "Already played · {{date}}",
+  "playedBadgeCount": "Already played {{count}}× · {{date}}",
+  "selectBarLabel": "Game for",
+  "selectBarHint": "Choose the customer to see the scenarios they have already played.",
+  "clear": "Remove the customer",
+  "remember": "Remember the customer in this configuration",
+  "setClient": "Customer…",
+  "assignTitle": "Customer of the game",
+  "save": "Save",
+  "cancel": "Cancel",
+  "assignFailed": "Could not change the customer of this game.",
+  "createFailed": "Could not create this customer.",
+  "unsupportedMother": "Update the main device to tag games with customers."
+}

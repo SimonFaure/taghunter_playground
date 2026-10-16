@@ -13,6 +13,7 @@ import { sportidentService as usbReaderService, CardData, detectReaderPort, isRe
 import { GameMessageOverlay } from './GameMessageOverlay';
 import { PendingTeamsBar } from './PendingTeamsBar';
 import { usePresentationQueue } from '../hooks/usePresentationQueue';
+import { useGameSounds } from '../hooks/useGameSounds';
 import type { GameMessageType } from '../services/gameMessages';
 import * as scenarioStore from '../services/scenarioStore';
 import { scenarioAssetUrl } from '../services/contentFs';
@@ -36,6 +37,9 @@ import { ClashRegistrationScreen } from './ClashRegistrationScreen';
 import { ClashResultsScreen } from './ClashResultsScreen';
 import { renderEventSentence } from './clashEventFeed';
 import { parseDbTs } from '../utils/dbTime';
+import { pickGameVisual } from '../utils/coverVisual';
+import { useAuth } from './auth/AuthProvider';
+import { gameClock } from '../services/gameClock';
 
 interface ClashGamePageProps {
   config: GameConfig;
@@ -164,6 +168,7 @@ function pickLocalized(v: Record<string, string> | string | undefined, lang: str
 
 export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: ClashGamePageProps) {
   const lang = config.language || 'fr';
+  const { user } = useAuth();
   // Every player-facing Clash string resolves against the LAUNCH language, not
   // the operator's chrome language. Scenario-authored names (clans,
   // territories) go through pickLocalized with the same `lang`.
@@ -203,6 +208,8 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
   // message is on screen waits its turn; the waiting clans show in the bottom
   // line. There is no combo/piece art in V2 - feedback is a status message.
   const queue = usePresentationQueue();
+  // Stops the purge announcement when the page is left (quit / rankings).
+  const playAudio = useGameSounds();
 
   const resolveMedia = useCallback(
     (filename: string) => (filename ? scenarioAssetUrl(gameUniqid, filename.replace(/^media\//, '')) : ''),
@@ -444,15 +451,11 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         clanColor: clan?.color ?? '#fff',
         terrName: territoryNames[terrIndex] || tc('territory_fallback', { n: terrIndex + 1 }),
       });
-      const audio = purgeAudioRef.current;
-      if (audio) {
-        audio.currentTime = 0;
-        void audio.play().catch(() => {});
-      }
+      void playAudio(purgeAudioRef.current).catch(() => {});
       if (purgeFlashTimerRef.current) clearTimeout(purgeFlashTimerRef.current);
       purgeFlashTimerRef.current = setTimeout(() => setPurgeFlash(null), 4000);
     },
-    [clanByTeamId, territoryNames, tc],
+    [clanByTeamId, territoryNames, tc, playAudio],
   );
 
   useEffect(() => {
@@ -570,7 +573,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       if (endMsRef.current == null || ticks % 5 === 0) void prime();
       ticks += 1;
       if (endMsRef.current == null) return;
-      const remaining = Math.max(0, Math.round((endMsRef.current - Date.now()) / 1000));
+      const remaining = Math.max(0, Math.round((endMsRef.current - gameClock.now()) / 1000));
       setRemainingSec(remaining);
       if (remaining <= 0) {
         void endLaunchedGame(launchedGameId).catch(() => {});
@@ -721,14 +724,16 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
 
     const initUSB = async () => {
       if (!usbReaderService.isAvailable()) return;
+      // Bound before reader detection so the game simulator's injected reads
+      // (no physical reader) reach the page too; harmless without events.
+      usbReaderService.setCardDetectedCallback((card: CardData) => {
+        handleLocalCardRef.current(card);
+      });
       const detected = await detectReaderPort();
       if (cancelled || !detected) return;
       try {
         const ok = await usbReaderService.initializePort(detected.path);
         if (!ok) return;
-        usbReaderService.setCardDetectedCallback((card: CardData) => {
-          handleLocalCardRef.current(card);
-        });
         await usbReaderService.start();
       } catch (err) {
         console.error('[Clash] USB init failed', err);
@@ -739,6 +744,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     void initUSB();
     window.addEventListener('reader:status', onReaderStatus);
     return () => {
+      usbReaderService.setCardDetectedCallback(undefined);
       cancelled = true;
       window.removeEventListener('reader:status', onReaderStatus);
       if (usbReaderService.isAvailable()) usbReaderService.stop().catch(() => {});
@@ -784,7 +790,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
   const handleStart = useCallback(async () => {
     if (!launchedGameId) return;
     try {
-      await startLaunchedGame(launchedGameId, new Date().toISOString());
+      await startLaunchedGame(launchedGameId, gameClock.date().toISOString());
     } catch (err) {
       console.error('[Clash] start failed', err);
     } finally {
@@ -798,8 +804,9 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     // Scenario visual shown as the registration background; the screen falls
     // back to the clan banners when the scenario has none. Clash has no
     // `background_image` any more (retours #49) - `game_visual` is the only
-    // cover art it carries.
-    const regVisualUrl = resolveMedia(meta?.game_visual || '');
+    // cover art it carries, in the licensee's language when the scenario has
+    // that version.
+    const regVisualUrl = resolveMedia(pickGameVisual(meta, user?.language) || '');
     return (
       <ClashRegistrationScreen
         standings={standings}

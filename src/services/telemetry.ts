@@ -12,6 +12,9 @@
 //     local lg_* tables once a game ends (teams/players that actually played).
 //     Server upserts on summary_uuid (last-write-wins); see
 //     project_playground_statistics_to_studio.
+//   - bug_report: a licensee's "Report a problem" (services/bugReport.ts).
+//     Drained first and one per request (it can be ~900 KB), never trimmed by
+//     the queue cap, and pushed immediately via drainNow().
 //
 // Delivery is invisible and non-blocking: enqueue is synchronous from the
 // caller's perspective (SQLite write), the drainer runs on a 5-min interval
@@ -48,7 +51,9 @@ export type TelemetryEventType =
   | 'game_summary'
   | 'recovery_code_used'
   | 'sync_item_failed'
-  | 'sync_item_resolved';
+  | 'sync_item_resolved'
+  | 'bug_report'
+  | 'customer_upsert';
 
 /** Wire shape of a sync_item_failed event (a content-sync item that has failed
  * to download 2+ consecutive cycles). Studio upserts the current-state row on
@@ -85,6 +90,20 @@ export interface GameSummaryPayload {
   teams_launched: number | null;
   teams_played: number;
   players_played: number;
+  /** Licensee customer (project_licensee_customers). Present only when the
+   * game has an assignment; customer_id null + a timestamp = removed. */
+  customer_id?: string | null;
+  customer_name?: string | null;
+  /** ISO UTC ms, mother clock - newest wins against a studio-side edit. */
+  customer_assigned_at?: string;
+}
+
+/** A licensee customer quick-created on this LAN (studio creates it once). */
+export interface CustomerUpsertPayload {
+  customer_id: string;
+  name: string;
+  type: string | null;
+  created_at: string;
 }
 
 export interface ErrorContext {
@@ -202,6 +221,15 @@ export async function captureGameSummary(summary: GameSummaryPayload): Promise<v
 }
 
 /**
+ * Enqueue a customer quick-created in the Playground. Studio creates it once
+ * (a re-send is a no-op) and keeps it un-acked on failure, so the outbox
+ * retries. Throws on enqueue failure: the caller must not mark it pushed.
+ */
+export async function captureCustomerUpsert(payload: CustomerUpsertPayload): Promise<void> {
+  await enqueue('customer_upsert', payload);
+}
+
+/**
  * Report that an offline recovery code was consumed on this device, so studio
  * can show the pool's used/unused status. Best-effort and version-gated server
  * side (a report against a since-regenerated pool is ignored). The device label
@@ -252,6 +280,40 @@ export async function captureSyncItemResolved(payload: SyncItemResolvedPayload):
 }
 
 /**
+ * Queue a licensee bug report (services/bugReport.ts builds the payload).
+ * Unlike the other captures this one THROWS: the modal must know whether the
+ * report was saved. Returns the event_uuid so the caller can ask whether it is
+ * still pending after `drainNow()`.
+ */
+export async function captureBugReport(payload: Record<string, unknown>): Promise<string> {
+  return enqueue('bug_report', payload);
+}
+
+/** True while the outbox still holds this event (not yet acked by studio). */
+export async function isEventPending(eventUuid: string): Promise<boolean> {
+  const db = await getDb();
+  const rows = await db.select<Array<{ n: number }>>(
+    'SELECT COUNT(*) AS n FROM pending_writes WHERE event_uuid = $1',
+    [eventUuid]
+  );
+  return (rows[0]?.n ?? 0) > 0;
+}
+
+/**
+ * Deliver the outbox now instead of waiting for the 5-minute tick. If a drain
+ * is already running it may have selected its rows before the caller's event
+ * was queued, so a second pass follows it. Never throws.
+ */
+export async function drainNow(): Promise<void> {
+  try {
+    await drainOnce();
+    await drainOnce();
+  } catch (err) {
+    console.warn('[telemetry] drainNow failed:', err);
+  }
+}
+
+/**
  * Read and clear any pending Rust panic written by the panic hook on the
  * previous run, and enqueue it as a normal error event. Idempotent: the
  * native command deletes the file after reading.
@@ -288,7 +350,7 @@ export async function recoverPendingPanic(): Promise<void> {
 }
 
 let drainTimer: ReturnType<typeof setInterval> | null = null;
-let drainInFlight = false;
+let drainInFlight: Promise<void> | null = null;
 
 /**
  * Start the periodic drainer. Idempotent: starting twice is a no-op. Kicks
@@ -367,7 +429,7 @@ async function enqueue(
   eventType: TelemetryEventType,
   payload: unknown,
   payloadHash: string | null = null
-): Promise<void> {
+): Promise<string> {
   const db = await getDb();
   await enforceQueueCap(db);
 
@@ -386,6 +448,7 @@ async function enqueue(
         1, $2, $2, $2)`,
     [JSON.stringify(payload), nowIso, eventUuid, eventType, payloadHash]
   );
+  return eventUuid;
 }
 
 async function enforceQueueCap(db: Database): Promise<void> {
@@ -394,11 +457,14 @@ async function enforceQueueCap(db: Database): Promise<void> {
   if (count < MAX_QUEUE_ROWS) return;
 
   // Drop the oldest rows to make room. We over-trim by 50 so we don't run
-  // this query on every insert when at the cap.
+  // this query on every insert when at the cap. Bug reports are never
+  // trimmed: a licensee wrote them, and there are only ever a handful.
   const overflow = count - MAX_QUEUE_ROWS + 50;
   await db.execute(
     `DELETE FROM pending_writes
-       WHERE id IN (SELECT id FROM pending_writes ORDER BY id ASC LIMIT $1)`,
+       WHERE id IN (SELECT id FROM pending_writes
+                     WHERE event_type IS NOT 'bug_report'
+                     ORDER BY id ASC LIMIT $1)`,
     [overflow]
   );
 }
@@ -421,91 +487,130 @@ interface IngestResult {
   status: 'ok' | 'rejected';
 }
 
-async function drainOnce(): Promise<void> {
-  if (drainInFlight) return;
+/** Concurrent callers share the running pass. */
+function drainOnce(): Promise<void> {
+  if (drainInFlight) return drainInFlight;
+  drainInFlight = drainPass().finally(() => {
+    drainInFlight = null;
+  });
+  return drainInFlight;
+}
 
+async function drainPass(): Promise<void> {
   // Pre-check: no JWT means we're logged out. Don't even try; wait for the
   // next tick. The outbox accumulates harmlessly in the meantime.
   const jwt = await loadJwt().catch(() => null);
   if (!jwt) return;
 
-  drainInFlight = true;
-  try {
-    const db = await getDb();
+  const db = await getDb();
+  const COLS = `id, event_uuid, event_type, body_json, occurrence_count,
+                first_seen_at, last_seen_at, occurred_at`;
 
-    while (true) {
-      const rows = await db.select<PendingRow[]>(
-        `SELECT id, event_uuid, event_type, body_json, occurrence_count,
-                first_seen_at, last_seen_at, occurred_at
-           FROM pending_writes
-           ORDER BY id ASC
-           LIMIT $1`,
-        [BATCH_SIZE]
-      );
-      if (rows.length === 0) return;
-
-      const events = rows.map((row) => {
-        const inner = safeParseJson(row.body_json);
-        // For errors, the dedup window may have bumped the row's
-        // occurrence_count + last_seen_at after the original payload was
-        // serialized; re-apply them so the server sees the freshest values.
-        if (row.event_type === 'error') {
-          if (inner) {
-            (inner as { occurrence_count?: number }).occurrence_count = row.occurrence_count;
-            if (row.first_seen_at) (inner as { first_seen_at?: string }).first_seen_at = row.first_seen_at;
-            if (row.last_seen_at) (inner as { last_seen_at?: string }).last_seen_at = row.last_seen_at;
-          }
-        }
-        return {
-          event_uuid: row.event_uuid,
-          event_type: row.event_type,
-          occurred_at: row.occurred_at ?? new Date().toISOString(),
-          payload: inner ?? {},
-        };
-      });
-
-      let response: { results: IngestResult[] };
-      try {
-        response = await apiCall<{ results: IngestResult[] }>('telemetry', 'ingest', {
-          method: 'POST',
-          body: { events },
-          bearer: true,
-        });
-      } catch (err) {
-        if (err instanceof ApiError) {
-          // 401/403: auth issue. Bail; user will re-login and the queue stays.
-          if (err.status === 401 || err.status === 403) return;
-          // 429 / 5xx: transient. Bail this tick; retry next interval.
-          if (err.status === 429 || err.status >= 500) return;
-          // Other 4xx: the request shape is malformed. Drop this batch so it
-          // doesn't block the queue forever. The events themselves are lost,
-          // which is acceptable for telemetry; logging surfaces the cause.
-          console.warn('[telemetry] drainOnce: server rejected batch:', err.status, err.body);
-          await deleteRows(db, rows.map((r) => r.id));
-          continue;
-        }
-        // Network error (no response). Leave rows; retry next interval.
-        return;
-      }
-
-      // Delete rows the server acknowledged (ok or rejected; the latter
-      // means malformed and retrying won't help). The id list is small (50
-      // max) so we can pass a parameterized IN clause.
-      const acked = new Set(response.results.map((r) => r.event_uuid));
-      const idsToDelete = rows.filter((r) => acked.has(r.event_uuid)).map((r) => r.id);
-      if (idsToDelete.length === 0) {
-        // Server returned no statuses - pathological case. Don't loop forever.
-        return;
-      }
-      await deleteRows(db, idsToDelete);
-
-      // If the server didn't ack the whole batch, leave the unacked rows for
-      // next pass. Otherwise loop and drain the next batch.
-      if (idsToDelete.length < rows.length) return;
-    }
-  } finally {
-    drainInFlight = false;
+  // Phase 1 - bug reports, first (a licensee is waiting on the modal) and one
+  // per request: a single report can approach the server's 1 MiB request cap.
+  // A report studio can't take yet stops this phase only, so it never blocks
+  // the ordinary telemetry below.
+  const bugs = await db.select<PendingRow[]>(
+    `SELECT ${COLS} FROM pending_writes WHERE event_type = 'bug_report' ORDER BY id ASC`
+  );
+  for (const bug of bugs) {
+    const outcome = await sendRows(db, [bug]);
+    if (outcome === 'offline') return;
+    if (outcome !== 'done') break;
   }
+
+  // Phase 2 - everything else, in batches.
+  while (true) {
+    const rows = await db.select<PendingRow[]>(
+      `SELECT ${COLS} FROM pending_writes
+        WHERE event_type IS NOT 'bug_report'
+        ORDER BY id ASC
+        LIMIT $1`,
+      [BATCH_SIZE]
+    );
+    if (rows.length === 0) return;
+    if ((await sendRows(db, rows)) !== 'done') return;
+  }
+}
+
+/**
+ * POST one batch. 'done' = every row handled (acked, or dropped as malformed);
+ * 'partial' = some rows left for a later pass; 'offline' = auth / transient /
+ * network failure, stop draining for now.
+ */
+async function sendRows(db: Database, rows: PendingRow[]): Promise<'done' | 'partial' | 'offline'> {
+  const events = rows.map((row) => {
+    const inner = safeParseJson(row.body_json);
+    // For errors, the dedup window may have bumped the row's
+    // occurrence_count + last_seen_at after the original payload was
+    // serialized; re-apply them so the server sees the freshest values.
+    if (row.event_type === 'error') {
+      if (inner) {
+        (inner as { occurrence_count?: number }).occurrence_count = row.occurrence_count;
+        if (row.first_seen_at) (inner as { first_seen_at?: string }).first_seen_at = row.first_seen_at;
+        if (row.last_seen_at) (inner as { last_seen_at?: string }).last_seen_at = row.last_seen_at;
+      }
+    }
+    return {
+      event_uuid: row.event_uuid,
+      event_type: row.event_type,
+      occurred_at: row.occurred_at ?? new Date().toISOString(),
+      payload: inner ?? {},
+    };
+  });
+
+  let response: { results: IngestResult[] };
+  try {
+    response = await apiCall<{ results: IngestResult[] }>('telemetry', 'ingest', {
+      method: 'POST',
+      body: { events },
+      bearer: true,
+    });
+  } catch (err) {
+    if (err instanceof ApiError) {
+      // 401/403: auth issue. Bail; user will re-login and the queue stays.
+      if (err.status === 401 || err.status === 403) return 'offline';
+      // 429 / 5xx: transient. Bail this tick; retry next interval.
+      if (err.status === 429 || err.status >= 500) return 'offline';
+      // A bug report too large for the server (a proxy with a smaller body
+      // limit than ours): keep the licensee's comment, drop the snapshot, and
+      // send again rather than losing the whole report.
+      if (err.status === 413 && rows.length === 1 && rows[0].event_type === 'bug_report') {
+        const stripped = await stripBugReportSnapshot(db, rows[0]);
+        if (stripped) return sendRows(db, [stripped]);
+      }
+      // Other 4xx: the request shape is malformed. Drop this batch so it
+      // doesn't block the queue forever. The events themselves are lost,
+      // which is acceptable for telemetry; logging surfaces the cause.
+      console.warn('[telemetry] drainOnce: server rejected batch:', err.status, err.body);
+      await deleteRows(db, rows.map((r) => r.id));
+      return 'done';
+    }
+    // Network error (no response). Leave rows; retry next interval.
+    return 'offline';
+  }
+
+  // Delete rows the server acknowledged (ok or rejected; the latter
+  // means malformed and retrying won't help). The id list is small (50
+  // max) so we can pass a parameterized IN clause.
+  const acked = new Set(response.results.map((r) => r.event_uuid));
+  const idsToDelete = rows.filter((r) => acked.has(r.event_uuid)).map((r) => r.id);
+  await deleteRows(db, idsToDelete);
+
+  // Unacked rows (none acked is the pathological case, or the server could
+  // not store them yet) stay for a later pass.
+  return idsToDelete.length < rows.length ? 'partial' : 'done';
+}
+
+/** The rewritten row, or null when there was no snapshot left to strip. */
+async function stripBugReportSnapshot(db: Database, row: PendingRow): Promise<PendingRow | null> {
+  const body = safeParseJson(row.body_json) as Record<string, unknown> | null;
+  if (!body || body.snapshot == null) return null;
+  body.snapshot_error = `Snapshot too large for upload (${row.body_json.length} bytes)`;
+  body.snapshot = null;
+  const bodyJson = JSON.stringify(body);
+  await db.execute('UPDATE pending_writes SET body_json = $1 WHERE id = $2', [bodyJson, row.id]);
+  return { ...row, body_json: bodyJson };
 }
 
 async function deleteRows(db: Database, ids: number[]): Promise<void> {

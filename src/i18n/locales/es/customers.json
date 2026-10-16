@@ -1,0 +1,22 @@
+{
+  "label": "Cliente",
+  "none": "Ningún cliente",
+  "search": "Buscar o crear un cliente…",
+  "newOption": "+ Nuevo cliente «{{name}}»",
+  "similarTitle": "Ya existen clientes con un nombre parecido:",
+  "useExisting": "Usar «{{name}}»",
+  "createAnyway": "Crear de todos modos",
+  "playedBadge": "Ya jugado · {{date}}",
+  "playedBadgeCount": "Ya jugado {{count}}× · {{date}}",
+  "selectBarLabel": "Partida para",
+  "selectBarHint": "Elija el cliente para ver los escenarios que ya ha jugado.",
+  "clear": "Quitar el cliente",
+  "remember": "Recordar el cliente en esta configuración",
+  "setClient": "Cliente…",
+  "assignTitle": "Cliente de la partida",
+  "save": "Guardar",
+  "cancel": "Cancelar",
+  "assignFailed": "No se ha podido cambiar el cliente de esta partida.",
+  "createFailed": "No se ha podido crear este cliente.",
+  "unsupportedMother": "Actualice el dispositivo principal para asociar clientes a las partidas."
+}
