@@ -21,12 +21,14 @@ import type {
 import * as contentSyncState from './contentSyncState';
 import * as namePoolsStore from './namePoolsStore';
 import * as reportLayoutsStore from './reportLayoutsStore';
+import * as customersStore from './customersStore';
 import { getState as getOrchestratorState, runPeerSync } from './syncOrchestrator';
 
 const SCENARIOS_REL = `${PEER_INBOX_REL}/scenarios`;
 const PATTERNS_REL = `${PEER_INBOX_REL}/patterns`;
 const TEAM_NAMES_REL = `${PEER_INBOX_REL}/team_names.json`;
 const REPORT_LAYOUTS_REL = `${PEER_INBOX_REL}/report_layouts.json`;
+const CUSTOMERS_REL = `${PEER_INBOX_REL}/customers.json`;
 
 async function readStaged<T>(rel: string): Promise<T | null> {
   const text = await readTextRel(rel);
@@ -58,6 +60,7 @@ function inboxSource(clientId: number): PeerContentSource {
   return {
     kind: 'peer',
     label: 'peer inbox',
+    local: true,
     getInventory: async () => {
       const inbox = await readInboxManifest();
       const scenarios: PeerInventory['scenarios'] = [];
@@ -65,7 +68,12 @@ function inboxSource(clientId: number): PeerContentSource {
         if (!name.endsWith('.json')) continue;
         const meta = await readStaged<ScenarioMetaResponse>(`${SCENARIOS_REL}/${name}`);
         if (meta?.scenario?.uniqid && meta.content_hash) {
-          scenarios.push({ uniqid: meta.scenario.uniqid, hash: meta.content_hash, complete: true });
+          scenarios.push({
+            uniqid: meta.scenario.uniqid,
+            hash: meta.content_hash,
+            complete: true,
+            title: meta.title ?? meta.scenario.name,
+          });
         }
       }
       const patterns: PeerInventory['patterns'] = [];
@@ -76,6 +84,7 @@ function inboxSource(clientId: number): PeerContentSource {
       }
       const names = await readStaged<{ version: number }>(TEAM_NAMES_REL);
       const layouts = await readStaged<{ version: number }>(REPORT_LAYOUTS_REL);
+      const customers = await readStaged<{ version: number }>(CUSTOMERS_REL);
       return {
         client_id: clientId,
         cloud_as_of_ms: inbox?.asOf ?? null,
@@ -87,6 +96,7 @@ function inboxSource(clientId: number): PeerContentSource {
         patterns,
         team_names: names?.version ?? null,
         report_layouts: layouts?.version ?? null,
+        customers: customers?.version ?? null,
         game_types: [],
         overrides: [],
       };
@@ -114,6 +124,10 @@ function inboxSource(clientId: number): PeerContentSource {
     getReportLayouts: async () => {
       const l = await readStaged<ReportLayoutsResponse>(REPORT_LAYOUTS_REL);
       return l ?? notStaged('report layouts');
+    },
+    getCustomers: async () => {
+      const c = await readStaged<{ content: string }>(CUSTOMERS_REL);
+      return c?.content ?? notStaged('customers');
     },
     streamGameTypeVideo: () => notStaged('game-type video'),
     getGameTypeSubtitle: () => notStaged('game-type subtitles'),
@@ -145,7 +159,9 @@ async function pruneInbox(): Promise<void> {
       : [];
     const row = rows[0];
     const held = !!meta && row?.local_content_hash === meta.content_hash;
-    const unwanted = !meta || !row || row.remote_content_hash !== meta.content_hash;
+    // No row here at all = an addition still to take (syncOrchestrator
+    // peerAdditions): keep it. A row wanting another hash = unwanted.
+    const unwanted = !meta || (!!row && row.remote_content_hash !== meta.content_hash);
     if (held || (unwanted && !newerPending)) await removeRecursive(rel).catch(() => {});
   }
   for (const name of await listFileNames(PATTERNS_REL)) {
@@ -173,6 +189,11 @@ async function pruneInbox(): Promise<void> {
   const layoutsState = await reportLayoutsStore.getState();
   if (layouts && layoutsState?.local_version != null && layoutsState.local_version >= layouts.version) {
     await removeRecursive(REPORT_LAYOUTS_REL).catch(() => {});
+  }
+  const customers = await readStaged<{ version: number }>(CUSTOMERS_REL);
+  const customersState = user ? await customersStore.getState(user.client_id) : null;
+  if (customers && customersState?.local_version != null && customersState.local_version >= customers.version) {
+    await removeRecursive(CUSTOMERS_REL).catch(() => {});
   }
 }
 

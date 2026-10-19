@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Copy, Check, Router } from 'lucide-react';
+import { Copy, Check, Router, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { getLocalIpv4s } from '../../services/lanPairing';
+import { getLocalIpv4s, refreshMdns } from '../../services/lanPairing';
 import { getCurrentSsid } from '../../services/wifi';
 import { HelpDot } from '../../help';
 
@@ -21,6 +21,8 @@ export function MotherLanSection() {
   const [ssid, setSsid] = useState<string | null>(null);
   const [addrs, setAddrs] = useState<string[]>([]);
   const [copied, setCopied] = useState<string | null>(null);
+  const [reannouncing, setReannouncing] = useState(false);
+  const [reannounceResult, setReannounceResult] = useState<'ok' | 'no_address' | 'error' | null>(null);
 
   const refresh = useCallback(async () => {
     const [current, ips] = await Promise.all([
@@ -37,6 +39,23 @@ export function MotherLanSection() {
     const id = setInterval(() => void refresh(), POLL_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  // After a Wi-Fi network change the server keeps listening (0.0.0.0) but its
+  // mDNS announcement still carries the old IP. The 10 s keepalive in App.tsx
+  // catches that on its own; this button does it now, instead of restarting.
+  async function reannounce() {
+    setReannouncing(true);
+    setReannounceResult(null);
+    try {
+      const advertised = await refreshMdns();
+      setReannounceResult(advertised.length > 0 ? 'ok' : 'no_address');
+    } catch {
+      setReannounceResult('error');
+    } finally {
+      setReannouncing(false);
+      void refresh();
+    }
+  }
 
   async function copy(value: string) {
     try {
@@ -78,6 +97,23 @@ export function MotherLanSection() {
         </div>
       </div>
       <p className="mt-2 text-xs text-[var(--pg-text-dim)]">{t('networkCardAddressHint')}</p>
+
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <button type="button" className="pg-btn" disabled={reannouncing} onClick={() => void reannounce()}>
+          <RefreshCw className={`w-4 h-4 ${reannouncing ? 'animate-spin' : ''}`} />
+          {t('networkCardReannounce')}
+        </button>
+        {reannounceResult === 'ok' && (
+          <span className="text-sm text-[var(--pg-ok-icon)]">{t('networkCardReannounceOk')}</span>
+        )}
+        {reannounceResult === 'no_address' && (
+          <span className="text-sm text-[var(--pg-warn-text)]">{t('networkCardNoAddress')}</span>
+        )}
+        {reannounceResult === 'error' && (
+          <span className="text-sm text-[var(--pg-warn-text)]">{t('networkCardReannounceError')}</span>
+        )}
+      </div>
+      <p className="mt-1 text-xs text-[var(--pg-text-dim)]">{t('networkCardReannounceHint')}</p>
 
       <p className="mt-4 text-sm text-[var(--pg-text)]">{t('networkCardRouterLine')}</p>
     </div>

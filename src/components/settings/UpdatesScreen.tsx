@@ -120,8 +120,10 @@ export function UpdatesScreen() {
                       {t('update:updateRequiredHint')}
                     </div>
                   )}
-                  {status.source === 'mother' && (
-                    <div className="text-xs text-[var(--pg-text-dim)]">{t('update:fromMotherHint')}</div>
+                  {status.source !== 'cloud' && (
+                    <div className="text-xs text-[var(--pg-text-dim)]">
+                      {t(status.source === 'mother' ? 'update:fromMotherHint' : 'update:fromDeviceHint')}
+                    </div>
                   )}
                 </div>
               </div>

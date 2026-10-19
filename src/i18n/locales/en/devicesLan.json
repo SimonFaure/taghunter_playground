@@ -173,5 +173,9 @@
   "statusHostAsSubstituteHint": "If the mother is away: this device hosts the games in its place, and hands back as soon as it returns.",
   "statusHostAsSubstituteDone": "This device now hosts the games, in place of the mother.",
   "statusRoleResetNote": "Since the update, this device is no longer set as mother. If it is your mother device, set it in Advanced options → Role of this device.",
-  "networkCardRouterLine": "Plug the supplied router into a USB port of this device."
+  "networkCardRouterLine": "Plug the supplied router into a USB port of this device.",
+  "networkCardReannounce": "Refresh network",
+  "networkCardReannounceOk": "Network refreshed: satellites will find this device again within a few seconds.",
+  "networkCardReannounceError": "Refresh failed. Try again, or restart the app.",
+  "networkCardReannounceHint": "Changed this PC's Wi-Fi network? No need to restart the app: click here."
 }

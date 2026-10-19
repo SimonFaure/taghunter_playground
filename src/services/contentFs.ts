@@ -109,6 +109,13 @@ export function teamNamesFileRel(): string {
   return `media/name_pools/team_names.json`;
 }
 
+// Licensee customers: studio's get_customers payload as downloaded (contact-
+// free). Applied to the DB by customersStore, and served verbatim by the LAN
+// mother (Rust content_server, same path) to peers.
+export function customersFileRel(): string {
+  return `media/customers/customers.json`;
+}
+
 export async function teamNamesFileAbs(): Promise<string> {
   const root = await mediaRootAbs();
   return join(root, 'name_pools', 'team_names.json');
@@ -269,6 +276,15 @@ export async function readTextRel(relPath: string): Promise<string | null> {
     return await readTextFile(relPath, { baseDir: APP });
   } catch {
     return null;
+  }
+}
+
+/** Whether a file under AppData exists (false on any error). */
+export async function existsRel(relPath: string): Promise<boolean> {
+  try {
+    return await exists(relPath, { baseDir: APP });
+  } catch {
+    return false;
   }
 }
 

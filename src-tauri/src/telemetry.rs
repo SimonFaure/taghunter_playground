@@ -37,7 +37,7 @@ pub struct PendingPanic {
 /// callback (an AppHandle is required). Idempotent: subsequent calls no-op.
 pub fn install_panic_hook(app_handle: tauri::AppHandle) {
     INSTALL.call_once(|| {
-        let app_version = env!("CARGO_PKG_VERSION").to_string();
+        let app_version = crate::app_version().to_string();
         let panic_path: Option<PathBuf> = app_handle
             .path()
             .app_data_dir()

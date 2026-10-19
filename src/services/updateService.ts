@@ -35,6 +35,7 @@ import { isGameActive } from './activeSession';
 import { isOnline, studioReachableFresh } from './connectivity';
 import { listLaunchedGames } from './launchedGames';
 import { tError } from '../i18n/errors';
+import { getUpkeep, patchUpdate } from './upkeepState';
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/+$/, '') ||
@@ -42,8 +43,10 @@ const API_BASE =
 
 export type UpdateState = 'up-to-date' | 'optional' | 'required' | 'error';
 
-/** Where an update comes from: the studio, or the LAN mother (offline). */
-export type UpdateSource = 'cloud' | 'mother';
+/** Where an update comes from: the studio, the LAN mother (offline), or
+ *  this device's installer cache (handed over by a satellite, or downloaded
+ *  earlier) - the only offline source a MOTHER has. */
+export type UpdateSource = 'cloud' | 'mother' | 'cache';
 
 export interface UpdateStatus {
   state: UpdateState;
@@ -146,7 +149,7 @@ export async function resolveUpdateChannel(): Promise<string> {
 }
 
 // Compare two "x.y.z" semver strings. Returns -1 / 0 / 1.
-function compareSemver(a: string, b: string): number {
+export function compareSemver(a: string, b: string): number {
   const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
   const pb = b.split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) {
@@ -226,8 +229,36 @@ function statusFrom(
 /**
  * Network failure on the studio falls back to the mother; when neither
  * answers this resolves to `state: 'error'` (the caller proceeds silently).
+ * The outcome goes into this device's upkeep report (Devices modal).
  */
 export async function checkForUpdate(): Promise<UpdateStatus> {
+  const status = await checkForUpdateUnreported();
+  const busy = ['downloading', 'installing'].includes(getUpkeep().update.phase);
+  const channel = await resolveUpdateChannel();
+  if (status.state === 'error') {
+    if (!busy && getUpkeep().update.phase === 'checking') patchUpdate({ phase: 'unknown', channel });
+    return status;
+  }
+  if (status.state === 'up-to-date') {
+    if (!busy) patchUpdate({ phase: 'up_to_date', latest: null, progress: null, blocked: null, error: null, source: status.source, channel });
+    return status;
+  }
+  const staged = await stagedUpdateVersion().catch(() => null);
+  patchUpdate({
+    latest: status.latestVersion,
+    source: status.source,
+    channel,
+    ...(busy
+      ? {}
+      : {
+          phase: !status.canSelfUpdate ? 'store_only' : staged && staged === status.latestVersion ? 'ready' : 'available',
+          error: null,
+        }),
+  });
+  return status;
+}
+
+async function checkForUpdateUnreported(): Promise<UpdateStatus> {
   const currentVersion = await getVersion().catch(() => '0.0.0');
   const base: Omit<UpdateStatus, 'state'> = {
     currentVersion,
@@ -249,19 +280,45 @@ export async function checkForUpdate(): Promise<UpdateStatus> {
     /* unreachable: try the mother */
   }
 
+  let fromMother: UpdateStatus | null = null;
   const mother = motherRoute();
   if (mother) {
     try {
       const json = await fetchManifest(currentVersion, { source: 'mother', motherBase: mother.baseUrl });
       if (json) {
         lastSource = { source: 'mother', motherBase: mother.baseUrl };
-        return statusFrom(json, base, 'mother');
+        fromMother = statusFrom(json, base, 'mother');
+        if (fromMother.state !== 'up-to-date') return fromMother;
       }
     } catch {
       /* fall through */
     }
   }
-  return { ...base, state: 'error' };
+
+  // Nothing newer over the network: a newer installer may already be in our
+  // own cache - a satellite handed it to us (we are the mother: there is no
+  // one else to ask offline), or it was downloaded earlier. It installs as is.
+  const cached = await stagedUpdateMeta();
+  if (cached) {
+    lastSource = { source: 'cache' };
+    return statusFrom(
+      {
+        available: true,
+        manifest: {
+          version: cached.version,
+          notes: cached.notes,
+          min_supported_version: cached.min_supported_version ?? undefined,
+          channel: cached.channel,
+          ...(currentTarget() === 'android' && cached.sha256
+            ? { apk: { id: 0, sha256: cached.sha256, size: cached.size } }
+            : {}),
+        },
+      },
+      base,
+      'cache'
+    );
+  }
+  return fromMother ?? { ...base, state: 'error' };
 }
 
 /**
@@ -297,19 +354,24 @@ async function cacheStatus(): Promise<CacheStatus | null> {
 
 /** A device on `device`'s channel may install a `build` of that channel; a
  *  tester may also take a stable build (same rule as update_cache.rs). */
-function channelOk(device: string, build: string): boolean {
+export function channelOk(device: string, build: string): boolean {
   return device === build || (device === 'test' && build === 'stable');
 }
 
-/** The version staged in the cache, newer than this app and for our channel, or null. */
-export async function stagedUpdateVersion(): Promise<string | null> {
+/** The installer staged in the cache, newer than this app and for our channel, or null. */
+async function stagedUpdateMeta(): Promise<ReleaseMeta | null> {
   const [status, current, channel] = await Promise.all([
     cacheStatus(),
     getVersion().catch(() => '0.0.0'),
     resolveUpdateChannel(),
   ]);
   const own = status?.own;
-  return own && channelOk(channel, own.channel) && compareSemver(own.version, current) > 0 ? own.version : null;
+  return own && channelOk(channel, own.channel) && compareSemver(own.version, current) > 0 ? own : null;
+}
+
+/** The version staged in the cache, newer than this app and for our channel, or null. */
+export async function stagedUpdateVersion(): Promise<string | null> {
+  return (await stagedUpdateMeta())?.version ?? null;
 }
 
 /** Boot: drop a cached installer no newer than this app + updater leftovers. */
@@ -327,6 +389,21 @@ export async function pruneUpdateCache(): Promise<void> {
 export async function downloadUpdate(
   onProgress: (p: DownloadProgress) => void
 ): Promise<void> {
+  patchUpdate({ phase: 'downloading', progress: 0, error: null, blocked: null });
+  const report = (p: DownloadProgress) => {
+    onProgress(p);
+    if (p.total) patchUpdate({ progress: Math.min(100, Math.round((p.downloaded / p.total) * 100)) });
+  };
+  try {
+    await downloadUpdateUnreported(report);
+    patchUpdate({ phase: 'ready', progress: null });
+  } catch (e) {
+    patchUpdate({ phase: 'error', progress: null, error: e instanceof Error ? e.message : String(e) });
+    throw e;
+  }
+}
+
+async function downloadUpdateUnreported(onProgress: (p: DownloadProgress) => void): Promise<void> {
   if (currentTarget() === 'android') {
     await downloadApk(onProgress, lastSource.source, lastSource.motherBase);
     return;
@@ -364,17 +441,41 @@ async function fetchDesktopInstaller(
  * On Windows the installer (passive mode) takes over and the process exits.
  */
 export async function installAndRelaunch(): Promise<void> {
-  if (currentTarget() === 'android') {
-    const path = pendingApkPath ?? (await cachedApkPath());
-    if (!path) throw new Error(tError('noUpdateToInstall'));
-    // Opens Android's "update this app?" screen. Once the operator confirms,
-    // Android replaces the app and it restarts on the new version by itself.
-    await invoke('android_install_apk', { path });
-    return;
+  patchUpdate({ phase: 'installing', blocked: null, error: null });
+  try {
+    if (currentTarget() === 'android') {
+      const path = pendingApkPath ?? (await cachedApkPath());
+      if (!path) throw new Error(tError('noUpdateToInstall'));
+      // Opens Android's "update this app?" screen. Once the operator confirms,
+      // Android replaces the app and it restarts on the new version by itself.
+      await invoke('android_install_apk', { path });
+      patchUpdate({ phase: 'ready', blocked: 'confirm_on_device' });
+      return;
+    }
+    if (!(await stagedUpdateVersion())) throw new Error(tError('noUpdateToInstall'));
+    // Rust re-checks the signature through the plugin, installs and restarts.
+    await invoke('update_install_from_cache', { channel: await resolveUpdateChannel() });
+  } catch (e) {
+    patchUpdate({ phase: 'error', error: e instanceof Error ? e.message : String(e) });
+    throw e;
   }
-  if (!(await stagedUpdateVersion())) throw new Error(tError('noUpdateToInstall'));
-  // Rust re-checks the signature through the plugin, installs and restarts.
-  await invoke('update_install_from_cache', { channel: await resolveUpdateChannel() });
+}
+
+/**
+ * A launched game is open on this device, or this device is a mother hosting
+ * at least one un-ended game: restarting now would interrupt it. The mother
+ * server alone is NOT a signal - it stays up on any mother with no game.
+ */
+export async function isGameRunningHere(): Promise<boolean> {
+  if (isGameActive()) return true;
+  try {
+    const role = await invoke<{ mother_server_running?: boolean }>('client_describe_local_role');
+    if (!role?.mother_server_running) return false;
+    const hosted = await listLaunchedGames({ ended: false, forceLocal: true });
+    return hosted.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ── android: sideload APK ────────────────────────────────────────────────────

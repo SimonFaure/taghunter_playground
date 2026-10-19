@@ -28,6 +28,7 @@ import {
   Palette,
   ServerCog,
   Tags,
+  Building2,
 } from 'lucide-react';
 import { syncAutostart } from '../utils/autostart';
 import { useTranslation } from 'react-i18next';
@@ -72,6 +73,7 @@ import { UpdatesScreen } from './settings/UpdatesScreen';
 import { UsbDriverScreen } from './settings/UsbDriverScreen';
 import { PrintingScreen } from './settings/PrintingScreen';
 import { TeamNamesScreen } from './settings/TeamNamesScreen';
+import { CustomersScreen } from './settings/CustomersScreen';
 import { ApiDocsPage } from './ApiDocsPage';
 import { DevicePinSettings } from './settings/DevicePinSettings';
 
@@ -102,6 +104,7 @@ export type SettingsTab =
   | 'updates'
   | 'printing'
   | 'team-names'
+  | 'customers'
   | 'api-docs';
 
 interface ConfigurationPageProps {
@@ -647,6 +650,7 @@ export function ConfigurationPage({ initialTab, isAdminMode = false }: Configura
             {activeTab === 'updates' && <UpdatesScreen />}
             {activeTab === 'printing' && <PrintingScreen />}
             {activeTab === 'team-names' && <TeamNamesScreen />}
+            {activeTab === 'customers' && <CustomersScreen />}
             {activeTab === 'api-docs' && isAdminMode && <ApiDocsPage />}
           </main>
         </div>
@@ -1453,6 +1457,7 @@ function SettingsNav({ active, onChange, isAdminMode = false, operatorOnly = fal
         { tab: 'videos', label: t('settings:navVideos'), icon: <Film size={16} /> },
         { tab: 'images', label: t('settings:navImages'), icon: <ImageIcon size={16} /> },
         { tab: 'team-names', label: t('settings:navTeamNames'), icon: <Tags size={16} /> },
+        { tab: 'customers', label: t('settings:navCustomers'), icon: <Building2 size={16} /> },
       ],
     },
     {

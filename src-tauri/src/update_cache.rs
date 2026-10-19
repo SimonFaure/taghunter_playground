@@ -37,6 +37,7 @@ use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 
 pub(crate) const ANDROID: &str = "android";
+pub(crate) const UPDATE_CACHED_EVENT: &str = "taghunter://update-cached";
 const META_FILE: &str = "release.json";
 const STREAM_CHUNK: usize = 64 * 1024;
 /// Installers are tens of MB; an APK pushed by a satellite is buffered for
@@ -85,12 +86,32 @@ pub(crate) fn desktop_platform() -> String {
     format!("{os}-{arch}")
 }
 
-fn this_platform() -> String {
+pub(crate) fn this_platform() -> String {
     if cfg!(target_os = "android") {
         ANDROID.to_string()
     } else {
         desktop_platform()
     }
+}
+
+/// Every installer the cache holds, `[{platform, version, channel}]`: what this
+/// device, as a mother, can hand its satellites (Devices modal upkeep).
+pub(crate) fn cached_installers(app: &AppHandle) -> Value {
+    let Ok(root) = cache_root(app) else {
+        return json!([]);
+    };
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        return json!([]);
+    };
+    let out: Vec<Value> = dirs
+        .flatten()
+        .filter_map(|e| {
+            let platform = e.file_name().to_string_lossy().to_string();
+            let meta = read_meta(&root, &platform)?;
+            Some(json!({ "platform": platform, "version": meta.version, "channel": meta.channel }))
+        })
+        .collect();
+    Value::Array(out)
 }
 
 fn is_safe_platform(p: &str) -> bool {
@@ -502,7 +523,7 @@ pub(crate) async fn receive_installer(app: &AppHandle, platform: &str, meta: Rel
     let mut meta2 = meta.clone();
     meta2.fetched_from = "peer".into();
     meta2.fetched_at = now_ms();
-    tokio::task::spawn_blocking(move || -> Result<bool, String> {
+    let kept = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         if let Err(e) = verify_installer(&app2, &platform2, &tmp2, &meta2) {
             let _ = std::fs::remove_file(&tmp2);
             return Err(format!("rejected: {e}"));
@@ -510,7 +531,14 @@ pub(crate) async fn receive_installer(app: &AppHandle, platform: &str, meta: Rel
         commit(&cache_root(&app2)?, &platform2, &tmp2, &meta2)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    if kept {
+        // The renderer re-checks: this mother can now offer the update to
+        // itself (offline it has no one else to ask).
+        use tauri::Emitter;
+        let _ = app.emit(UPDATE_CACHED_EVENT, &meta.version);
+    }
+    Ok(kept)
 }
 
 // ─── renderer commands ──────────────────────────────────────────────────────

@@ -18,5 +18,22 @@
   "cancel": "Cancel",
   "assignFailed": "Could not change the customer of this game.",
   "createFailed": "Could not create this customer.",
-  "unsupportedMother": "Update the main device to tag games with customers."
+  "unsupportedMother": "Update the main device to tag games with customers.",
+  "screen": {
+    "title": "Customers",
+    "intro": "The customers you run games for, with the scenarios they have already played. The list comes from the Studio and the main device.",
+    "unsupported": "The customer list will appear after a sync with the Studio (on this device or on the main device).",
+    "newPlaceholder": "New customer name…",
+    "add": "Add",
+    "search": "Search a customer…",
+    "showArchived": "Show archived",
+    "empty": "No customers yet.",
+    "emptySearch": "No customer matches this search.",
+    "archived": "Archived",
+    "games_one": "{{count}} game",
+    "games_other": "{{count}} games",
+    "lastPlayed": "Last game: {{date}}",
+    "never": "No game yet",
+    "editInStudio": "To edit, archive or merge customers, use the Studio (My Customers)."
+  }
 }

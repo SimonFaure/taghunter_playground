@@ -8,13 +8,11 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Download, RotateCw, Loader2, AlertTriangle, CheckCircle2 } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
 import { ConfirmDialog } from '../ConfirmDialog';
-import { isGameActive } from '../../services/activeSession';
-import { listLaunchedGames } from '../../services/launchedGames';
 import {
   downloadUpdate,
   installAndRelaunch,
+  isGameRunningHere,
   stagedUpdateVersion,
   type DownloadProgress,
   type UpdateSource,
@@ -25,23 +23,6 @@ type Phase = 'idle' | 'downloading' | 'downloaded' | 'installing' | 'error';
 function formatBytes(n: number): string {
   const mb = n / (1024 * 1024);
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(n / 1024).toFixed(0)} KB`;
-}
-
-// Returns true if a launched game is open on this device, or this device is a
-// mother hosting at least one un-ended game. The mother server alone is NOT a
-// signal: it stays up on any mother device even with no game running.
-async function aGameIsRunning(): Promise<boolean> {
-  if (isGameActive()) return true;
-  try {
-    const role = await invoke<{ mother_server_running?: boolean }>(
-      'client_describe_local_role'
-    );
-    if (!role?.mother_server_running) return false;
-    const hosted = await listLaunchedGames({ ended: false, forceLocal: true });
-    return hosted.length > 0;
-  } catch {
-    return false;
-  }
 }
 
 export function DesktopUpdateInstaller({ version, source = 'cloud' }: { version?: string | null; source?: UpdateSource }) {
@@ -97,7 +78,7 @@ export function DesktopUpdateInstaller({ version, source = 'cloud' }: { version?
   };
 
   const requestRestart = async () => {
-    if (await aGameIsRunning()) {
+    if (await isGameRunningHere()) {
       setConfirmOpen(true);
     } else {
       void doInstall();

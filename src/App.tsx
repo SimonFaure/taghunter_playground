@@ -54,6 +54,7 @@ import { UpdateAvailableNotice } from './components/update/UpdateAvailableNotice
 import { useAuth } from './components/auth/AuthProvider';
 import { start as startSync, stop as stopSync } from './services/syncOrchestrator';
 import { installPeerContentSync } from './services/peerContent';
+import { installDeviceUpkeep } from './services/deviceUpkeep';
 import { checkForUpdate, pruneUpdateCache, type UpdateStatus } from './services/updateService';
 // Import for side effects: syncLog wires its event listeners on first
 // module load, so it must be referenced before any cycle:* events fire (or
@@ -198,7 +199,10 @@ function App() {
           | 'become_mother'
           | 'reload_config'
           | 'lock_device'
-          | 'show_logo';
+          | 'show_logo'
+          // Handled by services/deviceUpkeep.
+          | 'sync_content'
+          | 'update_app';
         payload: Record<string, unknown> & { launched_game_id?: number };
         mother_uuid?: string;
         mother_addr?: string;
@@ -478,11 +482,23 @@ function App() {
     // The installer cache: drop what's no newer than this build, and the
     // updater's leftovers in %TEMP%.
     void pruneUpdateCache();
+    // A satellite handed this device a newer installer (LAN): offer it now.
+    let cancelled = false;
+    let unlistenCached: (() => void) | null = null;
+    void listen('taghunter://update-cached', () => void runCheck()).then((fn) => {
+      if (cancelled) fn();
+      else unlistenCached = fn;
+    });
     // Offline, the boot check can't reach the studio and the mother route
     // isn't up yet: check again (against the mother) once it is.
-    return onLaunchedGamesRouteChange((route) => {
+    const offRoute = onLaunchedGamesRouteChange((route) => {
       if (route === 'mother' && lastState === 'error') void runCheck();
     });
+    return () => {
+      cancelled = true;
+      unlistenCached?.();
+      offRoute();
+    };
   }, []);
 
   // Start the orchestrator once we have an authenticated user. Stop on
@@ -573,6 +589,10 @@ function App() {
   // LAN content sync: pull newer scenarios/catalogs from the mother whenever its
   // content revision moves (offline venue). See services/peerContent.
   useEffect(() => installPeerContentSync(), []);
+
+  // Devices modal upkeep: report this device's update / sync state to the
+  // mother, and run the "Update" / "Sync" commands sent from another device.
+  useEffect(() => installDeviceUpkeep(), []);
 
   // Who hosts the games (services/hostingRole.ts). One pass at boot, then a
   // tick: the device set as the mother starts serving by itself; a substitute

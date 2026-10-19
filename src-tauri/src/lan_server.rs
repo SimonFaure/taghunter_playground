@@ -105,6 +105,16 @@ pub struct OperatorPresence {
     inner: Mutex<bool>,
 }
 
+/// Client-side: this device's upkeep report (app update + content sync state),
+/// an opaque JSON string pushed by JS (`services/upkeepState.ts` ->
+/// `client_set_upkeep`) whenever it changes. Sent in every ping so the top-bar
+/// Devices modal shows what each device needs; read directly for the mother's
+/// own row.
+#[derive(Default)]
+pub struct UpkeepPresence {
+    inner: Mutex<Option<String>>,
+}
+
 struct Running {
     port: u16,
     shutdown: oneshot::Sender<()>,
@@ -182,6 +192,9 @@ pub(crate) fn must_stand_down(
 struct MdnsHandle {
     daemon: ServiceDaemon,
     full_name: String,
+    /// The addresses this announcement carries (sorted). Compared against the
+    /// host's current ones so a Wi-Fi change re-announces the new IP.
+    advertised: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -482,7 +495,7 @@ async fn lan_proto_gate(request: Request<Body>, next: axum::middleware::Next) ->
             "error": "LAN_PROTO_MISMATCH",
             "peer_proto": peer_proto,
             "lan_proto": LAN_PROTO,
-            "app_version": env!("CARGO_PKG_VERSION"),
+            "app_version": crate::app_version(),
         })),
     )
         .into_response()
@@ -2485,16 +2498,21 @@ async fn upsert_cached_snapshot(
 }
 
 /// Re-announce the mother over mDNS with this host's CURRENT LAN IPv4s - e.g.
-/// after the PC joined the router's Wi-Fi once the server was already up. No-op
-/// if the server isn't running.
+/// after the PC switched Wi-Fi network once the server was already up (the
+/// "Actualiser le réseau" button). The TCP server listens on 0.0.0.0 and needs
+/// nothing; only the announcement carries addresses. Returns the addresses now
+/// advertised (empty = no LAN address yet). No-op if the server isn't running.
 #[tauri::command]
 pub async fn mother_refresh_mdns(
     state: tauri::State<'_, MotherServerState>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let mut guard = state.inner.lock().await;
     match guard.as_mut() {
-        Some(running) => reregister_mdns(running),
-        None => Ok(()),
+        Some(running) => {
+            reregister_mdns(running)?;
+            Ok(running.mdns.as_ref().map(|m| m.advertised.clone()).unwrap_or_default())
+        }
+        None => Ok(Vec::new()),
     }
 }
 
@@ -2518,50 +2536,39 @@ fn reregister_mdns(running: &mut Running) -> Result<(), String> {
     Ok(())
 }
 
-/// Self-healing mDNS keepalive for the mother. A mother that booted before its
-/// PC got a LAN address (Wi-Fi not joined yet, cable unplugged) registers an
-/// INERT announcement. A cheap periodic call from JS re-registers the
-/// announcement the moment a LAN address exists - and ONLY then, so a healthy
-/// announcement is never churned. Returns true if it (re)registered.
+/// Self-healing mDNS keepalive for the mother. Re-registers the announcement
+/// when the addresses it carries no longer match the host's LAN addresses:
+/// - a mother that booted before its PC got a LAN address (Wi-Fi not joined
+///   yet, cable unplugged) holds an INERT announcement;
+/// - a mother whose PC switched Wi-Fi network still advertises the OLD IP, so
+///   satellites resolve an unreachable address (used to need an app restart).
+/// A healthy announcement is never churned. Returns true if it (re)registered.
 #[tauri::command]
 pub async fn mother_ensure_mdns_live(
     state: tauri::State<'_, MotherServerState>,
 ) -> Result<bool, String> {
     // Not-a-mother check FIRST: this command is polled on EVERY device every
-    // 10s, but only a running mother with an INERT announcement can act on it.
-    // Bail under a short lock before paying for the if_addrs interface scan - a
-    // pure satellite (the common case) would do it every 10s for a guaranteed
-    // Ok(false).
+    // 10s. Bail under a short lock before paying for the if_addrs interface
+    // scan - a pure satellite (the common case) would do it every 10s for a
+    // guaranteed Ok(false).
     {
         let guard = state.inner.lock().await;
-        match guard.as_ref() {
-            None => return Ok(false), // not a mother
-            Some(r) => {
-                let is_inert = r.mdns.as_ref().map(|m| m.full_name.is_empty()).unwrap_or(true);
-                if !is_inert {
-                    return Ok(false); // already advertising - don't churn discovery
-                }
-            }
+        if guard.is_none() {
+            return Ok(false); // not a mother
         }
     }
-    let locals: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
-    if designated_lan_addrs(&locals).is_empty() {
-        return Ok(false); // nothing to advertise yet (no LAN address)
-    }
+    let current = current_designated_addrs();
     // Re-acquire to mutate; re-check the state we dropped the lock on.
     let mut guard = state.inner.lock().await;
     let running = match guard.as_mut() {
         Some(r) => r,
         None => return Ok(false),
     };
-    let is_inert = running
-        .mdns
-        .as_ref()
-        .map(|m| m.full_name.is_empty())
-        .unwrap_or(true);
-    if !is_inert {
-        return Ok(false);
+    let advertised: &[String] = running.mdns.as_ref().map(|m| m.advertised.as_slice()).unwrap_or(&[]);
+    if advertised == current.as_slice() {
+        return Ok(false); // already advertising exactly these - don't churn discovery
     }
+    // Includes "address lost": go inert rather than keep advertising a dead IP.
     reregister_mdns(running).map(|_| true)
 }
 
@@ -2947,7 +2954,7 @@ struct ActionQuery {
 
 pub(crate) async fn resolve_peer(state: &AppState, headers: &HeaderMap) -> Result<i64, Response> {
     let id = resolve_peer_for_ping(state, headers).await?;
-    bump_presence(state, id, None, None, None).await;
+    bump_presence(state, id, None, None, None, PeerReport::default()).await;
     Ok(id)
 }
 
@@ -2983,12 +2990,24 @@ async fn resolve_peer_for_ping(state: &AppState, headers: &HeaderMap) -> Result<
 /// devices modal stays within ~10s of the truth (the satellite pings at 10s
 /// cadence). Failures are swallowed - presence is observability, not the
 /// critical path.
+/// What a ping reports besides presence: the peer's running app version, its
+/// installer platform key (update_cache: "windows-x86_64", "android"), and its
+/// upkeep report as a JSON string. All None from an older satellite / non-ping
+/// call, which leaves the stored values untouched.
+#[derive(Default)]
+struct PeerReport {
+    app_version: Option<String>,
+    platform: Option<String>,
+    upkeep_json: Option<String>,
+}
+
 async fn bump_presence(
     state: &AppState,
     peer_id: i64,
     has_reader: Option<bool>,
     screen_state: Option<String>,
     operator_only: Option<bool>,
+    report: PeerReport,
 ) {
     {
         let mut guard = state.last_bump.lock().await;
@@ -2999,7 +3018,11 @@ async fn bump_presence(
         // promptly even if the last bump was <5s ago. (The /ping.php path always
         // carries a screen_state once the satellite has reported one, so the
         // change-triggered out-of-band ping is never debounced away.)
-        if has_reader.is_none() && screen_state.is_none() && operator_only.is_none() {
+        if has_reader.is_none()
+            && screen_state.is_none()
+            && operator_only.is_none()
+            && report.upkeep_json.is_none()
+        {
             if let Some(prev) = guard.get(&peer_id) {
                 if now.duration_since(*prev) < Duration::from_secs(5) {
                     return;
@@ -3012,6 +3035,7 @@ async fn bump_presence(
     let db = state.db.clone();
     let has_reader_i64: Option<i64> = has_reader.map(|b| if b { 1 } else { 0 });
     let operator_only_i64: Option<i64> = operator_only.map(|b| if b { 1 } else { 0 });
+    let PeerReport { app_version, platform, upkeep_json } = report;
     tokio::spawn(async move {
         let _ = db
             .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -3024,9 +3048,20 @@ async fn bump_presence(
                                 ELSE reader_last_seen_at
                             END,
                             screen_state_json = COALESCE(?2, screen_state_json),
-                            operator_only = COALESCE(?4, operator_only)
+                            operator_only = COALESCE(?4, operator_only),
+                            peer_app_version = COALESCE(?5, peer_app_version),
+                            peer_platform = COALESCE(?6, peer_platform),
+                            upkeep_json = COALESCE(?7, upkeep_json)
                       WHERE id = ?3",
-                    params![has_reader_i64, screen_state, peer_id, operator_only_i64],
+                    params![
+                        has_reader_i64,
+                        screen_state,
+                        peer_id,
+                        operator_only_i64,
+                        app_version,
+                        platform,
+                        upkeep_json
+                    ],
                 )?;
                 Ok(())
             })
@@ -3676,7 +3711,7 @@ async fn dispatch_pair(
             // a mother on another one (see client_pair_with_mother).
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("lan_proto".into(), json!(LAN_PROTO));
-                obj.insert("app_version".into(), json!(env!("CARGO_PKG_VERSION")));
+                obj.insert("app_version".into(), json!(crate::app_version()));
                 // This mother serves scenario content on /content.php.
                 obj.insert("content_caps".into(), json!(crate::content_server::CONTENT_CAPS));
             }
@@ -3706,7 +3741,8 @@ async fn dispatch_ping(
         Err(resp) => return resp,
     };
 
-    let body_bytes = axum::body::to_bytes(request.into_body(), 8 * 1024)
+    // 16 KB: the upkeep report rides along (the renderer keeps it to ~1 KB).
+    let body_bytes = axum::body::to_bytes(request.into_body(), 16 * 1024)
         .await
         .unwrap_or_default();
     let body: Value = if body_bytes.is_empty() {
@@ -3730,7 +3766,14 @@ async fn dispatch_ping(
     let known_version = body.get("known_version").and_then(|v| v.as_i64());
     let launched_game_id = body.get("launched_game_id").and_then(|v| v.as_i64());
 
-    bump_presence(&state, peer_id, has_reader, screen_state, operator_only).await;
+    // Devices modal upkeep: what the satellite runs and what it still needs.
+    let report = PeerReport {
+        app_version: vstr(&body, "app_version").filter(|s| s.len() <= 32),
+        platform: vstr(&body, "platform").filter(|s| s.len() <= 40),
+        upkeep_json: body.get("upkeep").filter(|v| v.is_object()).map(|v| v.to_string()),
+    };
+
+    bump_presence(&state, peer_id, has_reader, screen_state, operator_only, report).await;
     let commands = pickup_pending_commands(&state, peer_id).await;
 
     let state_version = read_state_version(&state).await;
@@ -3746,7 +3789,7 @@ async fn dispatch_ping(
         "mother_uuid": state.mother_uuid,
         "commands": commands,
         "lan_proto": LAN_PROTO,
-        "app_version": env!("CARGO_PKG_VERSION"),
+        "app_version": crate::app_version(),
         "content_caps": crate::content_server::CONTENT_CAPS,
         "content_rev": content_rev,
         "state_version": state_version,
@@ -5876,11 +5919,17 @@ async fn customers_create(state: &AppState, body: Value) -> Result<Value, ApiErr
     let row = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<Value>> {
-            c.execute(
+            let added = c.execute(
                 "INSERT OR IGNORE INTO customers (id, client_id, name, type, origin)
                  VALUES (?1, ?2, ?3, ?4, 'local')",
                 params![id, client_id, name, ty],
             )?;
+            if added > 0 {
+                // Satellites see the revision move on their next ping and take a
+                // copy right away (customers_sync.rs), so whoever hosts next
+                // still lists this customer.
+                c.execute("UPDATE content_sync_state SET content_rev = content_rev + 1 WHERE id = 1", [])?;
+            }
             Ok(c
                 .query_row(
                     "SELECT id, name, type, city, archived FROM customers WHERE id = ?1 AND client_id = ?2",
@@ -6237,6 +6286,20 @@ async fn operator_only_ids(state: &AppState) -> (std::collections::HashSet<i64>,
     (ids, self_op)
 }
 
+/// This (hosting) device's upkeep report, for its own `is_self` row.
+async fn self_upkeep(state: &AppState) -> Value {
+    match state.app.try_state::<UpkeepPresence>() {
+        Some(p) => p
+            .inner
+            .lock()
+            .await
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
 /// This (hosting) device's live reader + screen state, for its own `is_self`
 /// row - the mother never pings itself, so the DB columns stay stale.
 async fn self_presence(state: &AppState) -> (bool, Value) {
@@ -6262,35 +6325,56 @@ async fn self_presence(state: &AppState) -> (bool, Value) {
 // device is registered in - a device can be registered yet showing something
 // else (it left the game page without leaving the game), which the screen
 // state alone can't tell.
+struct FleetDbRow {
+    id: i64,
+    label: String,
+    os: Option<String>,
+    is_self: bool,
+    last_seen_at: Option<String>,
+    has_reader: bool,
+    online: bool,
+    screen_json: Option<String>,
+    app_version: Option<String>,
+    platform: Option<String>,
+    upkeep_json: Option<String>,
+}
+
 async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, ApiErr> {
     let (self_has_reader, self_screen_state) = self_presence(state).await;
+    let self_upkeep = self_upkeep(state).await;
     let (op_ids, self_op) = operator_only_ids(state).await;
+    let content_rev = crate::content_server::content_rev(state).await;
+    let installers = crate::update_cache::cached_installers(&state.app);
     let client_id = state.client_id;
     let (devices, regs) = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<(i64, String, Option<String>, bool, Option<String>, bool, bool, Option<String>)>, Vec<(i64, i64, String)>)> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<FleetDbRow>, Vec<(i64, i64, String)>)> {
             let mut stmt = c.prepare(
                 "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
                         pd.last_seen_at, pd.has_reader,
                         CASE WHEN pd.last_seen_at IS NOT NULL
                                AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
                              THEN 1 ELSE 0 END AS online,
-                        pd.screen_state_json
+                        pd.screen_state_json,
+                        pd.peer_app_version, pd.peer_platform, pd.upkeep_json
                    FROM paired_devices pd
                  ORDER BY pd.is_self DESC, online DESC, pd.peer_label COLLATE NOCASE ASC",
             )?;
             let devices = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, i64>(3)? == 1,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, i64>(5)? == 1,
-                        r.get::<_, i64>(6)? == 1,
-                        r.get::<_, Option<String>>(7)?,
-                    ))
+                    Ok(FleetDbRow {
+                        id: r.get(0)?,
+                        label: r.get(1)?,
+                        os: r.get(2)?,
+                        is_self: r.get::<_, i64>(3)? == 1,
+                        last_seen_at: r.get(4)?,
+                        has_reader: r.get::<_, i64>(5)? == 1,
+                        online: r.get::<_, i64>(6)? == 1,
+                        screen_json: r.get(7)?,
+                        app_version: r.get(8)?,
+                        platform: r.get(9)?,
+                        upkeep_json: r.get(10)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // Newest game first, so the first entry is the one to rejoin.
@@ -6310,17 +6394,15 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
         })
         .await?;
 
+    let parse = |s: Option<&str>| {
+        s.and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or(Value::Null)
+    };
     let rows: Vec<Value> = devices
         .into_iter()
-        .map(|(id, label, os, is_self, last_seen_at, has_reader, online, screen_json)| {
-            let screen_state = if is_self {
-                self_screen_state.clone()
-            } else {
-                screen_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .unwrap_or(Value::Null)
-            };
+        .map(|d| {
+            let id = d.id;
+            let is_self = d.is_self;
             let games: Vec<Value> = regs
                 .iter()
                 .filter(|(dev, _, _)| *dev == id)
@@ -6328,19 +6410,35 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
                 .collect();
             json!({
                 "id": id,
-                "device_label": label,
-                "peer_os": os,
+                "device_label": d.label,
+                "peer_os": d.os,
                 "is_self": is_self,
-                "online": is_self || online,
-                "last_seen_at": last_seen_at,
-                "has_reader": if is_self { self_has_reader } else { has_reader },
-                "screen_state": screen_state,
+                "online": is_self || d.online,
+                "last_seen_at": d.last_seen_at,
+                "has_reader": if is_self { self_has_reader } else { d.has_reader },
+                "screen_state": if is_self { self_screen_state.clone() } else { parse(d.screen_json.as_deref()) },
                 "operator_only": if is_self { self_op } else { op_ids.contains(&id) },
                 "games": games,
+                // Upkeep (Devices modal update / sync): an older satellite never
+                // reports them, so its version is the one it paired with.
+                "app_version": if is_self { Some(crate::app_version().to_string()) } else { d.app_version },
+                "platform": if is_self { Some(crate::update_cache::this_platform()) } else { d.platform },
+                "upkeep": if is_self { self_upkeep.clone() } else { parse(d.upkeep_json.as_deref()) },
             })
         })
         .collect();
-    Ok(json!({ "devices": rows, "caller_device_id": caller_device_id }))
+    Ok(json!({
+        "devices": rows,
+        "caller_device_id": caller_device_id,
+        // What the hosting mother runs and can hand out: devices behind it are
+        // flagged in the modal, and update from its cached installers offline.
+        "mother": {
+            "app_version": crate::app_version(),
+            "platform": crate::update_cache::this_platform(),
+            "content_rev": content_rev,
+            "installers": installers,
+        },
+    }))
 }
 
 /// Mother-only push queue. Three command kinds today:
@@ -6359,6 +6457,8 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
 ///                     freshly-saved meta, so a config edit applies live.
 /// - `lock_device` / `show_logo` - payload `{}` - raise the PIN lock overlay /
 ///                     the idle logo screen on any paired device.
+/// - `sync_content` / `update_app` - payload `{}` / `{force?}` - sync the
+///                     target's content now / update its app.
 ///
 /// Authorization: any authenticated paired device may queue commands. Children
 /// operate the mother's games (add teams, launch on another device, push videos,
@@ -6434,7 +6534,13 @@ async fn queue_command_inner(
         && !sim_self
         && !matches!(
             kind,
-            "play_video" | "stop_video" | "join_game" | "lock_device" | "show_logo"
+            "play_video"
+                | "stop_video"
+                | "join_game"
+                | "lock_device"
+                | "show_logo"
+                | "sync_content"
+                | "update_app"
         )
     {
         return Err(ApiErr::bad("Cannot queue a command targeting self"));
@@ -6582,6 +6688,11 @@ async fn queue_command_inner(
             // Top-bar Devices modal: raise the PIN lock overlay / the idle logo
             // screen on any paired device, in a game or not. Display-only, no
             // game to validate; the target's own PIN still gates unlocking.
+        }
+        "sync_content" | "update_app" => {
+            // Top-bar Devices modal upkeep: sync the target's content now / have
+            // it update its app (`{force}`: restart even with a game running
+            // there). The target decides what that takes (services/deviceUpkeep).
         }
         _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
     }
@@ -7919,7 +8030,7 @@ async fn pair_hello_handler(state: &AppState) -> Result<Value, ApiErr> {
         "running_games": running_games,
         "label": label,
         "lan_proto": LAN_PROTO,
-        "app_version": env!("CARGO_PKG_VERSION"),
+        "app_version": crate::app_version(),
     }))
 }
 
@@ -8808,10 +8919,7 @@ fn start_mdns(
     // This host's interface IPv4s, filtered by `designated_lan_addrs`. We
     // deliberately do NOT call `enable_addr_auto()`: it re-adds ALL interfaces
     // (loopback, link-local, virtual adapters) at register time.
-    let mut candidates: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
-    candidates.sort();
-    candidates.dedup();
-    let advertised = designated_lan_addrs(&candidates);
+    let advertised = current_designated_addrs();
     if advertised.is_empty() {
         // No LAN address yet (Wi-Fi not joined). Inert handle: empty full_name ->
         // unregister/shutdown are safe no-ops; `mother_ensure_mdns_live`
@@ -8819,6 +8927,7 @@ fn start_mdns(
         return Ok(MdnsHandle {
             daemon,
             full_name: String::new(),
+            advertised: Vec::new(),
         });
     }
 
@@ -8853,7 +8962,16 @@ fn start_mdns(
     .map_err(|e| e.to_string())?;
     let full_name = svc.get_fullname().to_string();
     daemon.register(svc).map_err(|e| e.to_string())?;
-    Ok(MdnsHandle { daemon, full_name })
+    Ok(MdnsHandle { daemon, full_name, advertised })
+}
+
+/// The addresses a mother on this host should advertise right now (sorted,
+/// deduped - the same order `start_mdns` stores in `MdnsHandle::advertised`).
+fn current_designated_addrs() -> Vec<String> {
+    let mut candidates: Vec<String> = local_ipv4s().iter().map(|i| i.to_string()).collect();
+    candidates.sort();
+    candidates.dedup();
+    designated_lan_addrs(&candidates)
 }
 
 async fn run_mdns_discovery(timeout: Duration) -> Result<Vec<DiscoveredMother>, String> {
@@ -9639,6 +9757,16 @@ pub async fn client_ping_mother(
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
             .unwrap_or(Value::Null)
     };
+    let upkeep: Value = match app.try_state::<UpkeepPresence>() {
+        Some(p) => p
+            .inner
+            .lock()
+            .await
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    };
 
     let url = format!("http://{addr}/ping.php");
     let client = lan_client_builder()
@@ -9656,6 +9784,9 @@ pub async fn client_ping_mother(
             "screen_state": screen_state,
             "known_version": known_version,
             "launched_game_id": launched_game_id,
+            "app_version": crate::app_version(),
+            "platform": crate::update_cache::this_platform(),
+            "upkeep": upkeep,
         }))
         .send()
         .await
@@ -9830,6 +9961,20 @@ pub async fn client_set_screen_state(
 ) -> Result<(), String> {
     let mut guard = presence.inner.lock().await;
     *guard = json.filter(|s| !s.is_empty());
+    Ok(())
+}
+
+/// Renderer-driven setter: `services/upkeepState.ts` reports this device's
+/// update + content-sync state as a JSON string whenever it changes. Cached
+/// in-process, shipped on every ping (`paired_devices.upkeep_json` on the
+/// mother), read directly for the mother's own row in `list_fleet`.
+#[tauri::command]
+pub async fn client_set_upkeep(
+    presence: tauri::State<'_, UpkeepPresence>,
+    json: Option<String>,
+) -> Result<(), String> {
+    let mut guard = presence.inner.lock().await;
+    *guard = json.filter(|s| !s.is_empty() && s.len() <= 8 * 1024);
     Ok(())
 }
 

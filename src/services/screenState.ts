@@ -71,7 +71,9 @@ function sameState(a: ScreenState, b: ScreenState): boolean {
 
 let pingTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function pingMothersNow(): Promise<void> {
+/** Ping every paired mother now, so a state change reaches it within ~1s
+ *  (also used by services/upkeepState). */
+export async function pingMothersNow(): Promise<void> {
   try {
     const mothers = await invoke<Array<{ mother_uuid: string }>>(
       'client_list_paired_mothers'

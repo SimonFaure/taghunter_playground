@@ -29,6 +29,8 @@ import {
   ensureDir,
   onDemandCardsFileRel,
   teamNamesFileRel,
+  customersFileRel,
+  existsRel,
   writeJson,
   writeBinary,
   streamBinary,
@@ -414,16 +416,39 @@ export function stop(): void {
   currentUser = null;
 }
 
-export async function runCycleNow(trigger: Trigger = 'manual'): Promise<void> {
+/** How a manual sync went: with the studio, with the LAN devices (no
+ *  internet), or with neither. */
+export type ManualSyncRoute = 'cloud' | 'lan' | 'none';
+
+// Registered by services/peerContent (it imports this module, so not the
+// other way round): sync with the LAN devices now, false when none answers.
+let lanSyncHandler: (() => Promise<boolean>) | null = null;
+export function setLanSyncHandler(fn: (() => Promise<boolean>) | null): void {
+  lanSyncHandler = fn;
+}
+
+export async function runCycleNow(trigger: Trigger = 'manual'): Promise<ManualSyncRoute> {
   if (trigger === 'manual' && launchGate !== 'open') {
     // A manual sync answers the launch question too: close the prompt.
     if (launchGate === 'awaiting_answer') {
       pendingUpdates = null;
+      pendingPeerSource = null;
       emit('updates:resolved', { accepted: true });
     }
     launchGate = 'open';
   }
+  // No internet: a manual sync syncs with the other devices of the LAN instead
+  // of failing on the studio.
+  if (trigger === 'manual' && lanSyncHandler && !(isOnline() && (await studioReachableFresh(0)))) {
+    return (await lanSyncHandler().catch(() => false)) ? 'lan' : 'none';
+  }
   await fireTrigger(trigger, { force: trigger === 'manual' });
+  return 'cloud';
+}
+
+/** Where the launch-sync consent stands (diagnostics). */
+export function getLaunchGate(): string {
+  return launchGate;
 }
 
 // After a local card edit: get it to the studio soon. With the launch gate
@@ -553,6 +578,9 @@ function peerCanServe(item: WorkItem, inv: PeerInventory): boolean {
       return inv.team_names !== null && inv.team_names === item.remoteVersion;
     case 'report_layouts':
       return inv.report_layouts !== null && inv.report_layouts === item.remoteVersion;
+    case 'customers':
+      // != null: a mother that predates customers has no such field at all.
+      return inv.customers != null && inv.customers === item.remoteVersion;
     case 'game_type_admin_video':
       return !inv.game_active && inv.game_types.some((g) => g.code === item.code && g.version === item.remoteVersion);
     case 'game_type_override_video':
@@ -584,8 +612,9 @@ export async function runPeerSync(source: PeerContentSource, signal?: AbortSigna
   if (cycleInFlight || checkInFlight || peerFetchInFlight) return false;
   // Same consent as cloud downloads (LaunchGate): nothing in the background
   // until the operator has agreed to this session's sync. Joining a game still
-  // fetches its scenario (fetchScenarioFromSource).
-  if (launchGate === 'declined' || launchGate === 'awaiting_answer') return false;
+  // fetches its scenario (fetchScenarioFromSource), and content a satellite
+  // already pushed to us (local) downloads nothing.
+  if (!source.local && (launchGate === 'declined' || launchGate === 'awaiting_answer')) return false;
   const clientId = currentUser.client_id;
 
   const ctrl = new AbortController();
@@ -608,14 +637,17 @@ export async function runPeerSync(source: PeerContentSource, signal?: AbortSigna
   try {
     const inv = await source.getInventory(ctrl.signal);
     if (inv.client_id !== clientId) return false;
-    const mine = await contentSyncState.get();
-    const mineAsOf = mine && mine.client_id === clientId ? mine.cloud_as_of_ms : null;
+    const mineRow = await contentSyncState.get();
+    const mine = mineRow && mineRow.client_id === clientId ? mineRow : null;
+    const mineAsOf = mine ? mine.cloud_as_of_ms : null;
     const peerNewer = inv.cloud_as_of_ms !== null && !inv.approx && (mineAsOf === null || inv.cloud_as_of_ms > mineAsOf);
-    const cloudUsable = isOnline() && (await studioReachableFresh());
+    // Online, the studio stays the source - except for what is already on our
+    // disk (a satellite's push): committing it is free.
+    const cloudUsable = !source.local && isOnline() && (await studioReachableFresh());
     if (cloudUsable && !peerNewer) return false;
 
     operatorOnly = await readOperatorOnly();
-    if (launchGate === 'pending_check') {
+    if (launchGate === 'pending_check' && !source.local) {
       // Online, the cloud launch check asks the operator; let it.
       if (cloudUsable) return false;
       // Launched offline: ask about what the mother can bring, like the cloud
@@ -626,10 +658,11 @@ export async function runPeerSync(source: PeerContentSource, signal?: AbortSigna
         if (pm.client_id !== clientId || pm.approx) return false;
         await applyManifest(clientId, pm.manifest as ManifestResponse, { prune: false, fromPeer: true });
       }
-      const pending = (await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) =>
-        peerCanServe(w, inv)
-      );
-      const summary = await summarizeWork(pending);
+      const pending = [
+        ...(await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) => peerCanServe(w, inv)),
+        ...(await peerAdditions(inv, mine)),
+      ];
+      const summary = await summarizeWork(pending, 'peer');
       if (summary.total > 0) {
         launchGate = 'awaiting_answer';
         pendingUpdates = summary;
@@ -650,9 +683,10 @@ export async function runPeerSync(source: PeerContentSource, signal?: AbortSigna
       emit('content:updated', { kind: 'scenarios', ids: [] });
     }
 
-    const work = (await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) =>
-      peerCanServe(w, inv)
-    );
+    const work = [
+      ...(await buildWorkList(clientId, { onDemand: false, fromPeer: true })).filter((w) => peerCanServe(w, inv)),
+      ...(await peerAdditions(inv, mine)),
+    ];
     if (work.length === 0) return peerNewer;
     scenarioProgress.clear();
     peerFirstError = null;
@@ -671,6 +705,80 @@ export async function runPeerSync(source: PeerContentSource, signal?: AbortSigna
     peerFetchInFlight = false;
     release();
   }
+}
+
+// Scenarios the peer holds complete and this device doesn't have at all.
+// Taking them needs no snapshot ordering - an addition never deletes anything -
+// unless the peer's snapshot is reliably OLDER than ours (the cloud may have
+// removed them since). Covers a studio without server_time (approx snapshots)
+// and a scenario newer than both devices' manifests. Our next cloud sync
+// corrects or removes whatever this adds.
+async function peerAdditions(
+  inv: PeerInventory,
+  mine: { cloud_as_of_ms: number | null; approx: number } | null
+): Promise<WorkItem[]> {
+  const peerStale =
+    mine?.cloud_as_of_ms != null && !mine.approx && inv.cloud_as_of_ms !== null && !inv.approx && inv.cloud_as_of_ms < mine.cloud_as_of_ms;
+  if (peerStale) return [];
+  const out: WorkItem[] = [];
+  for (const s of inv.scenarios) {
+    if (!s.complete || !s.hash) continue;
+    if (await scenarioStore.get(s.uniqid)) continue;
+    out.push({
+      kind: 'scenario_meta',
+      priority: 4,
+      uniqid: s.uniqid,
+      remoteVersion: 0,
+      remoteContentHash: s.hash,
+      label: `Scenario: ${s.title ?? s.uniqid}`,
+    });
+  }
+  return out;
+}
+
+// ---------- what is still to sync (Devices modal) ----------
+
+export interface PendingContentReport {
+  summary: PendingUpdatesSummary;
+  /** Of those, what the LAN mother can bring - only with its inventory. */
+  fromMother: number | null;
+  /** The mother saw the studio more recently than this device. */
+  motherNewer: boolean;
+  /** A cycle, launch check or peer sync is running right now. */
+  busy: boolean;
+  /** The operator said "Plus tard" (or has yet to answer): nothing downloads. */
+  declined: boolean;
+}
+
+/**
+ * What this device still lacks: its manifest's pending downloads, plus what
+ * `inv` (the mother's inventory, when routed to one) holds that it doesn't.
+ * Read-only - no download, no manifest fetch. Null before the orchestrator runs.
+ */
+export async function pendingContentReport(inv: PeerInventory | null): Promise<PendingContentReport | null> {
+  if (!started || !currentUser) return null;
+  const clientId = currentUser.client_id;
+  // buildWorkList reads the operator-only policy from module state.
+  if (!cycleInFlight && !peerFetchInFlight) operatorOnly = await readOperatorOnly();
+  const work = await buildWorkList(clientId, { onDemand: false, fromPeer: false });
+  let additions: WorkItem[] = [];
+  let fromMother: number | null = null;
+  let motherNewer = false;
+  if (inv && inv.client_id === clientId) {
+    const mineRow = await contentSyncState.get();
+    const mine = mineRow && mineRow.client_id === clientId ? mineRow : null;
+    additions = await peerAdditions(inv, mine);
+    motherNewer =
+      inv.cloud_as_of_ms !== null && !inv.approx && (mine?.cloud_as_of_ms == null || inv.cloud_as_of_ms > mine.cloud_as_of_ms);
+    fromMother = work.filter((w) => peerCanServe(w, inv)).length + additions.length;
+  }
+  return {
+    summary: await summarizeWork([...work, ...additions], inv ? 'peer' : 'cloud'),
+    fromMother,
+    motherNewer,
+    busy: cycleInFlight || checkInFlight || peerFetchInFlight,
+    declined: launchGate === 'declined' || launchGate === 'awaiting_answer',
+  };
 }
 
 function clearRetry(): void {
@@ -790,7 +898,7 @@ async function runLaunchCheck(): Promise<void> {
   emit('updates:available', summary);
 }
 
-async function summarizeWork(work: WorkItem[]): Promise<PendingUpdatesSummary> {
+async function summarizeWork(work: WorkItem[], source: 'cloud' | 'peer' = 'cloud'): Promise<PendingUpdatesSummary> {
   const summary: PendingUpdatesSummary = {
     total: 0,
     newScenarios: [],
@@ -798,7 +906,14 @@ async function summarizeWork(work: WorkItem[]): Promise<PendingUpdatesSummary> {
     patterns: 0,
     videos: 0,
     other: 0,
+    patternNames: [],
+    videoNames: [],
+    others: [],
+    source,
   };
+  // "Scenario: X" / "Pattern: X" -> X (a peer's addition has no local row yet).
+  const labelName = (label: string) => label.replace(/^[^:]+:\s*/, '');
+  const gameTypeName = async (code: string) => (await gameTypesStore.getGameType(code))?.name ?? code;
   const pendingScenarios = new Map(
     (await scenarioStore.listPendingDownloads()).map((s) => [s.uniqid, s])
   );
@@ -808,20 +923,28 @@ async function summarizeWork(work: WorkItem[]): Promise<PendingUpdatesSummary> {
     switch (w.kind) {
       case 'scenario_meta': {
         const row = pendingScenarios.get(w.uniqid);
-        const title = row?.title ?? w.label;
+        const title = row?.title ?? labelName(w.label);
         if (row && row.local_version !== null) summary.updatedScenarios.push(title);
         else summary.newScenarios.push(title);
         break;
       }
       case 'pattern':
         summary.patterns += 1;
+        summary.patternNames.push((await patternStore.get(w.uniqid))?.name ?? labelName(w.label));
         break;
       case 'game_type_admin_video':
       case 'game_type_override_video':
         summary.videos += 1;
+        summary.videoNames.push(await gameTypeName(w.code));
+        break;
+      case 'game_type_admin_subtitles':
+      case 'game_type_override_subtitles':
+        summary.other += 1;
+        summary.others.push({ kind: 'subtitles', name: await gameTypeName(w.code) });
         break;
       default:
         summary.other += 1;
+        summary.others.push({ kind: w.kind });
     }
   }
   return summary;
@@ -1214,11 +1337,13 @@ async function applyManifest(
     await recoveryCodesStore.upsertFromManifest(clientId, {
       recovery_codes_version: manifest.recovery_codes_version ?? null,
     });
-    // Licensee customers (cloud only: contact-free cache, see customersStore).
-    await customersStore.upsertFromManifest(clientId, {
-      customers_version: manifest.customers_version ?? null,
-    });
   }
+
+  // Licensee customers (contact-free, see customersStore). From a peer too:
+  // the list travels over the LAN like team names.
+  await customersStore.upsertFromManifest(clientId, {
+    customers_version: manifest.customers_version ?? null,
+  });
 
   // Mission-report PDF layout defaults (global, single-row state).
   await reportLayoutsStore.upsertFromManifest({
@@ -1272,7 +1397,12 @@ async function buildWorkList(clientId: number, opts: { onDemand: boolean; fromPe
       });
     }
   }
-  if (!opts.fromPeer && (await customersStore.needsDownload(clientId))) {
+  // Also when the file peers are served from is missing (a cache filled by a
+  // build that didn't keep it): one fresh download restores it.
+  if (
+    (await customersStore.needsDownload(clientId)) ||
+    ((await customersStore.studioSupportsCustomers()) && !(await existsRel(customersFileRel())))
+  ) {
     const row = await customersStore.getState(clientId);
     if (row && row.remote_version !== null) {
       work.push({
@@ -1662,7 +1792,7 @@ async function downloadOne(item: WorkItem, signal: AbortSignal, source: ContentS
     case 'recovery_codes':
       return downloadRecoveryCodes(item, signal);
     case 'customers':
-      return downloadCustomers(item, signal);
+      return downloadCustomers(item, signal, source);
     case 'report_layouts':
       return downloadReportLayouts(item, signal, source);
     case 'pattern':
@@ -1788,22 +1918,24 @@ async function downloadRecoveryCodes(
 // (badges, studio-side reassignments). Version-gated like recovery codes.
 async function downloadCustomers(
   item: Extract<WorkItem, { kind: 'customers' }>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  source: ContentSource = cloudSource
 ): Promise<DownloadOutcome> {
-  const bytes = await withRetry(() =>
-    apiDownloadBytesStream('playground', 'get_customers', {
-      bearer: true,
-      signal,
-      onProgress: (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total),
-    })
+  const text = await withRetry(() =>
+    source.getCustomers(signal, (p) => emitItemProgress(item.label, item.kind, p.loaded, p.total))
   );
-  emitItemProgress(item.label, item.kind, bytes.byteLength, bytes.byteLength, true);
+  const size = new TextEncoder().encode(text).byteLength;
+  emitItemProgress(item.label, item.kind, size, size, true);
   // A parse failure throws: the item fails and is retried, the cache is untouched.
-  const payload = JSON.parse(new TextDecoder().decode(bytes)) as customersStore.CustomersDownload;
-  const version = typeof payload.version === 'number' ? payload.version : item.remoteVersion;
+  const payload = JSON.parse(text) as customersStore.CustomersDownload;
   await customersStore.applyDownload(item.clientId, payload);
-  await customersStore.markDownloaded(item.clientId, version);
-  return { enqueued: null, bytes: bytes.byteLength };
+  // Kept verbatim on disk: the LAN mother serves it to peers (content_server),
+  // and an online child pushes it to an offline mother (peerContent).
+  await ensureDir('media/customers');
+  await writeText(customersFileRel(), text);
+  // The version the manifest asked for: peers compare exactly on it.
+  await customersStore.markDownloaded(item.clientId, item.remoteVersion);
+  return { enqueued: null, bytes: size };
 }
 
 // Mission-report PDF layouts: download the per-game-type set (studio merges the

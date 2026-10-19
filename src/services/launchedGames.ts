@@ -22,6 +22,7 @@ import {
 } from './telemetry';
 import { studioSupportsCustomers } from './customersStore';
 import type { ScreenState } from './screenState';
+import type { UpkeepReport } from './upkeepState';
 
 // ---------- types ----------
 
@@ -700,6 +701,8 @@ async function queueCommandBulk(
     | 'reload_config'
     | 'lock_device'
     | 'show_logo'
+    | 'sync_content'
+    | 'update_app'
     | 'sim_control',
   payload: Record<string, unknown>
 ): Promise<QueueCommandBulkResp> {
@@ -844,12 +847,28 @@ export interface FleetDeviceRow {
   /** Operator-only device: never pushed into a game. */
   operator_only?: boolean;
   games: Array<{ launched_game_id: number; name: string }>;
+  /** The app version it runs (an older satellite: the one it paired with). */
+  app_version?: string | null;
+  /** Its installer platform key ("windows-x86_64", "android"). */
+  platform?: string | null;
+  /** Its update / content-sync state; null from a build that predates it. */
+  upkeep?: UpkeepReport | null;
+}
+
+export interface FleetMotherInfo {
+  app_version: string;
+  platform: string;
+  content_rev: number;
+  /** The installers the mother holds for its satellites. */
+  installers: Array<{ platform: string; version: string; channel: string }>;
 }
 
 export interface ListFleetResp {
   devices: FleetDeviceRow[];
   // paired_devices.id of the CALLER - see ListPairedWithStatusResp.
   caller_device_id?: number;
+  /** Absent from a mother that predates the upkeep columns. */
+  mother?: FleetMotherInfo;
 }
 
 export async function listFleet(): Promise<ListFleetResp> {
@@ -871,6 +890,18 @@ export async function queueLockDeviceBulk(targets: number[]): Promise<QueueComma
 // with join_game `rejoin`.
 export async function queueShowLogoBulk(targets: number[]): Promise<QueueCommandBulkResp> {
   return queueCommandBulk(targets, 'show_logo', {});
+}
+
+// Have paired device(s) sync their content now (studio, or the LAN offline) -
+// a manual sync there, which also answers its "Plus tard".
+export async function queueSyncContentBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'sync_content', {});
+}
+
+// Have paired device(s) download and install the newest app version. A device
+// with a game running stops at "ready" unless `force` (restart anyway).
+export async function queueUpdateAppBulk(targets: number[], opts?: { force?: boolean }): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'update_app', opts?.force ? { force: true } : {});
 }
 
 // ---------- team_completed_quests (tagquest scoring) ----------

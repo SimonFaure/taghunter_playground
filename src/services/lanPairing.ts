@@ -98,8 +98,9 @@ export interface MotherServerInfo {
 export const getMotherServerInfo = () =>
   invoke<MotherServerInfo | null>('mother_get_server_info');
 
-/** Re-announce this mother over mDNS with the PC's current LAN addresses. */
-export const refreshMdns = () => invoke<void>('mother_refresh_mdns');
+/** Re-announce this mother over mDNS with the PC's current LAN addresses.
+ *  Resolves to the addresses now advertised (empty = no LAN address yet). */
+export const refreshMdns = () => invoke<string[]>('mother_refresh_mdns');
 
 /** This PC's non-loopback IPv4s (shown on the mother so satellites can pair by IP). */
 export const getLocalIpv4s = () => invoke<string[]>('get_local_ipv4s');

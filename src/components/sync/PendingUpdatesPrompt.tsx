@@ -50,12 +50,23 @@ export function PendingUpdatesPrompt() {
     });
   }
   if (summary.patterns > 0) {
-    lines.push({ label: t('sync:pendingPatterns', { count: summary.patterns }) });
+    lines.push({
+      label: t('sync:pendingPatterns', { count: summary.patterns }),
+      detail: summary.patternNames?.length ? titles(summary.patternNames) : undefined,
+    });
   }
   if (summary.videos > 0) {
-    lines.push({ label: t('sync:pendingVideos', { count: summary.videos }) });
+    lines.push({
+      label: t('sync:pendingVideos', { count: summary.videos }),
+      detail: summary.videoNames?.length ? titles(summary.videoNames) : undefined,
+    });
   }
-  if (summary.other > 0) {
+  // Each other item by name (chips list, team names, customers...).
+  if (summary.others?.length) {
+    for (const o of summary.others) {
+      lines.push({ label: t(`sync:pendingKind_${o.kind}`, { name: o.name ?? '', defaultValue: t('sync:pendingKind_other') }) });
+    }
+  } else if (summary.other > 0) {
     lines.push({ label: t('sync:pendingOther', { count: summary.other }) });
   }
 
@@ -72,7 +83,7 @@ export function PendingUpdatesPrompt() {
                 {t('sync:pendingTitle')}
               </h3>
               <p className="text-sm text-[var(--pg-text-muted)] leading-relaxed mb-3">
-                {t('sync:pendingBody')}
+                {t(summary.source === 'peer' ? 'sync:pendingBodyLan' : 'sync:pendingBody')}
               </p>
               <ul className="space-y-2 text-sm text-[var(--pg-text)]">
                 {lines.map((l) => (

@@ -199,6 +199,7 @@ pub(crate) async fn dispatch_content(
             (Some("pattern"), Some(u)) if !u.is_empty() => pattern(&state, u.to_string()).await,
             (Some("team_names"), _) => team_names(&state).await,
             (Some("report_layouts"), _) => report_layouts(&state).await,
+            (Some("customers"), _) => customers(&state).await,
             _ => err(StatusCode::BAD_REQUEST, "unsupported catalog"),
         },
         // ── satellite → mother (push) ──
@@ -219,6 +220,23 @@ pub(crate) async fn dispatch_content(
                 Err(e) => err(StatusCode::UNPROCESSABLE_ENTITY, &e),
             }
         }
+        // Customers quick-created offline, both ways (customers_sync.rs).
+        "customers_exchange" => {
+            let v = match read_json(body).await {
+                Ok(v) => v,
+                Err(r) => return r,
+            };
+            let Ok(theirs) = serde_json::from_value::<crate::customers_sync::CustomersPayload>(v) else {
+                return err(StatusCode::BAD_REQUEST, "invalid customers payload");
+            };
+            if theirs.client_id != state.client_id {
+                return err(StatusCode::FORBIDDEN, "CLIENT_MISMATCH");
+            }
+            match crate::customers_sync::mother_exchange(&state.db, &state.app, state.client_id, theirs).await {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            }
+        }
         // Chip lists + unpushed chip edits, both ways (cards_sync.rs).
         "cards_exchange" => {
             let v = match read_json(body).await {
@@ -237,7 +255,7 @@ pub(crate) async fn dispatch_content(
             }
         }
         "put_catalog" => match q.kind.as_deref() {
-            Some(k @ ("pattern" | "team_names" | "report_layouts")) => put_staged(&state, body, k).await,
+            Some(k @ ("pattern" | "team_names" | "report_layouts" | "customers")) => put_staged(&state, body, k).await,
             _ => err(StatusCode::BAD_REQUEST, "unsupported catalog"),
         },
         "" => err(StatusCode::BAD_REQUEST, "action is required"),
@@ -560,6 +578,7 @@ pub(crate) async fn content_rev(state: &AppState) -> i64 {
 /// whether our cloud snapshot is newer than its own.
 async fn inventory(state: &AppState) -> Response {
     let client_id = state.client_id;
+    let customers_file = customers_path(&state.media_root).is_file();
     let res = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Value> {
@@ -575,7 +594,7 @@ async fn inventory(state: &AppState) -> Response {
             let as_of = if snap_client == Some(client_id) { as_of } else { None };
 
             let mut st = c.prepare(
-                "SELECT uniqid, local_content_hash, remote_content_hash FROM scenarios
+                "SELECT uniqid, local_content_hash, remote_content_hash, title FROM scenarios
                   WHERE local_version IS NOT NULL",
             )?;
             let scenarios: Vec<Value> = st
@@ -583,11 +602,13 @@ async fn inventory(state: &AppState) -> Response {
                     let uniqid: String = r.get(0)?;
                     let local: Option<String> = r.get(1)?;
                     let remote: Option<String> = r.get(2)?;
+                    let title: String = r.get(3)?;
                     let complete = local.is_some() && local == remote;
                     Ok(json!({
                         "uniqid": uniqid,
                         "hash": if complete { local } else { None },
                         "complete": complete,
+                        "title": title,
                     }))
                 })?
                 .collect::<Result<_, _>>()?;
@@ -613,6 +634,18 @@ async fn inventory(state: &AppState) -> Response {
                 .query_row("SELECT local_version FROM report_layouts_state WHERE id = 1", [], |r| r.get(0))
                 .optional()?
                 .flatten();
+            // Licensee customers: only with the file it is served from.
+            let customers: Option<f64> = if customers_file {
+                c.query_row(
+                    "SELECT local_version FROM customers_state WHERE client_id = ?",
+                    params![client_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten()
+            } else {
+                None
+            };
 
             let mut st = c.prepare(
                 "SELECT code, local_version, subtitles_local_version FROM game_types
@@ -658,6 +691,7 @@ async fn inventory(state: &AppState) -> Response {
                 "patterns": patterns,
                 "team_names": team_names,
                 "report_layouts": report_layouts,
+                "customers": customers,
                 "game_types": game_types,
                 "overrides": overrides,
             }))
@@ -723,6 +757,37 @@ async fn team_names(state: &AppState) -> Response {
         return err(StatusCode::NOT_FOUND, "NOT_ON_MOTHER");
     };
     match tokio::fs::read_to_string(state.media_root.join("name_pools").join("team_names.json")).await {
+        Ok(content) => Json(json!({ "version": version, "content": content })).into_response(),
+        Err(_) => err(StatusCode::NOT_FOUND, "NOT_ON_MOTHER"),
+    }
+}
+
+/// Where the renderer keeps studio's `get_customers` payload as downloaded
+/// (contentFs.customersFileRel) - contact-free, served verbatim to peers.
+fn customers_path(media_root: &Path) -> PathBuf {
+    media_root.join("customers").join("customers.json")
+}
+
+/// The licensee-customers file, verbatim, with the version it was downloaded
+/// at (project_licensee_customers). Same shape as team_names.
+async fn customers(state: &AppState) -> Response {
+    let client_id = state.client_id;
+    let version = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<f64>> {
+            Ok(c.query_row(
+                "SELECT local_version FROM customers_state WHERE client_id = ?",
+                params![client_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+        })
+        .await;
+    let Ok(Some(version)) = version else {
+        return err(StatusCode::NOT_FOUND, "NOT_ON_MOTHER");
+    };
+    match tokio::fs::read_to_string(customers_path(&state.media_root)).await {
         Ok(content) => Json(json!({ "version": version, "content": content })).into_response(),
         Err(_) => err(StatusCode::NOT_FOUND, "NOT_ON_MOTHER"),
     }
@@ -1043,6 +1108,11 @@ async fn put_staged(state: &AppState, body: Body, kind: &str) -> Response {
         {
             "report_layouts.json".to_string()
         }
+        "customers" if v.get("version").map_or(false, |x| x.is_number())
+            && v.get("content").map_or(false, |x| x.is_string()) =>
+        {
+            "customers.json".to_string()
+        }
         _ => return err(StatusCode::BAD_REQUEST, "invalid catalog"),
     };
     let path = inbox_dir(&state.media_root).join(&rel);
@@ -1168,6 +1238,13 @@ mod tests {
         assert!(try_acquire(&slots, 3).is_none(), "global cap");
         drop(a1);
         assert!(try_acquire(&slots, 3).is_some(), "freed on drop");
+    }
+
+    #[test]
+    fn customers_file_matches_renderer_path() {
+        // contentFs.customersFileRel() = media/customers/customers.json
+        let p = customers_path(Path::new("media"));
+        assert_eq!(p, Path::new("media").join("customers").join("customers.json"));
     }
 
     #[test]

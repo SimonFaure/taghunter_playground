@@ -11,7 +11,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { ApiError } from './api';
 import { getAuthUser } from './authStore';
-import { blobExists, readTextRel, teamNamesFileRel } from './contentFs';
+import { blobExists, customersFileRel, readTextRel, teamNamesFileRel } from './contentFs';
 import * as contentSyncState from './contentSyncState';
 import {
   motherRoute,
@@ -25,14 +25,18 @@ import {
 import * as namePoolsStore from './namePoolsStore';
 import * as patternStore from './patternStore';
 import * as reportLayoutsStore from './reportLayoutsStore';
+import * as customersStore from './customersStore';
 import * as scenarioStore from './scenarioStore';
-import { fetchScenarioFromSource, runPeerSync, type PeerFetchProgress } from './syncOrchestrator';
+import { fetchScenarioFromSource, runPeerSync, setLanSyncHandler, type PeerFetchProgress } from './syncOrchestrator';
 import { pushInstallerToMother } from './updateService';
 
 export { motherRoute };
-import { emit } from './syncEvents';
-import { scheduleInboxCommit } from './peerInbox';
+import { emit, on } from './syncEvents';
+import { commitPeerInboxNow, scheduleInboxCommit } from './peerInbox';
 import { loadConfig } from '../utils/config';
+
+const VIDEO_EXTENSIONS = ['.mp4', '.webm', '.ogv', '.mov', '.m4v'];
+const isVideoFile = (relPath: string) => VIDEO_EXTENSIONS.some((ext) => relPath.toLowerCase().endsWith(ext));
 
 export type MotherFetchFailure =
   | 'no_mother' // not routed to a mother (or this device IS the mother)
@@ -84,10 +88,47 @@ export async function fetchScenarioFromMother(
 
 // ---------- background sync ----------
 
-const PEER_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// Fallback poll only: the mother's content revision (on every ping) and the
+// end of our own studio sync trigger a sync right away.
+const PEER_SYNC_MIN_INTERVAL_MS = 60 * 1000;
 let syncInFlight: Promise<void> | null = null;
+// The last LAN sync, step by step (diagnostics: contentSyncSmokeTest).
+let lastReport: { at: string; mother: string; steps: Record<string, string> } | null = null;
+export function lastLanSyncReport() {
+  return lastReport;
+}
+// Why scenarios were not pushed during the current sync (into the report).
+let pushSkips: string[] = [];
+function skip(title: string, why: string): false {
+  pushSkips.push(`${title}: ${why}`);
+  return false;
+}
 let lastSyncAt = 0;
 let lastSeenRev: number | null = null;
+// The mother's inventory as of the last sync, for this device's upkeep report
+// (services/deviceUpkeep): what it holds that we don't.
+let lastInventory: { baseUrl: string; at: number; inv: PeerInventory } | null = null;
+const INVENTORY_FRESH_MS = 5 * 60 * 1000;
+const syncDoneListeners = new Set<() => void>();
+
+/** The routed mother's inventory from the last sync, if recent. */
+export function lastMotherInventory(): PeerInventory | null {
+  const route = motherRoute();
+  if (!route || !lastInventory || lastInventory.baseUrl !== route.baseUrl) return null;
+  return Date.now() - lastInventory.at < INVENTORY_FRESH_MS ? lastInventory.inv : null;
+}
+
+export function isLanSyncInFlight(): boolean {
+  return syncInFlight !== null;
+}
+
+/** Called after every sync with the mother (whatever its outcome). */
+export function onLanSyncDone(fn: () => void): () => void {
+  syncDoneListeners.add(fn);
+  return () => {
+    syncDoneListeners.delete(fn);
+  };
+}
 // Whether a mother (by base URL) serves /content.php: an old one won't start
 // to mid-session, so ask once.
 const contentCaps = new Map<string, boolean>();
@@ -110,10 +151,14 @@ export function syncFromMotherNow(): Promise<void> {
       const source = peerSource(route, user.client_id, { priority: 'background' });
       // Each step on its own: one failing (a busy mother, a dropped request)
       // must not cost the others their turn.
+      const report: Record<string, string> = {};
+      lastReport = { at: new Date().toISOString(), mother: route.baseUrl, steps: report };
       const step = async (name: string, fn: () => Promise<void>) => {
         try {
           await fn();
+          report[name] ??= 'ok';
         } catch (e) {
+          report[name] = `failed: ${e instanceof Error ? e.message : String(e)}`;
           console.warn(`[peerContent] ${name} with ${route.baseUrl} failed:`, e);
         }
       };
@@ -124,7 +169,11 @@ export function syncFromMotherNow(): Promise<void> {
       // with the studio more recently than it did).
       await step('content push', async () => {
         const inv = await source.getInventory(new AbortController().signal);
+        lastInventory = { baseUrl: route.baseUrl, at: Date.now(), inv };
+        pushSkips = [];
         const pushed = await pushToMother(route, user.client_id, inv);
+        report['content push'] = `${pushed} item(s) pushed`;
+        if (pushSkips.length) report['scenario skips'] = pushSkips.join(' | ');
         if (pushed) console.log(`[peerContent] pushed ${pushed} item(s) to ${route.baseUrl}`);
       });
       // Chips: both lists and unpushed edits, merged per chip (cards_sync.rs).
@@ -136,6 +185,17 @@ export function syncFromMotherNow(): Promise<void> {
         });
         if (cards.changed > 0) emit('content:updated', { kind: 'cards', ids: [user.client_id] });
       });
+      // Licensee customers quick-created offline, both ways (customers_sync.rs):
+      // whoever hosts next lists them, whoever gets online first sends them on.
+      await step('customer exchange', async () => {
+        const res = await invoke<{ added: number }>('client_customers_exchange', {
+          baseUrl: route.baseUrl,
+          token: route.token,
+          clientId: user.client_id,
+        });
+        report['customer exchange'] = `${res.added} added here`;
+        if (res.added > 0) emit('content:updated', { kind: 'customers', ids: [user.client_id] });
+      });
       // A newer app installer we hold, for the mother to offer the others.
       await step('installer push', async () => {
         if (await pushInstallerToMother(route, user.client_id)) {
@@ -146,6 +206,7 @@ export function syncFromMotherNow(): Promise<void> {
       console.warn('[peerContent] sync from mother failed:', e);
     } finally {
       syncInFlight = null;
+      for (const fn of syncDoneListeners) fn();
     }
   })();
   return syncInFlight;
@@ -178,6 +239,11 @@ export function installPeerContentSync(): () => void {
   // Mother side: a satellite pushed content to us (services/peerInbox), or
   // merged its chip list/edits into ours.
   void listen('taghunter://content-inbox', () => scheduleInboxCommit()).then(keep);
+  void listen('taghunter://customers-merged', () => {
+    void getAuthUser().then((u) => {
+      if (u) emit('content:updated', { kind: 'customers', ids: [u.client_id] });
+    });
+  }).then(keep);
   void listen('taghunter://cards-merged', () => {
     void getAuthUser().then((u) => {
       if (u) emit('content:updated', { kind: 'cards', ids: [u.client_id] });
@@ -185,11 +251,34 @@ export function installPeerContentSync(): () => void {
   }).then(keep);
   // Something staged before a restart, or that waited for the operator's go.
   const boot = setTimeout(() => scheduleInboxCommit(0), 20_000);
+  // Fresh content from the studio: hand the mother what it lacks right away.
+  const offFinished = on('cycle:finished', () => void syncFromMotherNow());
+  setLanSyncHandler(syncWithLanNow);
   return () => {
     cancelled = true;
     clearTimeout(boot);
+    offFinished();
+    setLanSyncHandler(null);
     for (const fn of unlisteners) fn();
   };
+}
+
+/**
+ * The manual "Synchronise" without internet. A satellite syncs with its mother
+ * (pull + push + chips + installer). The mother commits what its satellites
+ * pushed, and bumps its content revision: every satellite sees it on its next
+ * ping (seconds) and pushes what it holds. False when there's no LAN peer.
+ */
+export async function syncWithLanNow(): Promise<boolean> {
+  if (motherRoute()) {
+    await syncFromMotherNow();
+    return true;
+  }
+  const role = await invoke<{ mother_server_running?: boolean }>('client_describe_local_role').catch(() => null);
+  if (!role?.mother_server_running) return false;
+  await commitPeerInboxNow();
+  await contentSyncState.bumpRev();
+  return true;
 }
 
 // ---------- push to the mother ----------
@@ -204,18 +293,52 @@ export function installPeerContentSync(): () => void {
  */
 async function pushToMother(route: PeerRoute, clientId: number, inv: PeerInventory): Promise<number> {
   if (inv.client_id !== clientId) return 0;
-  const mine = await contentSyncState.get();
-  if (!mine || mine.client_id !== clientId || mine.cloud_as_of_ms === null || mine.approx || !mine.manifest_json) return 0;
+  const row = await contentSyncState.get();
+  const mine = row && row.client_id === clientId ? row : null;
+  // Our snapshot can be ordered against the mother's (a studio with
+  // server_time): only then do we offer it, and push catalogs and CHANGED
+  // scenarios. Without it we still push scenarios the mother doesn't have at
+  // all - an addition deletes nothing (see syncOrchestrator.peerAdditions).
+  const reliable = !!mine && mine.cloud_as_of_ms !== null && !mine.approx && !!mine.manifest_json;
   // The mother saw the cloud after us: our copies may be stale for it.
-  if (inv.cloud_as_of_ms !== null && inv.cloud_as_of_ms > mine.cloud_as_of_ms) return 0;
+  if (reliable && inv.cloud_as_of_ms !== null && !inv.approx && inv.cloud_as_of_ms > mine!.cloud_as_of_ms!) return 0;
 
   let pushed = 0;
-  if (inv.cloud_as_of_ms === null || mine.cloud_as_of_ms > inv.cloud_as_of_ms) {
+  if (reliable) pushed += await pushSnapshotAndCatalogs(route, clientId, inv, mine!);
+
+  // Scenarios. An operator-only device holds only a subset of each one's media.
+  // While the mother hosts a game, videos wait (they'd compete with the game's
+  // traffic): the rest makes the scenario launchable there already.
+  const config = await loadConfig().catch(() => null);
+  if (config?.operatorOnlyDevice) return pushed;
+  const deferVideos = inv.game_active;
+  for (const s of await scenarioStore.list({ downloaded: true })) {
+    const hash = s.local_content_hash;
+    if (!hash || hash !== s.remote_content_hash) continue;
+    const theirs = inv.scenarios.find((m) => m.uniqid === s.uniqid);
+    if (theirs?.complete && theirs.hash === hash) continue;
+    // A different full copy on the mother: ours only wins with a snapshot to prove it.
+    if (theirs?.complete && !reliable) continue;
+    // Launchable there already; its videos come after the game.
+    if (theirs && deferVideos) continue;
+    if (await pushScenario(route, clientId, s.uniqid, hash, s, deferVideos)) pushed += 1;
+  }
+  return pushed;
+}
+
+async function pushSnapshotAndCatalogs(
+  route: PeerRoute,
+  clientId: number,
+  inv: PeerInventory,
+  mine: contentSyncState.ContentSyncState
+): Promise<number> {
+  let pushed = 0;
+  if (inv.cloud_as_of_ms === null || inv.approx || mine.cloud_as_of_ms! > inv.cloud_as_of_ms) {
     const res = await peerPostJson<{ accepted: boolean }>(route, clientId, 'offer_manifest', {}, {
       client_id: clientId,
       cloud_as_of_ms: mine.cloud_as_of_ms,
       approx: false,
-      manifest: JSON.parse(mine.manifest_json),
+      manifest: JSON.parse(mine.manifest_json!),
     });
     if (res.accepted) pushed += 1;
   }
@@ -237,6 +360,25 @@ async function pushToMother(route: PeerRoute, clientId: number, inv: PeerInvento
     });
     pushed += 1;
   }
+  // Licensee customers (the studio file as downloaded). A mother that predates
+  // them has no `customers` field in its inventory: nothing to push there.
+  const customers = await customersStore.getState(clientId);
+  if (
+    inv.customers !== undefined &&
+    customers?.local_version != null &&
+    customers.local_version === customers.remote_version &&
+    inv.customers !== customers.local_version
+  ) {
+    const content = await readTextRel(customersFileRel());
+    if (content !== null) {
+      try {
+        await peerPostJson(route, clientId, 'put_catalog', { kind: 'customers' }, { version: customers.local_version, content });
+        pushed += 1;
+      } catch (err) {
+        console.warn('[peerContent] customers push failed:', err);
+      }
+    }
+  }
   for (const p of await patternStore.list()) {
     if (p.is_local || p.local_version == null || p.local_version !== p.remote_version) continue;
     if (inv.patterns.some((ip) => ip.uniqid === p.pattern_uniqid && ip.version === p.local_version)) continue;
@@ -244,17 +386,6 @@ async function pushToMother(route: PeerRoute, clientId: number, inv: PeerInvento
     if (!payload) continue;
     await peerPostJson(route, clientId, 'put_catalog', { kind: 'pattern' }, payload);
     pushed += 1;
-  }
-
-  // Scenarios: an operator-only device holds only a subset of each one's
-  // media, and big uploads would compete with a running game's traffic.
-  const config = await loadConfig().catch(() => null);
-  if (config?.operatorOnlyDevice || inv.game_active) return pushed;
-  for (const s of await scenarioStore.list({ downloaded: true })) {
-    const hash = s.local_content_hash;
-    if (!hash || hash !== s.remote_content_hash) continue;
-    if (inv.scenarios.some((m) => m.uniqid === s.uniqid && m.complete && m.hash === hash)) continue;
-    if (await pushScenario(route, clientId, s.uniqid, hash, s)) pushed += 1;
   }
   return pushed;
 }
@@ -264,22 +395,27 @@ async function pushScenario(
   clientId: number,
   uniqid: string,
   hash: string,
-  row: scenarioStore.ScenarioRow
+  row: scenarioStore.ScenarioRow,
+  deferVideos: boolean
 ): Promise<boolean> {
-  // The full list the studio sent for this hash (a scenario synced before the
-  // LAN feature has none until its next studio sync).
-  const files = await scenarioStore.listRemoteFiles(uniqid, hash);
+  // The full list the studio sent for this hash. A scenario synced before the
+  // LAN feature has none: its committed files are the full list then (the
+  // caller only pushes copies whose local hash is the remote one, and never
+  // from an operator-only device, which commits a subset).
+  let files = await scenarioStore.listRemoteFiles(uniqid, hash);
+  if (files.length === 0) files = await scenarioStore.listCommittedFiles(uniqid);
   const gameDataEntry = files.find((f) => f.rel_path === 'game-data.json');
-  if (!gameDataEntry) return false;
+  if (!gameDataEntry) return skip(row.title, 'no game-data entry');
   const media = files.filter((f) => f.rel_path !== 'game-data.json');
   for (const f of media) {
-    if (!(await blobExists(f.hash))) return false;
+    if (!(await blobExists(f.hash))) return skip(row.title, `missing file ${f.rel_path}`);
   }
   const gameData = await scenarioStore.getGameData(uniqid);
-  if (gameData == null) return false;
+  if (gameData == null) return skip(row.title, 'game data unreadable');
+  const deferred = new Set(deferVideos ? media.filter((f) => isVideoFile(f.rel_path)).map((f) => f.hash) : []);
 
   const { missing } = await peerPostJson<{ missing: Array<{ hash: string; have: number }> }>(
-    route, clientId, 'missing_blobs', {}, { hashes: media.map((f) => f.hash) }
+    route, clientId, 'missing_blobs', {}, { hashes: media.filter((f) => !deferred.has(f.hash)).map((f) => f.hash) }
   );
   for (const m of missing) {
     const res = await invoke<{ done?: boolean }>('client_push_blob', {
@@ -289,7 +425,7 @@ async function pushScenario(
       hash: m.hash,
       offset: m.have,
     });
-    if (!res?.done) return false;
+    if (!res?.done) return skip(row.title, `upload of ${m.hash.slice(0, 8)} incomplete`);
   }
   await peerPostJson(route, clientId, 'put_scenario_meta', {}, {
     scenario: { uniqid, name: row.title, scenario_type: row.game_type },
@@ -303,7 +439,9 @@ async function pushScenario(
     content_hash: hash,
     game_data: gameData,
     data_hash: gameDataEntry.hash,
-    files: files.map((f) => ({ rel_path: f.rel_path, hash: f.hash, size: f.size ?? 0, available: true })),
+    // A deferred video is "not available": the mother commits the rest as
+    // launchable and gets the video on a push after the game.
+    files: files.map((f) => ({ rel_path: f.rel_path, hash: f.hash, size: f.size ?? 0, available: !deferred.has(f.hash) })),
     medias: null,
   });
   return true;

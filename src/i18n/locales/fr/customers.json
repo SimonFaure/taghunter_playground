@@ -18,5 +18,22 @@
   "cancel": "Annuler",
   "assignFailed": "Impossible de changer le client de cette partie.",
   "createFailed": "Impossible de créer ce client.",
-  "unsupportedMother": "Mettez à jour l'appareil principal pour associer des clients aux parties."
+  "unsupportedMother": "Mettez à jour l'appareil principal pour associer des clients aux parties.",
+  "screen": {
+    "title": "Clients",
+    "intro": "Les clients pour lesquels vous organisez des parties, avec les scénarios qu'ils ont déjà joués. La liste vient du Studio et de l'appareil principal.",
+    "unsupported": "La liste des clients apparaîtra après une synchronisation avec le Studio (sur cet appareil ou sur l'appareil principal).",
+    "newPlaceholder": "Nom d'un nouveau client…",
+    "add": "Ajouter",
+    "search": "Rechercher un client…",
+    "showArchived": "Afficher les archivés",
+    "empty": "Aucun client pour l'instant.",
+    "emptySearch": "Aucun client ne correspond à cette recherche.",
+    "archived": "Archivé",
+    "games_one": "{{count}} partie",
+    "games_other": "{{count}} parties",
+    "lastPlayed": "Dernière partie : {{date}}",
+    "never": "Aucune partie",
+    "editInStudio": "Pour modifier, archiver ou fusionner des clients, utilisez le Studio (Mes clients)."
+  }
 }

@@ -65,6 +65,15 @@ export async function recordSnapshot(
   );
 }
 
+/** When the cloud produced the snapshot a satellite staged here, or null. */
+export async function inboxAsOf(): Promise<number | null> {
+  const db = await getDb();
+  const rows = await db.select<Array<{ inbox_as_of_ms: number | null }>>(
+    'SELECT inbox_as_of_ms FROM content_sync_state WHERE id = 1'
+  );
+  return rows[0]?.inbox_as_of_ms ?? null;
+}
+
 /** Bump content_rev after content changed without a new manifest (a blob/catalog committed). */
 export async function bumpRev(): Promise<void> {
   const db = await getDb();

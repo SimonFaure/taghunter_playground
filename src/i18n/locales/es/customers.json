@@ -18,5 +18,22 @@
   "cancel": "Cancelar",
   "assignFailed": "No se ha podido cambiar el cliente de esta partida.",
   "createFailed": "No se ha podido crear este cliente.",
-  "unsupportedMother": "Actualice el dispositivo principal para asociar clientes a las partidas."
+  "unsupportedMother": "Actualice el dispositivo principal para asociar clientes a las partidas.",
+  "screen": {
+    "title": "Clientes",
+    "intro": "Los clientes para los que organiza partidas, con los escenarios que ya han jugado. La lista procede del Studio y del dispositivo principal.",
+    "unsupported": "La lista de clientes aparecerá tras una sincronización con el Studio (en este dispositivo o en el dispositivo principal).",
+    "newPlaceholder": "Nombre de un nuevo cliente…",
+    "add": "Añadir",
+    "search": "Buscar un cliente…",
+    "showArchived": "Mostrar archivados",
+    "empty": "Todavía no hay clientes.",
+    "emptySearch": "Ningún cliente coincide con esta búsqueda.",
+    "archived": "Archivado",
+    "games_one": "{{count}} partida",
+    "games_other": "{{count}} partidas",
+    "lastPlayed": "Última partida: {{date}}",
+    "never": "Ninguna partida",
+    "editInStudio": "Para modificar, archivar o fusionar clientes, utilice el Studio (Mis clientes)."
+  }
 }

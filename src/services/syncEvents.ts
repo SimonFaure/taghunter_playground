@@ -126,6 +126,14 @@ export interface UpdatesAvailablePayload {
   patterns: number;
   videos: number;
   other: number;
+  /** Pattern names, game-type names of the tutorial videos. */
+  patternNames: string[];
+  videoNames: string[];
+  /** Each other item: its work-item kind (cards, team_names, customers...) and,
+   *  for subtitle tracks, the game type's name. */
+  others: Array<{ kind: string; name?: string }>;
+  /** Where it comes from: the studio, or the LAN mother (offline launch). */
+  source: 'cloud' | 'peer';
 }
 
 export interface UpdatesResolvedPayload {

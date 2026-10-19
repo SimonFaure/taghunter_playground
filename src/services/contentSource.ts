@@ -104,6 +104,8 @@ export interface ContentSource {
   /** The team-name pools file, as text. */
   getTeamNames(signal: AbortSignal, onProgress?: (p: DownloadProgress) => void): Promise<string>;
   getReportLayouts(signal: AbortSignal, onProgress?: (p: DownloadProgress) => void): Promise<ReportLayoutsResponse>;
+  /** The licensee-customers file (studio get_customers, contact-free), as text. */
+  getCustomers(signal: AbortSignal, onProgress?: (p: DownloadProgress) => void): Promise<string>;
   /** A game-type tutorial video. */
   streamGameTypeVideo(
     args: GameTypeFileArgs & { filename: string },
@@ -153,6 +155,10 @@ export const cloudSource: ContentSource = {
         await apiDownloadBytesStream('playground', 'get_report_layouts', { bearer: true, signal, onProgress })
       )
     ) as ReportLayoutsResponse,
+  getCustomers: async (signal, onProgress) =>
+    new TextDecoder().decode(
+      await apiDownloadBytesStream('playground', 'get_customers', { bearer: true, signal, onProgress })
+    ),
   streamGameTypeVideo: (a, sink) =>
     apiDownloadStreamed(
       'playground',
@@ -204,10 +210,13 @@ export interface PeerInventory {
   approx: boolean;
   content_rev: number;
   game_active: boolean;
-  scenarios: Array<{ uniqid: string; hash: string | null; complete: boolean }>;
+  /** `title`: absent from a mother that predates it. */
+  scenarios: Array<{ uniqid: string; hash: string | null; complete: boolean; title?: string }>;
   patterns: Array<{ uniqid: string; version: number }>;
   team_names: number | null;
   report_layouts: number | null;
+  /** Licensee customers file version; absent from a mother that predates it. */
+  customers?: number | null;
   game_types: Array<{ code: string; version: number; subtitles_version: number }>;
   overrides: Array<{ code: string; version: number; subtitles_version: number }>;
 }
@@ -222,6 +231,10 @@ export interface PeerManifest {
 
 export interface PeerContentSource extends ContentSource {
   kind: 'peer';
+  /** The content is already on this device's disk (a satellite pushed it:
+   *  services/peerInbox). Committing it downloads nothing, so it isn't held
+   *  back for the studio or the operator's go-ahead. */
+  local?: boolean;
   getInventory(signal: AbortSignal): Promise<PeerInventory>;
   getManifest(signal: AbortSignal): Promise<PeerManifest>;
 }
@@ -288,6 +301,8 @@ export function peerSource(
     getTeamNames: async (signal) =>
       (await getJson<{ version: number; content: string }>('get_catalog', { kind: 'team_names' }, signal)).content,
     getReportLayouts: (signal) => getJson<ReportLayoutsResponse>('get_catalog', { kind: 'report_layouts' }, signal),
+    getCustomers: async (signal) =>
+      (await getJson<{ version: number; content: string }>('get_catalog', { kind: 'customers' }, signal)).content,
     streamGameTypeVideo: (a, sink) =>
       runDownloadUrl(
         url('get_file', gameTypeQuery(a, a.filename, false)),

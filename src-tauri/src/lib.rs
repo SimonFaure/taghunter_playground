@@ -12,6 +12,7 @@ use tauri_plugin_sql::{Migration, MigrationKind};
 mod app_uninstall;
 mod cards_sync;
 mod content_server;
+mod customers_sync;
 mod cp210x_driver;
 mod lan_server;
 mod legacy_net_cleanup;
@@ -21,6 +22,16 @@ mod sim_control_server;
 mod sportident;
 mod telemetry;
 mod win_health;
+
+// The app's real version - tauri.conf.json `version` (1.1.150...), the one the
+// updater and the renderer's getVersion() use. NOT env!("CARGO_PKG_VERSION"):
+// Cargo.toml stays at 1.1.0. Set once at setup; the fallback only covers code
+// running before it.
+static APP_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub(crate) fn app_version() -> &'static str {
+    APP_VERSION.get().map(String::as_str).unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -53,8 +64,10 @@ pub fn run() {
         .manage(lan_server::ReaderPresence::default())
         .manage(lan_server::ScreenPresence::default())
         .manage(lan_server::OperatorPresence::default())
+        .manage(lan_server::UpkeepPresence::default())
         .manage(sportident::SportIdentState::default())
         .setup(|app| {
+        let _ = APP_VERSION.set(app.package_info().version.to_string());
         // Install the Rust panic hook now that an AppHandle exists, so
         // it can resolve app_data_dir for the persisted panic file. Any
         // Rust panic past this point lands as a structured record the
@@ -131,6 +144,7 @@ pub fn run() {
             lan_server::client_ping_mother,
             content_server::client_push_blob,
             cards_sync::client_cards_exchange,
+            customers_sync::client_customers_exchange,
             update_cache::update_cache_status,
             update_cache::update_cache_commit_apk,
             update_cache::update_cache_prune,
@@ -142,6 +156,7 @@ pub fn run() {
             lan_server::client_set_reader_presence,
             lan_server::client_set_operator_only,
             lan_server::client_set_screen_state,
+            lan_server::client_set_upkeep,
             lan_server::client_describe_local_role,
             lan_server::client_clear_substitute_state,
             lan_server::client_list_local_games,
@@ -1411,6 +1426,21 @@ fn playground_migrations() -> Vec<Migration> {
                 ALTER TABLE lg_game_summaries ADD COLUMN customer_dirty INTEGER NOT NULL DEFAULT 0;
 
                 UPDATE schema_meta SET value = '40' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 41,
+            description: "paired_devices upkeep: installer platform + update/sync report",
+            sql: r#"
+                -- Reported on every /ping.php heartbeat (with peer_app_version,
+                -- now refreshed there too) for the top-bar Devices modal: the
+                -- peer's installer platform key ("windows-x86_64", "android")
+                -- and its upkeep report (app update + content sync state, JSON).
+                ALTER TABLE paired_devices ADD COLUMN peer_platform TEXT NULL;
+                ALTER TABLE paired_devices ADD COLUMN upkeep_json TEXT NULL;
+
+                UPDATE schema_meta SET value = '41' WHERE key = 'version';
             "#,
             kind: MigrationKind::Up,
         },

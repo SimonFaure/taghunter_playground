@@ -2,7 +2,9 @@
 // doing - in a game (and which), off its game page, idle, on the logo screen,
 // locked, or not connected to the mother - with remote Lock / Logo screen
 // actions, per row or on a selection, and "Back to the game" for a device that
-// is registered in a game but no longer showing it.
+// is registered in a game but no longer showing it. Each row also shows the app
+// version and what the device needs (FleetUpkeep): an app update and/or a
+// content sync, with the buttons to run them remotely (one row, or "all").
 //
 // Reads the mother's `list_fleet` (the launched_games route already points at
 // the mother on a child) every 2s while open. Commands reach a satellite on its
@@ -33,15 +35,30 @@ import {
   queueLockDeviceBulk,
   queueShowLogoBulk,
   queueJoinGameCommandBulk,
+  queueSyncContentBulk,
+  queueUpdateAppBulk,
   type FleetDeviceRow,
+  type FleetMotherInfo,
   type QueueCommandBulkResp,
 } from '../services/launchedGames';
 import { subscribeScreenState, type ScreenState } from '../services/screenState';
+import { subscribeUpkeep, type UpkeepReport } from '../services/upkeepState';
+import { syncContentNow, updateAppNow } from '../services/deviceUpkeep';
 import { displayDeviceLabel } from '../services/lanPairing';
 import { getDeviceLockState, type LockReason } from '../services/deviceLock';
 import { formatStaleness } from '../utils/staleness';
 import { GameLockGate } from './GameLockGate';
+import { ConfirmDialog } from './ConfirmDialog';
 import { ReaderBadge } from './GameDevicesModal';
+import {
+  SyncButton,
+  UpdateButton,
+  UpkeepLine,
+  needsSync,
+  updateBusy,
+  updateNeedOf,
+  type UpdateNeed,
+} from './FleetUpkeep';
 
 interface DevicesFleetModalProps {
   onClose: () => void;
@@ -55,11 +72,19 @@ const POLL_MS = 2000;
 // the push as in flight, like the game Devices modal.
 const BUSY_MS = 1500;
 
-type Action = 'lock' | 'logo' | 'rejoin';
+type Action = 'lock' | 'logo' | 'rejoin' | 'sync' | 'update';
+
+// An update restarts the app: confirm first when it is this device, when the
+// operator forces it past a running game, or for several devices at once.
+type UpdateConfirm =
+  | { kind: 'self'; force: boolean }
+  | { kind: 'force'; row: FleetDeviceRow }
+  | { kind: 'bulk'; ids: number[] };
 
 export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: DevicesFleetModalProps) {
   const { t } = useTranslation();
   const [devices, setDevices] = useState<FleetDeviceRow[] | null>(null);
+  const [mother, setMother] = useState<FleetMotherInfo | null>(null);
   const [callerId, setCallerId] = useState<number | null>(null);
   const [unreachable, setUnreachable] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -67,6 +92,10 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
   const [errorFor, setErrorFor] = useState<Map<number, string>>(new Map());
   const [selfState, setSelfState] = useState<ScreenState | null>(null);
   useEffect(() => subscribeScreenState(setSelfState), []);
+  // This device's own upkeep, live (its row from the mother lags a ping).
+  const [selfUpkeep, setSelfUpkeep] = useState<UpkeepReport | null>(null);
+  useEffect(() => subscribeUpkeep(setSelfUpkeep), []);
+  const [updateConfirm, setUpdateConfirm] = useState<UpdateConfirm | null>(null);
 
   // Device-lock gate (emergency-disabled / past billing grace): pulling a
   // device into a game counts as joining it, like the game Devices modal's
@@ -88,6 +117,7 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
         const res = await listFleet();
         if (cancelled) return;
         setDevices(res.devices);
+        setMother(res.mother ?? null);
         // Older mother: no caller id, and `is_self` is only "me" when we ARE
         // the mother - the best available guess.
         setCallerId(res.caller_device_id ?? res.devices.find((d) => d.is_self)?.id ?? null);
@@ -114,6 +144,17 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
   const isMe = (row: FleetDeviceRow) => row.id === callerId;
   const stateOf = (row: FleetDeviceRow): ScreenState | null =>
     isMe(row) ? selfState : row.screen_state ?? null;
+  const upkeepOf = (row: FleetDeviceRow): UpkeepReport | null =>
+    isMe(row) ? selfUpkeep : row.upkeep ?? null;
+
+  // Devices another device can act on (online, reporting upkeep: an older
+  // build ignores the commands) that need an update / a sync.
+  const actionable = (devices ?? []).filter((d) => d.online && !isMe(d) && upkeepOf(d));
+  const toUpdate = actionable.filter((d) => {
+    const u = upkeepOf(d);
+    return updateNeedOf(d, u, mother).target && !updateBusy(u) && u?.update.phase !== 'store_only';
+  });
+  const toSync = actionable.filter((d) => needsSync(upkeepOf(d)) && upkeepOf(d)?.content.phase !== 'syncing');
 
   // Selectable = online and not this device.
   const selectable = (devices ?? []).filter((d) => d.online && !isMe(d));
@@ -178,6 +219,37 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
     void send([row.id], 'rejoin', () => queueJoinGameCommandBulk([row.id], gameId, { rejoin: true }));
   }
 
+  function onSync(row: FleetDeviceRow) {
+    if (isMe(row)) {
+      void syncContentNow();
+      return;
+    }
+    void send([row.id], 'sync', () => queueSyncContentBulk([row.id]));
+  }
+
+  // `force`: restart even though a game runs there (the device stopped at
+  // "ready" and said so).
+  function onUpdate(row: FleetDeviceRow, force: boolean) {
+    if (isMe(row)) {
+      setUpdateConfirm({ kind: 'self', force });
+      return;
+    }
+    if (force) {
+      setUpdateConfirm({ kind: 'force', row });
+      return;
+    }
+    void send([row.id], 'update', () => queueUpdateAppBulk([row.id]));
+  }
+
+  function confirmUpdate() {
+    const c = updateConfirm;
+    setUpdateConfirm(null);
+    if (!c) return;
+    if (c.kind === 'self') void updateAppNow({ force: c.force });
+    else if (c.kind === 'force') void send([c.row.id], 'update', () => queueUpdateAppBulk([c.row.id], { force: true }));
+    else void send(c.ids, 'update', () => queueUpdateAppBulk(c.ids));
+  }
+
   function onBulk(action: 'lock' | 'logo') {
     const ids = Array.from(selected);
     void send(ids, action, () => (action === 'lock' ? queueLockDeviceBulk(ids) : queueShowLogoBulk(ids)));
@@ -219,7 +291,40 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
               <X size={24} />
             </button>
           </div>
-          <p className="text-sm text-[var(--pg-text-dim)] mb-5">{t('fleet:subtitle')}</p>
+          <p className="text-sm text-[var(--pg-text-dim)] mb-5">
+            {t('fleet:subtitle')}
+            {mother && <span className="whitespace-nowrap"> {t('fleet:motherVersion', { version: mother.app_version })}</span>}
+          </p>
+
+          {(toUpdate.length > 0 || toSync.length > 0) && (
+            <div className="mb-4 px-3 py-2 rounded-[var(--pg-radius-md)] bg-amber-500/10 border border-amber-500/30 text-sm text-amber-200 flex items-center gap-3 flex-wrap">
+              <span className="flex-1 min-w-0">
+                {[
+                  toUpdate.length > 0 ? t('fleet:needUpdateCount', { count: toUpdate.length }) : null,
+                  toSync.length > 0 ? t('fleet:needSyncCount', { count: toSync.length }) : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </span>
+              {toSync.length > 0 && (
+                <SyncButton
+                  label={t('fleet:syncAll')}
+                  title={t('fleet:syncAllTitle')}
+                  onClick={() => {
+                    const ids = toSync.map((d) => d.id);
+                    void send(ids, 'sync', () => queueSyncContentBulk(ids));
+                  }}
+                />
+              )}
+              {toUpdate.length > 0 && (
+                <UpdateButton
+                  label={t('fleet:updateAll')}
+                  title={t('fleet:updateAllTitle')}
+                  onClick={() => setUpdateConfirm({ kind: 'bulk', ids: toUpdate.map((d) => d.id) })}
+                />
+              )}
+            </div>
+          )}
 
           {unreachable && (
             <div className="mb-4 px-3 py-2 rounded-[var(--pg-radius-md)] bg-amber-500/10 border border-amber-500/30 text-sm text-amber-300 flex items-center gap-2">
@@ -288,6 +393,10 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
                       onLock={() => onLock(row)}
                       onLogo={() => onLogo(row)}
                       onRejoin={(gid) => void onRejoin(row, gid)}
+                      upkeep={upkeepOf(row)}
+                      need={updateNeedOf(row, upkeepOf(row), mother)}
+                      onSync={() => onSync(row)}
+                      onUpdate={(force) => onUpdate(row, force)}
                     />
                   </li>
                 ))}
@@ -296,6 +405,25 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={updateConfirm !== null}
+        onConfirm={confirmUpdate}
+        onCancel={() => setUpdateConfirm(null)}
+        title={t('fleet:updateConfirmTitle')}
+        message={
+          updateConfirm?.kind === 'self'
+            ? t(updateConfirm.force ? 'fleet:updateConfirmSelfForce' : 'fleet:updateConfirmSelf')
+            : updateConfirm?.kind === 'force'
+              ? t('fleet:updateConfirmForce', {
+                  name: displayDeviceLabel(updateConfirm.row.device_label) || t('fleet:unknownDevice'),
+                })
+              : t('fleet:updateConfirmBulk', { count: updateConfirm?.kind === 'bulk' ? updateConfirm.ids.length : 0 })
+        }
+        confirmText={updateConfirm?.kind === 'bulk' ? t('fleet:updateAll') : t('fleet:update')}
+        cancelText={t('fleet:cancel')}
+        variant={updateConfirm?.kind === 'bulk' ? 'info' : 'warning'}
+      />
 
       {lockGate && (
         <GameLockGate
@@ -323,6 +451,10 @@ function FleetRow({
   onLock,
   onLogo,
   onRejoin,
+  upkeep,
+  need,
+  onSync,
+  onUpdate,
 }: {
   row: FleetDeviceRow;
   me: boolean;
@@ -334,6 +466,10 @@ function FleetRow({
   onLock: () => void;
   onLogo: () => void;
   onRejoin: (launchedGameId: number) => void;
+  upkeep: UpkeepReport | null;
+  need: UpdateNeed;
+  onSync: () => void;
+  onUpdate: (force: boolean) => void;
 }) {
   const { t } = useTranslation();
   const label =
@@ -363,6 +499,15 @@ function FleetRow({
     </span>
   );
   const offlineTitle = t('fleet:offlineActionTitle');
+
+  // Upkeep actions: only on a connected device that reports upkeep (an older
+  // build ignores the commands), and not while it is already at it.
+  const canAct = (me || row.online) && upkeep != null;
+  const u = upkeep?.update;
+  const readyBlocked = u?.phase === 'ready' && u.blocked === 'game_running';
+  const showUpdate =
+    canAct && !updateBusy(upkeep) && u?.phase !== 'store_only' && (need.target != null || u?.phase === 'error');
+  const showSync = canAct && needsSync(upkeep);
 
   return (
     <div
@@ -394,9 +539,32 @@ function FleetRow({
         <div className="text-xs text-[var(--pg-text-dim)] truncate">
           {gameLine ?? row.peer_os ?? ''}
         </div>
+        <UpkeepLine row={row} upkeep={upkeep} need={need} />
       </div>
       <StatusPill row={row} state={state} />
       <ReaderBadge has={row.has_reader} />
+      {showSync &&
+        (busy === 'sync' ? (
+          spinner
+        ) : (
+          <SyncButton label={t('fleet:sync')} title={t('fleet:syncTitle')} onClick={onSync} />
+        ))}
+      {showUpdate &&
+        (busy === 'update' ? (
+          spinner
+        ) : (
+          <UpdateButton
+            label={readyBlocked ? t('fleet:updateForce') : t('fleet:update')}
+            title={
+              readyBlocked
+                ? t('fleet:updateForceTitle')
+                : need.target
+                  ? t('fleet:updateTitle', { version: need.target })
+                  : t('fleet:updateRetryTitle')
+            }
+            onClick={() => onUpdate(readyBlocked)}
+          />
+        ))}
       {canRejoin &&
         rejoinGame &&
         (busy === 'rejoin' ? (

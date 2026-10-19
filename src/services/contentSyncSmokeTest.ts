@@ -7,10 +7,19 @@
 // Manual run from DevTools:
 //   await window.__contentSyncSmokeTest()
 //   await window.__contentSyncSmokeTest({ uniqid: '...' })   // a given scenario
+//   await window.__lanSyncDiag()   // satellite: why isn't something moving?
 
 import { ApiError, getLocalLaunchedGamesRoute } from './api';
 import { getAuthUser } from './authStore';
-import { peerErrorCode, peerSource, peerSupportsContent } from './contentSource';
+import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
+import { fetch } from '@tauri-apps/plugin-http';
+import { motherRoute, peerErrorCode, peerSource, peerSupportsContent } from './contentSource';
+import * as contentSyncState from './contentSyncState';
+import { resolveUpdateChannel, stagedUpdateVersion } from './updateService';
+import { getLaunchGate } from './syncOrchestrator';
+import { lastLanSyncReport } from './peerContent';
+import { PEER_INBOX_REL, listFileNames } from './contentFs';
 import * as scenarioStore from './scenarioStore';
 
 interface StepResult {
@@ -120,12 +129,75 @@ export async function runContentSyncSmokeTest(opts?: { uniqid?: string }): Promi
   return { passed, failed: steps.length - passed, steps };
 }
 
+/**
+ * Why isn't content / an update moving between this device and its mother?
+ * Read-only. Run on the satellite (also works on the mother: no route then).
+ *   await window.__lanSyncDiag()
+ */
+export async function lanSyncDiag(): Promise<Record<string, unknown>> {
+  const user = await getAuthUser();
+  const mine = await contentSyncState.get();
+  const out: Record<string, unknown> = {
+    app_version: await getVersion().catch(() => '?'),
+    // approx = true: the studio sent no server_time (old PHP) - snapshots
+    // can't be ordered, only scenarios a side lacks entirely move.
+    snapshot: mine && { as_of: mine.cloud_as_of_ms && new Date(mine.cloud_as_of_ms).toISOString(), approx: !!mine.approx, source: mine.source, rev: mine.content_rev },
+    update_cache: await invoke('update_cache_status').catch((e) => String(e)),
+    staged_update: await stagedUpdateVersion().catch(() => null),
+  };
+  out.launch_gate = getLaunchGate();
+  out.last_lan_sync = lastLanSyncReport();
+  const route = motherRoute();
+  if (!route || !user) {
+    out.mother = route ? 'not signed in' : 'none (not routed to a mother, or this device is the mother)';
+    // On the mother: what satellites pushed and is waiting to be committed.
+    out.inbox_scenarios = await listFileNames(`${PEER_INBOX_REL}/scenarios`);
+    out.inbox_manifest = await contentSyncState.inboxAsOf().then((t) => (t ? new Date(t).toISOString() : null));
+    out.rows_not_downloaded = (await scenarioStore.list()).filter((s) => s.local_version === null).map((s) => s.title);
+    return out;
+  }
+  out.mother = route.baseUrl;
+  const signal = new AbortController().signal;
+  try {
+    if (!(await peerSupportsContent(route, user.client_id, signal))) {
+      out.mother_content = 'mother app too old: no /content.php';
+      return out;
+    }
+    const inv = await peerSource(route, user.client_id).getInventory(signal);
+    out.mother_snapshot = { as_of: inv.cloud_as_of_ms && new Date(inv.cloud_as_of_ms).toISOString(), approx: inv.approx, game_active: inv.game_active };
+    const here = await scenarioStore.list({ downloaded: true });
+    const there = new Map(inv.scenarios.map((s) => [s.uniqid, s]));
+    out.scenarios_only_here = here.filter((s) => !there.has(s.uniqid)).map((s) => s.title);
+    out.scenarios_only_on_mother = inv.scenarios.filter((m) => !here.some((s) => s.uniqid === m.uniqid)).map((m) => m.uniqid);
+    out.scenarios_differing = here
+      .filter((s) => there.has(s.uniqid) && there.get(s.uniqid)!.hash !== s.local_content_hash)
+      .map((s) => s.title);
+    out.scenarios_here_without_full_file_list = [];
+    for (const s of here) {
+      if (s.local_content_hash && !(await scenarioStore.listRemoteFiles(s.uniqid, s.local_content_hash)).length) {
+        (out.scenarios_here_without_full_file_list as string[]).push(s.title);
+      }
+    }
+  } catch (e) {
+    out.mother_content = `error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  try {
+    const res = await fetch(`${route.baseUrl}/update.php?action=check&target=windows&arch=x86_64&current_version=0.0.0&channel=${await resolveUpdateChannel()}`);
+    out.mother_update_offer = res.ok ? await res.json() : `HTTP ${res.status} (mother app too old for /update.php?)`;
+  } catch (e) {
+    out.mother_update_offer = `error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  return out;
+}
+
 declare global {
   interface Window {
     __contentSyncSmokeTest?: typeof runContentSyncSmokeTest;
+    __lanSyncDiag?: typeof lanSyncDiag;
   }
 }
 
 if (typeof window !== 'undefined') {
   window.__contentSyncSmokeTest = runContentSyncSmokeTest;
+  window.__lanSyncDiag = lanSyncDiag;
 }

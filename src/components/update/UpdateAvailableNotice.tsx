@@ -43,7 +43,13 @@ export function UpdateAvailableNotice({
         <ArrowUpCircle className="w-4 h-4" />
         <span>
           {status.canSelfUpdate
-            ? t(status.source === 'mother' ? 'update:availableFromMother' : 'update:availableDesktop', {
+            ? t(
+                status.source === 'mother'
+                  ? 'update:availableFromMother'
+                  : status.source === 'cache'
+                    ? 'update:availableFromDevice'
+                    : 'update:availableDesktop',
+                {
                 version: status.latestVersion,
               })
             : t('update:availableStore', { version: status.latestVersion })}

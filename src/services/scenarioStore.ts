@@ -348,6 +348,18 @@ export async function listRemoteFiles(
   );
 }
 
+// The files this device committed for a scenario (scenario_files), in the
+// listRemoteFiles shape. Sizes unknown here.
+export async function listCommittedFiles(
+  uniqid: string
+): Promise<Array<{ rel_path: string; hash: string; size: number | null }>> {
+  const db = await getDb();
+  return db.select<Array<{ rel_path: string; hash: string; size: number | null }>>(
+    'SELECT rel_path, content_hash AS hash, NULL AS size FROM scenario_files WHERE uniqid = $1 ORDER BY rel_path',
+    [uniqid]
+  );
+}
+
 export async function incrementFailedAttempts(uniqid: string): Promise<void> {
   const db = await getDb();
   await db.execute(

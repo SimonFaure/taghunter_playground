@@ -173,5 +173,9 @@
   "statusHostAsSubstituteHint": "Si el puesto madre está ausente: este equipo aloja las partidas en su lugar y le devolverá el control en cuanto vuelva.",
   "statusHostAsSubstituteDone": "Este equipo aloja ahora las partidas, en sustitución del puesto madre.",
   "statusRoleResetNote": "Desde la actualización, este equipo ya no está configurado como puesto madre. Si es su puesto madre, configúrelo en Opciones avanzadas → Rol de este equipo.",
-  "networkCardRouterLine": "Conecte el router suministrado a un puerto USB de este equipo."
+  "networkCardRouterLine": "Conecte el router suministrado a un puerto USB de este equipo.",
+  "networkCardReannounce": "Actualizar la red",
+  "networkCardReannounceOk": "Red actualizada: los satélites volverán a encontrar este puesto en unos segundos.",
+  "networkCardReannounceError": "Error al actualizar. Inténtelo de nuevo o reinicie la aplicación.",
+  "networkCardReannounceHint": "¿Ha cambiado la red Wi-Fi de este PC? No hace falta reiniciar la aplicación: haga clic aquí."
 }

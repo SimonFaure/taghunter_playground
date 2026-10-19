@@ -173,5 +173,9 @@
   "statusHostAsSubstituteHint": "Si le poste mère est absent : ce poste héberge les parties à sa place, et lui rendra la main dès son retour.",
   "statusHostAsSubstituteDone": "Ce poste héberge maintenant les parties, en remplacement du poste mère.",
   "statusRoleResetNote": "Depuis la mise à jour, ce poste n'est plus réglé poste mère. S'il est bien votre poste mère, réglez-le dans Options avancées → Rôle de ce poste.",
-  "networkCardRouterLine": "Branchez le routeur fourni en USB sur ce poste."
+  "networkCardRouterLine": "Branchez le routeur fourni en USB sur ce poste.",
+  "networkCardReannounce": "Actualiser le réseau",
+  "networkCardReannounceOk": "Réseau actualisé : les satellites retrouvent ce poste d'ici quelques secondes.",
+  "networkCardReannounceError": "Échec de l'actualisation. Réessayez, ou redémarrez l'application.",
+  "networkCardReannounceHint": "Après un changement de réseau Wi-Fi sur ce poste : inutile de redémarrer l'application, cliquez ici."
 }

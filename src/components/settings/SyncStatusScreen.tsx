@@ -96,10 +96,14 @@ export function SyncStatusScreen() {
     };
   }, []);
 
+  // No internet: the button syncs with the LAN devices instead; say so.
+  const [lanNote, setLanNote] = useState<'lan' | 'none' | null>(null);
   const handleSync = async () => {
     setSyncing(true);
+    setLanNote(null);
     try {
-      await runCycleNow('manual');
+      const route = await runCycleNow('manual');
+      if (route !== 'cloud') setLanNote(route);
     } finally {
       setSyncing(false);
     }
@@ -123,6 +127,11 @@ export function SyncStatusScreen() {
           {inFlight ? t('sync:syncing') : t('sync:syncNow')}
         </button>
       </div>
+      {lanNote && (
+        <div className="text-sm text-[var(--pg-text-dim)]">
+          {t(lanNote === 'lan' ? 'sync:offlineSyncedWithLan' : 'sync:offlineNoLan')}
+        </div>
+      )}
 
       <SyncExplainer />
 
