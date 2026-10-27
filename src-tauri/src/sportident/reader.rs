@@ -39,8 +39,16 @@ use super::transport::{BytesRx, SerialTransport};
 
 pub struct Reader;
 
+/// Requests into the running reader task (it owns the transport writes).
+pub enum ReaderCtl {
+    /// Beep the master `count` times. Replies whether it was sent: only once
+    /// the station answered (Listening), never mid card-read.
+    Beep { count: u8, reply: oneshot::Sender<bool> },
+}
+
 pub struct ReaderHandle {
     stop_tx: Option<oneshot::Sender<()>>,
+    ctl_tx: mpsc::UnboundedSender<ReaderCtl>,
     /// JoinHandle for the reader task. `stop().await` awaits it so the
     /// caller knows the full shutdown chain (reader task → transport
     /// close → owner task → SerialStream drop) has completed and the
@@ -60,12 +68,14 @@ impl Reader {
     ) -> (ReaderHandle, mpsc::UnboundedReceiver<ReaderEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
 
-        let task = tokio::spawn(reader_task(transport, rx_bytes, event_tx, stop_rx));
+        let task = tokio::spawn(reader_task(transport, rx_bytes, event_tx, stop_rx, ctl_rx));
 
         (
             ReaderHandle {
                 stop_tx: Some(stop_tx),
+                ctl_tx,
                 task_handle: Some(task),
             },
             event_rx,
@@ -74,6 +84,16 @@ impl Reader {
 }
 
 impl ReaderHandle {
+    /// Beep the master `count` times. False when the station isn't
+    /// listening yet (or is reading a card) or the reader task is gone.
+    pub async fn beep(&self, count: u8) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self.ctl_tx.send(ReaderCtl::Beep { count, reply }).is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
     /// Explicit shutdown - awaits the reader task to fully exit, which
     /// in turn awaits the transport's owner task to drop the
     /// SerialStream and release the OS handle. Idempotent: calling on
@@ -123,6 +143,7 @@ async fn reader_task(
     mut rx_bytes: BytesRx,
     event_tx: mpsc::UnboundedSender<ReaderEvent>,
     mut stop_rx: oneshot::Receiver<()>,
+    mut ctl_rx: mpsc::UnboundedReceiver<ReaderCtl>,
 ) {
     let mut decoder = Decoder::new();
     let mut state = ReaderState::Idle;
@@ -186,6 +207,16 @@ async fn reader_task(
                         // Transport closed (sender dropped its end).
                         set_state(&mut state, ReaderState::Stopped, &event_tx);
                         return;
+                    }
+                }
+            }
+
+            Some(ctl) = ctl_rx.recv() => {
+                match ctl {
+                    ReaderCtl::Beep { count, reply } => {
+                        let ok = matches!(state, ReaderState::Listening)
+                            && transport.write(&commands::build_beep(count)).await.is_ok();
+                        let _ = reply.send(ok);
                     }
                 }
             }
@@ -882,6 +913,24 @@ mod tests {
             matches!(e, ReaderEvent::StateChanged(ReaderState::Listening))
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn beep_writes_frame_only_while_listening() {
+        // Awakening: refused, nothing written beyond the handshake.
+        let (mock, rx_bytes) = MockTransport::new();
+        let transport: Arc<dyn SerialTransport> = mock.clone();
+        let (handle, mut events) = Reader::spawn(transport, rx_bytes);
+        let _ = events.recv().await; // boot Awakening
+        mock.clear_tx_log();
+        assert!(!handle.beep(2).await);
+        assert!(mock.captured_tx().is_empty());
+        drop(handle);
+
+        let (mock, handle, _events) = spawn_listening().await;
+        mock.clear_tx_log();
+        assert!(handle.beep(2).await);
+        assert_eq!(mock.captured_tx(), commands::build_beep(2));
     }
 
     #[tokio::test]

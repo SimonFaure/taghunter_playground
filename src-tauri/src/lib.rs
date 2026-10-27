@@ -16,6 +16,7 @@ mod customers_sync;
 mod cp210x_driver;
 mod lan_server;
 mod legacy_net_cleanup;
+mod licence_sync;
 mod scenario_protocol;
 mod update_cache;
 mod sim_control_server;
@@ -65,6 +66,7 @@ pub fn run() {
         .manage(lan_server::ScreenPresence::default())
         .manage(lan_server::OperatorPresence::default())
         .manage(lan_server::UpkeepPresence::default())
+        .manage(lan_server::CommandLedger::default())
         .manage(sportident::SportIdentState::default())
         .setup(|app| {
         let _ = APP_VERSION.set(app.package_info().version.to_string());
@@ -142,6 +144,7 @@ pub fn run() {
             lan_server::client_refresh_mother_endpoints,
             lan_server::client_resolve_mother_link,
             lan_server::client_ping_mother,
+            lan_server::client_ack_command,
             content_server::client_push_blob,
             cards_sync::client_cards_exchange,
             customers_sync::client_customers_exchange,
@@ -1441,6 +1444,43 @@ fn playground_migrations() -> Vec<Migration> {
                 ALTER TABLE paired_devices ADD COLUMN upkeep_json TEXT NULL;
 
                 UPDATE schema_meta SET value = '41' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 42,
+            description: "auth_user.licence_as_of_ms: studio time of the licence, shared over the LAN",
+            sql: r#"
+                -- The studio's clock (auth_state.server_time) at the check that
+                -- produced this device's licence. Devices exchange the licence on
+                -- /ping.php and keep the newest (licence_sync.rs), so one device
+                -- reaching the studio renews the offline allowance of all.
+                -- Backfilled from the device's own last check (its clock).
+                ALTER TABLE auth_user ADD COLUMN licence_as_of_ms INTEGER NULL;
+                UPDATE auth_user
+                   SET licence_as_of_ms = CAST(strftime('%s', last_server_check_at) AS INTEGER) * 1000
+                 WHERE strftime('%s', last_server_check_at) IS NOT NULL;
+
+                UPDATE schema_meta SET value = '42' WHERE key = 'version';
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 43,
+            description: "remote control: peer command caps + command results",
+            sql: r#"
+                -- The command kinds a peer's build handles (JSON array, sent on
+                -- every /ping.php): the mother refuses a newer kind for a peer
+                -- that can't run it (409 target_outdated) and the modals grey
+                -- the button out. NULL = an older build.
+                ALTER TABLE paired_devices ADD COLUMN command_caps TEXT NULL;
+                -- What the target reported once its handler ran ({ok, error?,
+                -- detail?}), and who queued it, so only the sender reads it back
+                -- (launched_games.php?action=command_status).
+                ALTER TABLE pending_commands ADD COLUMN result_json TEXT NULL;
+                ALTER TABLE pending_commands ADD COLUMN queued_by INTEGER NULL;
+
+                UPDATE schema_meta SET value = '43' WHERE key = 'version';
             "#,
             kind: MigrationKind::Up,
         },

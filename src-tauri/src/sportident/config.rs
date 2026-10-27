@@ -18,6 +18,7 @@ pub const CMD_GET_SYSTEM_DATA: u8 = 0x83; // station config probe
 pub const CMD_CARD_INSERTED: u8 = 0xE8; // master → host notification
 pub const CMD_CARD_REMOVED: u8 = 0xE7; // master → host notification
 pub const CMD_GET_SI9_DATA: u8 = 0xEF; // host → master block read
+pub const CMD_BEEP: u8 = 0xF9; // host → master: beep N times (echoed back)
 // Consumed only by `build_set_time`, which is itself pending the step-5
 // set-station-time control channel.
 #[allow(dead_code)]

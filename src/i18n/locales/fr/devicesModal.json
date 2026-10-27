@@ -71,5 +71,14 @@
   "stateSubInstructions": "Affiche les consignes",
   "stateSubReveal": "Affiche les résultats",
   "regAssignLabel": "Inscrit :",
-  "regAssignAllTeams": "toutes les équipes"
+  "regAssignAllTeams": "toutes les équipes",
+  "needsUpdate": "Mettez à jour l'application sur cet appareil pour cette action",
+  "start": "Démarrer",
+  "startTitle": "Démarrer la partie depuis l'écran d'inscription de cet appareil",
+  "resetDisplay": "Réinitialiser",
+  "resetDisplayTitle": "Effacer le résultat affiché sur cet appareil pour l'équipe suivante",
+  "home": "Accueil",
+  "homeTitle": "Fermer la page de jeu sur cet appareil et afficher son écran logo (il reste dans la partie : « Reconnecter » l'y renvoie)",
+  "stateSubRegister": "Inscriptions",
+  "stateSubResults": "Résultat affiché"
 }

@@ -27,7 +27,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tokio::sync::mpsc;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use tokio_serial::{SerialPort, SerialPortBuilderExt};
+use tokio_serial::SerialPortBuilderExt;
+// `clear` on the async stream (non-Windows; Windows purges a blocking open).
+#[cfg(not(any(target_os = "android", target_os = "ios", windows)))]
+use tokio_serial::SerialPort;
 
 use super::{BytesRx, PortInfo, SerialTransport, TransportError};
 
@@ -64,17 +67,41 @@ pub async fn open(
     // 8N1 - SI master default. data_bits/stop_bits/parity are explicit even
     // though they match tokio-serial's defaults, so the wire config is
     // documented in one place.
-    let stream = tokio_serial::new(device_id, baud)
+    let builder = tokio_serial::new(device_id, baud)
         .data_bits(tokio_serial::DataBits::Eight)
         .stop_bits(tokio_serial::StopBits::One)
         .parity(tokio_serial::Parity::None)
-        .flow_control(tokio_serial::FlowControl::None)
-        .open_native_async()
-        .map_err(|e| TransportError::Other(format!("open {}: {}", device_id, e)))?;
+        .flow_control(tokio_serial::FlowControl::None);
 
     // Discard whatever the driver buffered before we opened (tail of a
     // previous session's frames, line noise at power-up). A stray 0x02 in
     // there reads as a false STX and holds real frames back.
+    //
+    // Windows: never on the async stream. ClearBuffer::Input is
+    // PurgeComm(PURGE_RXABORT | PURGE_RXCLEAR), and mio has already queued
+    // its overlapped read on that handle when open_native_async returns: the
+    // abort cancelled it, the first read failed with os error 995 ("I/O
+    // aborted") and the reader died ~17 ms after every open. So purge on a
+    // short blocking open first, nothing pending there.
+    #[cfg(windows)]
+    {
+        match builder.clone().open() {
+            Ok(blocking) => {
+                if let Err(e) = blocking.clear(tokio_serial::ClearBuffer::Input) {
+                    eprintln!("[sportident] clear input buffer on {} failed: {}", device_id, e);
+                }
+                drop(blocking);
+            }
+            Err(e) => eprintln!("[sportident] pre-open purge of {} skipped: {}", device_id, e),
+        }
+    }
+
+    let stream = builder
+        .open_native_async()
+        .map_err(|e| TransportError::Other(format!("open {}: {}", device_id, e)))?;
+
+    // Elsewhere the async stream has no read in flight: purge it directly.
+    #[cfg(not(windows))]
     if let Err(e) = stream.clear(tokio_serial::ClearBuffer::Input) {
         eprintln!("[sportident] clear input buffer on {} failed: {}", device_id, e);
     }
@@ -123,6 +150,15 @@ async fn owner_task(
                 // - both mean "wind down". No emitted Err: the consumer
                 // asked for this.
                 let _ = close_signal;
+                // Writes queued before the close still go out: `write()` only
+                // queues, so a frame sent right before a stop (the reader-test
+                // beep, opened just for it) was dropped with the port.
+                while let Ok(bytes) = write_rx.try_recv() {
+                    if stream.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = stream.flush().await;
                 break;
             }
 

@@ -1,4 +1,4 @@
-import { WifiOff, Lock } from 'lucide-react';
+import { WifiOff, Lock, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { offlineGraceInfo } from '../../services/authStore';
 import type { AuthUser } from '../../services/authStore';
@@ -49,6 +49,10 @@ export function OfflineGraceBanner({ user, variant, onRetry }: OfflineGraceBanne
         <h2 className="text-2xl font-semibold text-[var(--pg-text)]">{t('authChrome:offlineGrace.lockTitle')}</h2>
         <p className="text-[var(--pg-text-dim)]">
           {t('authChrome:offlineGrace.lockBody', { ageDays, graceDays: user.offline_grace_days })}
+        </p>
+        <p className="text-sm text-[var(--pg-text-dim)] flex items-start gap-2 text-left">
+          <Loader2 className="w-4 h-4 mt-0.5 shrink-0 animate-spin" />
+          <span>{t('authChrome:offlineGrace.lockLanSearch')}</span>
         </p>
         {onRetry && (
           <button

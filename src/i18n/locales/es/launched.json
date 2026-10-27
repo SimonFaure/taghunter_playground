@@ -194,5 +194,10 @@
   "chipsInClan": "Tarjetas en este clan",
   "slowLoadTitle": "Puesto madre inaccesible",
   "slowLoadHint": "La lista de partidas viene del puesto madre, que no responde por ahora. Si hay una recuperación en curso, espere: este equipo se reconecta solo.",
-  "slowLoadRetry": "Reintentar"
+  "slowLoadRetry": "Reintentar",
+  "startGame": "Iniciar",
+  "startGameTitle": "Iniciar la partida en los dispositivos que muestran la pantalla de inscripción",
+  "startNoRegistrarTitle": "Ninguna pantalla de inscripción responde",
+  "startNoRegistrarMessage": "Ningún dispositivo muestra la pantalla de inscripción de esta partida. ¿Iniciarla ahora desde aquí? Los vídeos de lanzamiento no se reproducirán.",
+  "startGameFailed": "No se pudo iniciar la partida"
 }

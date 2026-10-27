@@ -23,16 +23,22 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getActiveLaunchedGameId } from './activeGameStore';
 
+/** What the game page is on, within the game: its registration screen
+ *  (self-registered Quest / Clash: the operator can Start it remotely), a
+ *  results screen waiting for the operator (Mystery summary, Tracks result:
+ *  remote "reset display"), or the instructions / reveal animation. */
+export type InGameSub = 'instructions' | 'reveal' | 'register' | 'results';
+
 export type ScreenState =
   | { kind: 'home' }
   | {
       kind: 'in_game';
       launchedGameId: number | null;
       gameName: string | null;
-      // Within-game refinements (Q11: wired incrementally; absent in v1 wrapper
-      // publishing, so the pill renders a plain "In game").
+      // Within-game refinements, reported by the game-type pages
+      // (refineInGame). Absent: the pill renders a plain "In game".
       boardHidden?: boolean;
-      sub?: 'instructions' | 'reveal';
+      sub?: InGameSub;
     }
   | { kind: 'ranking' }
   | { kind: 'video' }
@@ -43,6 +49,11 @@ type BaseState = Extract<ScreenState, { kind: 'home' | 'in_game' }>;
 type OverlayKind = 'ranking' | 'video' | 'logo' | 'locked';
 
 let base: BaseState = { kind: 'home' };
+// Within-game detail, kept apart from `base`: the game-type page (a child)
+// reports it before GamePage (its parent) sets the in_game base, and GamePage
+// re-sets the base without knowing about it. Merged while the base is that
+// same game.
+let refinement: { launchedGameId: number; boardHidden?: boolean; sub?: InGameSub } | null = null;
 // Stack of mounted overlays; the top (last) wins. A stack rather than a single
 // flag so an unmounting overlay cleanly reveals whatever is still beneath it.
 const overlays: OverlayKind[] = [];
@@ -53,6 +64,14 @@ const listeners = new Set<(s: ScreenState) => void>();
 function resolveEffective(): ScreenState {
   if (overlays.includes('locked')) return { kind: 'locked' };
   if (overlays.length > 0) return { kind: overlays[overlays.length - 1] };
+  if (base.kind === 'in_game' && refinement && refinement.launchedGameId === base.launchedGameId) {
+    const { boardHidden, sub } = refinement;
+    return {
+      ...base,
+      ...(boardHidden ? { boardHidden } : {}),
+      ...(sub ? { sub } : {}),
+    };
+  }
   return base;
 }
 
@@ -147,6 +166,7 @@ export function useInGame(): boolean {
 
 export function setBaseHome(): void {
   base = { kind: 'home' };
+  refinement = null;
   recompute();
   notifyInGame();
 }
@@ -157,12 +177,21 @@ export function setBaseInGame(launchedGameId: number | null, gameName: string | 
   notifyInGame();
 }
 
-/** Refine the in-game base with within-game detail (Q11 incremental). No-op
- *  while the base isn't in_game, so a stray late call can't resurrect a game
- *  pill after the page unmounted. */
-export function refineInGame(detail: { boardHidden?: boolean; sub?: 'instructions' | 'reveal' }): void {
-  if (base.kind !== 'in_game') return;
-  base = { ...base, ...detail };
+/** Report within-game detail for `launchedGameId` (the game-type pages).
+ *  Replaces the previous detail; shown only while that game is the base, so a
+ *  stray late call can't resurrect a game pill after the page unmounted. */
+export function refineInGame(
+  launchedGameId: number,
+  detail: { boardHidden?: boolean; sub?: InGameSub },
+): void {
+  refinement = { launchedGameId, ...detail };
+  recompute();
+}
+
+/** The game-type page unmounted: drop its detail (only if still its own). */
+export function clearInGameRefinement(launchedGameId: number): void {
+  if (refinement?.launchedGameId !== launchedGameId) return;
+  refinement = null;
   recompute();
 }
 

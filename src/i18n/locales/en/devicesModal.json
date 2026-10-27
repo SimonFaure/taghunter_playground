@@ -71,5 +71,14 @@
   "stateSubInstructions": "Showing instructions",
   "stateSubReveal": "Showing results",
   "regAssignLabel": "Registers:",
-  "regAssignAllTeams": "all teams"
+  "regAssignAllTeams": "all teams",
+  "needsUpdate": "Update the app on this device for this action",
+  "start": "Start",
+  "startTitle": "Start the game from this device's registration screen",
+  "resetDisplay": "Reset",
+  "resetDisplayTitle": "Clear the result shown on this device for the next team",
+  "home": "Home",
+  "homeTitle": "Close the game page on this device and show its logo screen (it stays in the game: \"Reconnect\" brings it back)",
+  "stateSubRegister": "Registration",
+  "stateSubResults": "Result shown"
 }

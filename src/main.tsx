@@ -6,6 +6,7 @@ import { AuthProvider, useAuth } from './components/auth/AuthProvider';
 import { FullscreenHint } from './components/FullscreenHint';
 import { SoundMuteNotice } from './components/SoundMuteNotice';
 import { installSoundMute } from './utils/soundMute';
+import { installLanCommandBus } from './services/lanCommands';
 import { captureError } from './services/telemetry';
 import { installConsoleBuffer } from './services/consoleBuffer';
 import { loadConfig } from './utils/config';
@@ -156,6 +157,10 @@ const projectorTarget = readProjectorTargetFromUrl();
 // Ctrl+M mutes every sound in the app. Only the main window resets the mute at
 // boot; the projector/simulator windows pick up the current state.
 installSoundMute({ resetOnBoot: !projectorTarget && !simulatorGameId });
+
+// The mother's pushed commands: one dispatcher, main window only (every webview
+// receives the event; a second one would answer for the projector).
+if (!projectorTarget && !simulatorGameId) installLanCommandBus();
 
 // Apply the `fullscreenOnLaunch` preference before the app renders so the
 // LoginScreen comes up fullscreen too. Fire-and-forget: the config read is

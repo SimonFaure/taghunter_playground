@@ -115,6 +115,28 @@ pub struct UpkeepPresence {
     inner: Mutex<Option<String>>,
 }
 
+/// Client-side: the pushed commands this device received, keyed by (mother
+/// uuid, command id). The renderer acks a command once its handler ran
+/// (`client_ack_command`, with the result); until then the mother redelivers it
+/// on a later ping (at most every 30 s), which this ledger absorbs:
+/// - in flight and recent: not emitted again;
+/// - in flight for over `RENDERER_ACK_TIMEOUT`: acked `renderer_timeout`, so a
+///   handler that never answers can't make it come back forever;
+/// - handled (our ack POST was lost): acked again, not emitted again.
+/// In-process only: a restart forgets it (restart_app has its own guard).
+#[derive(Default)]
+pub struct CommandLedger {
+    inner: Mutex<HashMap<(String, i64), LedgerEntry>>,
+}
+
+enum LedgerEntry {
+    Inflight(Instant),
+    Handled(Instant, Option<Value>),
+}
+
+const RENDERER_ACK_TIMEOUT: Duration = Duration::from_secs(45);
+const LEDGER_KEEP: Duration = Duration::from_secs(2 * 60 * 60);
+
 struct Running {
     port: u16,
     shutdown: oneshot::Sender<()>,
@@ -2999,6 +3021,8 @@ struct PeerReport {
     app_version: Option<String>,
     platform: Option<String>,
     upkeep_json: Option<String>,
+    /// The command kinds the peer's build handles (`command_caps()`), JSON array.
+    caps_json: Option<String>,
 }
 
 async fn bump_presence(
@@ -3022,6 +3046,7 @@ async fn bump_presence(
             && screen_state.is_none()
             && operator_only.is_none()
             && report.upkeep_json.is_none()
+            && report.caps_json.is_none()
         {
             if let Some(prev) = guard.get(&peer_id) {
                 if now.duration_since(*prev) < Duration::from_secs(5) {
@@ -3035,7 +3060,7 @@ async fn bump_presence(
     let db = state.db.clone();
     let has_reader_i64: Option<i64> = has_reader.map(|b| if b { 1 } else { 0 });
     let operator_only_i64: Option<i64> = operator_only.map(|b| if b { 1 } else { 0 });
-    let PeerReport { app_version, platform, upkeep_json } = report;
+    let PeerReport { app_version, platform, upkeep_json, caps_json } = report;
     tokio::spawn(async move {
         let _ = db
             .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
@@ -3051,7 +3076,8 @@ async fn bump_presence(
                             operator_only = COALESCE(?4, operator_only),
                             peer_app_version = COALESCE(?5, peer_app_version),
                             peer_platform = COALESCE(?6, peer_platform),
-                            upkeep_json = COALESCE(?7, upkeep_json)
+                            upkeep_json = COALESCE(?7, upkeep_json),
+                            command_caps = COALESCE(?8, command_caps)
                       WHERE id = ?3",
                     params![
                         has_reader_i64,
@@ -3060,7 +3086,8 @@ async fn bump_presence(
                         operator_only_i64,
                         app_version,
                         platform,
-                        upkeep_json
+                        upkeep_json,
+                        caps_json
                     ],
                 )?;
                 Ok(())
@@ -3072,7 +3099,10 @@ async fn bump_presence(
 /// Drain (with delivery-stamp side-effect) the open commands queued for this
 /// peer, opportunistically pruning long-dead rows on the way in. Returns the
 /// payloads ready to be embedded in the /ping.php response; the satellite is
-/// expected to POST `ack_command` once it has acted on each.
+/// expected to POST `ack_command` once it has acted on each. A current build
+/// acks only after its handler ran, so an unacked command is redelivered at most
+/// every 30 s (`delivered_at` = last delivery): back-to-back pings never get the
+/// same command twice, and one whose reply was lost comes back.
 ///
 /// TTLs: undelivered rows > 15min are dropped (the operator can re-issue);
 /// acked rows > 1h are dropped (kept briefly for at-least-once audit).
@@ -3093,6 +3123,8 @@ async fn pickup_pending_commands(state: &AppState, peer_id: i64) -> Vec<Value> {
                    FROM pending_commands
                   WHERE target_device_id = ?
                     AND acked_at IS NULL
+                    AND (delivered_at IS NULL
+                         OR delivered_at < datetime('now','-30 seconds'))
                   ORDER BY id ASC
                   LIMIT 32",
             )?;
@@ -3110,7 +3142,7 @@ async fn pickup_pending_commands(state: &AppState, peer_id: i64) -> Vec<Value> {
                 let placeholders = vec!["?"; rows.len()].join(",");
                 let sql = format!(
                     "UPDATE pending_commands
-                        SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP)
+                        SET delivered_at = CURRENT_TIMESTAMP
                       WHERE id IN ({placeholders})"
                 );
                 let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
@@ -3614,8 +3646,8 @@ async fn dispatch_launched_games(
         ("POST", "start_game") => start_game(&state, body).await,
         ("POST", "end_game") => end_game(&state, body).await,
         ("POST", "add_time") => add_time(&state, body).await,
-        ("POST", "delete_game") => delete_game(&state, body).await,
-        ("POST", "archive_game") => archive_game(&state, body).await,
+        ("POST", "delete_game") => delete_game(&state, peer_id, body).await,
+        ("POST", "archive_game") => archive_game(&state, peer_id, body).await,
         ("POST", "sync_summaries") => sync_summaries(&state).await,
         ("POST", "mark_summaries_pushed") => mark_summaries_pushed(&state, body).await,
         ("GET", "list_archived_summaries") => list_archived_summaries(&state).await,
@@ -3632,6 +3664,7 @@ async fn dispatch_launched_games(
         ("POST", "queue_command") => queue_command(&state, peer_id, body).await,
         ("POST", "queue_command_bulk") => queue_command_bulk(&state, peer_id, body).await,
         ("POST", "ack_command") => ack_command(&state, peer_id, body).await,
+        ("GET", "command_status") => command_status(&state, peer_id, &q.rest).await,
         ("GET", "list_completed_quests") => list_completed_quests(&state, &q.rest).await,
         ("POST", "record_completed_quest") => record_completed_quest(&state, body).await,
         ("POST", "delete_completed_quest") => delete_completed_quest(&state, body).await,
@@ -3771,10 +3804,27 @@ async fn dispatch_ping(
         app_version: vstr(&body, "app_version").filter(|s| s.len() <= 32),
         platform: vstr(&body, "platform").filter(|s| s.len() <= 40),
         upkeep_json: body.get("upkeep").filter(|v| v.is_object()).map(|v| v.to_string()),
+        caps_json: body
+            .get("caps")
+            .filter(|v| v.is_array())
+            .map(|v| v.to_string())
+            .filter(|s| s.len() <= 1024),
     };
 
     bump_presence(&state, peer_id, has_reader, screen_state, operator_only, report).await;
-    let commands = pickup_pending_commands(&state, peer_id).await;
+    // A satellite on its offline lock screen pings only to exchange the licence:
+    // it can't act on commands, so leave them queued for its real pings.
+    let licence_only = body.get("licence_only").and_then(|v| v.as_bool()) == Some(true);
+    let commands = if licence_only {
+        Vec::new()
+    } else {
+        pickup_pending_commands(&state, peer_id).await
+    };
+
+    // Licence sync (licence_sync.rs): keep the satellite's copy when it is a
+    // newer studio check, then answer with ours - the newest either way.
+    crate::licence_sync::adopt_from_peer(&state.app, &state.db, body.get("licence")).await;
+    let licence = crate::licence_sync::local_value(&state.db).await;
 
     let state_version = read_state_version(&state).await;
     let content_rev = crate::content_server::content_rev(&state).await;
@@ -3794,6 +3844,7 @@ async fn dispatch_ping(
         "content_rev": content_rev,
         "state_version": state_version,
         "snapshot": snapshot,
+        "licence": licence,
     }))
 }
 
@@ -4358,7 +4409,13 @@ fn list_games_sync(
                     AND m.meta_name = 'customerId' LIMIT 1) AS customer_id,
                 (SELECT m.meta_value FROM lg_launched_game_meta m
                   WHERE m.launched_game_id = lg_launched_games.id
-                    AND m.meta_name = 'customerName' LIMIT 1) AS customer_name
+                    AND m.meta_name = 'customerName' LIMIT 1) AS customer_name,
+                (start_time IS NULL AND ended = 0
+                 AND (lower(game_type) = 'clash'
+                      OR EXISTS(SELECT 1 FROM lg_launched_game_meta m
+                                 WHERE m.launched_game_id = lg_launched_games.id
+                                   AND m.meta_name = 'tagquestSelfRegister'
+                                   AND m.meta_value = 'true'))) AS awaiting_start
          FROM lg_launched_games
          {where_sql}
          ORDER BY created_at DESC"
@@ -4388,6 +4445,9 @@ fn list_games_sync(
             // Licensee customer (project_licensee_customers), from meta.
             "customer_id": r.get::<_, Option<String>>(14)?,
             "customer_name": r.get::<_, Option<String>>(15)?,
+            // Self-registered Quest / Clash still on its registration screen:
+            // the card offers a remote Start (`start_game` command).
+            "awaiting_start": r.get::<_, i64>(16)? != 0,
         }))
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -5134,13 +5194,16 @@ fn write_tombstone(c: &rusqlite::Connection, game_id: i64, kind: &str) -> rusqli
     Ok(())
 }
 
-async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+async fn delete_game(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
     let id = json_i64(&body, "id")?;
     let client_id = state.client_id;
+    let self_peer_id = state.self_peer_id;
     require_game_owned(state, id).await?;
-    state
+    let mother_in = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+            // Every other device showing this game leaves it.
+            let mother_in = queue_game_gone(c, id, peer_id, self_peer_id, "game_deleted")?;
             // Hard delete also discards any non-archived local summary for this
             // game (Delete = "throw it away"; Archive is the "keep the summary"
             // path). Archived summaries point at a now-gone game id and are left
@@ -5155,9 +5218,12 @@ async fn delete_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
                 "DELETE FROM lg_launched_games WHERE id = ? AND client_id = ?",
                 params![id, client_id],
             )?;
-            Ok(())
+            Ok(mother_in)
         })
         .await?;
+    if mother_in {
+        dispatch_game_gone_local(state, id, "game_deleted");
+    }
     Ok(json!({ "success": true }))
 }
 
@@ -5529,13 +5595,16 @@ async fn mark_summaries_pushed(state: &AppState, body: Value) -> Result<Value, A
 /// Archive a launched game: finalise its summary (kept forever) and delete the
 /// heavy lg_* rows. Ineligible games (test / nobody played) keep no summary, so
 /// archiving them is equivalent to a delete.
-async fn archive_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
+async fn archive_game(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
     let id = json_i64(&body, "id")?;
     require_game_owned(state, id).await?;
     let client_id = state.client_id;
-    let kept = state
+    let self_peer_id = state.self_peer_id;
+    let (kept, mother_in) = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<bool> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(bool, bool)> {
+            // Every other device showing this game leaves it.
+            let mother_in = queue_game_gone(c, id, peer_id, self_peer_id, "game_archived")?;
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let kept = if let Some(s) = compute_summary(c, id)? {
                 upsert_summary(c, id, &s, &now)?;
@@ -5555,9 +5624,12 @@ async fn archive_game(state: &AppState, body: Value) -> Result<Value, ApiErr> {
                 "DELETE FROM lg_launched_games WHERE id = ?1 AND client_id = ?2",
                 params![id, client_id],
             )?;
-            Ok(kept)
+            Ok((kept, mother_in))
         })
         .await?;
+    if mother_in {
+        dispatch_game_gone_local(state, id, "game_archived");
+    }
     Ok(json!({ "success": true, "summary_kept": kept }))
 }
 
@@ -6111,7 +6183,7 @@ async fn list_paired_with_status(
     let (op_ids, self_op) = operator_only_ids(state).await;
     let rows = state
         .db
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String, Option<String>, i64, Option<String>, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, i64, Option<String>)>> {
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, String, Option<String>, i64, Option<String>, i64, Option<String>, Option<i64>, Option<i64>, Option<String>, i64, Option<String>, Option<String>)>> {
             let mut stmt = c.prepare(
                 "SELECT pd.id, pd.peer_label, pd.peer_os, pd.is_self,
                         pd.last_seen_at, pd.has_reader, pd.reader_last_seen_at,
@@ -6119,7 +6191,7 @@ async fn list_paired_with_status(
                         CASE WHEN pd.last_seen_at IS NOT NULL
                                AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
                              THEN 1 ELSE 0 END AS online,
-                        pd.screen_state_json
+                        pd.screen_state_json, pd.command_caps
                    FROM paired_devices pd
                    LEFT JOIN lg_launched_game_devices lgd
                      ON lgd.device_id = pd.id AND lgd.launched_game_id = ?
@@ -6139,6 +6211,7 @@ async fn list_paired_with_status(
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, i64>(10)?,
                     r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
                 ))
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -6161,6 +6234,7 @@ async fn list_paired_with_status(
         _last_conn_attempt,
         online,
         screen_state_json,
+        caps_json,
     ) in rows
     {
         // The mother's own row is never bumped by a ping (it doesn't ping
@@ -6191,6 +6265,7 @@ async fn list_paired_with_status(
             "lgd_id": lgd_id,
             "screen_state": screen_state,
             "operator_only": if self_row { self_op } else { op_ids.contains(&id) },
+            "caps": if self_row { json!(command_caps()) } else { parse_caps(caps_json.as_deref()) },
         });
         if lgd_id.is_some() {
             in_game.push(row);
@@ -6210,6 +6285,9 @@ async fn list_paired_with_status(
         // itself to the mother's device_id and pick up the mother's station
         // assignment. Callers that need "my device_id" must use this.
         "caller_device_id": caller_device_id,
+        // What the hosting mother's own build handles (its row's `caps` too):
+        // the modals gate mother-side actions (disconnect the mother...) on it.
+        "mother_caps": command_caps(),
     }))
 }
 
@@ -6337,6 +6415,7 @@ struct FleetDbRow {
     app_version: Option<String>,
     platform: Option<String>,
     upkeep_json: Option<String>,
+    caps_json: Option<String>,
 }
 
 async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, ApiErr> {
@@ -6356,7 +6435,8 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
                                AND (strftime('%s','now') - strftime('%s', pd.last_seen_at)) < 25
                              THEN 1 ELSE 0 END AS online,
                         pd.screen_state_json,
-                        pd.peer_app_version, pd.peer_platform, pd.upkeep_json
+                        pd.peer_app_version, pd.peer_platform, pd.upkeep_json,
+                        pd.command_caps
                    FROM paired_devices pd
                  ORDER BY pd.is_self DESC, online DESC, pd.peer_label COLLATE NOCASE ASC",
             )?;
@@ -6374,6 +6454,7 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
                         app_version: r.get(8)?,
                         platform: r.get(9)?,
                         upkeep_json: r.get(10)?,
+                        caps_json: r.get(11)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -6424,6 +6505,7 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
                 "app_version": if is_self { Some(crate::app_version().to_string()) } else { d.app_version },
                 "platform": if is_self { Some(crate::update_cache::this_platform()) } else { d.platform },
                 "upkeep": if is_self { self_upkeep.clone() } else { parse(d.upkeep_json.as_deref()) },
+                "caps": if is_self { json!(command_caps()) } else { parse_caps(d.caps_json.as_deref()) },
             })
         })
         .collect();
@@ -6437,51 +6519,101 @@ async fn list_fleet(state: &AppState, caller_device_id: i64) -> Result<Value, Ap
             "platform": crate::update_cache::this_platform(),
             "content_rev": content_rev,
             "installers": installers,
+            "caps": command_caps(),
         },
     }))
 }
 
-/// Mother-only push queue. Three command kinds today:
-/// - `join_game`     - payload `{launched_game_id}` - target satellite is
-///                     expected to register_device + navigate to GamePage.
-/// - `play_video`    - payload `{launched_game_id, kinds[], language}` - the
-///                     target plays the named videos (intro/tutorial) on top
-///                     of whatever it was showing; preempts any in-flight
-///                     `play_video` for the same (target, game).
-/// - `stop_video`    - payload `{}` - unmount any operator overlay.
-/// - `disconnect_device` - payload `{launched_game_id}` - drop the target's
-///                     participation row (it must be in the game) and tell the
-///                     satellite to leave the in-game page.
-/// - `reload_config` - payload `{launched_game_id}` - target (must be in the
-///                     game) re-derives its running game page's config from the
-///                     freshly-saved meta, so a config edit applies live.
-/// - `lock_device` / `show_logo` - payload `{}` - raise the PIN lock overlay /
-///                     the idle logo screen on any paired device.
-/// - `sync_content` / `update_app` - payload `{}` / `{force?}` - sync the
-///                     target's content now / update its app.
+/// The command kinds THIS build's renderer handles, reported on every ping
+/// (`caps`) and stored on the mother as `paired_devices.command_caps`. The kinds
+/// in `NEW_KINDS` are only queued for a peer whose caps list them (an older
+/// build silently drops an unknown kind), so the operator gets
+/// `409 target_outdated` instead of a click that does nothing.
+/// `ack_v2`: acks once the handler ran, with a result (command_status).
+/// `self_reload_config` / `self_disconnect`: as a MOTHER, this build accepts
+/// those two kinds aimed at itself.
+pub fn command_caps() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut caps = vec![
+        "ack_v2",
+        "go_home",
+        "unlock_device",
+        "hide_logo",
+        "start_game",
+        "reset_display",
+        "set_mute",
+        "self_reload_config",
+        "self_disconnect",
+    ];
+    // Relaunch (process plugin) and the USB reader are desktop-only.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    caps.extend(["restart_app", "reader_refresh", "reader_beep"]);
+    caps
+}
+
+/// Command kinds an older build doesn't know: queued only for a peer that
+/// reports them in its caps.
+const NEW_KINDS: [&str; 9] = [
+    "go_home",
+    "unlock_device",
+    "hide_logo",
+    "start_game",
+    "reset_display",
+    "set_mute",
+    "reader_refresh",
+    "reader_beep",
+    "restart_app",
+];
+
+fn parse_caps(s: Option<&str>) -> Value {
+    s.and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(|v| v.is_array())
+        .unwrap_or(Value::Null)
+}
+
+/// Mother push queue. A command is queued for one paired device and delivered on
+/// its next /ping.php; a command aimed at the mother itself runs in-process
+/// (`emit_local_command`). Kinds and payloads:
+/// - `join_game` `{launched_game_id, rejoin?}` - register + open the game page.
+/// - `disconnect_device` `{launched_game_id, reason?}` - drop the target's
+///   participation row and make it leave the game page. `reason`
+///   (`game_deleted` / `game_archived`) when the game itself went away.
+/// - `reload_config` `{launched_game_id}` - re-derive the running page's config.
+/// - `play_video` `{launched_game_id, kinds[], language}` / `stop_video` `{}`.
+/// - `open_ranking` / `show_team_summary` - push a ranking / a team summary.
+/// - `lock_device` / `show_logo` - PIN lock overlay / idle logo screen;
+///   `unlock_device` / `hide_logo` take them off again (the Devices modal's
+///   toggles; the operator waives the device's PIN, as a remote join does).
+/// - `sync_content` / `update_app {force?}` - upkeep.
+/// - `go_home` `{}` - close every overlay, leave the game page (stays
+///   registered) and show the logo screen.
+/// - `start_game` `{launched_game_id}` - press Start on a registration screen
+///   (self-registered Quest / Clash).
+/// - `reset_display` `{launched_game_id}` - clear a Mystery results screen /
+///   resume a Tracks screen waiting for Enter.
+/// - `set_mute` `{muted}` - Ctrl+M sound mute.
+/// - `reader_refresh` / `reader_beep` `{}` - reconnect / test-beep the SI reader.
+/// - `restart_app` `{force?, sent_at}` - relaunch the app.
+/// - `sim_control` - game simulator (tester builds).
 ///
-/// Authorization: any authenticated paired device may queue commands. Children
-/// operate the mother's games (add teams, launch on another device, push videos,
-/// etc.) without having joined - so the launch wizard's mother is no longer the
-/// only allowed caller. The bearer token is already validated upstream by
-/// `resolve_peer`; per-kind target validation below (plus `require_game_owned`,
-/// which keys off the hosting mother's own client_id) is what keeps it safe.
-/// Targets are validated per-kind: `play_video`/`stop_video` require the target
-/// to be currently in `lg_launched_game_devices` for the payload's game;
-/// `join_game` requires the target NOT to be in it (409 otherwise).
-async fn queue_command(state: &AppState, _peer_id: i64, body: Value) -> Result<Value, ApiErr> {
+/// Authorization: any authenticated paired device may queue commands (children
+/// operate the mother's games without having joined). The bearer token is
+/// validated upstream by `resolve_peer`; the per-kind target validation below
+/// (plus `require_game_owned`, keyed off the hosting mother's own client_id) is
+/// what keeps it safe.
+async fn queue_command(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
     let target_device_id = json_i64(&body, "target_device_id")?;
     let kind = json_str(&body, "kind")?.to_string();
     let payload = body.get("payload").cloned().unwrap_or(Value::Null);
-    let id = queue_command_inner(state, target_device_id, &kind, payload).await?;
+    let id = queue_command_inner(state, peer_id, target_device_id, &kind, payload).await?;
     Ok(json!({ "command_id": id }))
 }
 
 /// Batch convenience used by the launch wizard (`join_game` for N satellites)
-/// and the in-game modal's video action bar (`play_video`/`stop_video` for N
-/// targets). Per-target failures are returned alongside successes so the
-/// caller can render partial-success UI without aborting the whole batch.
-async fn queue_command_bulk(state: &AppState, _peer_id: i64, body: Value) -> Result<Value, ApiErr> {
+/// and the modals' action bars. Per-target failures are returned alongside
+/// successes so the caller can render partial-success UI without aborting the
+/// whole batch.
+async fn queue_command_bulk(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
     let kind = json_str(&body, "kind")?.to_string();
     let payload = body.get("payload").cloned().unwrap_or(Value::Null);
     let targets: Vec<i64> = body
@@ -6495,7 +6627,7 @@ async fn queue_command_bulk(state: &AppState, _peer_id: i64, body: Value) -> Res
 
     let mut results = Vec::with_capacity(targets.len());
     for target_device_id in targets {
-        match queue_command_inner(state, target_device_id, &kind, payload.clone()).await {
+        match queue_command_inner(state, peer_id, target_device_id, &kind, payload.clone()).await {
             Ok(id) => results.push(json!({
                 "target_device_id": target_device_id,
                 "command_id": id,
@@ -6510,45 +6642,98 @@ async fn queue_command_bulk(state: &AppState, _peer_id: i64, body: Value) -> Res
     Ok(json!({ "results": results }))
 }
 
+/// The target must currently be a participant of `gid` (409 otherwise).
+async fn require_target_in_game(state: &AppState, gid: i64, target_device_id: i64) -> Result<(), ApiErr> {
+    let registered: Option<i64> = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+            Ok(c.query_row(
+                "SELECT id FROM lg_launched_game_devices
+                  WHERE launched_game_id = ? AND device_id = ?",
+                params![gid, target_device_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    if registered.is_none() {
+        return Err(ApiErr::status(StatusCode::CONFLICT, "target_not_in_game"));
+    }
+    Ok(())
+}
+
+/// Run a command on the mother's own screen: emit the very same
+/// `taghunter://lan-command` event the satellite path emits on /ping.php pickup,
+/// with `local: true` (the game lives in OUR db: enter it through our own server
+/// route, never repoint at some paired mother). `id: 0`: nothing to ack.
+fn emit_local_command(state: &AppState, kind: &str, payload: Value) -> Result<(), ApiErr> {
+    use tauri::Emitter;
+    state
+        .app
+        .emit(
+            "taghunter://lan-command",
+            json!({ "id": 0, "kind": kind, "payload": payload, "local": true }),
+        )
+        .map_err(|e| {
+            ApiErr::status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("local dispatch failed: {e}"),
+            )
+        })
+}
+
 /// Validates the command and inserts it. Factored out so both `queue_command`
 /// and `queue_command_bulk` enforce identical semantics - including the
 /// `play_video` preempt rule that auto-acks a previous in-flight `play_video`
 /// for the same (target, game) before inserting the new one.
 async fn queue_command_inner(
     state: &AppState,
+    caller_id: i64,
     target_device_id: i64,
     kind: &str,
     payload: Value,
 ) -> Result<i64, ApiErr> {
     // Nothing polls the mother's own `pending_commands` (only satellites drain
-    // it via /ping.php), so a row targeting the mother would sit unread
-    // forever. Video commands are still meaningful on the mother's screen - a
-    // satellite operator driving the room's main display - so those are
-    // executed IN-PROCESS further down instead of being enqueued. Same for
-    // `join_game`: a child (e.g. an operator-only tablet) launching a game can
-    // pick the mother as a participating device. Every other kind stays
-    // rejected: they only make sense for a satellite.
+    // it via /ping.php), so a command for the mother runs IN-PROCESS further
+    // down instead of being enqueued: a child's operator drives the room's main
+    // display like any other screen. Only the ranking / team-summary pushes stay
+    // satellite-only (the mother shows those from its own UI).
     // Game simulator remote control (tester builds) may also drive the mother.
+    let to_self = target_device_id == state.self_peer_id;
     let sim_self = cfg!(feature = "devtools") && kind == "sim_control";
-    if target_device_id == state.self_peer_id
-        && !sim_self
-        && !matches!(
-            kind,
-            "play_video"
-                | "stop_video"
-                | "join_game"
-                | "lock_device"
-                | "show_logo"
-                | "sync_content"
-                | "update_app"
-        )
-    {
+    if to_self && !sim_self && matches!(kind, "open_ranking" | "show_team_summary" | "sim_control") {
         return Err(ApiErr::bad("Cannot queue a command targeting self"));
     }
     let launched_game_id = payload
         .get("launched_game_id")
         .and_then(|v| v.as_i64());
     let kind_owned = kind.to_string();
+
+    // A kind an older build doesn't know is refused up front for it.
+    if NEW_KINDS.contains(&kind) {
+        let supported = if to_self {
+            command_caps().contains(&kind)
+        } else {
+            let caps: Option<String> = state
+                .db
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+                    Ok(c.query_row(
+                        "SELECT command_caps FROM paired_devices WHERE id = ?",
+                        params![target_device_id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+                })
+                .await?;
+            caps.as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .is_some_and(|v| v.iter().any(|k| k == kind))
+        };
+        if !supported {
+            return Err(ApiErr::status(StatusCode::CONFLICT, "target_outdated"));
+        }
+    }
 
     // Per-kind validation.
     match kind {
@@ -6559,7 +6744,7 @@ async fn queue_command_inner(
             // An operator-only device (every Android tablet) controls games but
             // never plays one: refuse to push it into a game, whoever asks.
             let (op_ids, self_op) = operator_only_ids(state).await;
-            let target_op = if target_device_id == state.self_peer_id {
+            let target_op = if to_self {
                 self_op
             } else {
                 op_ids.contains(&target_device_id)
@@ -6597,55 +6782,38 @@ async fn queue_command_inner(
                 }
             }
         }
-        "play_video" | "stop_video" | "reload_config" => {
+        // The target must be in the game. For disconnect_device we drop its
+        // participation row below (in the same transaction as the command
+        // insert) so it leaves the in-game bucket immediately, then the pushed
+        // command makes the device leave the in-game page.
+        "play_video" | "stop_video" | "reload_config" | "disconnect_device" | "reset_display" => {
             let gid = launched_game_id
                 .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
             require_game_owned(state, gid).await?;
-            let registered: Option<i64> = state
-                .db
-                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
-                    Ok(c.query_row(
-                        "SELECT id FROM lg_launched_game_devices
-                          WHERE launched_game_id = ? AND device_id = ?",
-                        params![gid, target_device_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?)
-                })
-                .await?;
-            if registered.is_none() {
-                return Err(ApiErr::status(
-                    StatusCode::CONFLICT,
-                    "target_not_in_game",
-                ));
-            }
+            require_target_in_game(state, gid, target_device_id).await?;
         }
-        "disconnect_device" => {
-            // Remove a participating device from the game. The target must
-            // currently be in the game; we drop its participation row below (in
-            // the same transaction as the command insert) so it leaves bucket A
-            // immediately, then the pushed command makes the satellite leave the
-            // in-game page.
+        "start_game" => {
+            // Press Start on the target's registration screen: only while the
+            // game is still waiting for it.
             let gid = launched_game_id
                 .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
             require_game_owned(state, gid).await?;
-            let registered: Option<i64> = state
+            require_target_in_game(state, gid, target_device_id).await?;
+            let (started, ended): (bool, bool) = state
                 .db
-                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(bool, bool)> {
                     Ok(c.query_row(
-                        "SELECT id FROM lg_launched_game_devices
-                          WHERE launched_game_id = ? AND device_id = ?",
-                        params![gid, target_device_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?)
+                        "SELECT start_time IS NOT NULL, ended = 1 FROM lg_launched_games WHERE id = ?",
+                        params![gid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?)
                 })
                 .await?;
-            if registered.is_none() {
-                return Err(ApiErr::status(
-                    StatusCode::CONFLICT,
-                    "target_not_in_game",
-                ));
+            if ended {
+                return Err(ApiErr::status(StatusCode::CONFLICT, "game_ended"));
+            }
+            if started {
+                return Err(ApiErr::status(StatusCode::CONFLICT, "already_started"));
             }
         }
         "open_ranking" => {
@@ -6667,14 +6835,6 @@ async fn queue_command_inner(
                 require_game_owned(state, gid).await?;
             }
         }
-        "become_mother" => {
-            // Planned handover: hand hosting to another paired device. It needs
-            // the game id so it can adopt; the target need not be a current
-            // participant (it caches snapshots regardless). Verify ownership.
-            let gid = launched_game_id
-                .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
-            require_game_owned(state, gid).await?;
-        }
         "sim_control" if cfg!(feature = "devtools") => {
             // Game simulator remote control (tester builds only): start /
             // pause / speed / stop the simulator executor on the target. The
@@ -6684,31 +6844,26 @@ async fn queue_command_inner(
                 .ok_or_else(|| ApiErr::bad("payload.launched_game_id is required"))?;
             require_game_owned(state, gid).await?;
         }
-        "lock_device" | "show_logo" => {
-            // Top-bar Devices modal: raise the PIN lock overlay / the idle logo
-            // screen on any paired device, in a game or not. Display-only, no
-            // game to validate; the target's own PIN still gates unlocking.
+        "set_mute" => {
+            if payload.get("muted").and_then(|v| v.as_bool()).is_none() {
+                return Err(ApiErr::bad("payload.muted (bool) is required"));
+            }
         }
-        "sync_content" | "update_app" => {
-            // Top-bar Devices modal upkeep: sync the target's content now / have
-            // it update its app (`{force}`: restart even with a game running
-            // there). The target decides what that takes (services/deviceUpkeep).
-        }
+        // Device-level, any paired device, in a game or not. Display / upkeep
+        // only; the target's own PIN still gates unlocking, and the target
+        // decides what an update / restart takes (a game running there).
+        "lock_device" | "unlock_device" | "show_logo" | "hide_logo" | "go_home"
+        | "sync_content" | "update_app" | "reader_refresh" | "reader_beep" | "restart_app" => {}
         _ => return Err(ApiErr::bad(format!("Unknown command kind: {kind}"))),
     }
 
-    // Self-targeted command (video: a satellite operator driving the mother's
-    // own screen; join_game: a child launching onto the mother; lock_device /
-    // show_logo: a child locking or blanking the mother). Emit the very same `taghunter://lan-command` event the
-    // satellite path emits on /ping.php pickup - <OperatorVideoOverlay> at the
-    // App root already handles it - instead of inserting an unreadable queue
-    // row. The overlay's usual "repoint at the pushing mother, then fetch the
-    // game state over HTTP" would be wrong here: WE are that mother, the game
-    // lives in our own db, and our `launched_games` route may legitimately be
-    // pointed at a different mother right now. So resolve the scenario
-    // identity server-side and ship it in the payload; the overlay uses those
-    // fields verbatim when present and skips the fetch entirely.
-    if target_device_id == state.self_peer_id {
+    // Self-targeted command: run it on the mother's own screen. The video
+    // overlay's usual "repoint at the pushing mother, then fetch the game state
+    // over HTTP" would be wrong here: WE are that mother, the game lives in our
+    // own db, and our `launched_games` route may legitimately be pointed at a
+    // different mother right now. So resolve the scenario identity server-side
+    // and ship it in the payload; the overlay uses those fields verbatim.
+    if to_self {
         let mut enriched = payload.clone();
         if kind == "play_video" {
             let gid = launched_game_id
@@ -6733,22 +6888,22 @@ async fn queue_command_inner(
                 obj.insert("game_type".into(), Value::String(game_type));
             }
         }
-        use tauri::Emitter;
-        // `local: true` tells the renderer the game lives in OUR db: a
-        // self-targeted join_game must enter it through our own server route,
-        // not repoint at some paired mother.
-        state
-            .app
-            .emit(
-                "taghunter://lan-command",
-                json!({ "id": 0, "kind": kind, "payload": enriched, "local": true }),
-            )
-            .map_err(|e| {
-                ApiErr::status(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("local dispatch failed: {e}"),
-                )
-            })?;
+        if kind == "disconnect_device" {
+            // Same participation drop as the queued path below.
+            let gid = launched_game_id.unwrap_or_default();
+            state
+                .db
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                    c.execute(
+                        "DELETE FROM lg_launched_game_devices
+                          WHERE launched_game_id = ? AND device_id = ?",
+                        params![gid, target_device_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+        emit_local_command(state, kind, enriched)?;
         // Handled in-process: no queue row exists, so there is nothing to ack.
         return Ok(0);
     }
@@ -6801,9 +6956,9 @@ async fn queue_command_inner(
                 )?;
             }
             c.execute(
-                "INSERT INTO pending_commands (target_device_id, kind, payload_json)
-                 VALUES (?, ?, ?)",
-                params![target_device_id, kind_for_insert, payload_str],
+                "INSERT INTO pending_commands (target_device_id, kind, payload_json, queued_by)
+                 VALUES (?, ?, ?, ?)",
+                params![target_device_id, kind_for_insert, payload_str, caller_id],
             )?;
             Ok(c.last_insert_rowid())
         })
@@ -6811,18 +6966,74 @@ async fn queue_command_inner(
     Ok(new_id)
 }
 
+/// The game is being deleted / archived: queue a `disconnect_device` (with the
+/// reason) for every device registered in it except the mother and the caller,
+/// so their game page leaves instead of polling a game that is gone. Runs in the
+/// delete/archive transaction, BEFORE the game row (and its device rows) go.
+/// Returns whether the mother itself was in the game (the caller then dispatches
+/// it in-process after commit). `disconnect_device` is a kind every build knows.
+fn queue_game_gone(
+    c: &rusqlite::Connection,
+    gid: i64,
+    caller_id: i64,
+    self_peer_id: i64,
+    reason: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = c.prepare(
+        "SELECT device_id FROM lg_launched_game_devices WHERE launched_game_id = ?",
+    )?;
+    let devices: Vec<i64> = stmt
+        .query_map(params![gid], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let payload = json!({ "launched_game_id": gid, "reason": reason }).to_string();
+    let mut mother_in = false;
+    for d in devices {
+        if d == caller_id {
+            continue;
+        }
+        if d == self_peer_id {
+            mother_in = true;
+            continue;
+        }
+        c.execute(
+            "INSERT INTO pending_commands (target_device_id, kind, payload_json, queued_by)
+             VALUES (?, 'disconnect_device', ?, ?)",
+            params![d, payload, caller_id],
+        )?;
+    }
+    Ok(mother_in)
+}
+
+/// After a delete/archive commit: the mother's own screen leaves the game too.
+fn dispatch_game_gone_local(state: &AppState, gid: i64, reason: &str) {
+    let _ = emit_local_command(
+        state,
+        "disconnect_device",
+        json!({ "launched_game_id": gid, "reason": reason }),
+    );
+}
+
 /// Satellite-side confirmation that a command was acted upon. Only the target
-/// device may ack its own command. Idempotent: re-acking is a no-op.
+/// device may ack its own command. Idempotent: re-acking is a no-op. A current
+/// build acks once its handler ran and sends what happened (`result`: `{ok,
+/// error?, detail?}`, kept for the sender's `command_status`); an older build
+/// acks on receipt, without one.
 async fn ack_command(state: &AppState, peer_id: i64, body: Value) -> Result<Value, ApiErr> {
     let command_id = json_i64(&body, "command_id")?;
+    let result: Option<String> = body
+        .get("result")
+        .filter(|v| v.is_object())
+        .map(|v| v.to_string())
+        .filter(|s| s.len() <= 1024);
     let updated = state
         .db
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<usize> {
             Ok(c.execute(
                 "UPDATE pending_commands
-                    SET acked_at = CURRENT_TIMESTAMP
-                  WHERE id = ? AND target_device_id = ?",
-                params![command_id, peer_id],
+                    SET acked_at = COALESCE(acked_at, CURRENT_TIMESTAMP),
+                        result_json = COALESCE(result_json, ?3)
+                  WHERE id = ?1 AND target_device_id = ?2",
+                params![command_id, peer_id, result],
             )?)
         })
         .await?;
@@ -6830,6 +7041,53 @@ async fn ack_command(state: &AppState, peer_id: i64, body: Value) -> Result<Valu
         return Err(ApiErr::not_found("Command not found or not owned by caller"));
     }
     Ok(json!({ "ok": true }))
+}
+
+/// The sender reads back what became of the commands it queued: delivered, done
+/// and the target's result. Only rows this caller queued (`queued_by`). A row
+/// pruned (1 h after its ack, 15 min undelivered) is simply absent.
+async fn command_status(
+    state: &AppState,
+    peer_id: i64,
+    rest: &HashMap<String, String>,
+) -> Result<Value, ApiErr> {
+    let ids: Vec<i64> = rest
+        .get("ids")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect())
+        .unwrap_or_default();
+    if ids.is_empty() || ids.len() > 64 {
+        return Err(ApiErr::bad("ids is required (1-64 comma-separated ids)"));
+    }
+    let rows = state
+        .db
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<Value>> {
+            let placeholders = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT id, target_device_id, kind, delivered_at, acked_at, result_json
+                   FROM pending_commands
+                  WHERE queued_by = ? AND id IN ({placeholders})"
+            );
+            let mut stmt = c.prepare(&sql)?;
+            let mut args: Vec<i64> = vec![peer_id];
+            args.extend(ids.iter().copied());
+            let rows = stmt.query_map(params_from_iter(args.iter()), |r| {
+                let result: Option<String> = r.get(5)?;
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "target_device_id": r.get::<_, i64>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "delivered_at": r.get::<_, Option<String>>(3)?,
+                    "acked_at": r.get::<_, Option<String>>(4)?,
+                    "result": result
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(Value::Null),
+                }))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(json!({ "commands": rows }))
 }
 
 async fn list_completed_quests(
@@ -7209,6 +7467,17 @@ fn clash_purge_pick(order: &[i64], owner_of: impl Fn(i64) -> Option<i64>, purger
     order.iter().copied().find(|ti| owner_of(*ti) != Some(purger)).ok_or("own_territory")
 }
 
+/// `lg_clash_consumed` marker for a purge punch that was refused but stays
+/// pending. Never equal to a real `station@time` key, so it doesn't consume it.
+const PURGE_SEEN_PREFIX: &str = "purge_seen:";
+
+/// Whether a purge attempt with this outcome uses up the station punch. Only a
+/// fired purge, or a clan whose quota is already spent (can never succeed).
+/// "no_target" / "own_territory" keep it pending for a later read.
+fn purge_consumes(status: &str) -> bool {
+    matches!(status, "ok" | "already_used")
+}
+
 fn compute_clash_standings(
     c: &rusqlite::Connection,
     lgid: i64,
@@ -7545,10 +7814,57 @@ fn compute_clash_standings(
 
 /// Bind a chip to a clan (lg_teams row). Server-authoritative so concurrent
 /// stations can't double-bind a chip or overfill a clan past `max_per_clan`.
+/// The `punches` array of a Clash request as (station, time) pairs. Accepts
+/// `code` (SI read shape) or `station`.
+fn parse_clash_punches(body: &Value) -> Vec<(i64, String)> {
+    body.get("punches")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let station = p
+                        .get("code")
+                        .and_then(|x| x.as_i64())
+                        .or_else(|| p.get("station").and_then(|x| x.as_i64()))?;
+                    let time = p
+                        .get("time")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((station, time))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Mark every punch already on a card as consumed for this game. Called when a
+/// chip self-registers: cards are often not wiped between games, and leftover
+/// punches (a station-25 purge punch included) must not count in the new game.
+/// Clock-independent - SI station clocks drift by minutes.
+fn clash_consume_baseline(
+    tx: &rusqlite::Connection,
+    launched_game_id: i64,
+    chip_id: i64,
+    punches: &[(i64, String)],
+) -> rusqlite::Result<()> {
+    for (station, time) in punches {
+        tx.execute(
+            "INSERT OR IGNORE INTO lg_clash_consumed
+               (launched_game_id, chip_id, punch_key) VALUES (?, ?, ?)",
+            params![launched_game_id, chip_id, format!("{station}@{time}")],
+        )?;
+    }
+    Ok(())
+}
+
 async fn clash_register(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let launched_game_id = json_i64(&body, "launched_game_id")?;
     let team_id = json_i64(&body, "team_id")?;
     let chip_id = json_i64(&body, "chip_id")?;
+    // Only the Clash station's self-registration bip sends these (the card's
+    // current punches); operator/TagQuest/predetermined bindings send none.
+    let punches = parse_clash_punches(&body);
     require_game_owned(state, launched_game_id).await?;
 
     let outcome = state
@@ -7583,6 +7899,10 @@ async fn clash_register(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                     |r| r.get(0),
                 )?;
                 let status = if t == team_id {
+                    // Same clan re-bipped at the inscription screen: anything on
+                    // the card by now is still pre-game.
+                    clash_consume_baseline(&tx, launched_game_id, chip_id, &punches)?;
+                    tx.commit()?;
                     "already_in_clan"
                 } else {
                     "already_in_other_clan"
@@ -7608,6 +7928,7 @@ async fn clash_register(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                  VALUES (?, ?, ?)",
                 params![launched_game_id, team_id, chip_id],
             )?;
+            clash_consume_baseline(&tx, launched_game_id, chip_id, &punches)?;
             tx.commit()?;
             Ok(("ok".to_string(), cnt + 1))
         })
@@ -7665,26 +7986,7 @@ async fn clash_unregister(state: &AppState, body: Value) -> Result<Value, ApiErr
 async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> {
     let launched_game_id = json_i64(&body, "launched_game_id")?;
     let chip_id = json_i64(&body, "chip_id")?;
-    let punches: Vec<(i64, String)> = body
-        .get("punches")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    let station = p
-                        .get("code")
-                        .and_then(|x| x.as_i64())
-                        .or_else(|| p.get("station").and_then(|x| x.as_i64()))?;
-                    let time = p
-                        .get("time")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    Some((station, time))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let punches = parse_clash_punches(&body);
     require_game_owned(state, launched_game_id).await?;
 
     let result = state
@@ -7736,8 +8038,8 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
 
             // Available (unconsumed, de-duped within this read) punch keys per
             // station. Purge-station punches are split out: they never help
-            // complete a territory and are consumed on ANY outcome (a rejected
-            // purge attempt costs the player a trip back to the purge station).
+            // complete a territory, and a refused one stays pending (see the
+            // Purge block below).
             let mut by_station: HashMap<i64, Vec<String>> = HashMap::new();
             let mut seen: HashSet<String> = HashSet::new();
             let mut purge_keys: Vec<String> = Vec::new();
@@ -7766,18 +8068,19 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
 
             // ── The Purge (processed BEFORE crediting, so a read that both
             // purges territory T and completes T starts the recapture at 1).
-            // Quota = one SUCCESS per clan; rejections don't spend it but the
-            // physical punches are consumed either way. Multiple purge punches
-            // in one read = one attempt. Design: project_clash_purge_feature.
+            // Quota = one SUCCESS per clan. A punch refused for "no_target" /
+            // "own_territory" stays PENDING: it is retried on every later read
+            // of this card and fires once a purge is possible (bug report #3:
+            // a punch burned on a 0-0 start made the purge unreachable). Only
+            // success or "already_used" (can never succeed) consume it. A
+            // "purge_seen:" marker row tells the station whether the refusal is
+            // new (show it) or a repeat (stay quiet). Multiple purge punches in
+            // one read = one attempt. Design: project_clash_purge_feature.
             let mut purge_json: Option<Value> = None;
             if !purge_keys.is_empty() {
-                for key in &purge_keys {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO lg_clash_consumed
-                           (launched_game_id, chip_id, punch_key) VALUES (?, ?, ?)",
-                        params![launched_game_id, chip_id, key],
-                    )?;
-                }
+                let repeat = purge_keys
+                    .iter()
+                    .all(|k| consumed.contains(&format!("{PURGE_SEEN_PREFIX}{k}")));
                 let already_used: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM lg_clash_purges
                                    WHERE launched_game_id = ? AND team_id = ?)",
@@ -7785,8 +8088,9 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                     |r| r.get(0),
                 )?;
                 if already_used {
-                    purge_json =
-                        Some(json!({ "attempted": true, "status": "already_used" }));
+                    // Never "repeat": a pending punch whose clan has since
+                    // purged (via a clanmate) gets told why it is now spent.
+                    purge_json = Some(json!({ "attempted": true, "status": "already_used" }));
                 } else {
                     // Target as of this instant (pre-purge state): the first
                     // territory of the order that this clan does not own. Only
@@ -7807,7 +8111,11 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                     };
                     match clash_purge_pick(&order, owner_of, team_id) {
                         Err(status) => {
-                            purge_json = Some(json!({ "attempted": true, "status": status }));
+                            purge_json = Some(json!({
+                                "attempted": true,
+                                "status": status,
+                                "repeat": repeat,
+                            }));
                         }
                         Ok(ti) => {
                             seq += 1;
@@ -7831,6 +8139,23 @@ async fn clash_validate(state: &AppState, body: Value) -> Result<Value, ApiErr> 
                             }));
                         }
                     }
+                }
+                let status = purge_json
+                    .as_ref()
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                for key in &purge_keys {
+                    let row = if purge_consumes(status) {
+                        key.clone()
+                    } else {
+                        format!("{PURGE_SEEN_PREFIX}{key}")
+                    };
+                    tx.execute(
+                        "INSERT OR IGNORE INTO lg_clash_consumed
+                           (launched_game_id, chip_id, punch_key) VALUES (?, ?, ?)",
+                        params![launched_game_id, chip_id, row],
+                    )?;
                 }
             }
 
@@ -9691,7 +10016,11 @@ pub async fn client_ping_mother(
     // for a game the satellite is actually playing. Backward-compatible: TS
     // callers that omit it send null → no snapshot requested.
     launched_game_id: Option<i64>,
+    // The offline lock screen's ping: exchange the licence only, leave queued
+    // commands for later (nothing could act on them there).
+    licence_only: Option<bool>,
 ) -> Result<(), PingErr> {
+    let licence_only = licence_only == Some(true);
     let secret: Option<String> = {
         let conn = open_db_for_command(&app)
             .await
@@ -9768,6 +10097,13 @@ pub async fn client_ping_mother(
         None => Value::Null,
     };
 
+    // Our licence, so the mother keeps it when it's a newer studio check
+    // (licence_sync.rs). The reply carries the mother's, adopted below.
+    let db = open_db_for_command(&app)
+        .await
+        .map_err(|e| PingErr::Network { message: e })?;
+    let licence = crate::licence_sync::local_value(&db).await;
+
     let url = format!("http://{addr}/ping.php");
     let client = lan_client_builder()
         .timeout(Duration::from_secs(2))
@@ -9787,6 +10123,9 @@ pub async fn client_ping_mother(
             "app_version": crate::app_version(),
             "platform": crate::update_cache::this_platform(),
             "upkeep": upkeep,
+            "caps": command_caps(),
+            "licence": licence,
+            "licence_only": licence_only,
         }))
         .send()
         .await
@@ -9844,6 +10183,12 @@ pub async fn client_ping_mother(
         });
     }
 
+    // The mother's licence, when it's a newer studio check than ours.
+    crate::licence_sync::adopt_from_peer(&app, &db, body.get("licence")).await;
+    if licence_only {
+        return Ok(());
+    }
+
     // LAN content sync: the mother's content revision. The renderer pulls new
     // content from the mother when it changes (services/peerContent.ts).
     if let Some(rev) = body.get("content_rev").and_then(|v| v.as_i64()) {
@@ -9886,14 +10231,61 @@ pub async fn client_ping_mother(
         }
     }
 
-    // Drain & dispatch pending commands. We emit before acking so a crash
-    // mid-emit doesn't lose the work (the mother's 15-min TTL will re-issue).
+    // Drain & dispatch pending commands. The renderer acks each one once its
+    // handler ran (`client_ack_command`); see `CommandLedger` for redelivery.
     if let Some(commands) = body.get("commands").and_then(|v| v.as_array()) {
         use tauri::Emitter;
+        let ledger = app.try_state::<CommandLedger>();
         for cmd in commands {
+            let id = cmd.get("id").and_then(|v| v.as_i64());
+            // What to do with a redelivered command (first delivery: emit).
+            enum Seen {
+                New,
+                Skip,
+                Reack(Option<Value>),
+            }
+            let seen = match (&ledger, id) {
+                (Some(l), Some(id)) => {
+                    let mut guard = l.inner.lock().await;
+                    let now = Instant::now();
+                    guard.retain(|_, e| match e {
+                        LedgerEntry::Handled(at, _) => now.duration_since(*at) < LEDGER_KEEP,
+                        LedgerEntry::Inflight(at) => now.duration_since(*at) < LEDGER_KEEP,
+                    });
+                    let key = (mother_uuid.clone(), id);
+                    match guard.get(&key) {
+                        None => {
+                            guard.insert(key, LedgerEntry::Inflight(now));
+                            Seen::New
+                        }
+                        Some(LedgerEntry::Handled(_, result)) => Seen::Reack(result.clone()),
+                        Some(LedgerEntry::Inflight(since)) => {
+                            if now.duration_since(*since) >= RENDERER_ACK_TIMEOUT {
+                                let result = json!({ "ok": false, "error": "renderer_timeout" });
+                                guard.insert(key, LedgerEntry::Handled(now, Some(result.clone())));
+                                Seen::Reack(Some(result))
+                            } else {
+                                Seen::Skip
+                            }
+                        }
+                    }
+                }
+                _ => Seen::New,
+            };
+            match seen {
+                Seen::Skip => continue,
+                Seen::Reack(result) => {
+                    if let Some(id) = id {
+                        tokio::spawn(post_ack(addr, secret.clone(), id, result));
+                    }
+                    continue;
+                }
+                Seen::New => {}
+            }
             // Enrich each command with the originating mother's uuid + address so
             // the renderer can repoint `launched_games` traffic at the mother
-            // (a satellite must read/write the mother's game, not its own server).
+            // (a satellite must read/write the mother's game, not its own server)
+            // and ack it there once handled.
             let mut enriched = cmd.clone();
             if let Some(obj) = enriched.as_object_mut() {
                 obj.insert(
@@ -9906,30 +10298,79 @@ pub async fn client_ping_mother(
                 );
             }
             let _ = app.emit("taghunter://lan-command", enriched);
-            if let Some(id) = cmd.get("id").and_then(|v| v.as_i64()) {
-                let ack_addr = addr;
-                let ack_secret = secret.clone();
-                tokio::spawn(async move {
-                    let ack_client = lan_client_builder()
-                        .timeout(Duration::from_secs(2))
-                        .connect_timeout(Duration::from_millis(700))
-                        .build();
-                    if let Ok(ack_client) = ack_client {
-                        let ack_url = format!(
-                            "http://{ack_addr}/launched_games.php?action=ack_command"
-                        );
-                        let _ = ack_client
-                            .post(&ack_url)
-                            .header(header::AUTHORIZATION, format!("Bearer {ack_secret}"))
-                            .json(&serde_json::json!({ "command_id": id }))
-                            .send()
-                            .await;
-                    }
-                });
-            }
         }
     }
     Ok(())
+}
+
+/// POST `ack_command` (with the handler's result, when known) to the mother.
+async fn post_ack(addr: SocketAddr, secret: String, id: i64, result: Option<Value>) -> bool {
+    let Ok(client) = lan_client_builder()
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("http://{addr}/launched_games.php?action=ack_command");
+    let body = match result {
+        Some(r) => json!({ "command_id": id, "result": r }),
+        None => json!({ "command_id": id }),
+    };
+    client
+        .post(&url)
+        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .json(&body)
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
+
+/// The renderer finished handling a pushed command (`services/lanCommands.ts`):
+/// record it in the ledger and ack it on the mother that sent it, with what
+/// happened (`{ok, error?, detail?}`). `mother_addr` is the address the command
+/// came from (the event carries it); the warm endpoint cache is the fallback.
+#[tauri::command]
+pub async fn client_ack_command(
+    app: AppHandle,
+    cache: tauri::State<'_, MotherEndpointCache>,
+    ledger: tauri::State<'_, CommandLedger>,
+    mother_uuid: String,
+    mother_addr: Option<String>,
+    command_id: i64,
+    result: Option<Value>,
+) -> Result<bool, String> {
+    let result = result.filter(|v| v.is_object());
+    ledger.inner.lock().await.insert(
+        (mother_uuid.clone(), command_id),
+        LedgerEntry::Handled(Instant::now(), result.clone()),
+    );
+    let secret: Option<String> = {
+        let conn = open_db_for_command(&app).await?;
+        let uuid_for_q = mother_uuid.clone();
+        conn.call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<String>> {
+            Ok(c.query_row(
+                "SELECT peer_secret FROM paired_mothers WHERE mother_uuid = ?",
+                params![uuid_for_q],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    let Some(secret) = secret else {
+        return Ok(false);
+    };
+    let addr = match mother_addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()) {
+        Some(a) => Some(a),
+        None => cache.inner.lock().await.get(&mother_uuid).copied(),
+    };
+    let Some(addr) = addr else {
+        // Not reachable now: the next delivery re-acks it from the ledger.
+        return Ok(false);
+    };
+    Ok(post_ack(addr, secret, command_id, result).await)
 }
 
 /// Renderer-driven setter: the JS-side `sportidentService` poll in the Footer
@@ -10994,6 +11435,46 @@ mod clash_purge_tests {
         // Only own territories left: refused (quota kept).
         assert_eq!(clash_purge_pick(&[2], owner, 7), Err("own_territory"));
         assert_eq!(clash_purge_pick(&[], owner, 7), Err("no_target"));
+    }
+
+    #[test]
+    fn refused_purge_punch_stays_pending() {
+        // Bug report #3: a punch refused at 0-0 must stay usable later.
+        assert!(purge_consumes("ok"));
+        assert!(purge_consumes("already_used"));
+        assert!(!purge_consumes("no_target"));
+        assert!(!purge_consumes("own_territory"));
+        // The pending marker can never collide with a real punch key.
+        assert_ne!(format!("{PURGE_SEEN_PREFIX}55@15:31:02"), "55@15:31:02");
+    }
+
+    #[test]
+    fn baseline_consumes_every_punch_already_on_the_card() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE lg_clash_consumed (id INTEGER PRIMARY KEY AUTOINCREMENT,
+               launched_game_id INTEGER NOT NULL, chip_id INTEGER NOT NULL,
+               punch_key TEXT NOT NULL, UNIQUE(launched_game_id, chip_id, punch_key));",
+        )
+        .unwrap();
+        let body = serde_json::json!({ "punches": [
+            { "code": 55, "time": "15:31:02" },
+            { "station": 31, "time": "15:32:28" },
+            { "code": 31, "time": "15:32:28" }
+        ]});
+        let punches = parse_clash_punches(&body);
+        assert_eq!(punches.len(), 3);
+        clash_consume_baseline(&c, 8, 1915788, &punches).unwrap();
+        let keys: Vec<String> = c
+            .prepare("SELECT punch_key FROM lg_clash_consumed ORDER BY punch_key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(keys, vec!["31@15:32:28", "55@15:31:02"]);
+        // No punches sent (operator / TagQuest / old client) ⇒ nothing recorded.
+        assert!(parse_clash_punches(&serde_json::json!({})).is_empty());
     }
 }
 

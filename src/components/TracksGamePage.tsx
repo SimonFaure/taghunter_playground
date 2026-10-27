@@ -52,6 +52,8 @@ import {
   type TracksScoreType,
 } from '../services/tracksScoring';
 import { gameClock } from '../services/gameClock';
+import { onPendingResetDisplay } from '../services/pendingJoinStore';
+import { refineInGame, clearInGameRefinement } from '../services/screenState';
 
 interface TracksGamePageProps {
   config: GameConfig;
@@ -433,6 +435,11 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
   // Default screen is the resting background image; the map only appears for the
   // second-bip reveal (see tracks-reveal-redesign.md).
   const [screen, setScreen] = useState<TracksScreen>('background');
+  // A team's result is on screen until it is reset (Enter, or the auto-reset
+  // delay): the operator can reset it remotely (`reset_display`) - this
+  // resolves the pending Enter wait so the presentation queue moves on.
+  const [awaitingReset, setAwaitingReset] = useState(false);
+  const enterResolverRef = useRef<(() => void) | null>(null);
   const [focusTeamName, setFocusTeamName] = useState('');
   // The in-focus team's display language (their reveal/clues render in it). Empty
   // ⇒ idle/shared screen, which falls back to the launch language below.
@@ -1190,6 +1197,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
         }
 
         // --- Reset back to the map -------------------------------------------
+        setAwaitingReset(true);
         if (gd.autoReset) {
           // eslint-disable-next-line no-await-in-loop
           await new Promise((r) => setTimeout(r, AUTO_RESET_SECONDS * 1000));
@@ -1213,6 +1221,7 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
   const resetDisplay = () => {
     // Back to the resting background screen until the next team interacts.
+    setAwaitingReset(false);
     setScreen('background');
     setPlacedCheckpoints(new Map());
     setBigReveal(null);
@@ -1230,14 +1239,53 @@ export function TracksGamePage({ config, gameUniqid, launchedGameId, onBack, onG
 
   const waitForEnter = () =>
     new Promise<void>((resolve) => {
-      const onKey = (e: KeyboardEvent) => {
-        if (e.key === 'Enter') {
-          window.removeEventListener('keydown', onKey);
-          resolve();
-        }
+      const done = () => {
+        window.removeEventListener('keydown', onKey);
+        if (enterResolverRef.current === done) enterResolverRef.current = null;
+        resolve();
       };
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === 'Enter') done();
+      };
+      enterResolverRef.current = done;
       window.addEventListener('keydown', onKey);
     });
+
+  // The operator's remote "reset display": as Enter on a result waiting for it;
+  // with auto-reset on, clear it now rather than after the delay (the delay's
+  // own reset then finds the resting screen already up).
+  const resetDisplayRef = useRef(resetDisplay);
+  resetDisplayRef.current = resetDisplay;
+  const awaitingResetRef = useRef(awaitingReset);
+  awaitingResetRef.current = awaitingReset;
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingResetDisplay((gid) => {
+      if (gid !== launchedGameId) return false;
+      const resolveEnter = enterResolverRef.current;
+      if (resolveEnter) {
+        resolveEnter();
+        return true;
+      }
+      if (!awaitingResetRef.current) return false;
+      resetDisplayRef.current();
+      return true;
+    });
+  }, [launchedGameId]);
+
+  // Tell the Devices modals what this screen shows: the resting background,
+  // or a team's result waiting to be reset.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    refineInGame(launchedGameId, {
+      boardHidden: screen === 'background',
+      sub: awaitingReset ? 'results' : undefined,
+    });
+  }, [launchedGameId, screen, awaitingReset]);
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return () => clearInGameRefinement(launchedGameId);
+  }, [launchedGameId]);
 
   const saveCardData = useCallback(
     async (card: CardData) => {

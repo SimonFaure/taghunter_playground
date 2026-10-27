@@ -54,7 +54,8 @@ import {
 } from '../services/tagquestPunchLogic';
 import type { PunchAnimationData } from '../services/tagquestPunchLogic';
 import { logApiCall } from '../services/apiLogger';
-import { onPendingConfigReload } from '../services/pendingJoinStore';
+import { onPendingConfigReload, onPendingStart } from '../services/pendingJoinStore';
+import { refineInGame, clearInGameRefinement } from '../services/screenState';
 // TagQuest self-register (mirrors Clash): team-mode chip→team binding reuses the
 // server-authoritative clash_register / lg_clash_members endpoints; solo-mode
 // enrols each chip as its own team via the shared dynamic-team helper.
@@ -1310,6 +1311,29 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
       for (const card of held) void saveCardDataRef.current(card);
     }
   }, [launchedGameId, playStartVideos]);
+
+  // The operator's remote Start (Devices modal / game card): same as the
+  // registration screen's Start button, once.
+  const handleRegistrationStartRef = useRef(handleRegistrationStart);
+  handleRegistrationStartRef.current = handleRegistrationStart;
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingStart((gid) => {
+      if (gid !== launchedGameId || phaseRef.current !== 'register' || startPressedRef.current) return false;
+      void handleRegistrationStartRef.current();
+      return true;
+    });
+  }, [launchedGameId]);
+
+  // Tell the Devices modals this screen waits on its registration Start.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    refineInGame(launchedGameId, { sub: phase === 'register' ? 'register' : undefined });
+  }, [launchedGameId, phase]);
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return () => clearInGameRefinement(launchedGameId);
+  }, [launchedGameId]);
 
   // Raw-data row ids for punches THIS device physically read. The 1s state poll
   // echoes every device's punches back to every device; this set lets

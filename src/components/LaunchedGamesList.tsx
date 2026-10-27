@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Trash2, Clock, CheckCircle, Trophy, Gamepad2, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, X, Database, Archive, Dices, Printer, Video, Bug, LayoutGrid, List } from 'lucide-react';
+import { Play, Trash2, Clock, CheckCircle, Trophy, Gamepad2, Minimize2, Maximize2, Monitor, StopCircle, Settings, FlaskConical, X, Database, Archive, Dices, Printer, Video, Bug, LayoutGrid, List, Loader2, PlayCircle } from 'lucide-react';
 import { GamePage } from './GamePage';
 import { GameTypeIcon } from './icons/GameTypeIcons';
 import { useCustomers } from './customers/useCustomers';
@@ -25,7 +25,12 @@ import {
   queueShowTeamSummaryBulk,
   getLaunchedGameDevices,
   broadcastConfigReload,
+  listPairedWithStatus,
+  queueStartGameBulk,
+  startRegistrationGame,
+  deviceSupports,
 } from '../services/launchedGames';
+import { sendRemote } from './RemoteCommandUi';
 import { loadLaunchedGameReports } from '../services/reportStats';
 import { printReports } from '../services/reportPrint';
 import { GameDevicesModal } from './GameDevicesModal';
@@ -162,6 +167,8 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
   const [rankingPageGame, setRankingPageGame] = useState<{ launchedGameId: number; gameName: string; config: GameConfig; autoScroll: boolean } | null>(null);
   const [playingGame, setPlayingGame] = useState<{ config: GameConfig; uniqid: string; launchedGameId: number } | null>(null);
   const [showDevices, setShowDevices] = useState<number | null>(null);
+  // Remote Start of a self-registered game in flight (its id).
+  const [startingGameId, setStartingGameId] = useState<number | null>(null);
   const [showVideo, setShowVideo] = useState<number | null>(null);
   const [printing, setPrinting] = useState(false);
   // Pre-print modal (paper size + orientation) - printing goes through it.
@@ -434,6 +441,7 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
         summary_uuid: g.summary_uuid,
         customer_id: g.customer_id ?? null,
         customer_name: g.customer_name ?? null,
+        awaiting_start: Boolean(g.awaiting_start),
       }));
       // Keep the same array when nothing changed (the grid re-polls this list).
       setGames((prev) => (JSON.stringify(prev) === JSON.stringify(normalized) ? prev : normalized));
@@ -515,6 +523,69 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
     } catch (error) {
       console.error('Error loading game data:', error);
     }
+  };
+
+  // The card's Start for a self-registered Quest / Clash still registering:
+  // press Start on every device showing its registration screen (each plays
+  // its launch videos, as when tapped there). When none answers, offer to start
+  // it from here without the videos.
+  const handleRemoteStart = async (game: LaunchedGame) => {
+    if (await blockedByLock(() => void handleRemoteStart(game))) return;
+    setStartingGameId(game.id);
+    let started = false;
+    try {
+      const buckets = await listPairedWithStatus(game.id);
+      const me = buckets.caller_device_id ?? null;
+      const registering = buckets.in_game.filter((r) => {
+        const st = r.screen_state;
+        return (
+          r.id !== me &&
+          r.online &&
+          st?.kind === 'in_game' &&
+          st.launchedGameId === game.id &&
+          st.sub === 'register' &&
+          deviceSupports(r.caps, 'start_game')
+        );
+      });
+      if (registering.length > 0) {
+        const res = await sendRemote(() => queueStartGameBulk(registering.map((r) => r.id), game.id));
+        started = [...res.values()].some((err) => err === null || err === 'already_started');
+      }
+    } catch (err) {
+      console.warn('[LaunchedGamesList] remote start failed:', err);
+    } finally {
+      setStartingGameId(null);
+    }
+    if (started) {
+      void loadGames();
+      return;
+    }
+    setConfirmDialog({
+      isOpen: true,
+      title: t('launched:startNoRegistrarTitle'),
+      message: t('launched:startNoRegistrarMessage'),
+      variant: 'info',
+      confirmText: t('launched:startGame'),
+      onConfirm: () => {
+        setConfirmDialog((prev) => ({ ...prev, isOpen: false }));
+        void (async () => {
+          try {
+            await startRegistrationGame(game.id);
+          } catch (err) {
+            console.error('[LaunchedGamesList] start without registration screen failed:', err);
+            setConfirmDialog({
+              isOpen: true,
+              title: t('launched:startGameFailed'),
+              message: (err as Error).message || '',
+              variant: 'warning',
+              onConfirm: () => setConfirmDialog((prev) => ({ ...prev, isOpen: false })),
+            });
+          } finally {
+            void loadGames();
+          }
+        })();
+      },
+    });
   };
 
   const handleEndGame = async (gameId: number) => {
@@ -1012,6 +1083,20 @@ export function LaunchedGamesList({ isAdminMode = false }: { isAdminMode?: boole
                 title={t('launched:playGame')}
               >
                 <Gamepad2 size={18} />
+              </button>
+            )}
+            {!game.ended && game.awaiting_start && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleRemoteStart(game);
+                }}
+                disabled={startingGameId === game.id}
+                className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg transition flex items-center gap-1.5 text-sm font-medium"
+                title={t('launched:startGameTitle')}
+              >
+                {startingGameId === game.id ? <Loader2 size={18} className="animate-spin" /> : <PlayCircle size={18} />}
+                {t('launched:startGame')}
               </button>
             )}
             <button

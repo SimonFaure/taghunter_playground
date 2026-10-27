@@ -22,7 +22,9 @@ import {
   recordCompletedQuest,
   deleteCompletedQuest,
   updateTeam,
+  broadcastConfigReload,
 } from '../services/launchedGames';
+import { emitPendingConfigReload } from '../services/pendingJoinStore';
 import { getClashMembers } from '../services/clash';
 import { wrongAnswerPoints } from '../services/mysteryScoring';
 import {
@@ -422,6 +424,13 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
   // Translated label for an enigma status (the ENIGMA_STATUS_META labels are
   // English fallbacks; the displayed text comes from the i18n catalogue).
   const enigmaStatusLabel = (status: EnigmaStatus): string => t(`teamDetails:enigmaStatus_${status}`);
+  // Save the game's meta (overrides, malus maps...) and have every device
+  // showing the game re-read its config, this one included.
+  const saveMeta = async (meta: Parameters<typeof updateLaunchedGameMeta>[1]) => {
+    await updateLaunchedGameMeta(launchedGameId, meta);
+    void broadcastConfigReload(launchedGameId);
+    emitPendingConfigReload(launchedGameId);
+  };
   // launched_games stores game_type capitalised ('Mystery'), while scenario rows
   // use the lowercase slug - compare case-insensitively so either value matches.
   const isMystery = (gameType ?? '').toLowerCase() === 'mystery';
@@ -561,7 +570,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
           delete ov[String(team.id)];
           overrideCleared = true;
         }
-        await updateLaunchedGameMeta(launchedGameId, {
+        await saveMeta({
           ...meta,
           late_malus: JSON.stringify(lm),
           late_malus_overrides: JSON.stringify(ov),
@@ -1004,7 +1013,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
       }
       if (Object.keys(nextOverrides).length === 0) delete all[String(team.id)];
       else all[String(team.id)] = nextOverrides;
-      await updateLaunchedGameMeta(launchedGameId, { ...meta, enigma_overrides: JSON.stringify(all) });
+      await saveMeta({ ...meta, enigma_overrides: JSON.stringify(all) });
 
       const score = recomputeMysteryScore(nextOverrides);
       await updateTeam(team.id, { score });
@@ -1036,7 +1045,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
       }
       if (value == null) delete all[String(team.id)];
       else all[String(team.id)] = value;
-      await updateLaunchedGameMeta(launchedGameId, { ...meta, late_malus_overrides: JSON.stringify(all) });
+      await saveMeta({ ...meta, late_malus_overrides: JSON.stringify(all) });
 
       const effective = value != null ? value : lateMalusAuto;
       const score = recomputeMysteryScore(enigmaOverrides, effective);
@@ -1070,7 +1079,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
       }
       if (value) all[String(team.id)] = true;
       else delete all[String(team.id)];
-      await updateLaunchedGameMeta(launchedGameId, { ...meta, stale_punches_allowed: JSON.stringify(all) });
+      await saveMeta({ ...meta, stale_punches_allowed: JSON.stringify(all) });
 
       if (currentTeam.end_time != null) {
         const codes = liveCodesForTeam(rawDataRecords, currentTeam.start_time, currentTeam.end_time, value).codes;
@@ -1190,7 +1199,7 @@ export function TeamDetailsModal({ team, launchedGameId, gameUniqid, gameType, c
       }
       if (Object.keys(next).length === 0) delete all[String(team.id)];
       else all[String(team.id)] = next;
-      await updateLaunchedGameMeta(launchedGameId, { ...meta, checkpoint_overrides: JSON.stringify(all) });
+      await saveMeta({ ...meta, checkpoint_overrides: JSON.stringify(all) });
       const score = recomputeTracksScore(next);
       await updateTeam(team.id, { score });
       setCurrentTeam((tm) => ({ ...tm, score }));

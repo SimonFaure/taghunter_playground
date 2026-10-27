@@ -1,0 +1,19 @@
+{
+  "title": "Raw Data",
+  "subtitle_one": "{{name}} · Game ID {{id}} · {{count}} record",
+  "subtitle_other": "{{name}} · Game ID {{id}} · {{count}} records",
+  "copyAllTitle": "Copy all raw data as JSON",
+  "copyAll": "Copy all",
+  "refresh": "Refresh",
+  "close": "Close",
+  "loading": "Loading raw data…",
+  "empty": "No raw data recorded for this game yet.",
+  "chip": "Chip {{id}}",
+  "punches_one": "{{count}} punch",
+  "punches_other": "{{count}} punches",
+  "end": "END {{code}}",
+  "deviceTitle": "Recording device",
+  "device": "dev {{id}}",
+  "copyRecordTitle": "Copy this record",
+  "copy": "Copy"
+}

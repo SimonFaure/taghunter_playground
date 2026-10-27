@@ -11,13 +11,19 @@
 // (latency up to one ping cycle, ~10s). Offline devices (section C) are
 // read-only with relative-time staleness.
 //
+// An in-game row also offers Start (its registration screen waits on the
+// operator: self-registered Quest / Clash), Reset display (a result waits to be
+// cleared: Mystery / Tracks) and Home (the device leaves the game page for its
+// logo screen, still registered). Every device can drive every other one,
+// the mother included; THIS device's own row runs the command locally.
+//
 // The modal polls list_paired_with_status every 2s while open; clicked launch
 // rows show a spinner that clears when the device crosses into bucket A on a
 // subsequent poll. A 30s timeout reverts the spinner with a retry hint.
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Monitor, X, Play, StopCircle, Loader2, Usb, Trophy, Gamepad2, Moon, RefreshCw, LogOut, Image as ImageIcon, Lock } from 'lucide-react';
+import { Monitor, X, Play, StopCircle, Loader2, Usb, Trophy, Gamepad2, Moon, RefreshCw, LogOut, Image as ImageIcon, Lock, Home, RotateCcw } from 'lucide-react';
 import {
   listPairedWithStatus,
   queueJoinGameCommandBulk,
@@ -28,9 +34,16 @@ import {
   getLaunchedGameMeta,
   mergeLaunchedGameMeta,
   broadcastConfigReload,
+  queueGoHomeBulk,
+  queueStartGameBulk,
+  queueResetDisplayBulk,
+  deviceSupports,
   type ListPairedWithStatusResp,
   type PairedDeviceStatusRow,
+  type QueueCommandBulkResp,
 } from '../services/launchedGames';
+import { runLocalCommand } from '../services/lanCommands';
+import { sendRemote, commandErrorText } from './RemoteCommandUi';
 import { emitPendingConfigReload } from '../services/pendingJoinStore';
 // Station-based registration assignments (Clash 'self' / TagQuest team mode):
 // while the game is still registering, the mother can re-pin each in-game
@@ -60,8 +73,8 @@ interface GameDevicesModalProps {
   // Used to render the language label on play_video commands. Empty string is
   // accepted; the satellite resolves to its default if absent.
   gameLanguage: string;
-  // Only the mother device renders the Launch/Play/Stop action surfaces. On a
-  // satellite this is false and the modal is purely read-only.
+  // Renders the action surfaces (Launch / Play / Stop / Start...). Every caller
+  // passes true: any paired device operates the mother's games.
   isMother: boolean;
   // Whether the scenario / game type advertise an intro / tutorial video.
   // If unknown, default both to true and let the server's per-target result
@@ -103,6 +116,8 @@ export function GameDevicesModal({
   // crossing-bucket signal to watch (the row leaves section A on the next poll
   // once the mother drops its registration), so clear optimistically.
   const [disconnecting, setDisconnecting] = useState<Set<number>>(new Set());
+  // Per-device Start / Reset display / Home in flight (until the device answered).
+  const [rowBusy, setRowBusy] = useState<Map<number, 'start' | 'reset' | 'home'>>(new Map());
   const [errorFor, setErrorFor] = useState<Map<number, string>>(new Map());
   const [selectedForVideo, setSelectedForVideo] = useState<Set<number>>(new Set());
   const [videoBusy, setVideoBusy] = useState<Set<number>>(new Set());
@@ -405,6 +420,44 @@ export function GameDevicesModal({
     }
   }
 
+  // Start / Reset display / Home on one in-game row. THIS device's row runs it
+  // here; any other (the mother's included) gets the command and answers.
+  async function onRowCommand(
+    row: PairedDeviceStatusRow,
+    action: 'start' | 'reset' | 'home',
+    kind: 'start_game' | 'reset_display' | 'go_home',
+    call: () => Promise<QueueCommandBulkResp>,
+  ) {
+    if (row.id === meId && action === 'home') return;
+    setRowBusy((m) => new Map(m).set(row.id, action));
+    setErrorFor((m) => {
+      if (!m.has(row.id)) return m;
+      const n = new Map(m);
+      n.delete(row.id);
+      return n;
+    });
+    let error: string | null = null;
+    try {
+      if (row.id === meId) {
+        const r = await runLocalCommand(kind, { launched_game_id: launchedGameId });
+        error = r.ok ? null : r.error;
+      } else {
+        error = (await sendRemote(call)).get(row.id) ?? null;
+      }
+    } catch (e) {
+      error = (e as Error).message || 'failed';
+    }
+    if (error) setErrorFor((m) => new Map(m).set(row.id, commandErrorText(t, error as string)));
+    window.setTimeout(() => {
+      setRowBusy((m) => {
+        if (!m.has(row.id)) return m;
+        const n = new Map(m);
+        n.delete(row.id);
+        return n;
+      });
+    }, 800);
+  }
+
   async function onPlayVideo(kinds: Array<'intro' | 'tutorial'>) {
     setPlayMenuOpen(false);
     const targets = Array.from(selectedForVideo);
@@ -625,11 +678,27 @@ export function GameDevicesModal({
                     canReconnect={isMother && row.id !== meId && !row.operator_only}
                     reconnecting={reconnecting.has(row.id)}
                     onReconnect={() => onReconnect(row.id)}
-                    // Never the mother (the server refuses a self-targeted
-                    // disconnect) nor this device (use the game page's Back).
-                    canDisconnect={isMother && !row.is_self && row.id !== meId}
+                    // Never this device (use the game page's Back). The mother
+                    // only when its build accepts a disconnect aimed at itself.
+                    canDisconnect={
+                      isMother &&
+                      row.id !== meId &&
+                      (!row.is_self || deviceSupports(buckets.mother_caps, 'self_disconnect'))
+                    }
                     disconnecting={disconnecting.has(row.id)}
                     onDisconnect={() => onDisconnect(row.id)}
+                    canHome={isMother && row.id !== meId}
+                    supports={(kind) => deviceSupports(row.caps, kind)}
+                    rowBusy={rowBusy.get(row.id) ?? null}
+                    onStart={() =>
+                      void onRowCommand(row, 'start', 'start_game', () => queueStartGameBulk([row.id], launchedGameId))
+                    }
+                    onResetDisplay={() =>
+                      void onRowCommand(row, 'reset', 'reset_display', () =>
+                        queueResetDisplayBulk([row.id], launchedGameId),
+                      )
+                    }
+                    onHome={() => void onRowCommand(row, 'home', 'go_home', () => queueGoHomeBulk([row.id]))}
                     busy={videoBusy.has(row.id)}
                     error={errorFor.get(row.id)}
                   />
@@ -786,6 +855,12 @@ function InGameRow({
   canDisconnect,
   disconnecting,
   onDisconnect,
+  canHome,
+  supports,
+  rowBusy,
+  onStart,
+  onResetDisplay,
+  onHome,
   busy,
   error,
 }: {
@@ -801,10 +876,27 @@ function InGameRow({
   canDisconnect: boolean;
   disconnecting: boolean;
   onDisconnect: () => void;
+  canHome: boolean;
+  supports: (kind: string) => boolean;
+  rowBusy: 'start' | 'reset' | 'home' | null;
+  onStart: () => void;
+  onResetDisplay: () => void;
+  onHome: () => void;
   busy: boolean;
   error: string | undefined;
 }) {
   const { t } = useTranslation();
+  const spinner = (
+    <span className="p-2 bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] rounded-[var(--pg-radius-md)] flex items-center">
+      <Loader2 size={16} className="animate-spin" />
+    </span>
+  );
+  const onThisGame = state?.kind === 'in_game' && state.launchedGameId === thisGameId;
+  const showStart = onThisGame && state?.kind === 'in_game' && state.sub === 'register';
+  const showReset = onThisGame && state?.kind === 'in_game' && state.sub === 'results';
+  const needsUpdate = t('devicesModal:needsUpdate');
+  const iconBtn =
+    'p-2 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] flex items-center';
   return (
     <div className="flex items-center gap-3 p-3 bg-[var(--pg-bg)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)]">
       {canSelect && (
@@ -821,6 +913,54 @@ function InGameRow({
       <ReaderBadge has={row.has_reader} />
       <OnlineBadge online={row.online} />
       {busy && <Loader2 size={16} className="animate-spin text-[var(--pg-accent-bright)]" />}
+      {showStart &&
+        (rowBusy === 'start' ? (
+          spinner
+        ) : (
+          <button
+            onClick={onStart}
+            disabled={!row.online || !supports('start_game')}
+            title={!supports('start_game') ? needsUpdate : t('devicesModal:startTitle')}
+            className="px-2.5 py-1.5 bg-green-600/15 hover:bg-green-600/25 disabled:opacity-40 text-green-400 border border-green-600/30 rounded-[var(--pg-radius-md)] text-sm flex items-center gap-1.5"
+          >
+            <Play size={14} />
+            {t('devicesModal:start')}
+          </button>
+        ))}
+      {showReset &&
+        (rowBusy === 'reset' ? (
+          spinner
+        ) : (
+          <button
+            onClick={onResetDisplay}
+            disabled={!row.online || !supports('reset_display')}
+            title={!supports('reset_display') ? needsUpdate : t('devicesModal:resetDisplayTitle')}
+            aria-label={t('devicesModal:resetDisplay')}
+            className={iconBtn}
+          >
+            <RotateCcw size={16} />
+          </button>
+        ))}
+      {canHome &&
+        (rowBusy === 'home' ? (
+          spinner
+        ) : (
+          <button
+            onClick={onHome}
+            disabled={!row.online || !supports('go_home')}
+            title={
+              !row.online
+                ? t('devicesModal:reconnectOfflineTitle')
+                : !supports('go_home')
+                  ? needsUpdate
+                  : t('devicesModal:homeTitle')
+            }
+            aria-label={t('devicesModal:home')}
+            className={iconBtn}
+          >
+            <Home size={16} />
+          </button>
+        ))}
       {canReconnect &&
         (reconnecting ? (
           <span className="p-2 bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] rounded-[var(--pg-radius-md)] flex items-center">
@@ -993,7 +1133,17 @@ function StatePill({
           : state.sub === 'reveal'
             ? t('devicesModal:stateSubReveal')
             : undefined;
-      if (state.boardHidden) {
+      const otherGame = state.launchedGameId != null && state.launchedGameId !== thisGameId;
+      if (!otherGame && state.sub === 'register') {
+        // Waiting on the operator's Start / reset: worth its own pill.
+        label = t('devicesModal:stateSubRegister');
+        cls = 'bg-blue-500/10 text-blue-400';
+        icon = <Gamepad2 size={12} />;
+      } else if (!otherGame && state.sub === 'results') {
+        label = t('devicesModal:stateSubResults');
+        cls = 'bg-amber-500/10 text-amber-400';
+        icon = <Trophy size={12} />;
+      } else if (state.boardHidden) {
         label = t('devicesModal:stateInGameIdleScreen');
         cls = 'bg-green-500/5 text-green-300';
         icon = <Moon size={12} />;

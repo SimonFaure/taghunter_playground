@@ -71,5 +71,14 @@
   "stateSubInstructions": "Muestra las instrucciones",
   "stateSubReveal": "Muestra los resultados",
   "regAssignLabel": "Registra:",
-  "regAssignAllTeams": "todos los equipos"
+  "regAssignAllTeams": "todos los equipos",
+  "needsUpdate": "Actualice la aplicación en este dispositivo para esta acción",
+  "start": "Iniciar",
+  "startTitle": "Iniciar la partida desde la pantalla de inscripción de este dispositivo",
+  "resetDisplay": "Reiniciar pantalla",
+  "resetDisplayTitle": "Borrar el resultado mostrado en este dispositivo para el equipo siguiente",
+  "home": "Inicio",
+  "homeTitle": "Cerrar la página de juego en este dispositivo y mostrar su pantalla de logo (sigue en la partida: «Reconectar» lo devuelve)",
+  "stateSubRegister": "Inscripciones",
+  "stateSubResults": "Resultado mostrado"
 }

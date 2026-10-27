@@ -61,7 +61,8 @@
     "retryNow": "Retry now",
     "lockTitle": "Reconnect to continue",
     "lockBody": "This device hasn't reached the server in {{ageDays}} days, exceeding your {{graceDays}}-day offline allowance. Connect to the internet to resume.",
-    "retryConnection": "Retry connection"
+    "retryConnection": "Retry connection",
+    "lockLanSearch": "Looking for an up-to-date device on the local network… This device unlocks by itself if it finds one that reached the server recently."
   },
   "capReached": {
     "title": "Device limit reached",

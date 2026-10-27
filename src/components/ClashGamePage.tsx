@@ -20,7 +20,8 @@ import { scenarioAssetUrl } from '../services/contentFs';
 import { recordPunch, startLaunchedGame, endLaunchedGame, getLaunchedGameState, getLaunchedGameMeta } from '../services/launchedGames';
 import { useGameStatePolling } from '../hooks/useGameStatePolling';
 import { clashValidate, clashRegister, getClashState, type ClashStandings } from '../services/clash';
-import { onPendingConfigReload } from '../services/pendingJoinStore';
+import { onPendingConfigReload, onPendingStart } from '../services/pendingJoinStore';
+import { refineInGame, clearInGameRefinement } from '../services/screenState';
 import { tIngame } from '../i18n/ingame';
 // Station-based registration assignment: this device may be hard-locked to
 // specific clan(s) during self-registration (meta.regAssignments, keyed by
@@ -589,7 +590,9 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
 
   // Messages serialise through the shared queue (label = null: Clash messages
   // aren't team chips - the combo reveal already carries the clan chip).
-  const showMessage = useCallback((text: string, type: GameMessageType = 'info', label: string | null = null) => {
+  // `minSeconds` keeps an important line up even when the operator set a very
+  // short message duration (purge refusals: 2 s was missed in the field).
+  const showMessage = useCallback((text: string, type: GameMessageType = 'info', label: string | null = null, minSeconds = 0) => {
     void queue.enqueue(label, () => new Promise<void>((resolve) => {
       setMessage(text);
       setMessageType(type);
@@ -598,7 +601,7 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         setMessage('');
         msgTimerRef.current = null;
         resolve();
-      }, (config.messageDisplayDuration || 5) * 1000);
+      }, Math.max(config.messageDisplayDuration || 5, minSeconds) * 1000);
     }));
   }, [config.messageDisplayDuration, queue.enqueue]);
 
@@ -612,7 +615,9 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
       const teamId = selectedTeamIdRef.current;
       if (teamId == null) return;
       try {
-        const res = await clashRegister(launchedGameId, teamId, card.id);
+        // The card's current punches go along: the mother ignores them in the
+        // match (leftovers from an earlier game, e.g. a station-25 punch).
+        const res = await clashRegister(launchedGameId, teamId, card.id, card.punches ?? []);
         setLastJoin({ teamId, status: res.status });
         // Reflect the server's authoritative count immediately (the 1s poll
         // would lag one bip behind), then hop the station's selection to the
@@ -651,11 +656,12 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
         return;
       }
       if (res.status !== 'ok') return;
-      // The Purge - this read carried a purge-station punch. Success flashes
-      // the game-wide announcement immediately on this station (other devices
-      // pick it up from the poll ≤1s later); rejections queue a local message.
-      // Either way the physical punch was consumed (re-punch to retry).
-      if (res.purge?.attempted) {
+      // The Purge - this read carried an unspent purge-station punch. Success
+      // flashes the game-wide announcement immediately on this station (other
+      // devices pick it up from the poll ≤1s later). A "no target" / "own
+      // territory" refusal leaves the punch pending (retried on every later
+      // read), so it is announced once, held ≥5 s, then the station stays quiet.
+      if (res.purge?.attempted && !(res.purge.status !== 'ok' && res.purge.repeat)) {
         if (res.purge.status === 'ok' && res.purge.territory_index != null) {
           // Mark the server-authored purge event(s) as seen so the standings
           // effect doesn't double-fire the announcement on the next poll.
@@ -666,17 +672,18 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
             );
           firePurgeAnnouncement(res.team_id ?? null, res.purge.territory_index);
         } else if (res.purge.status === 'already_used') {
-          showMessage(purgeTexts.alreadyUsed || tc('msg_purge_already_used'), 'warning');
+          showMessage(purgeTexts.alreadyUsed || tc('msg_purge_already_used'), 'warning', null, 5);
         } else if (res.purge.status === 'own_territory') {
-          showMessage(purgeTexts.ownTerritory || tc('msg_purge_own_territory'), 'warning');
+          showMessage(purgeTexts.ownTerritory || tc('msg_purge_own_territory'), 'warning', null, 5);
         } else if (res.purge.status === 'no_target') {
-          showMessage(purgeTexts.noTarget || tc('msg_purge_no_target'), 'info');
+          showMessage(purgeTexts.noTarget || tc('msg_purge_no_target'), 'warning', null, 5);
         }
       }
       if (res.credited.length === 0) {
         // A purge attempt already produced its own feedback - skip the
-        // "keep going" filler in that case.
-        if (!res.purge?.attempted) {
+        // "keep going" filler in that case. A quiet repeat of a pending purge
+        // punch did not, so the normal line applies.
+        if (!res.purge?.attempted || (res.purge.status !== 'ok' && res.purge.repeat)) {
           // Name the territory the read got closest to ("Hélico incomplet")
           // rather than a generic line - the operator sees WHICH lot is short.
           // No partial at all ⇒ every punch on the badge was already spent on
@@ -796,6 +803,30 @@ export function ClashGamePage({ config, gameUniqid, launchedGameId, onBack }: Cl
     } finally {
       setPhase('playing');
     }
+  }, [launchedGameId]);
+
+  // The operator's remote Start (Devices modal / game card): same as the
+  // registration screen's Start button.
+  const handleStartRef = useRef(handleStart);
+  handleStartRef.current = handleStart;
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingStart((gid) => {
+      if (gid !== launchedGameId || phaseRef.current !== 'register') return false;
+      phaseRef.current = 'playing';
+      void handleStartRef.current();
+      return true;
+    });
+  }, [launchedGameId]);
+
+  // Tell the Devices modals this screen waits on its registration Start.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    refineInGame(launchedGameId, { sub: phase === 'register' ? 'register' : undefined });
+  }, [launchedGameId, phase]);
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return () => clearInGameRefinement(launchedGameId);
   }, [launchedGameId]);
 
   const fontFamily = meta?.font;

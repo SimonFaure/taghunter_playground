@@ -5,7 +5,6 @@ import {
   Loader2,
   Mail,
   User as UserIcon,
-  Award,
   CheckCircle2,
   AlertTriangle,
   WifiOff,
@@ -61,11 +60,6 @@ export function AccountScreen() {
         <Row icon={<Mail className="w-4 h-4 text-[var(--pg-text-dim)]" />} label={t('accountSettings:email')}>
           <span className="text-[var(--pg-text)]">{user.email}</span>
         </Row>
-        <Row icon={<Award className="w-4 h-4 text-[var(--pg-text-dim)]" />} label={t('accountSettings:license')}>
-          <span className="pg-badge pg-badge--accent capitalize">
-            {user.license_type || t('accountSettings:unknown')}
-          </span>
-        </Row>
         <Row
           icon={
             user.billing_up_to_date ? (
@@ -97,6 +91,9 @@ export function AccountScreen() {
             )}
           </span>
         </Row>
+        <p className="text-xs text-[var(--pg-text-dim)] text-right -mt-2">
+          {t('accountSettings:offlineAccessLanHint')}
+        </p>
       </div>
 
       <div className="flex flex-col items-end gap-2">

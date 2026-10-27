@@ -16,6 +16,7 @@ import {
 } from '../services/launchedGames';
 import type { SimClockState } from '../services/gameClock';
 import { getActiveLaunchedGameId } from '../services/activeGameStore';
+import { registerLanCommandHandler } from '../services/lanCommands';
 import { clearSimBus, simBusEmit } from '../services/simBus';
 import { fromMotherClock, motherNow, refreshMotherOffset, toMotherClock } from '../services/motherTime';
 import { parseRegAssignments, REG_ASSIGNMENTS_META_KEY, type RegAssignmentMap } from '../services/regAssignments';
@@ -808,18 +809,17 @@ export function installSimulatorHost() {
   void refreshMotherOffset();
   installAutoStart();
   void listen<SimCommand>(EVT_SIM_CMD, (e) => void handle(e.payload));
-  void listen<{ kind: string; payload: Record<string, unknown> }>('taghunter://lan-command', (e) => {
-    if (e.payload.kind !== 'sim_control') return;
-    const p = e.payload.payload as {
+  registerLanCommandHandler('sim_control', (cmd) => {
+    const p = (cmd.payload ?? {}) as {
       launched_game_id?: number;
       device_id?: number;
       sent_at?: number;
       cmd?: SimCommand;
     };
-    if (!p.cmd || typeof p.launched_game_id !== 'number') return;
+    if (!p.cmd || typeof p.launched_game_id !== 'number') return { ok: false, error: 'bad_payload' };
     if (typeof p.sent_at === 'number' && motherNow() - p.sent_at > REMOTE_CMD_MAX_AGE_MS) {
       console.warn('[sim] dropped a stale remote command', p.cmd.kind);
-      return;
+      return { ok: false, error: 'stale' };
     }
     if (typeof p.device_id === 'number') mirror = { gid: p.launched_game_id, deviceId: p.device_id };
     void handle(p.cmd);

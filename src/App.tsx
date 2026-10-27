@@ -32,7 +32,18 @@ import { decodeRankingTarget, type RankingTarget } from './services/rankingTarge
 import { decodeTeamSummarySnapshot, type TeamSummarySnapshot } from './services/teamSummaryTarget';
 import { TeamSummaryOverlay } from './components/TeamSummaryOverlay';
 import { listen } from '@tauri-apps/api/event';
-import { emitPendingJoin, emitPendingLeave, emitPendingConfigReload, emitPendingRejoin, type PendingJoinRoute } from './services/pendingJoinStore';
+import {
+  emitPendingJoin,
+  emitPendingLeave,
+  emitPendingConfigReload,
+  emitPendingRejoin,
+  emitPendingStart,
+  emitPendingResetDisplay,
+  type PendingJoinRoute,
+} from './services/pendingJoinStore';
+import { registerLanCommandHandler, type CommandResult, type LanCommand } from './services/lanCommands';
+import { installRemoteDeviceCommands } from './services/remoteDeviceCommands';
+import { emitLocalStopVideo } from './services/localVideoStore';
 import { pointLaunchedGamesAtMother, msSincePromotion } from './services/lanMotherBoot';
 import { refreshLaunchedGamesRoute, installLanReauth, onLaunchedGamesRouteChange } from './services/childControlLink';
 import { ensureFirewallRuleOnce } from './services/firewall';
@@ -157,12 +168,13 @@ function App() {
   // from THAT game puts it back exactly there. null = it was on the normal app.
   const preJoinScreenRef = useRef<{ gameId: number; logo: boolean; locked: boolean } | null>(null);
 
-  // Listen for mother-issued LAN commands relayed by `client_ping_mother`.
-  // join_game and open_ranking land here at the App level because they control
-  // navigation; play_video / stop_video are handled by <OperatorVideoOverlay>.
+  // The mother's pushed commands that control navigation and what this screen
+  // shows (services/lanCommands dispatches; play_video / stop_video live in
+  // <OperatorVideoOverlay>, sync / update in services/deviceUpkeep, mute /
+  // reader / restart in services/remoteDeviceCommands). Each handler answers
+  // what happened; that answer is acked to the operator who sent it.
   useEffect(() => {
     let cancelled = false;
-    let unlistenFn: (() => void) | null = null;
     // The mother hosts launched games in ITS SQLite. Repoint our
     // `launched_games` traffic at the mother before any leaderboard/state
     // query, otherwise we hit our own empty local server.
@@ -186,169 +198,197 @@ function App() {
       }
       return undefined;
     };
-    void (async () => {
-      const unlisten = await listen<{
-        id: number;
-        kind:
-          | 'join_game'
-          | 'play_video'
-          | 'stop_video'
-          | 'open_ranking'
-          | 'show_team_summary'
-          | 'disconnect_device'
-          | 'become_mother'
-          | 'reload_config'
-          | 'lock_device'
-          | 'show_logo'
-          // Handled by services/deviceUpkeep.
-          | 'sync_content'
-          | 'update_app';
-        payload: Record<string, unknown> & { launched_game_id?: number };
-        mother_uuid?: string;
-        mother_addr?: string;
-        // Set when OUR OWN server dispatched the command in-process (a child
-        // targeted this device while it hosts the game) - there's no remote
-        // mother to repoint at.
-        local?: boolean;
-      }>('taghunter://lan-command', (event) => {
-        if (cancelled) return;
-        const cmd = event.payload;
-        if (cmd.kind === 'join_game') {
-          const gid = cmd.payload.launched_game_id;
-          if (typeof gid !== 'number') return;
-          void (async () => {
-            // An operator-only device never plays: ignore a push from an older
-            // mother that doesn't know this device is operator-only yet.
-            if (await isOperatorOnly()) {
-              console.warn('[App] join_game ignored: this device is operator-only');
-              return;
-            }
-            // Self-targeted join (a child launched the game onto this mother):
-            // the game lives in our own db, so enter it via our local server.
-            let joinRoute: PendingJoinRoute | undefined;
-            if (cmd.local) {
-              const local = getLocalLaunchedGamesRoute();
-              if (local) {
-                joinRoute = { baseUrl: local.baseUrl, token: local.token };
-                pointLaunchedGamesAtMother(joinRoute.baseUrl, joinRoute.token);
-              }
-            } else {
-              joinRoute = await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
-            }
-            if (cancelled) return;
-            // Remember a logo / lock screen this push pulls the device off, for
-            // disconnect_device to restore. A rejoin into the game it's already
-            // in keeps the screen recorded by the original join.
-            const wasLogo = logoPhaseRef.current === 'show';
-            const wasLocked = authRef.current.locked;
-            if (wasLogo || wasLocked) {
-              preJoinScreenRef.current = { gameId: gid, logo: wasLogo, locked: wasLocked };
-            } else if (preJoinScreenRef.current?.gameId !== gid) {
-              preJoinScreenRef.current = null;
-            }
-            // The operator chose to pull this device into a game: lift the PIN
-            // lock so the game page is actually visible (it re-locks if the
-            // device is removed from the game - see disconnect_device).
-            if (wasLocked) authRef.current.unlock();
-            // Dismiss any pushed overlay first - they render on top of the page
-            // tree, so leaving one up would hide the game page we're about to
-            // enter (the device would just sit on the ranking/summary).
-            setPushedRanking(null);
-            setPushedTeamSummary(null);
-            // A device parked on the idle logo screen renders nothing else -
-            // the join would stay buffered until someone dismissed the logo by
-            // hand. The operator selected this device, so pull it off the logo
-            // (disconnect_device sends it back there once the game is over).
-            setLogoPhase((p) => (p === 'show' ? 'done' : p));
-            setCurrentPage('launched');
-            emitPendingJoin(gid, joinRoute);
-            // If a GamePage for this game is already mounted but showing its
-            // own leaderboard / rankings overlay (a device the operator sent to
-            // rankings), emitPendingJoin just re-renders it in place and leaves
-            // that overlay up. Tell it to drop back to the game view.
-            emitPendingRejoin(gid);
-          })();
-        } else if (cmd.kind === 'open_ranking') {
-          const target = decodeRankingTarget(cmd.payload);
-          if (!target) return;
-          void (async () => {
-            await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
-            if (cancelled) return;
-            // The pushed overlay renders inside the main tree, which the idle
-            // logo screen's early return bypasses entirely - dismiss it.
-            setLogoPhase((p) => (p === 'show' ? 'done' : p));
-            setPushedRanking(target);
-          })();
-        } else if (cmd.kind === 'show_team_summary') {
-          // Self-contained snapshot (images resolve from this device's own
-          // synced scenario) - no mother-repoint needed.
-          const snapshot = decodeTeamSummarySnapshot(cmd.payload);
-          if (!snapshot) return;
-          // Same as open_ranking: the overlay is invisible behind the idle
-          // logo screen's early return.
-          setLogoPhase((p) => (p === 'show' ? 'done' : p));
-          setPushedTeamSummary(snapshot);
-        } else if (cmd.kind === 'disconnect_device') {
-          // The mother removed this device from the game. Drop any pushed
-          // overlay, leave the in-game page (back to the launched-games list),
-          // then put it back on the screen the join pulled it off (logo and/or
-          // PIN lock); failing that, on the logo screen if this device shows
-          // one at app start.
-          setPushedRanking(null);
-          setPushedTeamSummary(null);
-          emitPendingLeave();
-          setCurrentPage('launched');
-          const recorded = preJoinScreenRef.current;
-          const before =
-            recorded && recorded.gameId === cmd.payload.launched_game_id ? recorded : null;
-          preJoinScreenRef.current = null;
-          if (before?.locked) authRef.current.lock();
-          void (async () => {
-            try {
-              const cfg = await loadConfig();
-              if (cancelled || !(before?.logo || cfg.logoScreenOnLaunch)) return;
-              setLogoCfg({
-                bg: cfg.logoScreenBgColor ?? '#000000',
-                file: cfg.logoScreenLogoFile ?? null,
-                animation: cfg.logoScreenAnimation ?? 'pulse',
-                glowColor: cfg.logoScreenGlowColor ?? '#FFFFFF',
-                requirePin: Boolean(cfg.requirePinToExitLogo),
-              });
-              setLogoPhase('show');
-            } catch {
-              /* leave on the launched-games list if config can't be read */
-            }
-          })();
-        } else if (cmd.kind === 'lock_device') {
-          // Another device locked this one from its Devices modal: same PIN
-          // overlay as the nav-bar Lock button (the app keeps running beneath).
-          authRef.current.lock();
-        } else if (cmd.kind === 'show_logo') {
-          // Same as the nav-bar Logo button. Drop pushed overlays so they don't
-          // resurface once the logo is tapped away.
-          setPushedRanking(null);
-          setPushedTeamSummary(null);
-          void showLogoScreen();
-        } else if (cmd.kind === 'reload_config') {
-          // The mother (or another device) edited this game's config. Tell a
-          // mounted GamePage to re-derive its config from the freshly-saved
-          // meta so the edit applies live. Repoint at the mother first so the
-          // GamePage's getLaunchedGameMeta reads the mother's DB, not ours.
-          const gid = cmd.payload.launched_game_id;
-          if (typeof gid !== 'number') return;
-          void (async () => {
-            await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
-            if (cancelled) return;
-            emitPendingConfigReload(gid);
-          })();
+    const gameIdOf = (cmd: LanCommand): number | null => {
+      const gid = cmd.payload.launched_game_id;
+      return typeof gid === 'number' ? gid : null;
+    };
+    const badPayload: CommandResult = { ok: false, error: 'bad_payload' };
+    // Close every pushed overlay and leave the game page (the device stays
+    // registered in the game: "Back to the game" brings it back).
+    const clearScreen = () => {
+      setPushedRanking(null);
+      setPushedTeamSummary(null);
+      emitLocalStopVideo();
+      emitPendingLeave();
+      setCurrentPage('launched');
+    };
+
+    const offs = [
+      registerLanCommandHandler('join_game', async (cmd: LanCommand): Promise<CommandResult> => {
+        const gid = gameIdOf(cmd);
+        if (gid === null) return badPayload;
+        // An operator-only device never plays: ignore a push from an older
+        // mother that doesn't know this device is operator-only yet.
+        if (await isOperatorOnly()) {
+          console.warn('[App] join_game ignored: this device is operator-only');
+          return { ok: false, error: 'operator_only' };
         }
-      });
-      if (cancelled) unlisten();
-      else unlistenFn = unlisten;
-    })();
+        // Self-targeted join (a child launched the game onto this mother):
+        // the game lives in our own db, so enter it via our local server.
+        let joinRoute: PendingJoinRoute | undefined;
+        if (cmd.local) {
+          const local = getLocalLaunchedGamesRoute();
+          if (local) {
+            joinRoute = { baseUrl: local.baseUrl, token: local.token };
+            pointLaunchedGamesAtMother(joinRoute.baseUrl, joinRoute.token);
+          }
+        } else {
+          joinRoute = await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+        }
+        if (cancelled) return { ok: false, error: 'unmounted' };
+        // Remember a logo / lock screen this push pulls the device off, for
+        // disconnect_device to restore. A rejoin into the game it's already
+        // in keeps the screen recorded by the original join.
+        const wasLogo = logoPhaseRef.current === 'show';
+        const wasLocked = authRef.current.locked;
+        if (wasLogo || wasLocked) {
+          preJoinScreenRef.current = { gameId: gid, logo: wasLogo, locked: wasLocked };
+        } else if (preJoinScreenRef.current?.gameId !== gid) {
+          preJoinScreenRef.current = null;
+        }
+        // The operator chose to pull this device into a game: lift the PIN
+        // lock so the game page is actually visible (it re-locks if the
+        // device is removed from the game - see disconnect_device).
+        if (wasLocked) authRef.current.unlock();
+        // Dismiss any pushed overlay first - they render on top of the page
+        // tree, so leaving one up would hide the game page we're about to
+        // enter (the device would just sit on the ranking/summary).
+        setPushedRanking(null);
+        setPushedTeamSummary(null);
+        // A device parked on the idle logo screen renders nothing else -
+        // the join would stay buffered until someone dismissed the logo by
+        // hand. The operator selected this device, so pull it off the logo
+        // (disconnect_device sends it back there once the game is over).
+        setLogoPhase((p) => (p === 'show' ? 'done' : p));
+        setCurrentPage('launched');
+        emitPendingJoin(gid, joinRoute);
+        // If a GamePage for this game is already mounted but showing its
+        // own leaderboard / rankings overlay (a device the operator sent to
+        // rankings), emitPendingJoin just re-renders it in place and leaves
+        // that overlay up. Tell it to drop back to the game view.
+        emitPendingRejoin(gid);
+        return { ok: true };
+      }),
+      registerLanCommandHandler('open_ranking', async (cmd: LanCommand): Promise<CommandResult> => {
+        const target = decodeRankingTarget(cmd.payload);
+        if (!target) return badPayload;
+        await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+        if (cancelled) return { ok: false, error: 'unmounted' };
+        // The pushed overlay renders inside the main tree, which the idle
+        // logo screen's early return bypasses entirely - dismiss it.
+        setLogoPhase((p) => (p === 'show' ? 'done' : p));
+        setPushedRanking(target);
+        return { ok: true };
+      }),
+      registerLanCommandHandler('show_team_summary', (cmd: LanCommand): CommandResult => {
+        // Self-contained snapshot (images resolve from this device's own
+        // synced scenario) - no mother-repoint needed.
+        const snapshot = decodeTeamSummarySnapshot(cmd.payload);
+        if (!snapshot) return badPayload;
+        // Same as open_ranking: the overlay is invisible behind the idle
+        // logo screen's early return.
+        setLogoPhase((p) => (p === 'show' ? 'done' : p));
+        setPushedTeamSummary(snapshot);
+        return { ok: true };
+      }),
+      registerLanCommandHandler('disconnect_device', async (cmd: LanCommand): Promise<CommandResult> => {
+        // The mother removed this device from the game (or the game itself
+        // was deleted / archived: `reason`). Drop any pushed overlay, leave
+        // the in-game page (back to the launched-games list), then put it back
+        // on the screen the join pulled it off (logo and/or PIN lock); failing
+        // that, on the logo screen if this device shows one at app start. A
+        // game that went away always ends on the logo screen.
+        const gameGone = String(cmd.payload.reason ?? '').startsWith('game_');
+        setPushedRanking(null);
+        setPushedTeamSummary(null);
+        emitPendingLeave();
+        setCurrentPage('launched');
+        const recorded = preJoinScreenRef.current;
+        const before =
+          recorded && recorded.gameId === cmd.payload.launched_game_id ? recorded : null;
+        preJoinScreenRef.current = null;
+        if (before?.locked) authRef.current.lock();
+        try {
+          const cfg = await loadConfig();
+          if (cancelled || !(gameGone || before?.logo || cfg.logoScreenOnLaunch)) return { ok: true };
+          setLogoCfg({
+            bg: cfg.logoScreenBgColor ?? '#000000',
+            file: cfg.logoScreenLogoFile ?? null,
+            animation: cfg.logoScreenAnimation ?? 'pulse',
+            glowColor: cfg.logoScreenGlowColor ?? '#FFFFFF',
+            requirePin: Boolean(cfg.requirePinToExitLogo),
+          });
+          setLogoPhase('show');
+        } catch {
+          /* leave on the launched-games list if config can't be read */
+        }
+        return { ok: true };
+      }),
+      registerLanCommandHandler('lock_device', (): CommandResult => {
+        // Another device locked this one from its Devices modal: same PIN
+        // overlay as the nav-bar Lock button (the app keeps running beneath).
+        authRef.current.lock();
+        return { ok: true };
+      }),
+      registerLanCommandHandler('unlock_device', (): CommandResult => {
+        // The Devices modal's Lock toggle, back off: the operator waives the
+        // PIN (as a remote join_game already does).
+        authRef.current.unlock();
+        return { ok: true };
+      }),
+      registerLanCommandHandler('hide_logo', (): CommandResult => {
+        // The Devices modal's Logo toggle, back off: as if tapped away (the
+        // logo's own exit PIN is the operator's to waive).
+        setLogoPhase((p) => (p === 'show' ? 'done' : p));
+        return { ok: true };
+      }),
+      registerLanCommandHandler('show_logo', async (): Promise<CommandResult> => {
+        // Same as the nav-bar Logo button. Drop pushed overlays so they don't
+        // resurface once the logo is tapped away.
+        setPushedRanking(null);
+        setPushedTeamSummary(null);
+        await showLogoScreen();
+        return { ok: true };
+      }),
+      registerLanCommandHandler('go_home', async (): Promise<CommandResult> => {
+        // The operator's "Home": everything this screen shows goes away - the
+        // pushed overlays, an operator video, the game page (the exit PIN is
+        // the operator's to waive) - and the idle logo screen comes up. The
+        // PIN lock, when on, stays on.
+        clearScreen();
+        await showLogoScreen();
+        return { ok: true };
+      }),
+      registerLanCommandHandler('start_game', (cmd: LanCommand): CommandResult => {
+        // Press Start on this device's registration screen (self-registered
+        // Quest / Clash), as if the operator had tapped it here.
+        const gid = gameIdOf(cmd);
+        if (gid === null) return badPayload;
+        return emitPendingStart(gid) ? { ok: true } : { ok: false, error: 'not_registering' };
+      }),
+      registerLanCommandHandler('reset_display', (cmd: LanCommand): CommandResult => {
+        // Clear a results screen waiting for the operator (Mystery summary,
+        // Tracks result waiting for Enter).
+        const gid = gameIdOf(cmd);
+        if (gid === null) return badPayload;
+        return emitPendingResetDisplay(gid) ? { ok: true } : { ok: false, error: 'nothing_to_reset' };
+      }),
+      registerLanCommandHandler('reload_config', async (cmd: LanCommand): Promise<CommandResult> => {
+        // The mother (or another device) edited this game's config. Tell a
+        // mounted GamePage to re-derive its config from the freshly-saved
+        // meta so the edit applies live. Repoint at the mother first so the
+        // GamePage's getLaunchedGameMeta reads the mother's DB, not ours.
+        const gid = gameIdOf(cmd);
+        if (gid === null) return badPayload;
+        await repointAtMother(cmd.mother_uuid, cmd.mother_addr);
+        if (cancelled) return { ok: false, error: 'unmounted' };
+        emitPendingConfigReload(gid);
+        return { ok: true };
+      }),
+    ];
     return () => {
       cancelled = true;
-      if (unlistenFn) unlistenFn();
+      for (const off of offs) off();
     };
   }, []);
 
@@ -593,6 +633,7 @@ function App() {
   // Devices modal upkeep: report this device's update / sync state to the
   // mother, and run the "Update" / "Sync" commands sent from another device.
   useEffect(() => installDeviceUpkeep(), []);
+  useEffect(() => installRemoteDeviceCommands(), []);
 
   // Who hosts the games (services/hostingRole.ts). One pass at boot, then a
   // tick: the device set as the mother starts serving by itself; a substitute

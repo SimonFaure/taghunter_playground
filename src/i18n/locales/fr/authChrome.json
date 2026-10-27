@@ -61,7 +61,8 @@
     "retryNow": "Réessayer maintenant",
     "lockTitle": "Reconnectez-vous pour continuer",
     "lockBody": "Cet appareil n’a pas contacté le serveur depuis {{ageDays}} jours, dépassant votre autorisation d’accès hors ligne de {{graceDays}} jours. Connectez-vous à Internet pour reprendre.",
-    "retryConnection": "Réessayer la connexion"
+    "retryConnection": "Réessayer la connexion",
+    "lockLanSearch": "Recherche d’un appareil à jour sur le réseau local… Cet appareil se débloque tout seul s’il en trouve un qui s’est connecté au serveur récemment."
   },
   "capReached": {
     "title": "Limite d’appareils atteinte",

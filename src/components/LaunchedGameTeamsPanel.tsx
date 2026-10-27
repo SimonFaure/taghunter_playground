@@ -67,6 +67,9 @@ export interface LaunchedGame {
   /** Licensee customer (project_licensee_customers). */
   customer_id?: string | null;
   customer_name?: string | null;
+  /** Self-registered Quest / Clash still on its registration screen: the card
+   *  offers a remote Start. */
+  awaiting_start?: boolean;
 }
 
 export interface LaunchedTeam {

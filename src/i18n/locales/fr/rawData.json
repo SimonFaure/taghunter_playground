@@ -1,0 +1,19 @@
+{
+  "title": "Données brutes",
+  "subtitle_one": "{{name}} · Partie n° {{id}} · {{count}} enregistrement",
+  "subtitle_other": "{{name}} · Partie n° {{id}} · {{count}} enregistrements",
+  "copyAllTitle": "Copier toutes les données brutes en JSON",
+  "copyAll": "Tout copier",
+  "refresh": "Actualiser",
+  "close": "Fermer",
+  "loading": "Chargement des données brutes…",
+  "empty": "Aucune donnée brute enregistrée pour cette partie pour l'instant.",
+  "chip": "Puce {{id}}",
+  "punches_one": "{{count}} pointage",
+  "punches_other": "{{count}} pointages",
+  "end": "FIN {{code}}",
+  "deviceTitle": "Appareil qui a enregistré",
+  "device": "app. {{id}}",
+  "copyRecordTitle": "Copier cet enregistrement",
+  "copy": "Copier"
+}

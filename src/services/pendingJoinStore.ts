@@ -135,3 +135,49 @@ export function emitPendingConfigReload(launchedGameId: number): void {
     }
   }
 }
+
+// Operator-action channels for the `start_game` / `reset_display` pushes: press
+// Start on a mounted registration screen (self-registered Quest / Clash), or
+// clear a mounted results screen (Mystery summary, Tracks result waiting for
+// Enter). A listener returns true when it acted, so the command can report
+// "nothing to do here" instead of a silent success. No buffering: both only
+// matter while the page is mounted.
+type GameActionListener = (launchedGameId: number) => boolean;
+
+function makeGameActionChannel(name: string) {
+  const ls = new Set<GameActionListener>();
+  return {
+    on(l: GameActionListener): () => void {
+      ls.add(l);
+      return () => {
+        ls.delete(l);
+      };
+    },
+    emit(launchedGameId: number): boolean {
+      let acted = false;
+      for (const l of ls) {
+        try {
+          if (l(launchedGameId)) acted = true;
+        } catch (err) {
+          console.error(`[pendingJoinStore] ${name} listener threw:`, err);
+        }
+      }
+      return acted;
+    },
+  };
+}
+
+const startChannel = makeGameActionChannel('start');
+const resetDisplayChannel = makeGameActionChannel('reset-display');
+
+export const onPendingStart = startChannel.on;
+export const emitPendingStart = startChannel.emit;
+export const onPendingResetDisplay = resetDisplayChannel.on;
+export const emitPendingResetDisplay = resetDisplayChannel.emit;
+
+// The game a mounted page polls is gone from the mother (deleted / archived and
+// the push that should have said so was missed): useGameStatePolling reports
+// it, the mounted GamePage leaves.
+const gameGoneChannel = makeGameActionChannel('game-gone');
+export const onGameGone = gameGoneChannel.on;
+export const emitGameGone = gameGoneChannel.emit;

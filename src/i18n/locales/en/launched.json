@@ -194,5 +194,10 @@
   "chipsInClan": "Chips in this clan",
   "slowLoadTitle": "Mother unreachable",
   "slowLoadHint": "The games list comes from the mother, which isn't answering right now. If a takeover is in progress, wait: this device reconnects on its own.",
-  "slowLoadRetry": "Retry"
+  "slowLoadRetry": "Retry",
+  "startGame": "Start",
+  "startGameTitle": "Start the game on the devices showing the registration screen",
+  "startNoRegistrarTitle": "No registration screen answers",
+  "startNoRegistrarMessage": "No device is showing this game's registration screen. Start it now from here? The launch videos will not play.",
+  "startGameFailed": "Could not start the game"
 }

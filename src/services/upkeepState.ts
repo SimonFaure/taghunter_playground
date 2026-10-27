@@ -64,6 +64,9 @@ export interface UpkeepContent {
 export interface UpkeepReport {
   update: UpkeepUpdate;
   content: UpkeepContent;
+  /** Ctrl+M sound mute is on (the operator can toggle it remotely). Absent
+   *  from an older build. */
+  muted?: boolean;
 }
 
 let report: UpkeepReport = {
@@ -131,6 +134,12 @@ export function setContent(content: UpkeepContent): void {
 
 export function patchContent(patch: Partial<UpkeepContent>): void {
   setContent({ ...report.content, ...patch });
+}
+
+export function setMutedReport(muted: boolean): void {
+  if (report.muted === muted) return;
+  report = { ...report, muted };
+  publish();
 }
 
 export function getUpkeep(): UpkeepReport {

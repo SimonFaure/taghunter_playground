@@ -129,13 +129,17 @@ export interface ClashValidateResult {
      *  printed on them (retours #96). Absent on pre-2026-09 mothers. */
     missing?: number[];
   };
-  /** Present when the read carried a purge-station punch. `ok` = the purge
-   *  fired on territory_index; rejections keep the clan's quota (but the
-   *  physical punch is consumed either way - re-punch to retry). */
+  /** Present when the read carried an unspent purge-station punch. `ok` = the
+   *  purge fired on territory_index. `no_target` / `own_territory` keep both the
+   *  clan's quota AND the punch: it stays pending and is retried on every later
+   *  read of the card. `already_used` spends the punch. */
   purge?: {
     attempted: boolean;
     status: 'ok' | 'already_used' | 'no_target' | 'own_territory';
     territory_index?: number;
+    /** The same pending punch was already refused on an earlier read - the
+     *  station stays quiet. Absent on older mothers. */
+    repeat?: boolean;
   };
 }
 
@@ -147,17 +151,26 @@ export interface ClashRegisterResult {
 
 // ---------- endpoints ----------
 
-/** Bind a chip to a clan (server-enforced cap + single-clan membership). */
+/** Bind a chip to a clan (server-enforced cap + single-clan membership).
+ *  `punches` = the card's current punches, sent only by the Clash station's
+ *  self-registration bip: the mother marks them consumed so leftovers from an
+ *  earlier game (cards aren't always wiped) don't count. */
 export async function clashRegister(
   launchedGameId: number,
   teamId: number,
   chipId: number,
+  punches?: ClashPunch[],
 ): Promise<ClashRegisterResult> {
   return withRetry(() =>
     apiCall<ClashRegisterResult>('launched_games', 'clash_register', {
       method: 'POST',
       bearer: true,
-      body: { launched_game_id: launchedGameId, team_id: teamId, chip_id: chipId },
+      body: {
+        launched_game_id: launchedGameId,
+        team_id: teamId,
+        chip_id: chipId,
+        ...(punches ? { punches } : {}),
+      },
     }),
   );
 }

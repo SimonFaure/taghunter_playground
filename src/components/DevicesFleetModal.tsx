@@ -1,16 +1,23 @@
 // Top-bar "Devices" modal: every device paired to the mother, whatever it is
-// doing - in a game (and which), off its game page, idle, on the logo screen,
-// locked, or not connected to the mother - with remote Lock / Logo screen
-// actions, per row or on a selection, and "Back to the game" for a device that
-// is registered in a game but no longer showing it. Each row also shows the app
-// version and what the device needs (FleetUpkeep): an app update and/or a
-// content sync, with the buttons to run them remotely (one row, or "all").
+// doing - in a game (and which), on its registration screen or a result
+// waiting to be cleared, off its game page, idle, on the logo screen, locked,
+// or not connected to the mother - with remote Lock / Logo screen actions, per
+// row or on a selection, "Back to the game" for a device that is registered in
+// a game but no longer showing it, Start / Reset display when its game page
+// waits on the operator, and one icon per action: Logo, Lock, Home, sound,
+// SI reader (refresh) and its test beep, restart. Logo, Lock, sound and reader
+// show the device's state by their colour and toggle it (unlock / hide the
+// logo / unmute). Each row also shows the app version and what the device
+// needs (FleetUpkeep): an app update and/or a content sync, with the buttons to
+// run them remotely (one row, or "all").
 //
 // Reads the mother's `list_fleet` (the launched_games route already points at
 // the mother on a child) every 2s while open. Commands reach a satellite on its
-// next ping (~10s); a command aimed at the mother runs in-process on it. THIS
-// device's own row acts locally instead (no round trip), and is left out of
-// the selection so "lock everything" never locks the console doing it.
+// next ping (~10s); a command aimed at the mother runs in-process on it. The
+// target answers once it ran the command (sendRemote): a refusal shows on its
+// row. A newer action is greyed out for an older build that can't run it.
+// THIS device's own row acts locally instead (no round trip), and is left out
+// of the selection so "lock everything" never locks the console doing it.
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -29,6 +36,13 @@ import {
   WifiOff,
   Circle,
   LogOut,
+  Home,
+  Volume2,
+  VolumeX,
+  Usb,
+  BellRing,
+  Power,
+  RotateCcw,
 } from 'lucide-react';
 import {
   listFleet,
@@ -37,6 +51,16 @@ import {
   queueJoinGameCommandBulk,
   queueSyncContentBulk,
   queueUpdateAppBulk,
+  queueGoHomeBulk,
+  queueUnlockDeviceBulk,
+  queueHideLogoBulk,
+  queueSetMuteBulk,
+  queueReaderRefreshBulk,
+  queueReaderBeepBulk,
+  queueRestartAppBulk,
+  queueStartGameBulk,
+  queueResetDisplayBulk,
+  deviceSupports,
   type FleetDeviceRow,
   type FleetMotherInfo,
   type QueueCommandBulkResp,
@@ -49,7 +73,8 @@ import { getDeviceLockState, type LockReason } from '../services/deviceLock';
 import { formatStaleness } from '../utils/staleness';
 import { GameLockGate } from './GameLockGate';
 import { ConfirmDialog } from './ConfirmDialog';
-import { ReaderBadge } from './GameDevicesModal';
+import { runLocalCommand, type CommandResult } from '../services/lanCommands';
+import { sendRemote, commandErrorText } from './RemoteCommandUi';
 import {
   SyncButton,
   UpdateButton,
@@ -68,11 +93,23 @@ interface DevicesFleetModalProps {
 }
 
 const POLL_MS = 2000;
-// No per-target ack short of the device's next ping - the spinner just marks
-// the push as in flight, like the game Devices modal.
+// Shortest spinner: a command run in-process (the mother's row, this device's
+// row) answers at once.
 const BUSY_MS = 1500;
 
-type Action = 'lock' | 'logo' | 'rejoin' | 'sync' | 'update';
+type Action =
+  | 'lock'
+  | 'logo'
+  | 'rejoin'
+  | 'sync'
+  | 'update'
+  | 'home'
+  | 'mute'
+  | 'reader'
+  | 'beep'
+  | 'restart'
+  | 'start'
+  | 'reset';
 
 // An update restarts the app: confirm first when it is this device, when the
 // operator forces it past a running game, or for several devices at once.
@@ -96,6 +133,8 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
   const [selfUpkeep, setSelfUpkeep] = useState<UpkeepReport | null>(null);
   useEffect(() => subscribeUpkeep(setSelfUpkeep), []);
   const [updateConfirm, setUpdateConfirm] = useState<UpdateConfirm | null>(null);
+  // Restart confirm (`force`: even with a game running there).
+  const [restartConfirm, setRestartConfirm] = useState<{ row: FleetDeviceRow; force: boolean } | null>(null);
 
   // Device-lock gate (emergency-disabled / past billing grace): pulling a
   // device into a game counts as joining it, like the game Devices modal's
@@ -172,28 +211,34 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
       for (const id of ids) n.delete(id);
       return n;
     });
-    window.setTimeout(() => {
-      setBusy((m) => {
-        const n = new Map(m);
-        for (const id of ids) n.delete(id);
-        return n;
-      });
-    }, BUSY_MS);
   }
 
+  function clearBusy(ids: number[]) {
+    setBusy((m) => {
+      const n = new Map(m);
+      for (const id of ids) n.delete(id);
+      return n;
+    });
+  }
+
+  function setErrors(errors: Map<number, string | null>) {
+    setErrorFor((m) => {
+      const n = new Map(m);
+      for (const [id, code] of errors) {
+        if (code) n.set(id, commandErrorText(t, code));
+        else n.delete(id);
+      }
+      return n;
+    });
+  }
+
+  // Queue, then keep the spinner until each target answered (or ~20 s).
   async function send(ids: number[], action: Action, call: () => Promise<QueueCommandBulkResp>) {
     if (ids.length === 0) return;
     markBusy(ids, action);
+    const startedAt = Date.now();
     try {
-      const res = await call();
-      const failed = res.results.filter((r) => r.error);
-      if (failed.length > 0) {
-        setErrorFor((m) => {
-          const n = new Map(m);
-          for (const r of failed) n.set(r.target_device_id, r.error || t('fleet:errorFailed'));
-          return n;
-        });
-      }
+      setErrors(await sendRemote(call));
     } catch (e) {
       const msg = (e as Error).message || t('fleet:errorFailed');
       setErrorFor((m) => {
@@ -201,17 +246,83 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
         for (const id of ids) n.set(id, msg);
         return n;
       });
+    } finally {
+      const left = BUSY_MS - (Date.now() - startedAt);
+      if (left > 0) window.setTimeout(() => clearBusy(ids), left);
+      else clearBusy(ids);
     }
   }
 
-  function onLock(row: FleetDeviceRow) {
-    if (isMe(row)) return onLockSelf();
-    void send([row.id], 'lock', () => queueLockDeviceBulk([row.id]));
+  // This device's own row: run the command here, as a pushed one would run.
+  async function runSelf(row: FleetDeviceRow, action: Action, kind: string, payload: Record<string, unknown> = {}) {
+    markBusy([row.id], action);
+    let result: CommandResult;
+    try {
+      result = await runLocalCommand(kind, payload);
+    } catch {
+      result = { ok: false, error: 'failed' };
+    }
+    setErrors(new Map([[row.id, result.ok ? null : result.error]]));
+    window.setTimeout(() => clearBusy([row.id]), BUSY_MS);
   }
 
-  function onLogo(row: FleetDeviceRow) {
+  function onHome(row: FleetDeviceRow) {
+    if (isMe(row)) {
+      // The logo screen replaces this console: close the modal first.
+      onClose();
+      void runLocalCommand('go_home');
+      return;
+    }
+    void send([row.id], 'home', () => queueGoHomeBulk([row.id]));
+  }
+
+  function onMute(row: FleetDeviceRow, muted: boolean) {
+    if (isMe(row)) return void runSelf(row, 'mute', 'set_mute', { muted });
+    void send([row.id], 'mute', () => queueSetMuteBulk([row.id], muted));
+  }
+
+  function onReaderRefresh(row: FleetDeviceRow) {
+    if (isMe(row)) return void runSelf(row, 'reader', 'reader_refresh');
+    void send([row.id], 'reader', () => queueReaderRefreshBulk([row.id]));
+  }
+
+  function onReaderBeep(row: FleetDeviceRow) {
+    if (isMe(row)) return void runSelf(row, 'beep', 'reader_beep');
+    void send([row.id], 'beep', () => queueReaderBeepBulk([row.id]));
+  }
+
+  function confirmRestart() {
+    const c = restartConfirm;
+    setRestartConfirm(null);
+    if (!c) return;
+    if (isMe(c.row)) {
+      void runSelf(c.row, 'restart', 'restart_app', c.force ? { force: true } : {});
+      return;
+    }
+    void send([c.row.id], 'restart', () => queueRestartAppBulk([c.row.id], { force: c.force }));
+  }
+
+  // Start / reset the game page the device shows (it waits on the operator).
+  function onStartGame(row: FleetDeviceRow, gameId: number) {
+    if (isMe(row)) return void runSelf(row, 'start', 'start_game', { launched_game_id: gameId });
+    void send([row.id], 'start', () => queueStartGameBulk([row.id], gameId));
+  }
+
+  function onResetDisplay(row: FleetDeviceRow, gameId: number) {
+    if (isMe(row)) return void runSelf(row, 'reset', 'reset_display', { launched_game_id: gameId });
+    void send([row.id], 'reset', () => queueResetDisplayBulk([row.id], gameId));
+  }
+
+  // Toggles: `off` takes the lock / the logo screen away again. This device's
+  // own row is never locked nor on its logo while its modal is open.
+  function onLock(row: FleetDeviceRow, off: boolean) {
+    if (isMe(row)) return onLockSelf();
+    void send([row.id], 'lock', () => (off ? queueUnlockDeviceBulk([row.id]) : queueLockDeviceBulk([row.id])));
+  }
+
+  function onLogo(row: FleetDeviceRow, off: boolean) {
     if (isMe(row)) return onShowLogoSelf();
-    void send([row.id], 'logo', () => queueShowLogoBulk([row.id]));
+    void send([row.id], 'logo', () => (off ? queueHideLogoBulk([row.id]) : queueShowLogoBulk([row.id])));
   }
 
   async function onRejoin(row: FleetDeviceRow, gameId: number) {
@@ -250,9 +361,19 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
     else void send(c.ids, 'update', () => queueUpdateAppBulk(c.ids));
   }
 
-  function onBulk(action: 'lock' | 'logo') {
+  function onBulk(action: 'lock' | 'logo' | 'home' | 'mute' | 'unmute') {
     const ids = Array.from(selected);
-    void send(ids, action, () => (action === 'lock' ? queueLockDeviceBulk(ids) : queueShowLogoBulk(ids)));
+    switch (action) {
+      case 'lock':
+        return void send(ids, 'lock', () => queueLockDeviceBulk(ids));
+      case 'logo':
+        return void send(ids, 'logo', () => queueShowLogoBulk(ids));
+      case 'home':
+        return void send(ids, 'home', () => queueGoHomeBulk(ids));
+      case 'mute':
+      case 'unmute':
+        return void send(ids, 'mute', () => queueSetMuteBulk(ids, action === 'mute'));
+    }
   }
 
   function toggleAll() {
@@ -269,6 +390,8 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
   }
 
   const onlineCount = (devices ?? []).filter((d) => d.online).length;
+  const bulkBtn =
+    'px-3 py-1.5 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] text-sm flex items-center gap-1.5';
 
   return (
     <>
@@ -360,7 +483,34 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
                   {t('fleet:selectedCount', { count: selected.size })}
                 </span>
                 <button
-                  className="px-3 py-1.5 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] text-sm flex items-center gap-1.5"
+                  className={bulkBtn}
+                  disabled={selected.size === 0}
+                  title={selected.size === 0 ? t('fleet:tickOne') : t('fleet:muteSelectedTitle')}
+                  aria-label={t('fleet:mute')}
+                  onClick={() => onBulk('mute')}
+                >
+                  <VolumeX size={14} />
+                </button>
+                <button
+                  className={bulkBtn}
+                  disabled={selected.size === 0}
+                  title={selected.size === 0 ? t('fleet:tickOne') : t('fleet:unmuteSelectedTitle')}
+                  aria-label={t('fleet:unmute')}
+                  onClick={() => onBulk('unmute')}
+                >
+                  <Volume2 size={14} />
+                </button>
+                <button
+                  className={bulkBtn}
+                  disabled={selected.size === 0}
+                  title={selected.size === 0 ? t('fleet:tickOne') : t('fleet:homeSelectedTitle')}
+                  onClick={() => onBulk('home')}
+                >
+                  <Home size={14} />
+                  {t('fleet:home')}
+                </button>
+                <button
+                  className={bulkBtn}
                   disabled={selected.size === 0}
                   title={selected.size === 0 ? t('fleet:tickOne') : t('fleet:logoSelectedTitle')}
                   onClick={() => onBulk('logo')}
@@ -390,13 +540,20 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
                       onToggle={() => toggleOne(row.id)}
                       busy={busy.get(row.id) ?? null}
                       error={errorFor.get(row.id)}
-                      onLock={() => onLock(row)}
-                      onLogo={() => onLogo(row)}
+                      onLock={(off) => onLock(row, off)}
+                      onLogo={(off) => onLogo(row, off)}
                       onRejoin={(gid) => void onRejoin(row, gid)}
                       upkeep={upkeepOf(row)}
                       need={updateNeedOf(row, upkeepOf(row), mother)}
                       onSync={() => onSync(row)}
                       onUpdate={(force) => onUpdate(row, force)}
+                      onHome={() => onHome(row)}
+                      onMute={(muted) => onMute(row, muted)}
+                      onReaderRefresh={() => onReaderRefresh(row)}
+                      onReaderBeep={() => onReaderBeep(row)}
+                      onRestart={(force) => setRestartConfirm({ row, force })}
+                      onStartGame={(gid) => onStartGame(row, gid)}
+                      onResetDisplay={(gid) => onResetDisplay(row, gid)}
                     />
                   </li>
                 ))}
@@ -423,6 +580,22 @@ export function DevicesFleetModal({ onClose, onLockSelf, onShowLogoSelf }: Devic
         confirmText={updateConfirm?.kind === 'bulk' ? t('fleet:updateAll') : t('fleet:update')}
         cancelText={t('fleet:cancel')}
         variant={updateConfirm?.kind === 'bulk' ? 'info' : 'warning'}
+      />
+
+      <ConfirmDialog
+        isOpen={restartConfirm !== null}
+        onConfirm={confirmRestart}
+        onCancel={() => setRestartConfirm(null)}
+        title={t('fleet:restartConfirmTitle')}
+        message={(() => {
+          if (!restartConfirm) return '';
+          const name = displayDeviceLabel(restartConfirm.row.device_label) || t('fleet:unknownDevice');
+          if (restartConfirm.row.is_self) return t('fleet:restartConfirmMother', { name });
+          return t(restartConfirm.force ? 'fleet:restartConfirmForce' : 'fleet:restartConfirm', { name });
+        })()}
+        confirmText={t('fleet:restart')}
+        cancelText={t('fleet:cancel')}
+        variant="warning"
       />
 
       {lockGate && (
@@ -455,6 +628,13 @@ function FleetRow({
   need,
   onSync,
   onUpdate,
+  onHome,
+  onMute,
+  onReaderRefresh,
+  onReaderBeep,
+  onRestart,
+  onStartGame,
+  onResetDisplay,
 }: {
   row: FleetDeviceRow;
   me: boolean;
@@ -463,13 +643,20 @@ function FleetRow({
   onToggle: () => void;
   busy: Action | null;
   error: string | undefined;
-  onLock: () => void;
-  onLogo: () => void;
+  onLock: (off: boolean) => void;
+  onLogo: (off: boolean) => void;
   onRejoin: (launchedGameId: number) => void;
   upkeep: UpkeepReport | null;
   need: UpdateNeed;
   onSync: () => void;
   onUpdate: (force: boolean) => void;
+  onHome: () => void;
+  onMute: (muted: boolean) => void;
+  onReaderRefresh: () => void;
+  onReaderBeep: () => void;
+  onRestart: (force: boolean) => void;
+  onStartGame: (launchedGameId: number) => void;
+  onResetDisplay: (launchedGameId: number) => void;
 }) {
   const { t } = useTranslation();
   const label =
@@ -491,8 +678,6 @@ function FleetRow({
         ? t('fleet:registeredIn', { names: row.games.map((g) => g.name).join(', ') })
         : null;
 
-  const actionBtn =
-    'p-2 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] disabled:opacity-40 disabled:hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] flex items-center';
   const spinner = (
     <span className="p-2 bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] rounded-[var(--pg-radius-md)] flex items-center">
       <Loader2 size={16} className="animate-spin" />
@@ -508,6 +693,31 @@ function FleetRow({
   const showUpdate =
     canAct && !updateBusy(upkeep) && u?.phase !== 'store_only' && (need.target != null || u?.phase === 'error');
   const showSync = canAct && needsSync(upkeep);
+
+  // Newer remote actions: greyed out for a build that can't run them.
+  const reachable = me || row.online;
+  const supports = (kind: string) => deviceSupports(row.caps, kind);
+  // A build that lists its caps but not this kind can't do it at all (a tablet
+  // has no restart / USB reader); one that lists none is older.
+  const disabledTitle = (kind: string) =>
+    !reachable
+      ? offlineTitle
+      : !supports(kind)
+        ? Array.isArray(row.caps)
+          ? t('fleet:notOnThisDevice')
+          : t('fleet:needsUpdate')
+        : undefined;
+  const muted = upkeep?.muted === true;
+  // The game page waits on the operator: its registration Start, or a result
+  // to clear.
+  const waitingGameId = reachable && state?.kind === 'in_game' ? state.launchedGameId : null;
+  const showStart = waitingGameId != null && state?.kind === 'in_game' && state.sub === 'register' && supports('start_game');
+  const showReset = waitingGameId != null && state?.kind === 'in_game' && state.sub === 'results' && supports('reset_display');
+  const locked = row.online && state?.kind === 'locked';
+  const onLogoScreen = row.online && state?.kind === 'logo';
+  // A restart while it shows a game: say so, and restart it anyway.
+  const restartForce = state?.kind === 'in_game' || row.games.length > 0;
+  const iconTitle = (kind: string, title: string) => disabledTitle(kind) ?? title;
 
   return (
     <div
@@ -542,7 +752,34 @@ function FleetRow({
         <UpkeepLine row={row} upkeep={upkeep} need={need} />
       </div>
       <StatusPill row={row} state={state} />
-      <ReaderBadge has={row.has_reader} />
+      {showStart &&
+        waitingGameId != null &&
+        (busy === 'start' ? (
+          spinner
+        ) : (
+          <button
+            onClick={() => onStartGame(waitingGameId)}
+            title={t('fleet:startGameTitle')}
+            className="px-2.5 py-1.5 bg-green-600/15 hover:bg-green-600/25 text-green-400 border border-green-600/30 rounded-[var(--pg-radius-md)] text-sm flex items-center gap-1.5"
+          >
+            <Play size={14} />
+            {t('fleet:startGame')}
+          </button>
+        ))}
+      {showReset &&
+        waitingGameId != null &&
+        (busy === 'reset' ? (
+          spinner
+        ) : (
+          <button
+            onClick={() => onResetDisplay(waitingGameId)}
+            title={t('fleet:resetDisplayTitle')}
+            className="px-2.5 py-1.5 bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] border border-[var(--pg-line)] rounded-[var(--pg-radius-md)] text-sm flex items-center gap-1.5"
+          >
+            <RotateCcw size={14} />
+            {t('fleet:resetDisplay')}
+          </button>
+        ))}
       {showSync &&
         (busy === 'sync' ? (
           spinner
@@ -580,36 +817,133 @@ function FleetRow({
             {t('fleet:rejoin')}
           </button>
         ))}
-      {busy === 'logo' ? (
-        spinner
-      ) : (
-        <button
-          onClick={onLogo}
-          disabled={!row.online}
-          title={row.online ? t('fleet:logoTitle') : offlineTitle}
-          aria-label={t('fleet:logo')}
-          className={actionBtn}
-        >
-          <ImageIcon size={16} />
-        </button>
-      )}
-      {busy === 'lock' ? (
-        spinner
-      ) : (
-        <button
-          onClick={onLock}
-          disabled={!row.online}
-          title={row.online ? t('fleet:lockTitle') : offlineTitle}
-          aria-label={t('fleet:lock')}
-          className={actionBtn}
-        >
-          <Lock size={16} />
-        </button>
-      )}
+      <div className="flex items-center gap-1.5">
+        <IconAction
+          icon={<ImageIcon size={16} />}
+          tone={onLogoScreen ? 'blue' : 'default'}
+          busy={busy === 'logo'}
+          disabled={!row.online || (onLogoScreen && !supports('hide_logo'))}
+          label={onLogoScreen ? t('fleet:hideLogo') : t('fleet:logo')}
+          title={
+            !row.online
+              ? offlineTitle
+              : onLogoScreen
+                ? iconTitle('hide_logo', t('fleet:hideLogoTitle'))
+                : t('fleet:logoTitle')
+          }
+          onClick={() => onLogo(onLogoScreen)}
+        />
+        <IconAction
+          icon={<Lock size={16} />}
+          tone={locked ? 'red' : 'default'}
+          busy={busy === 'lock'}
+          disabled={!row.online || (locked && !supports('unlock_device'))}
+          label={locked ? t('fleet:unlock') : t('fleet:lock')}
+          title={
+            !row.online ? offlineTitle : locked ? iconTitle('unlock_device', t('fleet:unlockTitle')) : t('fleet:lockTitle')
+          }
+          onClick={() => onLock(locked)}
+        />
+        <IconAction
+          icon={<Home size={16} />}
+          busy={busy === 'home'}
+          disabled={!reachable || !supports('go_home')}
+          label={t('fleet:home')}
+          title={iconTitle('go_home', t('fleet:homeTitle'))}
+          onClick={onHome}
+        />
+        <IconAction
+          icon={muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+          tone={muted ? 'amber' : 'default'}
+          busy={busy === 'mute'}
+          disabled={!reachable || !supports('set_mute')}
+          label={muted ? t('fleet:unmute') : t('fleet:mute')}
+          title={iconTitle('set_mute', muted ? t('fleet:unmuteTitle') : t('fleet:muteTitle'))}
+          onClick={() => onMute(!muted)}
+        />
+        <IconAction
+          icon={<Usb size={16} />}
+          tone={row.has_reader ? 'green' : 'default'}
+          busy={busy === 'reader'}
+          disabled={!reachable || !supports('reader_refresh')}
+          label={t('fleet:readerRefresh')}
+          title={iconTitle(
+            'reader_refresh',
+            row.has_reader ? t('fleet:readerOnTitle') : t('fleet:readerOffTitle'),
+          )}
+          onClick={onReaderRefresh}
+        />
+        <IconAction
+          icon={<BellRing size={16} />}
+          busy={busy === 'beep'}
+          disabled={!reachable || !supports('reader_beep')}
+          label={t('fleet:readerBeep')}
+          title={iconTitle('reader_beep', t('fleet:readerBeepTitle'))}
+          onClick={onReaderBeep}
+        />
+        <IconAction
+          icon={<Power size={16} />}
+          tone="danger"
+          busy={busy === 'restart'}
+          disabled={!reachable || !supports('restart_app')}
+          label={t('fleet:restart')}
+          title={iconTitle('restart_app', t('fleet:restartTitle'))}
+          onClick={() => onRestart(restartForce)}
+        />
+      </div>
       {error && (
         <span className="basis-full text-xs text-red-400 px-2 py-0.5 bg-red-500/10 rounded">{error}</span>
       )}
     </div>
+  );
+}
+
+type IconTone = 'default' | 'red' | 'green' | 'amber' | 'blue' | 'danger';
+
+const TONES: Record<IconTone, string> = {
+  default: 'bg-[var(--pg-surface-2)] hover:bg-[var(--pg-surface-3)] text-[var(--pg-text)] border-[var(--pg-line)]',
+  red: 'bg-red-500/15 hover:bg-red-500/25 text-red-400 border-red-500/40',
+  green: 'bg-green-500/10 hover:bg-green-500/20 text-green-400 border-green-600/30',
+  amber: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-400 border-amber-500/40',
+  blue: 'bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border-blue-500/40',
+  danger: 'bg-[var(--pg-surface-2)] hover:bg-red-600/20 text-red-400 border-[var(--pg-line)]',
+};
+
+/** One row action as an icon button; its colour can carry the device's state. */
+function IconAction({
+  icon,
+  label,
+  title,
+  onClick,
+  disabled,
+  busy,
+  tone = 'default',
+}: {
+  icon: React.ReactNode;
+  label: string;
+  title?: string;
+  onClick: () => void;
+  disabled?: boolean;
+  busy?: boolean;
+  tone?: IconTone;
+}) {
+  if (busy) {
+    return (
+      <span className="p-2 bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)] border border-transparent rounded-[var(--pg-radius-md)] flex items-center">
+        <Loader2 size={16} className="animate-spin" />
+      </span>
+    );
+  }
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title ?? label}
+      aria-label={label}
+      className={`p-2 border rounded-[var(--pg-radius-md)] flex items-center disabled:opacity-40 disabled:cursor-not-allowed ${TONES[tone]}`}
+    >
+      {icon}
+    </button>
   );
 }
 
@@ -633,10 +967,8 @@ function StatusPill({ row, state }: { row: FleetDeviceRow; state: ScreenState | 
   } else {
     switch (state.kind) {
       case 'locked':
-        label = t('fleet:statusLocked');
-        cls = 'bg-red-500/10 text-red-400';
-        icon = <Lock size={12} />;
-        break;
+        // The row's lock icon turns red instead.
+        return null;
       case 'logo':
         label = t('fleet:statusLogo');
         cls = 'bg-[var(--pg-surface-3)] text-[var(--pg-text-muted)]';
@@ -653,9 +985,20 @@ function StatusPill({ row, state }: { row: FleetDeviceRow; state: ScreenState | 
         icon = <Trophy size={12} />;
         break;
       case 'in_game':
-        label = state.boardHidden ? t('fleet:statusInGameIdleScreen') : t('fleet:statusInGame');
-        cls = 'bg-green-500/10 text-green-400';
-        icon = state.boardHidden ? <Moon size={12} /> : <Gamepad2 size={12} />;
+        if (state.sub === 'register') {
+          label = t('fleet:statusRegistering');
+          cls = 'bg-blue-500/10 text-blue-400';
+          icon = <Gamepad2 size={12} />;
+        } else if (state.sub === 'results') {
+          label = t('fleet:statusResults');
+          cls = 'bg-amber-500/10 text-amber-400';
+          icon = <Trophy size={12} />;
+          title = t('fleet:statusResultsTitle');
+        } else {
+          label = state.boardHidden ? t('fleet:statusInGameIdleScreen') : t('fleet:statusInGame');
+          cls = 'bg-green-500/10 text-green-400';
+          icon = state.boardHidden ? <Moon size={12} /> : <Gamepad2 size={12} />;
+        }
         break;
       case 'home':
         if (row.games.length > 0) {

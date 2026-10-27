@@ -194,5 +194,10 @@
   "chipsInClan": "Puces dans ce clan",
   "slowLoadTitle": "Poste mère injoignable",
   "slowLoadHint": "La liste des parties vient du poste mère, qui ne répond pas pour l'instant. Si une reprise de partie est en cours, patientez : ce poste se reconnecte seul.",
-  "slowLoadRetry": "Réessayer"
+  "slowLoadRetry": "Réessayer",
+  "startGame": "Démarrer",
+  "startGameTitle": "Démarrer la partie sur les appareils qui affichent l'écran d'inscription",
+  "startNoRegistrarTitle": "Aucun écran d’inscription ne répond",
+  "startNoRegistrarMessage": "Aucun appareil n'affiche l'écran d'inscription de cette partie. La démarrer maintenant d'ici ? Les vidéos de lancement ne seront pas jouées.",
+  "startGameFailed": "Impossible de démarrer la partie"
 }

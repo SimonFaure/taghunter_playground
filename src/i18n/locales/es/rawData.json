@@ -1,0 +1,19 @@
+{
+  "title": "Datos brutos",
+  "subtitle_one": "{{name}} · Partida n.º {{id}} · {{count}} registro",
+  "subtitle_other": "{{name}} · Partida n.º {{id}} · {{count}} registros",
+  "copyAllTitle": "Copiar todos los datos brutos en JSON",
+  "copyAll": "Copiar todo",
+  "refresh": "Actualizar",
+  "close": "Cerrar",
+  "loading": "Cargando los datos brutos…",
+  "empty": "Todavía no hay datos brutos registrados para esta partida.",
+  "chip": "Chip {{id}}",
+  "punches_one": "{{count}} marcaje",
+  "punches_other": "{{count}} marcajes",
+  "end": "FIN {{code}}",
+  "deviceTitle": "Dispositivo que registró",
+  "device": "disp. {{id}}",
+  "copyRecordTitle": "Copiar este registro",
+  "copy": "Copiar"
+}

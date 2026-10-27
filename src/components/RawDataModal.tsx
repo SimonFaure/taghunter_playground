@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Database, RefreshCw, Loader2, X, Check, Copy, AlertTriangle, ChevronRight } from 'lucide-react';
 import { getLaunchedGameState, type RawPunchRow } from '../services/launchedGames';
 import { formatDbDateTime } from '../utils/dbTime';
@@ -28,6 +29,7 @@ interface CardLike {
 // the admin DB inspector. Data comes from getLaunchedGameState(id, 0), whose
 // `new_raw_data` (cursor 0 ⇒ all rows) routes to the mother during a LAN game.
 export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModalProps) {
+  const { t } = useTranslation();
   const [rows, setRows] = useState<RawPunchRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -98,31 +100,33 @@ export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModal
           <div className="min-w-0">
             <h3 className="pg-modal-title flex items-center gap-2">
               <Database size={20} className="text-emerald-400" />
-              Raw Data
+              {t('rawData:title')}
             </h3>
-            <p className="pg-modal-sub truncate">{gameName} · Game ID {launchedGameId} · {rows.length} record{rows.length === 1 ? '' : 's'}</p>
+            <p className="pg-modal-sub truncate">
+              {t('rawData:subtitle', { name: gameName, id: launchedGameId, count: rows.length })}
+            </p>
           </div>
           <div className="flex items-center gap-2">
             {rows.length > 0 && (
               <button
                 onClick={() => copy('all', JSON.stringify(rows, null, 2))}
                 className="pg-btn pg-btn--sm"
-                title="Copy all raw data as JSON"
+                title={t('rawData:copyAllTitle')}
               >
                 {copiedKey === 'all' ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
-                Copy all
+                {t('rawData:copyAll')}
               </button>
             )}
             <button
               onClick={load}
               disabled={loading}
               className="pg-btn pg-btn--sm"
-              title="Refresh"
+              title={t('rawData:refresh')}
             >
               {loading ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              Refresh
+              {t('rawData:refresh')}
             </button>
-            <button onClick={onClose} className="pg-modal-close" title="Close">
+            <button onClick={onClose} className="pg-modal-close" title={t('rawData:close')}>
               <X size={20} />
             </button>
           </div>
@@ -136,10 +140,10 @@ export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModal
             </div>
           ) : loading && rows.length === 0 ? (
             <div className="text-center py-12 text-[var(--pg-text-dim)] flex items-center justify-center gap-2">
-              <Loader2 size={16} className="animate-spin" /> Loading raw data…
+              <Loader2 size={16} className="animate-spin" /> {t('rawData:loading')}
             </div>
           ) : rows.length === 0 ? (
-            <div className="text-center py-12 text-[var(--pg-text-dim)]">No raw data recorded for this game yet.</div>
+            <div className="text-center py-12 text-[var(--pg-text-dim)]">{t('rawData:empty')}</div>
           ) : (
             <div className="space-y-2">
               {rows.map((row) => {
@@ -158,23 +162,23 @@ export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModal
                         className={`text-[var(--pg-text-dim)] shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`}
                       />
                       <span className="font-mono text-xs text-[var(--pg-text-dim)] shrink-0">#{row.id}</span>
-                      <span className="text-[var(--pg-text)] font-medium text-sm shrink-0">Chip {chipId}</span>
+                      <span className="text-[var(--pg-text)] font-medium text-sm shrink-0">{t('rawData:chip', { id: chipId })}</span>
                       <span className="text-[var(--pg-text-dim)] text-xs shrink-0">
-                        {punchCount} punch{punchCount === 1 ? '' : 'es'}
+                        {t('rawData:punches', { count: punchCount })}
                       </span>
                       {codes && (
                         <span className="text-[var(--pg-text-muted)] text-xs font-mono truncate min-w-0">[{codes}]</span>
                       )}
                       {endCode != null && (
                         <span className="px-1.5 py-0.5 bg-green-600/20 border border-green-600/40 text-green-400 rounded text-[10px] font-semibold shrink-0">
-                          END {endCode}
+                          {t('rawData:end', { code: endCode })}
                         </span>
                       )}
                       <span className="text-[var(--pg-text-dim)] text-xs ml-auto shrink-0 whitespace-nowrap">
                         {formatTs(row.created_at)}
                       </span>
-                      <span className="text-[var(--pg-text-dim)] text-[10px] font-mono shrink-0" title="Recording device">
-                        dev {row.device_id}
+                      <span className="text-[var(--pg-text-dim)] text-[10px] font-mono shrink-0" title={t('rawData:deviceTitle')}>
+                        {t('rawData:device', { id: row.device_id })}
                       </span>
                     </button>
                     {isOpen && (
@@ -182,10 +186,10 @@ export function RawDataModal({ launchedGameId, gameName, onClose }: RawDataModal
                         <button
                           onClick={() => copy(rowKey, JSON.stringify(row.raw_data, null, 2))}
                           className="absolute top-2 right-2 flex items-center gap-1 px-2 py-1 bg-[var(--pg-surface-3)] hover:bg-[var(--pg-surface-2)] text-[var(--pg-text)] rounded text-[11px] transition"
-                          title="Copy this record"
+                          title={t('rawData:copyRecordTitle')}
                         >
                           {copiedKey === rowKey ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
-                          Copy
+                          {t('rawData:copy')}
                         </button>
                         <pre className="text-xs text-[var(--pg-text-muted)] font-mono whitespace-pre-wrap break-words overflow-x-auto pr-16">
                           {JSON.stringify(row.raw_data, null, 2)}

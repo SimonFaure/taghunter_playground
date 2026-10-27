@@ -24,6 +24,7 @@ import { hasPin } from '../../services/pinStore';
 import { loadJwt } from '../../services/strongholdStore';
 import { getAuthUser, offlineGraceInfo, OFFLINE_WARNING_THRESHOLD_DAYS } from '../../services/authStore';
 import type { AuthUser } from '../../services/authStore';
+import { onLicenceAdopted, startLicenceLanWatch } from '../../services/licenceLanSync';
 
 // The manual lock is a `locked` boolean, NOT an auth state: the user taps
 // "Lock" in the nav bar and LockScreen renders as a full-screen overlay ON
@@ -177,6 +178,32 @@ export function AuthProvider({ children }: AuthProviderProps) {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // A LAN peer's newer licence replaced ours (services/licenceLanSync): the
+  // running shell picks up the renewed countdown and the account's locks in
+  // place; a locked-out device re-runs the gate, which now finds it in grace.
+  const stateKind = state.kind;
+  useEffect(() => {
+    if (stateKind === 'offline_locked') return onLicenceAdopted(() => void runServerBootstrap());
+    if (stateKind !== 'authenticated') return;
+    return onLicenceAdopted(() => {
+      void getAuthUser().then((user) => {
+        if (!user) return;
+        setState((prev) => {
+          if (prev.kind !== 'authenticated') return prev;
+          return user.playground_enabled ? { ...prev, user } : { kind: 'app_disabled', user };
+        });
+      });
+    });
+  }, [stateKind, runServerBootstrap]);
+
+  // Locked for being offline too long: look on the LAN for a device of the
+  // licensee holding a fresher licence (the shell's own ping loop is unmounted).
+  const lockedClientId = state.kind === 'offline_locked' ? state.user.client_id : null;
+  useEffect(() => {
+    if (lockedClientId == null) return;
+    return startLicenceLanWatch(lockedClientId);
+  }, [lockedClientId]);
 
   // Called by LoginScreen on successful OTP. The user now has a JWT and an
   // auth_user row but hasn't set a PIN yet - route to SetPinScreen.

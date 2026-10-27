@@ -5,7 +5,7 @@
 // first-bip) and the absence of a state-mutating callback when playback ends.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { registerLanCommandHandler, type CommandResult } from '../services/lanCommands';
 import { FirstBipVideoOverlay } from './FirstBipVideoOverlay';
 import { resolveVideosByKind, applySubtitleChoice, type VideoSource } from '../services/videoResolution';
 import { getLaunchedGameState } from '../services/launchedGames';
@@ -17,7 +17,7 @@ import { waitForPresentationIdle } from '../services/presentationGate';
 
 interface LanCommand {
   id: number;
-  kind: 'join_game' | 'play_video' | 'stop_video';
+  kind: string;
   payload: {
     launched_game_id?: number;
     kinds?: Array<'intro' | 'tutorial'>;
@@ -73,88 +73,76 @@ export function OperatorVideoOverlay() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenFn: (() => void) | null = null;
-
-    void (async () => {
-      const unlisten = await listen<LanCommand>('taghunter://lan-command', async (event) => {
-        if (cancelled) return;
-        const cmd = event.payload;
-        if (cmd.kind === 'stop_video') {
-          stopVideos();
-          return;
+    const offStop = registerLanCommandHandler('stop_video', () => {
+      stopVideos();
+    });
+    const offPlay = registerLanCommandHandler('play_video', async (cmd: LanCommand): Promise<CommandResult> => {
+      const gid = cmd.payload.launched_game_id;
+      const kinds = cmd.payload.kinds ?? [];
+      const language = cmd.payload.language ?? 'fr';
+      const subtitleChoice = cmd.payload.subtitle_lang;
+      if (!gid || kinds.length === 0) return { ok: false, error: 'bad_payload' };
+      // Locally dispatched by our own mother server: the scenario identity
+      // rode along in the payload, so there is nothing to repoint or fetch.
+      if (cmd.payload.game_uniqid && cmd.payload.game_type) {
+        const local = await resolveVideosByKind(
+          kinds,
+          cmd.payload.game_uniqid,
+          cmd.payload.game_type,
+          language,
+        );
+        if (cancelled) return { ok: false, error: 'unmounted' };
+        if (local.length === 0) {
+          console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
+          return { ok: false, error: 'no_videos' };
         }
-        if (cmd.kind === 'play_video') {
-          const gid = cmd.payload.launched_game_id;
-          const kinds = cmd.payload.kinds ?? [];
-          const language = cmd.payload.language ?? 'fr';
-          const subtitleChoice = cmd.payload.subtitle_lang;
-          if (!gid || kinds.length === 0) return;
-          // Locally dispatched by our own mother server: the scenario identity
-          // rode along in the payload, so there is nothing to repoint or fetch.
-          if (cmd.payload.game_uniqid && cmd.payload.game_type) {
-            const local = await resolveVideosByKind(
-              kinds,
-              cmd.payload.game_uniqid,
-              cmd.payload.game_type,
-              language,
-            );
-            if (cancelled) return;
-            if (local.length === 0) {
-              console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
-              return;
-            }
-            void startVideosDeferred(applySubtitleChoice(local, subtitleChoice));
-            return;
-          }
-          // The pushed game lives in the PUSHING mother's SQLite. Repoint our
-          // launched_games traffic there before the state fetch (same as App's
-          // join_game handler): the ambient route may have been restored to
-          // this device's own local server, where `gid` either doesn't exist
-          // (fetch throws -> silent abort) or collides with a DIFFERENT local
-          // game whose scenario resolves no videos.
-          if (cmd.mother_uuid && cmd.mother_addr) {
-            try {
-              const m = await getPairedMother(cmd.mother_uuid);
-              if (m) pointLaunchedGamesAtMother(`http://${cmd.mother_addr}`, m.peer_secret);
-            } catch (err) {
-              console.warn('[OperatorVideoOverlay] mother repoint failed:', err);
-            }
-          }
-          // Look up game_uniqid + game_type from the launched_game so we know
-          // which scenario to resolve videos against. One-shot fetch - the
-          // game's identity doesn't change after creation.
-          let gameUniqid = '';
-          let gameType = '';
-          try {
-            const state = await getLaunchedGameState(gid, 0);
-            gameUniqid = state.game_uniqid;
-            gameType = state.game_type;
-          } catch (err) {
-            console.warn('[OperatorVideoOverlay] state fetch failed:', err);
-            return;
-          }
-          const resolved = await resolveVideosByKind(kinds, gameUniqid, gameType, language);
-          if (cancelled) return;
-          if (resolved.length === 0) {
-            console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
-            return;
-          }
-          // Preempt any in-progress playback by replacing the source list
-          // wholesale once the screen is quiet. FirstBipVideoOverlay's keyed
-          // <video> remount on index/source change handles the transition.
-          void startVideosDeferred(applySubtitleChoice(resolved, subtitleChoice));
-        }
-      });
-      if (cancelled) {
-        unlisten();
-      } else {
-        unlistenFn = unlisten;
+        void startVideosDeferred(applySubtitleChoice(local, subtitleChoice));
+        return { ok: true };
       }
-    })();
+      // The pushed game lives in the PUSHING mother's SQLite. Repoint our
+      // launched_games traffic there before the state fetch (same as App's
+      // join_game handler): the ambient route may have been restored to
+      // this device's own local server, where `gid` either doesn't exist
+      // (fetch throws -> silent abort) or collides with a DIFFERENT local
+      // game whose scenario resolves no videos.
+      if (cmd.mother_uuid && cmd.mother_addr) {
+        try {
+          const m = await getPairedMother(cmd.mother_uuid);
+          if (m) pointLaunchedGamesAtMother(`http://${cmd.mother_addr}`, m.peer_secret);
+        } catch (err) {
+          console.warn('[OperatorVideoOverlay] mother repoint failed:', err);
+        }
+      }
+      // Look up game_uniqid + game_type from the launched_game so we know
+      // which scenario to resolve videos against. One-shot fetch - the
+      // game's identity doesn't change after creation.
+      let gameUniqid = '';
+      let gameType = '';
+      try {
+        const state = await getLaunchedGameState(gid, 0);
+        gameUniqid = state.game_uniqid;
+        gameType = state.game_type;
+      } catch (err) {
+        console.warn('[OperatorVideoOverlay] state fetch failed:', err);
+        return { ok: false, error: 'game_unreachable' };
+      }
+      const resolved = await resolveVideosByKind(kinds, gameUniqid, gameType, language);
+      if (cancelled) return { ok: false, error: 'unmounted' };
+      if (resolved.length === 0) {
+        console.warn('[OperatorVideoOverlay] no playable assets for kinds', kinds);
+        return { ok: false, error: 'no_videos' };
+      }
+      // Preempt any in-progress playback by replacing the source list
+      // wholesale once the screen is quiet. FirstBipVideoOverlay's keyed
+      // <video> remount on index/source change handles the transition.
+      void startVideosDeferred(applySubtitleChoice(resolved, subtitleChoice));
+      return { ok: true };
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenFn) unlistenFn();
+      offStop();
+      offPlay();
     };
   }, [startVideosDeferred, stopVideos]);
 

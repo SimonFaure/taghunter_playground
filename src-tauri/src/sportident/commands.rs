@@ -4,7 +4,7 @@
 // anywhere in the reader.
 
 use crate::sportident::config::{
-    ACK, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA, CMD_SET_MS_MODE, CMD_SET_STATION_TIME,
+    ACK, CMD_BEEP, CMD_GET_SI9_DATA, CMD_GET_SYSTEM_DATA, CMD_SET_MS_MODE, CMD_SET_STATION_TIME,
 };
 use crate::sportident::framing::{build_frame, build_wakeup_frame};
 
@@ -28,6 +28,12 @@ pub fn build_get_system_data() -> Vec<u8> {
 /// card. Block indices come from `CardType::blocks_to_read()`.
 pub fn build_get_card_block(block: u8) -> Vec<u8> {
     build_frame(CMD_GET_SI9_DATA, &[block])
+}
+
+/// "Beep" - the master beeps `count` times (the operator's remote reader
+/// test). Payload `[count]`; the master echoes a 0xF9 frame, ignored.
+pub fn build_beep(count: u8) -> Vec<u8> {
+    build_frame(CMD_BEEP, &[count])
 }
 
 /// ACK byte - single 0x06, not a framed message. Sent after a complete
@@ -89,6 +95,16 @@ mod tests {
         assert_eq!(f[1], CMD_GET_SI9_DATA);
         assert_eq!(f[2], 0x01); // LEN = 1
         assert_eq!(f[3], 0x03); // requested block
+        assert_eq!(*f.last().unwrap(), ETX);
+    }
+
+    #[test]
+    fn beep_encodes_count() {
+        let f = build_beep(2);
+        assert_eq!(f[0], STX);
+        assert_eq!(f[1], CMD_BEEP);
+        assert_eq!(f[2], 0x01); // LEN = 1
+        assert_eq!(f[3], 0x02);
         assert_eq!(*f.last().unwrap(), ETX);
     }
 

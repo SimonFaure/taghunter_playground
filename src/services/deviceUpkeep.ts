@@ -10,7 +10,7 @@
 // game is running unless the operator insisted (`force`): it stops at "ready"
 // and says why. Android still asks its operator to confirm the install.
 
-import { listen } from '@tauri-apps/api/event';
+import { registerLanCommandHandler } from './lanCommands';
 import { on as onSyncEvent } from './syncEvents';
 import { pendingContentReport, runCycleNow, type PendingUpdatesSummary } from './syncOrchestrator';
 import { isLanSyncInFlight, lastMotherInventory, onLanSyncDone } from './peerContent';
@@ -142,12 +142,7 @@ export async function updateAppNow(opts: { force?: boolean } = {}): Promise<void
  * from the App, after the orchestrator has started. Returns the unlisten.
  */
 export function installDeviceUpkeep(): () => void {
-  let cancelled = false;
   const offs: Array<() => void> = [];
-  const keep = (fn: () => void) => {
-    if (cancelled) fn();
-    else offs.push(fn);
-  };
 
   const soon = () => void recomputeContent();
   offs.push(
@@ -172,15 +167,18 @@ export function installDeviceUpkeep(): () => void {
     clearInterval(timer);
   });
 
-  void listen<{ kind: string; payload?: { force?: boolean } }>('taghunter://lan-command', (event) => {
-    if (cancelled) return;
-    const cmd = event.payload;
-    if (cmd.kind === 'sync_content') void syncContentNow();
-    else if (cmd.kind === 'update_app') void updateAppNow({ force: cmd.payload?.force === true });
-  }).then(keep);
+  // Long-running: answer once started (the outcome lands in the upkeep report,
+  // which the modal shows).
+  offs.push(
+    registerLanCommandHandler('sync_content', () => {
+      void syncContentNow();
+    }),
+    registerLanCommandHandler('update_app', (cmd) => {
+      void updateAppNow({ force: cmd.payload?.force === true });
+    }),
+  );
 
   return () => {
-    cancelled = true;
     for (const fn of offs) fn();
   };
 }

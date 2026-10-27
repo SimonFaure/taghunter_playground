@@ -61,7 +61,8 @@
     "retryNow": "Reintentar ahora",
     "lockTitle": "Reconéctate para continuar",
     "lockBody": "Este dispositivo no ha contactado con el servidor en {{ageDays}} días, superando tu margen de acceso sin conexión de {{graceDays}} días. Conéctate a internet para reanudar.",
-    "retryConnection": "Reintentar conexión"
+    "retryConnection": "Reintentar conexión",
+    "lockLanSearch": "Buscando un dispositivo actualizado en la red local… Este dispositivo se desbloquea solo si encuentra uno que se haya conectado al servidor recientemente."
   },
   "capReached": {
     "title": "Límite de dispositivos alcanzado",

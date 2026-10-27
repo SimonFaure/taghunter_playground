@@ -195,27 +195,42 @@ function TerritoryGauge({
   widthPx: number;
 }) {
   const total = clansOrdered.reduce((n, c) => n + (t.counts[String(c.team_id)] ?? 0), 0);
+  // The frame image is drawn OVER the clan segments: it is transparent in the
+  // middle so the colours show through it, and its border covers their edges.
   return (
     <div
-      className="flex rounded-full overflow-hidden bg-black/50 border border-white/25 shadow"
+      className="relative shadow rounded-full"
       style={{
         width: `${Math.max(8, widthPx)}px`,
         height: `${Math.max(2, widthPx / 12)}px`,
-        ...(frameUrl ? { backgroundImage: `url(${frameUrl})`, backgroundSize: '100% 100%' } : {}),
       }}
     >
-      {total > 0 &&
-        clansOrdered.map((c) => {
-          const count = t.counts[String(c.team_id)] ?? 0;
-          if (count <= 0) return null;
-          return (
-            <div
-              key={c.team_id}
-              className="h-full transition-all duration-500"
-              style={{ width: `${(count / total) * 100}%`, backgroundColor: c.color }}
-            />
-          );
-        })}
+      <div
+        className={`absolute inset-0 flex rounded-full overflow-hidden bg-black/50${
+          frameUrl ? '' : ' border border-white/25'
+        }`}
+      >
+        {total > 0 &&
+          clansOrdered.map((c) => {
+            const count = t.counts[String(c.team_id)] ?? 0;
+            if (count <= 0) return null;
+            return (
+              <div
+                key={c.team_id}
+                className="h-full transition-all duration-500"
+                style={{ width: `${(count / total) * 100}%`, backgroundColor: c.color }}
+              />
+            );
+          })}
+      </div>
+      {frameUrl && (
+        <img
+          src={frameUrl}
+          alt=""
+          draggable={false}
+          className="absolute inset-0 w-full h-full pointer-events-none select-none"
+        />
+      )}
     </div>
   );
 }
@@ -553,17 +568,34 @@ export function ClashGameRenderer({
                         >
                           {i + 1}
                         </span>
-                        {/* Purge token - full colour while this clan's one purge
-                            is unspent, greyed once used. */}
-                        {purgeActive && (
-                          <img
-                            src={purgeImageUrl}
-                            alt=""
-                            title={purge!.used_by.includes(s.team_id) ? tc('purge_used') : tc('purge_available')}
-                            className={`object-contain${purge!.used_by.includes(s.team_id) ? ' grayscale opacity-40' : ''}`}
-                            style={{ position: 'absolute', bottom: rpx(4), left: rpx(8), width: rpx(24), height: rpx(24) }}
-                          />
-                        )}
+                        {/* Purge token - as authored while this clan's one purge
+                            is unspent, greyed out once used. Grayscale alone did
+                            nothing on a black-and-white token (LES SURVIVANTS'
+                            biohazard), so the contrast is also flattened and
+                            lifted: blacks and whites both collapse into light
+                            greys, then slightly faded - still visible on a dark
+                            score card, clearly switched off. */}
+                        {purgeActive && (() => {
+                          const spent = purge!.used_by.includes(s.team_id);
+                          return (
+                            <img
+                              src={purgeImageUrl}
+                              alt=""
+                              title={spent ? tc('purge_used') : tc('purge_available')}
+                              className="object-contain transition-[filter,opacity] duration-500"
+                              style={{
+                                position: 'absolute',
+                                bottom: rpx(4),
+                                left: rpx(8),
+                                width: rpx(24),
+                                height: rpx(24),
+                                ...(spent
+                                  ? { filter: 'grayscale(1) contrast(0.35) brightness(1.45)', opacity: 0.75 }
+                                  : {}),
+                              }}
+                            />
+                          );
+                        })()}
                         {/* Name / score / rate, stacked on the right. */}
                         <div
                           className="absolute inset-0 flex items-center"

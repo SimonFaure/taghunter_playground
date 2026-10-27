@@ -24,7 +24,7 @@ import {
   broadcastConfigReload,
 } from '../services/launchedGames';
 import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
-import { onPendingConfigReload, onPendingRejoin } from '../services/pendingJoinStore';
+import { onPendingConfigReload, onPendingRejoin, onGameGone } from '../services/pendingJoinStore';
 import { setBaseInGame, setBaseHome } from '../services/screenState';
 import { setActiveLaunchedGameId } from '../services/activeGameStore';
 
@@ -86,6 +86,19 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
       if (gid === launchedGameId) void reloadConfig();
     });
   }, [launchedGameId, reloadConfig]);
+
+  // The game is gone from the mother (deleted / archived, the push that says
+  // so missed): leave it rather than poll a game that no longer exists.
+  const onBackRef = useRef(onBack);
+  onBackRef.current = onBack;
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onGameGone((gid) => {
+      if (gid !== launchedGameId) return false;
+      onBackRef.current();
+      return true;
+    });
+  }, [launchedGameId]);
 
   const [gameMetadata, setGameMetadata] = useState<GameMetadata | null>(null);
   const [loading, setLoading] = useState(true);

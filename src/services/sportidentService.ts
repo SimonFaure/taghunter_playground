@@ -209,6 +209,8 @@ class SportIdentService {
    * the state log shows how long the station took to answer the handshake.
    */
   private startedAt = 0;
+  // Last `si://error` message (the reader test reports it to the operator).
+  private lastReaderError: string | null = null;
 
   /** True when running inside the Tauri shell. Never on Android: the tablet is
    *  a locked operator-only device with no SI reader (utils/platform.ts). */
@@ -291,6 +293,76 @@ class SportIdentService {
         return false;
       }
     });
+  }
+
+  /**
+   * The operator's remote "refresh reader" (`reader_refresh`): re-detect the
+   * dongle (the OS may hand it another COM port after a replug) and, when a
+   * game page holds the reader, close and re-open it there. Publishes the
+   * result like the top-bar poll. Resolves whether a reader is plugged in.
+   */
+  async refresh(): Promise<boolean> {
+    if (!this.isAvailable()) return false;
+    const found = await detectReaderPort().catch(() => null);
+    if (this.isStarted || this.hasCardCallback()) {
+      if (this.isStarted) await this.stop();
+      if (found) await this.initializePort(found.path);
+      if (!this.isStarted) {
+        // Keep trying for the game page, as after an unplug.
+        this.intentionalStop = false;
+        this.scheduleReconnect();
+      }
+    }
+    publishReaderPresence(!!found);
+    return !!found;
+  }
+
+  /**
+   * The operator's remote reader test (`reader_beep`): beep the master twice.
+   * A reader nobody holds is opened for the test and closed again. The serial
+   * link can die during the station's wake-up (`transport: io error`); like a
+   * game page's reconnect, the test re-opens it, up to 3 times. `detail` is the
+   * last reader error, for the operator.
+   */
+  async testBeep(): Promise<{ result: 'ok' | 'no_reader' | 'not_listening'; detail?: string }> {
+    if (!this.isAvailable()) return { result: 'no_reader' };
+    this.lastReaderError = null;
+    let openedHere = false;
+    let result: 'ok' | 'not_listening' = 'not_listening';
+    for (let attempt = 0; attempt < 3 && result !== 'ok'; attempt++) {
+      if (!this.isStarted) {
+        // Our own retry, not the game page's background one.
+        if (openedHere || !this.hasCardCallback()) this.cancelReconnect();
+        const found = await detectReaderPort().catch(() => null);
+        if (!found) return { result: 'no_reader', detail: this.lastReaderError ?? undefined };
+        if (!(await this.initializePort(found.path))) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        openedHere = openedHere || !this.hasCardCallback();
+      }
+      // The station answers its wake-up within a second or so of opening.
+      for (let i = 0; i < 12 && this.isStarted; i++) {
+        try {
+          await invoke('si_send_beep', { count: 2 });
+          result = 'ok';
+          break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+      if (result !== 'ok' && this.isStarted) break; // open but silent: retrying won't help
+      if (result !== 'ok') {
+        console.warn(`[si] reader test: link lost (${this.lastReaderError ?? 'no detail'}), retrying`);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    if (openedHere && !this.hasCardCallback()) {
+      // Let the station play its beeps before the port closes under it.
+      if (result === 'ok') await new Promise((r) => setTimeout(r, 1500));
+      await this.stop();
+    }
+    return { result, detail: result === 'ok' ? undefined : this.lastReaderError ?? undefined };
   }
 
   setCardDetectedCallback(callback: ((card: CardData) => void) | undefined) {
@@ -498,6 +570,7 @@ class SportIdentService {
         // error is always followed by the matching state transition, and
         // the state machine is the authority on whether the task died.
         console.warn('[si] reader error:', e.payload.message);
+        this.lastReaderError = e.payload.message;
       }),
     );
 
@@ -619,4 +692,11 @@ export async function detectReaderPort(): Promise<USBPort | null> {
   } catch {
     return null;
   }
+}
+
+/** Report the reader to the mother (next ping) and to this window's game pages,
+ *  as TopbarStatus's poll does. */
+export function publishReaderPresence(ok: boolean): void {
+  void invoke('client_set_reader_presence', { hasReader: ok }).catch(() => {});
+  window.dispatchEvent(new CustomEvent('reader:status', { detail: { state: ok ? 'ok' : 'bad' } }));
 }

@@ -1,5 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { getLaunchedGameState, RawPunchRow } from '../services/launchedGames';
+import { ApiError } from '../services/api';
+import { emitGameGone } from '../services/pendingJoinStore';
+
+// Consecutive "Launched game not found" answers before the page gives up on a
+// game: the mother deleted / archived it and the disconnect push that says so
+// was missed (an older mother, a lost command). Long enough to ride out a
+// mother failover, which answers with network errors, not this.
+const GAME_GONE_AFTER_404S = 20;
 
 // Polls a single combined `state` endpoint per second that returns ended +
 // teams + new raw_data since the last cursor. Fires onGameEnded,
@@ -88,6 +96,8 @@ export function useGameStatePolling({
       }
     };
 
+    let notFoundStreak = 0;
+
     const tick = async () => {
       if (tickRunningRef.current) return;
       const gid = launchedGameIdRef.current;
@@ -96,6 +106,7 @@ export function useGameStatePolling({
       tickRunningRef.current = true;
       try {
         const state = await getLaunchedGameState(gid, lastRawIdRef.current);
+        notFoundStreak = 0;
 
         signalStartedIfNeeded(state);
 
@@ -127,6 +138,15 @@ export function useGameStatePolling({
         // Swallow per-tick errors so the interval keeps running. The next
         // poll will retry. 401/403 propagate via api.ts → AuthProvider.
         console.error('[useGameStatePolling] tick failed:', err);
+        if (err instanceof ApiError && err.status === 404) {
+          notFoundStreak += 1;
+          if (notFoundStreak === GAME_GONE_AFTER_404S) {
+            console.warn(`[useGameStatePolling] game ${gid} is gone from the mother - leaving it`);
+            emitGameGone(gid);
+          }
+        } else {
+          notFoundStreak = 0;
+        }
       } finally {
         tickRunningRef.current = false;
       }

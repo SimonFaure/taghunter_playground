@@ -14,6 +14,7 @@ import { listen } from '@tauri-apps/api/event';
 import { apiCall, getLanOverride, getLocalLaunchedGamesRoute } from './api';
 import { withRetry } from './apiRetry';
 import { motherNow } from './motherTime';
+import { gameClock } from './gameClock';
 import {
   captureCustomerUpsert,
   captureGameSummary,
@@ -47,6 +48,9 @@ export interface LaunchedGameRow {
   /** Licensee customer the game was played for (project_licensee_customers). */
   customer_id?: string | null;
   customer_name?: string | null;
+  /** Self-registered Quest / Clash still on its registration screen (not
+   *  started): the card offers a remote Start. Absent from an older mother. */
+  awaiting_start?: boolean;
 }
 
 export interface TeamRow {
@@ -605,6 +609,8 @@ export interface PairedDeviceStatusRow {
   screen_state?: ScreenState | null;
   /** The device is operator-only (every Android tablet): it never joins a game. */
   operator_only?: boolean;
+  /** The command kinds its build handles (null: an older build). */
+  caps?: string[] | null;
 }
 
 export interface ListPairedWithStatusResp {
@@ -617,6 +623,13 @@ export interface ListPairedWithStatusResp {
   // matter who asked. Anything answering "which device am I?" must use this.
   // Optional only for compatibility with an older mother build.
   caller_device_id?: number;
+  /** The hosting mother build's command kinds (absent: an older mother). */
+  mother_caps?: string[];
+}
+
+/** Whether a device (its `caps`, from the mother's lists) can run `kind`. */
+export function deviceSupports(caps: string[] | null | undefined, kind: string): boolean {
+  return Array.isArray(caps) && caps.includes(kind);
 }
 
 export async function listPairedWithStatus(
@@ -703,7 +716,16 @@ async function queueCommandBulk(
     | 'show_logo'
     | 'sync_content'
     | 'update_app'
-    | 'sim_control',
+    | 'sim_control'
+    | 'go_home'
+    | 'unlock_device'
+    | 'hide_logo'
+    | 'start_game'
+    | 'reset_display'
+    | 'set_mute'
+    | 'reader_refresh'
+    | 'reader_beep'
+    | 'restart_app',
   payload: Record<string, unknown>
 ): Promise<QueueCommandBulkResp> {
   return withRetry(() =>
@@ -817,10 +839,14 @@ export async function queueReloadConfigBulk(
 // in-game bucket (excluding self) and fans out; swallows errors so a failed push
 // never blocks the local save. Offline in-game devices still get a queued command
 // (delivered when they next ping, within the mother's command TTL).
+// The caller reloads its own page itself; `is_self` is the MOTHER's row (the
+// list comes from the mother), so it is only "me" on an older mother that
+// doesn't report the caller - and that one refuses a reload aimed at itself.
 export async function broadcastConfigReload(launchedGameId: number): Promise<void> {
   try {
     const buckets = await listPairedWithStatus(launchedGameId);
-    const targets = buckets.in_game.filter((r) => !r.is_self).map((r) => r.id);
+    const me = buckets.caller_device_id ?? buckets.in_game.find((r) => r.is_self)?.id;
+    const targets = buckets.in_game.filter((r) => r.id !== me).map((r) => r.id);
     if (targets.length === 0) return;
     await queueReloadConfigBulk(targets, launchedGameId);
   } catch (err) {
@@ -853,6 +879,8 @@ export interface FleetDeviceRow {
   platform?: string | null;
   /** Its update / content-sync state; null from a build that predates it. */
   upkeep?: UpkeepReport | null;
+  /** The command kinds its build handles (null: an older build). */
+  caps?: string[] | null;
 }
 
 export interface FleetMotherInfo {
@@ -861,6 +889,8 @@ export interface FleetMotherInfo {
   content_rev: number;
   /** The installers the mother holds for its satellites. */
   installers: Array<{ platform: string; version: string; channel: string }>;
+  /** The mother build's command kinds (absent: an older mother). */
+  caps?: string[];
 }
 
 export interface ListFleetResp {
@@ -902,6 +932,135 @@ export async function queueSyncContentBulk(targets: number[]): Promise<QueueComm
 // with a game running stops at "ready" unless `force` (restart anyway).
 export async function queueUpdateAppBulk(targets: number[], opts?: { force?: boolean }): Promise<QueueCommandBulkResp> {
   return queueCommandBulk(targets, 'update_app', opts?.force ? { force: true } : {});
+}
+
+// Take the PIN lock / the logo screen off device(s) again (the Devices modal's
+// Lock / Logo toggles). The operator waives the device's PIN, as a join does.
+export async function queueUnlockDeviceBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'unlock_device', {});
+}
+export async function queueHideLogoBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'hide_logo', {});
+}
+
+// The operator's "Home": close everything the device shows, leave the game page
+// (it stays registered - "Back to the game" brings it back) and show the logo.
+export async function queueGoHomeBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'go_home', {});
+}
+
+// Press Start on device(s) showing this game's registration screen
+// (self-registered Quest / Clash).
+export async function queueStartGameBulk(targets: number[], launchedGameId: number): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'start_game', { launched_game_id: launchedGameId });
+}
+
+// Clear a results screen waiting for the operator (Mystery summary, Tracks
+// result waiting for Enter).
+export async function queueResetDisplayBulk(targets: number[], launchedGameId: number): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'reset_display', { launched_game_id: launchedGameId });
+}
+
+// Ctrl+M sound mute on device(s). It still resets when the app restarts.
+export async function queueSetMuteBulk(targets: number[], muted: boolean): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'set_mute', { muted });
+}
+
+// Reconnect the SI reader / beep it twice (the remote reader test).
+export async function queueReaderRefreshBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'reader_refresh', {});
+}
+export async function queueReaderBeepBulk(targets: number[]): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'reader_beep', {});
+}
+
+// Relaunch the app on device(s). Refused while a game runs there unless `force`.
+export async function queueRestartAppBulk(targets: number[], opts?: { force?: boolean }): Promise<QueueCommandBulkResp> {
+  return queueCommandBulk(targets, 'restart_app', {
+    // Mother time: a restart that sat in the queue too long is dropped there.
+    sent_at: motherNow(),
+    ...(opts?.force ? { force: true } : {}),
+  });
+}
+
+// ---------- command results (what became of a queued command) ----------
+
+export interface CommandStatusRow {
+  id: number;
+  target_device_id: number;
+  kind: string;
+  delivered_at: string | null;
+  acked_at: string | null;
+  /** The target's answer once its handler ran; null from an older build
+   *  (acked on receipt) or while not acked. */
+  result: { ok: boolean; error?: string; detail?: string } | null;
+}
+
+export async function getCommandStatus(ids: number[]): Promise<CommandStatusRow[]> {
+  const res = await apiCall<{ commands: CommandStatusRow[] }>('launched_games', 'command_status', {
+    method: 'GET',
+    bearer: true,
+    query: { ids: ids.join(',') },
+  });
+  return res.commands;
+}
+
+/** A queued command's outcome as the operator sees it. */
+export type CommandOutcome =
+  | { state: 'done'; detail?: string }
+  | { state: 'failed'; error: string }
+  /** Not acked within the wait: the device is probably offline (it runs it on
+   *  its next ping, within the mother's 15-minute window). */
+  | { state: 'pending' };
+
+/**
+ * Wait for the targets' answers to commands just queued (`command_id`s from a
+ * bulk queue reply; 0 = run in-process on the mother, nothing to wait for).
+ * Resolves per command id. A mother that predates `command_status` answers
+ * nothing: everything resolves 'pending'.
+ */
+export async function waitForCommandResults(
+  ids: number[],
+  opts: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<Map<number, CommandOutcome>> {
+  const out = new Map<number, CommandOutcome>();
+  const open = new Set(ids.filter((id) => id > 0));
+  const deadline = Date.now() + (opts.timeoutMs ?? 30_000);
+  const interval = opts.intervalMs ?? 1_500;
+  while (open.size > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, interval));
+    let rows: CommandStatusRow[];
+    try {
+      rows = await getCommandStatus([...open]);
+    } catch {
+      break;
+    }
+    for (const row of rows) {
+      if (!row.acked_at) continue;
+      open.delete(row.id);
+      if (!row.result || row.result.ok) out.set(row.id, { state: 'done', detail: row.result?.detail });
+      else out.set(row.id, { state: 'failed', error: row.result.error ?? 'failed' });
+    }
+  }
+  for (const id of open) out.set(id, { state: 'pending' });
+  return out;
+}
+
+/**
+ * Start a self-registered game with no registration screen to press Start on
+ * (none open, or none answering): stamp the game's start and every team that
+ * has none, as the registration screen's Start does - without its launch
+ * videos. Devices in the game follow through their state poll.
+ */
+export async function startRegistrationGame(launchedGameId: number): Promise<void> {
+  const state = await getLaunchedGameState(launchedGameId, 0);
+  const startMs = gameClock.now();
+  await startLaunchedGame(launchedGameId, new Date(startMs).toISOString());
+  await Promise.all(
+    state.teams
+      .filter((t) => t.start_time == null)
+      .map((t) => updateTeam(t.id, { start_time: Math.floor(startMs / 1000) })),
+  );
 }
 
 // ---------- team_completed_quests (tagquest scoring) ----------

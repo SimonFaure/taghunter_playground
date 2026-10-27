@@ -68,6 +68,9 @@ export interface AuthUser {
   current_device_id: number | null;
   device_label: string | null;
   last_server_check_at: string;
+  // Studio time (ms) of the check this licence came from - this device's own,
+  // or a LAN peer's (licence_sync.rs). Null on a row older than migration 42.
+  licence_as_of_ms: number | null;
 }
 
 export interface AuthStateBlock {
@@ -165,6 +168,12 @@ export async function persistAuthState(
     // else: keep prior brandUrl/brandData so the next online persist retries.
   }
 
+  // The studio's clock at this check: what the LAN licence exchange orders on
+  // (src-tauri/src/licence_sync.rs), so the newest check among the devices wins
+  // whatever each device's own clock says.
+  const asOfMs = Date.parse(state.server_time);
+  const licenceAsOfMs = Number.isFinite(asOfMs) ? asOfMs : Date.now();
+
   // billing_reprieve_until is deliberately NOT written here: it is device-local
   // (set by grantReprieve) and must survive a bootstrap. It isn't in the column
   // list, so ON CONFLICT UPDATE leaves it untouched; a fresh INSERT takes its
@@ -177,8 +186,8 @@ export async function persistAuthState(
        playground_enabled,
        report_use_brand_logo, brand_logo_url, brand_logo_data,
        current_device_id, device_label,
-       last_server_check_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+       last_server_check_at, licence_as_of_ms
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
      ON CONFLICT(client_id) DO UPDATE SET
        email = excluded.email,
        name = excluded.name,
@@ -199,7 +208,8 @@ export async function persistAuthState(
        brand_logo_data = excluded.brand_logo_data,
        current_device_id = excluded.current_device_id,
        device_label = excluded.device_label,
-       last_server_check_at = excluded.last_server_check_at`,
+       last_server_check_at = excluded.last_server_check_at,
+       licence_as_of_ms = excluded.licence_as_of_ms`,
     [
       state.user.client_id,
       state.user.email,
@@ -223,6 +233,7 @@ export async function persistAuthState(
       currentDeviceId,
       deviceLabel,
       new Date().toISOString(),
+      licenceAsOfMs,
     ]
   );
 }

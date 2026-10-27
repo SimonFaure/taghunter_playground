@@ -31,6 +31,8 @@ import { SelfRegisterOverlay } from './SelfRegisterOverlay';
 import { resolveFirstBipVideos } from '../services/firstBipVideos';
 import { usePendingStarts } from '../hooks/usePendingStarts';
 import { useSimBus } from '../services/simBus';
+import { onPendingResetDisplay } from '../services/pendingJoinStore';
+import { refineInGame, clearInGameRefinement } from '../services/screenState';
 import { MysteryGameRenderer, type MysteryScreen, type EnigmaStatusKind } from './MysteryGameRenderer';
 import { MYSTERY_STATUS_COLORS } from './mysteryIngameLayout';
 import { resolveMysteryBonuses } from '../services/mysteryBonuses';
@@ -1158,6 +1160,33 @@ export function MysteryGamePage({ config, gameUniqid, launchedGameId, onGameEnd 
   useSimBus((a) => {
     if (a.kind === 'pressReset' && summaryShowingRef.current) resetToReadyRef.current();
   });
+
+  // The operator's remote "reset display" (Devices modal): same as the
+  // summary's reset button, while a results summary is on screen.
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return onPendingResetDisplay((gid) => {
+      if (gid !== launchedGameId || !summaryShowingRef.current) return false;
+      resetToReadyRef.current();
+      return true;
+    });
+  }, [launchedGameId]);
+
+  // Tell the Devices modals what this screen shows: the idle board (no reveal
+  // playing) or a results summary waiting to be reset.
+  const showingResults = summary != null;
+  const idleBoard = !gameEnded && !revealStarted;
+  useEffect(() => {
+    if (!launchedGameId) return;
+    refineInGame(launchedGameId, {
+      boardHidden: idleBoard && !showingResults,
+      sub: showingResults ? 'results' : undefined,
+    });
+  }, [launchedGameId, idleBoard, showingResults]);
+  useEffect(() => {
+    if (!launchedGameId) return;
+    return () => clearInGameRefinement(launchedGameId);
+  }, [launchedGameId]);
 
   useEffect(() => {
     let cancelled = false;

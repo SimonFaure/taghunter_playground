@@ -324,15 +324,28 @@ pub async fn si_stop(state: State<'_, SportIdentState>) -> Result<(), String> {
     Ok(())
 }
 
-// Beep / set-time / read-config require a control channel inside the
-// reader task that doesn't exist yet. Returning a clear error here is
-// better than silently no-op'ing - JS surfaces the message verbatim so
-// the developer knows to add the plumbing when first wiring these
-// buttons. Tracked as a follow-up to step 5.
+/// Beep the open reader `count` times (default 2): the operator's remote
+/// reader test (`reader_beep`). Errors when no reader is open or the station
+/// isn't listening yet.
 #[tauri::command]
-pub async fn si_send_beep(_state: State<'_, SportIdentState>) -> Result<(), String> {
-    Err("si_send_beep: control channel not yet wired (follow-up to step 5)".into())
+pub async fn si_send_beep(
+    state: State<'_, SportIdentState>,
+    count: Option<u8>,
+) -> Result<(), String> {
+    let guard = state.0.lock().await;
+    let Some(handle) = guard.as_ref() else {
+        return Err("no reader open".into());
+    };
+    if handle.beep(count.unwrap_or(2).clamp(1, 5)).await {
+        Ok(())
+    } else {
+        Err("station not listening".into())
+    }
 }
+
+// Set-time / read-config require more control-channel plumbing (a reply
+// frame to wait for). Returning a clear error here is better than silently
+// no-op'ing. Tracked as a follow-up to step 5.
 
 #[tauri::command]
 pub async fn si_set_station_time(
