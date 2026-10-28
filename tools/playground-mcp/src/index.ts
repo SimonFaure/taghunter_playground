@@ -121,7 +121,7 @@ const specShape = {
 const INSTRUCTIONS = `Tag Hunter Playground game simulator (tester builds only). The Playground app runs on this PC; a tester watches its screens while simulated teams play real games.
 
 When the user says "Launch the Playground simulations" (or similar), follow the launch_playground_simulations prompt:
-1. playground_info, then coverage. Summarise briefly: per game type, untested pairwise gaps, configs never passed, failed configs; devices online (combos with devices=several need 2 devices that can play; with one PC they are skipped).
+1. playground_info, then coverage. Summarise briefly: per game type, untested pairwise gaps, configs never passed, failed configs; devices online (combos with devices=several need 2 devices that can play; with one PC they are skipped). A device can play when it is online, not operator-only and not inGame (still in an active game: end that game in the Playground first). A reader is NEVER needed: simulated reads don't go through one, so the reader flag is only informative.
 2. Unless the user already said which series, ask: coverage gaps (recommended), a saved preset, specific configs, or every config. If the tester gives a game duration ("10-minute games"), pass it as gameDuration - it is the game's time limit, not the simulation's length (that one is set by speed). For Clash, one player always attempts the Purge: if the tester wants it at a given moment ("purge at minute 4"), pass clashPurgeAt.
    Runs meant for several devices need the other devices to be tester builds with the Playground open: if a run reports that devices never started their share, say so plainly. For "every config", call estimate_campaign first and state the run count and rough duration; suggest speed 20 and say the campaign can be paused and resumed (it survives an app restart).
 3. start_campaign, tell the tester what is about to play on screen, then loop on wait_next_result (pass back the returned seq as \`since\`).
@@ -137,13 +137,13 @@ RETRIES. When the tester asks to retry runs (or to check a fix): call retry_cand
 
 Write to the tester in their language (French if they write French). Keep messages short: they are watching the game screens. Skipped runs are not failures. The app never needs to be clicked while a campaign runs, but they can use Pause after this run / Skip run / Stop on the game page's SIM window.`;
 
-const server = new McpServer({ name: 'taghunter-playground', version: '1.4.0' }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: 'taghunter-playground', version: '1.4.1' }, { instructions: INSTRUCTIONS });
 
 server.registerTool(
   'playground_info',
   {
     title: 'Playground status',
-    description: 'App version, devices of the Playground network (online, operator-only, reader), tester name and the current campaign.',
+    description: 'App version, devices of the Playground network (online, operator-only, inGame = already in an active game, reader = informative only, never required), tester name and the current campaign.',
     annotations: { readOnlyHint: true },
   },
   () => run('info'),

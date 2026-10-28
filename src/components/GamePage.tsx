@@ -21,6 +21,7 @@ import {
   getLaunchedGameState,
   getLaunchedGameMeta,
   addLaunchedGameTime,
+  patchLaunchedGameMeta,
   broadcastConfigReload,
 } from '../services/launchedGames';
 import { gameConfigFromMeta } from '../utils/gameConfigFromMeta';
@@ -566,7 +567,10 @@ export function GamePage({ config: initialConfig, gameUniqid, launchedGameId, on
                   {gameMetadata?.type === 'clash' && (
                     <button
                       onClick={() => {
-                        void addLaunchedGameTime(launchedGameId, 5).catch(() => {});
+                        // Keep meta.duration equal to the server column (the config modal shows it).
+                        void addLaunchedGameTime(launchedGameId, 5)
+                          .then((r) => patchLaunchedGameMeta(launchedGameId, { duration: String(r.duration) }))
+                          .catch(() => {});
                         setShowPanel(false);
                       }}
                       className="flex items-center justify-center gap-2 px-4 py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-sm font-medium transition"

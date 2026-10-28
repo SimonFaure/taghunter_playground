@@ -1950,7 +1950,26 @@ export function LaunchGameModal({
         if (!motherChecked) return fail('this device cannot play (operator-only or already in a game)');
       } else {
         const count = (motherChecked ? 1 : 0) + selectedDeviceIds.size;
-        if (count < 2) return fail(`needs 2 devices that can play, ${count} available`);
+        if (count < 2) {
+          // Say WHY each device was left out (a reader is never required:
+          // simulated reads don't go through one).
+          const why = pairedDevices
+            .map((d) => {
+              const self = d.id === selfDeviceId;
+              const reason = self
+                ? operatorOnly ? 'operator-only' : busyDeviceIds.has(d.id) ? 'already in a game' : null
+                : !d.online ? 'offline'
+                : d.operator_only ? 'operator-only'
+                : busyDeviceIds.has(d.id) ? 'already in a game'
+                : motherOutdated && d.is_self ? 'mother on an older build'
+                : null;
+              return reason ? `${displayDeviceLabel(d.device_label) || `#${d.id}`}: ${reason}` : null;
+            })
+            .filter(Boolean);
+          return fail(
+            `needs 2 devices that can play, ${count} available` + (why.length ? ` (${why.join('; ')})` : ''),
+          );
+        }
       }
       later(() => {
         ap.phase = 'launching';
@@ -1958,7 +1977,7 @@ export function LaunchGameModal({
       });
     }
     return () => window.clearTimeout(timer);
-  }, [isOpen, autopilot, dataReady, step, pairedLoading, config, motherChecked, selectedDeviceIds, tracksOptions, clashHasPurgeImage]);
+  }, [isOpen, autopilot, dataReady, step, pairedLoading, config, motherChecked, selectedDeviceIds, tracksOptions, clashHasPurgeImage, pairedDevices, selfDeviceId, busyDeviceIds, motherOutdated, operatorOnly]);
 
   // Persist the current step-1 settings as a named, scenario-assigned config.
   // Does NOT launch and does NOT advance the wizard. Strips the per-instance

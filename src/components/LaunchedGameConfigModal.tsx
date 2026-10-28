@@ -6,7 +6,10 @@ import {
   updateLaunchedGameMeta,
   getLaunchedGameDevices,
   getLaunchedGameState,
+  setLaunchedGameDuration,
 } from '../services/launchedGames';
+import { gameClock } from '../services/gameClock';
+import { parseDbTs } from '../utils/dbTime';
 import * as scenarioStore from '../services/scenarioStore';
 import {
   extractTracksOptions,
@@ -123,6 +126,10 @@ const PICKER_KEYS = new Set(['victoryType', 'playMode']);
 // keeps every allowed key editable (legacy behaviour).
 const EDITABLE_KEYS_BY_TYPE: Record<string, Set<string>> = {
   tagquest: new Set([
+    // Durée - saved to the server duration column (what every station's
+    // countdown and the late malus read) AND to meta, see handleSave. Read-only
+    // once the game has ended.
+    'duration',
     'enigmaImageDisplayDuration', // Durée d'affichage de l'image
     'messageDisplayDuration',     // Durée d'affichage des messages
     'visibilityHideDelaySec',     // Garder le résultat à l'écran
@@ -169,6 +176,13 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
   const [editedValues, setEditedValues] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // The game row's own duration / start / ended, read from the server state.
+  // The duration column is the source of truth (timers + late malus read it);
+  // meta.duration is only the launch-time copy and goes stale after "add time".
+  const [serverDuration, setServerDuration] = useState<number | null>(null);
+  const [gameStartMs, setGameStartMs] = useState<number | null>(null);
+  const [gameEnded, setGameEnded] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [rawData, setRawData] = useState<Record<string, RawData[]>>({});
   const [showRawData, setShowRawData] = useState<Record<string, boolean>>({});
@@ -221,6 +235,24 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
       const fields: MetaField[] = Object.entries(meta)
         .filter(([k]) => k !== 'firstChipIndex')
         .map(([k, v]) => ({ meta_name: k, meta_value: v ?? null }));
+
+      // Show the server duration, not the (possibly stale) meta copy. A huge
+      // cursor skips the raw punch rows. Best-effort: on failure the meta
+      // value is shown and saving behaves as before.
+      try {
+        const st = await getLaunchedGameState(gameId, Number.MAX_SAFE_INTEGER);
+        if (typeof st.duration === 'number') {
+          setServerDuration(st.duration);
+          const existing = fields.find((f) => f.meta_name === 'duration');
+          if (existing) existing.meta_value = String(st.duration);
+          else fields.push({ meta_name: 'duration', meta_value: String(st.duration) });
+        }
+        const startMs = parseDbTs(st.start_time);
+        setGameStartMs(Number.isNaN(startMs) ? null : startMs);
+        setGameEnded(!!st.ended);
+      } catch (err) {
+        console.error('[LaunchedGameConfigModal] state read failed:', err);
+      }
       setMetaFields(fields);
 
       const initialValues: Record<string, string> = {};
@@ -276,8 +308,25 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
   };
 
   const handleSave = async () => {
+    if (durationInvalid) return;
     setSaving(true);
+    setSaveError(null);
     try {
+      // Duration first: the server column is what every station's countdown
+      // and the late malus read (picked up by the 1 s state poll on every
+      // device). Only touched when the operator changed it; otherwise re-read
+      // so meta is re-synced with any "add time" made meanwhile, never with a
+      // stale value. If this step fails nothing at all is saved.
+      let effectiveDuration: number | null = null;
+      if (durationEdited) {
+        effectiveDuration = await setLaunchedGameDuration(gameId, durationNum);
+      } else {
+        try {
+          const st = await getLaunchedGameState(gameId, Number.MAX_SAFE_INTEGER);
+          if (typeof st.duration === 'number') effectiveDuration = st.duration;
+        } catch { /* leave meta.duration as it is */ }
+      }
+
       // The server's update_meta atomically replaces the whole bag, so we
       // need the *full* current set, not just the edited fields. Pull fresh
       // (so we don't clobber firstChipIndex which we filtered out of the UI),
@@ -290,12 +339,20 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
       for (const [k, v] of Object.entries(editedValues)) {
         if (v !== undefined) next[k] = v;
       }
+      // meta.duration mirrors the server column. When the column couldn't be
+      // read, leave the stored meta value untouched (the field is read-only
+      // then, see keyEditable, so there's no edit to lose).
+      if (effectiveDuration != null) next.duration = String(effectiveDuration);
+      else if (current.duration !== undefined) next.duration = current.duration;
+      else delete next.duration;
       await updateLaunchedGameMeta(gameId, next);
     } catch (err) {
       console.error('Error saving meta:', err);
-    } finally {
+      setSaveError(t('launchedGameConfig:saveFailed'));
       setSaving(false);
+      return;
     }
+    setSaving(false);
     onSave();
     onClose();
   };
@@ -377,7 +434,12 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
   const editableSet = EDITABLE_KEYS_BY_TYPE[typeKey];
   // A field is editable when the type imposes no editable-set (legacy: all
   // allowed keys editable) or the key is explicitly in that set.
-  const keyEditable = (name: string): boolean => !editableSet || editableSet.has(name);
+  const keyEditable = (name: string): boolean => {
+    // Duration: only with a known server value (it's what gets changed) and
+    // never on an ended game.
+    if (name === 'duration' && (serverDuration == null || gameEnded)) return false;
+    return !editableSet || editableSet.has(name);
+  };
   const keyVisible = (name: string): boolean => {
     if (!keyAllowed(name)) return false;
     switch (name) {
@@ -426,6 +488,20 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
     }
   })();
   const setCluesConfig = (next: CluesPageConfig) => handleValueChange('cluesPage', JSON.stringify(next));
+
+  // ── Duration (minutes) ──
+  const durationRaw = (editedValues.duration ?? '').trim();
+  const durationNum = /^\d+$/.test(durationRaw) ? parseInt(durationRaw, 10) : NaN;
+  // An emptied / non-numeric field counts as edited (and then invalid).
+  const durationEdited = serverDuration != null && durationNum !== serverDuration;
+  // Only validated when changed - an untouched legacy value is never blocked.
+  const durationInvalid = durationEdited && (Number.isNaN(durationNum) || durationNum < 1);
+  // Shortened below the time already played: the countdown flips straight to
+  // overtime (and any late malus applies from the next bip). Allowed, but said.
+  const elapsedMin =
+    gameStartMs != null && !gameEnded ? Math.floor((gameClock.now() - gameStartMs) / 60000) : null;
+  const durationAlreadyElapsed =
+    durationEdited && !durationInvalid && elapsedMin != null && durationNum <= elapsedMin;
 
   // After per-type filtering the raw meta bag can be non-empty yet have nothing
   // to show - drive the empty state off the visible buckets, not the raw count.
@@ -696,9 +772,26 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
                           type={fieldType}
                           value={value}
                           disabled={!editable}
+                          min={field.meta_name === 'duration' ? 1 : undefined}
+                          step={field.meta_name === 'duration' ? 1 : undefined}
                           onChange={(e) => handleValueChange(field.meta_name, e.target.value)}
-                          className={`pg-input ${!editable ? 'cursor-not-allowed' : ''}`}
+                          className={`pg-input ${!editable ? 'cursor-not-allowed' : ''} ${
+                            field.meta_name === 'duration' && durationInvalid ? '!border-red-500' : ''
+                          }`}
                         />
+                        {field.meta_name === 'duration' && (
+                          gameEnded ? (
+                            <p className="text-xs text-[var(--pg-text-dim)]">{t('launchedGameConfig:durationEndedHint')}</p>
+                          ) : durationInvalid ? (
+                            <p className="text-xs text-red-400">{t('launchedGameConfig:durationInvalid')}</p>
+                          ) : durationAlreadyElapsed ? (
+                            <p className="text-xs text-amber-400">
+                              {t('launchedGameConfig:durationAlreadyElapsed', { elapsed: elapsedMin })}
+                            </p>
+                          ) : editable ? (
+                            <p className="text-xs text-[var(--pg-text-dim)]">{t('launchedGameConfig:durationLiveHint')}</p>
+                          ) : null
+                        )}
                       </div>
                     );
                   })}
@@ -799,10 +892,11 @@ export function LaunchedGameConfigModal({ gameId, gameName, gameUniqid, gameType
         )}
         </div>
 
-        <div className="sticky bottom-0 z-10 flex gap-3 p-6 bg-[var(--pg-surface)] border-t border-[var(--pg-line)]">
+        <div className="sticky bottom-0 z-10 flex flex-wrap gap-3 p-6 bg-[var(--pg-surface)] border-t border-[var(--pg-line)]">
+          {saveError && <p className="w-full text-sm text-red-400">{saveError}</p>}
           <button
             onClick={handleSave}
-            disabled={saving || loading}
+            disabled={saving || loading || durationInvalid}
             className="pg-btn pg-btn--primary flex-1 flex items-center justify-center gap-2"
           >
             <Save size={18} />

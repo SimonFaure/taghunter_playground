@@ -794,6 +794,19 @@ pub struct BecomeMotherInfo {
     pub mother_peer_secret: String,
     pub mother_peer_id: i64,
     pub epoch: i64,
+    /// Every game this promotion took over: the requested one first, then the
+    /// `also_game_ids` that passed their guards.
+    pub adopted_game_ids: Vec<i64>,
+    /// The `also_game_ids` left behind, with why.
+    pub skipped_games: Vec<SkippedGame>,
+}
+
+#[derive(Serialize)]
+pub struct SkippedGame {
+    pub id: i64,
+    /// `no_cached_snapshot`, `corrupt_snapshot`, `other_mother`, `ended`,
+    /// `wrong_client`, `no_content` or `stale_snapshot`.
+    pub reason: String,
 }
 
 // Typed rows parsed out of the snapshot JSON *before* the DB transaction so
@@ -1346,6 +1359,9 @@ pub async fn become_mother(
     // banner passes false: the device hosts as a substitute.
     configured: Option<bool>,
     designated_at: Option<i64>,
+    // The other games the dead mother was running that this device cached.
+    // A substitute takes them all over, not just the one on screen.
+    also_game_ids: Option<Vec<i64>>,
 ) -> Result<BecomeMotherInfo, String> {
     let role = HostRole::from_configured(configured);
     let since = if role == HostRole::Mother { designated_at.unwrap_or(0) } else { 0 };
@@ -1401,14 +1417,16 @@ pub async fn become_mother(
     // serving at N+1 ever since. Adopting would silently roll the game back to
     // the moment of the failover. The `stale_snapshot` marker lets the caller
     // fall back to simply (re)starting its own server.
+    //
+    // Matched by `summary_uuid`: ids are allocated per device, so another local
+    // game can sit at the same id. Matching by id alone refused the takeover
+    // with `stale_snapshot`, and the caller then served this device's own rows,
+    // which don't hold the game: the substitute showed no game at all.
+    // `apply_game_rows` moves such an unrelated game aside.
+    let summary_for_guard = rows.game.summary_uuid.clone();
     let local_epoch: Option<i64> = conn
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<i64>> {
-            Ok(c.query_row(
-                "SELECT mother_epoch FROM lg_launched_games WHERE id = ?",
-                params![launched_game_id],
-                |r| r.get(0),
-            )
-            .optional()?)
+            local_newer_epoch(c, &summary_for_guard)
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -1419,6 +1437,12 @@ pub async fn become_mother(
             ));
         }
     }
+    let snap_mother_uuid = vstr(&snap, "mother_uuid");
+    let also_game_ids: Vec<i64> = also_game_ids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| *id != launched_game_id)
+        .collect();
 
     // 3. Content guard - refuse if this device hasn't synced the scenario.
     let game_uniqid_for_guard = game_uniqid.clone();
@@ -1475,8 +1499,8 @@ pub async fn become_mother(
     let snap_revoked: Option<Vec<String>> = snap.get("revoked_devices").and_then(|v| v.as_array()).map(|a| {
         a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
     });
-    let (self_peer_id, self_peer_secret) = conn
-        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(i64, String)> {
+    let (self_peer_id, self_peer_secret, extras) = conn
+        .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(i64, String, ExtraAdoption)> {
             let tx = c.transaction()?;
 
             // 5a. Rebuild the pairing table from the snapshot, preserving ids.
@@ -1529,6 +1553,14 @@ pub async fn become_mother(
             // and our participant row is what surfaces it in "This device".
             apply_game_rows(&tx, &rows, new_epoch, false)?;
 
+            // 5b-bis. The mother's other running games this device cached.
+            let extras = adopt_extra_cached_games(
+                &tx,
+                &also_game_ids,
+                snap_mother_uuid.as_deref(),
+                game_client_id,
+            )?;
+
             // 5c. Our mother identity == our client_device_uuid (keeps the
             // self-row peer_uuid == mother_uuid convention).
             tx.execute(
@@ -1555,13 +1587,18 @@ pub async fn become_mother(
             // Take over the state-version counter too, or every snapshot WE ship
             // as the new mother looks stale to the satellites (see
             // `seed_state_version`).
-            seed_state_version(&tx, snap_state_version)?;
+            seed_state_version(&tx, snap_state_version.max(extras.max_state_version))?;
 
             tx.commit()?;
-            Ok((self_id, self_secret))
+            Ok((self_id, self_secret, extras))
         })
         .await
         .map_err(|e| format!("adopt snapshot: {e}"))?;
+    // Advertise the highest epoch among the adopted games, so fencing and
+    // re-pointing prefer us for each of them.
+    let new_epoch = new_epoch.max(extras.max_epoch);
+    let mut adopted_game_ids = vec![launched_game_id];
+    adopted_game_ids.extend(extras.adopted.iter().copied());
 
     // 5-bis. The in-memory endpoint cache is process-global and still holds the
     // dead mother's SocketAddr. `client_resolve_mother_link` reads ONLY that
@@ -1646,7 +1683,113 @@ pub async fn become_mother(
         mother_peer_secret: self_peer_secret,
         mother_peer_id: self_peer_id,
         epoch: new_epoch,
+        adopted_game_ids,
+        skipped_games: extras.skipped,
     })
+}
+
+/// Epoch of this device's own copy of a game, found by `summary_uuid`.
+fn local_newer_epoch(c: &rusqlite::Connection, summary_uuid: &str) -> tokio_rusqlite::Result<Option<i64>> {
+    Ok(c
+        .query_row(
+            "SELECT mother_epoch FROM lg_launched_games WHERE summary_uuid = ?",
+            params![summary_uuid],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// What `adopt_extra_cached_games` did.
+struct ExtraAdoption {
+    adopted: Vec<i64>,
+    skipped: Vec<SkippedGame>,
+    max_epoch: i64,
+    max_state_version: i64,
+}
+
+/// The second half of a substitute's takeover: besides the game it was asked
+/// to promote, adopt every OTHER running game of the same mother it holds a
+/// cached snapshot of. Before, a mother running two games failed over to a
+/// substitute holding one of them; the other was lost.
+///
+/// Each game is taken as `become_mother` takes the first one (its epoch + 1,
+/// `launched_by_self` left at 0) and must pass the same guards: a parseable
+/// snapshot from the same mother and client, not ended, scenario downloaded,
+/// and no newer copy here. The pairing table was rebuilt from the first
+/// snapshot; `map_device_ids` covers a device paired in between.
+fn adopt_extra_cached_games(
+    tx: &rusqlite::Transaction,
+    ids: &[i64],
+    mother_uuid: Option<&str>,
+    client_id: i64,
+) -> rusqlite::Result<ExtraAdoption> {
+    let mut out = ExtraAdoption { adopted: Vec::new(), skipped: Vec::new(), max_epoch: 0, max_state_version: 0 };
+    for &id in ids {
+        let skip = |out: &mut ExtraAdoption, reason: &str| {
+            out.skipped.push(SkippedGame { id, reason: reason.to_string() });
+        };
+        let json: Option<String> = tx
+            .query_row(
+                "SELECT snapshot_json FROM mother_snapshots WHERE launched_game_id = ?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            skip(&mut out, "no_cached_snapshot");
+            continue;
+        };
+        let Ok(snap) = serde_json::from_str::<Value>(&json) else {
+            skip(&mut out, "corrupt_snapshot");
+            continue;
+        };
+        if vstr(&snap, "mother_uuid").as_deref() != mother_uuid {
+            skip(&mut out, "other_mother");
+            continue;
+        }
+        let Ok(mut rows) = parse_snapshot_rows(&snap) else {
+            skip(&mut out, "corrupt_snapshot");
+            continue;
+        };
+        if rows.game.client_id != client_id {
+            skip(&mut out, "wrong_client");
+            continue;
+        }
+        if rows.game.ended {
+            skip(&mut out, "ended");
+            continue;
+        }
+        let has_content = tx
+            .query_row(
+                "SELECT 1 FROM scenarios WHERE uniqid = ? AND local_version IS NOT NULL",
+                params![rows.game.game_uniqid],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_content {
+            skip(&mut out, "no_content");
+            continue;
+        }
+        let local_epoch: Option<i64> = tx
+            .query_row(
+                "SELECT mother_epoch FROM lg_launched_games WHERE summary_uuid = ?",
+                params![rows.game.summary_uuid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if local_epoch.is_some_and(|le| le > rows.mother_epoch) {
+            skip(&mut out, "stale_snapshot");
+            continue;
+        }
+        map_device_ids(tx, &mut rows)?;
+        let epoch = rows.mother_epoch + 1;
+        apply_game_rows(tx, &rows, epoch, false)?;
+        out.adopted.push(id);
+        out.max_epoch = out.max_epoch.max(epoch);
+        out.max_state_version = out.max_state_version.max(rows.state_version);
+    }
+    Ok(out)
 }
 
 /// Outcome of `apply_mother_snapshot`. Never an error for the ordinary "nothing
@@ -1737,10 +1880,12 @@ pub async fn apply_mother_snapshot(
     let outcome = conn
         .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Option<&'static str>> {
             let tx = c.transaction()?;
+            // The same game, not just the same number: ids are per device, and
+            // an unrelated local game at this id must not be overwritten.
             let local: Option<i64> = tx
                 .query_row(
-                    "SELECT mother_epoch FROM lg_launched_games WHERE id = ?",
-                    params![launched_game_id],
+                    "SELECT mother_epoch FROM lg_launched_games WHERE id = ?1 AND summary_uuid = ?2",
+                    params![launched_game_id, rows.game.summary_uuid],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -2517,6 +2662,128 @@ async fn upsert_cached_snapshot(
         Ok(())
     })
     .await
+}
+
+// ─── background snapshots: every satellite keeps a copy of every running game ─
+//
+// The ping used to ship a snapshot only for the game the satellite had ON
+// SCREEN. A PC sitting on the games list, in settings or on rankings cached
+// nothing, so when the mother died and the operator hosted there, the
+// substitute took over with no game at all (Coralie, 2026-10-27). Now, at most
+// every BACKGROUND_SNAPSHOT_EVERY, a hosting-capable satellite also asks for
+// the mother's other games: it lists the copies it holds, and the mother ships
+// the ones that changed.
+
+/// How often a satellite asks for the games it is not playing.
+const BACKGROUND_SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+/// At most this many background snapshots per ping reply; the rest follow.
+const BACKGROUND_SNAPSHOT_CAP: usize = 3;
+/// Once the shipped snapshots reach this size, the rest wait for the next round.
+const BACKGROUND_SNAPSHOT_BYTES: usize = 512 * 1024;
+
+/// When this device last asked each mother (by uuid) for its other games.
+fn background_snapshot_clock() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static CLOCK: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Is it time to ask `mother_uuid` for its other games? Records the ask.
+/// Never on Android: a tablet never hosts, so a copy would serve nothing.
+fn background_snapshots_due(mother_uuid: &str) -> bool {
+    if cfg!(target_os = "android") {
+        return false;
+    }
+    let Ok(mut clock) = background_snapshot_clock().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    match clock.get(mother_uuid) {
+        Some(at) if now.duration_since(*at) < BACKGROUND_SNAPSHOT_EVERY => false,
+        _ => {
+            clock.insert(mother_uuid.to_string(), now);
+            true
+        }
+    }
+}
+
+/// The unfinished games this device holds a copy of from `mother_uuid`, with
+/// the per-game version of each copy. Sent so the mother ships only what changed.
+fn cached_games_of_mother(c: &rusqlite::Connection, mother_uuid: &str) -> rusqlite::Result<Vec<(i64, i64)>> {
+    c.prepare(
+        "SELECT launched_game_id,
+                COALESCE(json_extract(snapshot_json, '$.game.state_version'), state_version)
+           FROM mother_snapshots
+          WHERE json_extract(snapshot_json, '$.mother_uuid') = ?1
+            AND COALESCE(json_extract(snapshot_json, '$.game.ended'), 0) = 0",
+    )?
+    .query_map(params![mother_uuid], |r| Ok((r.get(0)?, r.get(1)?)))?
+    .collect()
+}
+
+/// Mother side: which games to ship to a satellite that listed `known` copies
+/// (game id → per-game version), and which games are running here.
+///
+/// Candidates are this client's unfinished games plus the games the satellite
+/// holds a copy of (so an ending reaches it once and its copy reads "ended").
+/// A game is shipped when the satellite has no copy or an older one, at most
+/// `BACKGROUND_SNAPSHOT_CAP`. `exclude` is the game the satellite is playing:
+/// the regular path already handles it.
+fn background_snapshot_plan(
+    c: &rusqlite::Connection,
+    client_id: i64,
+    known: &HashMap<i64, i64>,
+    exclude: Option<i64>,
+) -> rusqlite::Result<(Vec<i64>, Vec<(i64, i64)>)> {
+    let active: Vec<(i64, i64)> = c
+        .prepare(
+            "SELECT id, state_version FROM lg_launched_games
+              WHERE client_id = ? AND ended = 0 ORDER BY id",
+        )?
+        .query_map(params![client_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut candidates = active.clone();
+    for &id in known.keys() {
+        if candidates.iter().any(|(gid, _)| *gid == id) {
+            continue;
+        }
+        let row: Option<i64> = c
+            .query_row(
+                "SELECT state_version FROM lg_launched_games WHERE id = ? AND client_id = ?",
+                params![id, client_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(v) = row {
+            candidates.push((id, v));
+        }
+    }
+    let ship: Vec<i64> = candidates
+        .iter()
+        .filter(|(id, _)| Some(*id) != exclude)
+        .filter(|(id, version)| known.get(id) != Some(version))
+        .map(|(id, _)| *id)
+        .take(BACKGROUND_SNAPSHOT_CAP)
+        .collect();
+    Ok((ship, active))
+}
+
+/// "Still running at that version": refresh `updated_at` of a cached copy that
+/// is current, without touching its content. `updated_at` used to move only
+/// when the game changed, so a quiet game looked abandoned after 30 minutes and
+/// "Héberger les parties en remplacement" refused to take it over.
+fn touch_cached_snapshot(
+    c: &rusqlite::Connection,
+    launched_game_id: i64,
+    mother_uuid: &str,
+    game_version: i64,
+) -> rusqlite::Result<usize> {
+    c.execute(
+        "UPDATE mother_snapshots SET updated_at = CURRENT_TIMESTAMP
+          WHERE launched_game_id = ?1
+            AND json_extract(snapshot_json, '$.mother_uuid') = ?2
+            AND COALESCE(json_extract(snapshot_json, '$.game.state_version'), state_version) = ?3",
+        params![launched_game_id, mother_uuid, game_version],
+    )
 }
 
 /// Re-announce the mother over mDNS with this host's CURRENT LAN IPv4s - e.g.
@@ -3835,8 +4102,51 @@ async fn dispatch_ping(
         _ => None,
     };
 
+    // The satellite's other games (see `background_snapshot_plan`). Only when
+    // it asks, which it does at most every 30 s.
+    let mut snapshots: Vec<Value> = Vec::new();
+    let mut active_games: Vec<Value> = Vec::new();
+    if !licence_only && body.get("background_games").and_then(|v| v.as_bool()) == Some(true) {
+        let known: HashMap<i64, i64> = body
+            .get("known_games")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| Some((vi64(g, "id")?, vi64(g, "game_version")?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let client_id = state.client_id;
+        let plan = state
+            .db
+            .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<(Vec<i64>, Vec<(i64, i64)>)> {
+                Ok(background_snapshot_plan(c, client_id, &known, launched_game_id)?)
+            })
+            .await;
+        if let Ok((ship, active)) = plan {
+            // The satellite reads this reply under a 2 s timeout: past a budget,
+            // the remaining games wait for the next round (the first always goes).
+            let mut bytes = 0usize;
+            for gid in ship {
+                if bytes >= BACKGROUND_SNAPSHOT_BYTES {
+                    break;
+                }
+                if let Some(s) = build_snapshot(&state, gid, state_version).await {
+                    bytes += s.to_string().len();
+                    snapshots.push(s);
+                }
+            }
+            active_games = active
+                .into_iter()
+                .map(|(id, v)| json!({ "id": id, "game_version": v }))
+                .collect();
+        }
+    }
+
     json_ok(json!({
         "mother_uuid": state.mother_uuid,
+        "snapshots": snapshots,
+        "active_games": active_games,
         "commands": commands,
         "lan_proto": LAN_PROTO,
         "app_version": crate::app_version(),
@@ -10071,6 +10381,29 @@ pub async fn client_ping_mother(
         None => None,
     };
 
+    // Every 30 s, also ask for the mother's other games, so this device can
+    // take them all over if the mother dies (see `background_snapshot_plan`).
+    let background = !licence_only && background_snapshots_due(&mother_uuid);
+    let known_games: Value = if background {
+        let uuid_for_q = mother_uuid.clone();
+        let rows = match open_db_for_command(&app).await {
+            Ok(conn) => conn
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<Vec<(i64, i64)>> {
+                    Ok(cached_games_of_mother(c, &uuid_for_q)?)
+                })
+                .await
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        Value::Array(
+            rows.into_iter()
+                .map(|(id, v)| json!({ "id": id, "game_version": v }))
+                .collect(),
+        )
+    } else {
+        Value::Null
+    };
+
     let has_reader = *reader_presence.inner.lock().await;
     let operator_only = match app.try_state::<OperatorPresence>() {
         Some(p) => *p.inner.lock().await,
@@ -10126,6 +10459,8 @@ pub async fn client_ping_mother(
             "caps": command_caps(),
             "licence": licence,
             "licence_only": licence_only,
+            "background_games": background,
+            "known_games": known_games,
         }))
         .send()
         .await
@@ -10228,6 +10563,61 @@ pub async fn client_ping_mother(
             if let Ok(conn) = open_db_for_command(&app).await {
                 let _ = upsert_cached_snapshot(&conn, gid, ver, epoch, snap.to_string()).await;
             }
+        }
+    }
+    // Nothing shipped because our copy of the game on screen is current: it is
+    // still running, say so (see `touch_cached_snapshot`).
+    let mother_version = body.get("state_version").and_then(|v| v.as_i64());
+    if let (Some(gid), Some(kv)) = (launched_game_id, known_version) {
+        if body.get("snapshot").map_or(true, |v| v.is_null()) && mother_version == Some(kv) {
+            if let Ok(conn) = open_db_for_command(&app).await {
+                let _ = conn
+                    .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<usize> {
+                        Ok(c.execute(
+                            "UPDATE mother_snapshots SET updated_at = CURRENT_TIMESTAMP
+                              WHERE launched_game_id = ?1 AND state_version = ?2",
+                            params![gid, kv],
+                        )?)
+                    })
+                    .await;
+            }
+        }
+    }
+    // The mother's other games: store the copies it shipped, and mark the
+    // current ones as still running.
+    let background_snaps: Vec<Value> = body
+        .get("snapshots")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active_games: Vec<(i64, i64)> = body
+        .get("active_games")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| Some((vi64(g, "id")?, vi64(g, "game_version")?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !background_snaps.is_empty() || !active_games.is_empty() {
+        if let Ok(conn) = open_db_for_command(&app).await {
+            for snap in background_snaps.iter().filter(|v| v.is_object()) {
+                let gid = snap.get("game").and_then(|g| g.get("id")).and_then(|v| v.as_i64());
+                let ver = snap.get("state_version").and_then(|v| v.as_i64());
+                let epoch = snap.get("mother_epoch").and_then(|v| v.as_i64()).unwrap_or(1);
+                if let (Some(gid), Some(ver)) = (gid, ver) {
+                    let _ = upsert_cached_snapshot(&conn, gid, ver, epoch, snap.to_string()).await;
+                }
+            }
+            let uuid_for_q = mother_uuid.clone();
+            let _ = conn
+                .call(move |c: &mut rusqlite::Connection| -> tokio_rusqlite::Result<()> {
+                    for (id, v) in active_games {
+                        touch_cached_snapshot(c, id, &uuid_for_q, v)?;
+                    }
+                    Ok(())
+                })
+                .await;
         }
     }
 
@@ -11014,6 +11404,147 @@ mod adopt_tests {
             .query_row("SELECT launched_game_id FROM lg_launched_game_raw_data WHERE id = ?", [moved], |r| r.get(0))
             .unwrap();
         assert_eq!(gid, 1);
+    }
+
+    // ── substitute takeover: match by game, adopt every game, cache them all ──
+
+    const FAILOVER_SCHEMA: &str = r#"
+        CREATE TABLE mother_snapshots (launched_game_id INTEGER PRIMARY KEY, state_version INTEGER NOT NULL,
+            mother_epoch INTEGER NOT NULL DEFAULT 1, snapshot_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP));
+        CREATE TABLE scenarios (uniqid TEXT PRIMARY KEY, local_version INTEGER NULL);
+    "#;
+
+    fn failover_db() -> rusqlite::Connection {
+        let c = db();
+        c.execute_batch(FAILOVER_SCHEMA).unwrap();
+        c
+    }
+
+    fn cached(id: i64, mother: &str, uniqid: &str, ended: bool, game_version: i64) -> Value {
+        json!({
+            "mother_epoch": 1, "state_version": 40, "mother_uuid": mother,
+            "game": {"id": id, "summary_uuid": format!("uuid-{id}"), "client_id": 1, "game_uniqid": uniqid,
+                     "name": format!("game {id}"), "game_type": "quest", "ended": ended,
+                     "state_version": game_version},
+            "teams": [{"id": id * 100, "team_number": 1}],
+        })
+    }
+
+    fn cache(c: &rusqlite::Connection, snap: &Value) {
+        c.execute(
+            "INSERT INTO mother_snapshots (launched_game_id, state_version, mother_epoch, snapshot_json)
+             VALUES (?1, 40, 1, ?2)",
+            params![snap["game"]["id"].as_i64().unwrap(), snap.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_guard_ignores_another_game_at_the_same_id() {
+        let c = db();
+        seed_local(&c);
+        c.execute("UPDATE lg_launched_games SET mother_epoch = 5 WHERE id = 7", []).unwrap();
+        // The snapshot's game is also numbered 7, but it is another game.
+        assert_eq!(local_newer_epoch(&c, "adopted-uuid").unwrap(), None);
+        assert_eq!(local_newer_epoch(&c, "local-uuid").unwrap(), Some(5));
+    }
+
+    #[test]
+    fn substitute_adopts_every_running_game_of_the_mother() {
+        let mut c = failover_db();
+        c.execute_batch(
+            "INSERT INTO scenarios (uniqid, local_version) VALUES ('ok', 1), ('missing', NULL);",
+        )
+        .unwrap();
+        cache(&c, &cached(11, "M", "ok", false, 3));
+        cache(&c, &cached(12, "M", "ok", true, 3)); // ended
+        cache(&c, &cached(13, "X", "ok", false, 3)); // another mother
+        cache(&c, &cached(14, "M", "missing", false, 3)); // scenario not downloaded
+        // 15: nothing cached.
+
+        let tx = c.transaction().unwrap();
+        let out = adopt_extra_cached_games(&tx, &[11, 12, 13, 14, 15], Some("M"), 1).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(out.adopted, vec![11]);
+        assert_eq!(out.max_epoch, 2);
+        let reasons: Vec<(i64, &str)> = out.skipped.iter().map(|s| (s.id, s.reason.as_str())).collect();
+        assert_eq!(
+            reasons,
+            vec![(12, "ended"), (13, "other_mother"), (14, "no_content"), (15, "no_cached_snapshot")]
+        );
+        assert_eq!(one::<i64>(&c, "SELECT mother_epoch FROM lg_launched_games WHERE id = 11"), 2);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_teams WHERE launched_game_id = 11"), 1);
+        assert_eq!(one::<i64>(&c, "SELECT COUNT(*) FROM lg_launched_games"), 1);
+    }
+
+    #[test]
+    fn substitute_skips_a_game_it_already_holds_newer() {
+        let mut c = failover_db();
+        c.execute_batch(
+            "INSERT INTO scenarios (uniqid, local_version) VALUES ('ok', 1);
+             INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration, mother_epoch)
+               VALUES (11, 'uuid-11', 1, 'ok', 'mine', 1, 'quest', 0, 3);",
+        )
+        .unwrap();
+        cache(&c, &cached(11, "M", "ok", false, 3));
+        let tx = c.transaction().unwrap();
+        let out = adopt_extra_cached_games(&tx, &[11], Some("M"), 1).unwrap();
+        tx.commit().unwrap();
+        assert!(out.adopted.is_empty());
+        assert_eq!(out.skipped[0].reason, "stale_snapshot");
+        assert_eq!(one::<String>(&c, "SELECT name FROM lg_launched_games WHERE id = 11"), "mine");
+    }
+
+    #[test]
+    fn background_plan_ships_only_changed_games() {
+        let c = db();
+        c.execute_batch(
+            "INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration, ended, state_version) VALUES
+               (1, 'a', 1, 'g', 'a', 1, 'quest', 0, 0, 5),
+               (2, 'b', 1, 'g', 'b', 1, 'quest', 0, 0, 7),
+               (3, 'c', 1, 'g', 'c', 1, 'quest', 0, 1, 9),
+               (4, 'd', 1, 'g', 'd', 1, 'quest', 0, 0, 1),
+               (5, 'e', 2, 'g', 'e', 1, 'quest', 0, 0, 1);",
+        )
+        .unwrap();
+        // The satellite holds game 1 current, game 3 from before it ended, and
+        // plays game 4 (handled by the regular path).
+        let known: HashMap<i64, i64> = [(1, 5), (3, 8)].into_iter().collect();
+        let (ship, active) = background_snapshot_plan(&c, 1, &known, Some(4)).unwrap();
+        assert_eq!(ship, vec![2, 3]);
+        assert_eq!(active, vec![(1, 5), (2, 7), (4, 1)]);
+
+        // Nothing cached yet: at most BACKGROUND_SNAPSHOT_CAP per reply.
+        c.execute_batch(
+            "INSERT INTO lg_launched_games (id, summary_uuid, client_id, game_uniqid, name, number_of_teams, game_type, duration, ended) VALUES
+               (6, 'f', 1, 'g', 'f', 1, 'quest', 0, 0), (7, 'h', 1, 'g', 'h', 1, 'quest', 0, 0);",
+        )
+        .unwrap();
+        let (ship, _) = background_snapshot_plan(&c, 1, &HashMap::new(), None).unwrap();
+        assert_eq!(ship.len(), BACKGROUND_SNAPSHOT_CAP);
+    }
+
+    #[test]
+    fn touch_marks_a_current_copy_as_still_running() {
+        let c = failover_db();
+        cache(&c, &cached(11, "M", "ok", false, 3));
+        cache(&c, &cached(12, "M", "ok", true, 3));
+        c.execute("UPDATE mother_snapshots SET updated_at = '2000-01-01 00:00:00'", []).unwrap();
+
+        assert_eq!(touch_cached_snapshot(&c, 11, "M", 2).unwrap(), 0, "older copy: not current");
+        assert_eq!(touch_cached_snapshot(&c, 11, "X", 3).unwrap(), 0, "another mother's id");
+        assert_eq!(touch_cached_snapshot(&c, 11, "M", 3).unwrap(), 1);
+        assert_ne!(
+            one::<String>(&c, "SELECT updated_at FROM mother_snapshots WHERE launched_game_id = 11"),
+            "2000-01-01 00:00:00"
+        );
+        assert_eq!(one::<i64>(&c, "SELECT state_version FROM mother_snapshots WHERE launched_game_id = 11"), 40);
+
+        // Only unfinished copies of that mother are listed to it.
+        assert_eq!(cached_games_of_mother(&c, "M").unwrap(), vec![(11, 3)]);
+        assert!(cached_games_of_mother(&c, "X").unwrap().is_empty());
     }
 
     // ── reconciliation: the newer copy wins ──────────────────────────────────

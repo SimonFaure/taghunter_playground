@@ -43,6 +43,7 @@
   "bannerNoMother": "Aucun poste mère trouvé sur le réseau.",
   "hostAsSubstitute": "Héberger les parties en remplacement",
   "hostAsSubstituteWorking": "Démarrage…",
+  "hostedEmpty": "Ce poste héberge maintenant, mais aucune partie en cours n'a été retrouvée ici. Pour reprendre une partie, utilisez un poste qui était dans la partie.",
   "twoMothersTitle": "Deux postes mères",
   "twoMothersBody": "Ce poste et {{name}} sont tous les deux réglés poste mère. Il ne peut y en avoir qu'un par compte. Lequel garder ?",
   "twoMothersNote": "Playground redémarre sur ce poste pour appliquer votre choix. Le poste qui n'est pas gardé devient un satellite et transmet ses parties au poste mère.",

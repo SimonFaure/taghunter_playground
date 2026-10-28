@@ -11,7 +11,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { apiCall, getLanOverride, getLocalLaunchedGamesRoute } from './api';
+import { apiCall, ApiError, getLanOverride, getLocalLaunchedGamesRoute } from './api';
 import { withRetry } from './apiRetry';
 import { motherNow } from './motherTime';
 import { gameClock } from './gameClock';
@@ -427,6 +427,36 @@ export async function addLaunchedGameTime(id: number, minutes: number): Promise<
       body: { id, minutes },
     })
   );
+}
+
+// Set a game's duration to an exact number of minutes (operator edit in the
+// config modal). Reuses `add_time` so it works on every mother version and
+// stays in the failover versioning, but sends the DIFFERENCE from a fresh read
+// of the server value. add_time is not idempotent, so no blind retry: each
+// attempt re-reads the server value first, which means a request that timed out
+// but did land is never applied twice. Returns the resulting duration.
+export async function setLaunchedGameDuration(id: number, minutes: number): Promise<number> {
+  const target = Math.max(0, Math.round(minutes));
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      // A huge cursor skips the raw punch rows - only the game row is needed.
+      const { duration } = await getLaunchedGameState(id, Number.MAX_SAFE_INTEGER);
+      const delta = target - (duration ?? 0);
+      if (delta === 0) return target;
+      const res = await apiCall<{ duration: number }>('launched_games', 'add_time', {
+        method: 'POST',
+        bearer: true,
+        body: { id, minutes: delta },
+      });
+      return res.duration;
+    } catch (err) {
+      lastErr = err;
+      if (err instanceof ApiError && err.status >= 400 && err.status < 500 && err.status !== 429) break;
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 // ---------- game-summary statistics + Archive ----------

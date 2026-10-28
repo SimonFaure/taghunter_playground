@@ -103,6 +103,9 @@ export function NetworkScreen() {
   // "Héberger en remplacement" / "Reprendre maintenant", run from the status card.
   const [acting, setActing] = useState(false);
   const [actError, setActError] = useState<unknown>(null);
+  // "Héberger les parties en remplacement" worked, but no running game came
+  // with it: say so instead of letting an empty games list pass for success.
+  const [hostedEmpty, setHostedEmpty] = useState(false);
   const [roleReset, setRoleReset] = useState(false);
 
   useEffect(() => onMotherReachState(setReach), []);
@@ -153,8 +156,9 @@ export function NetworkScreen() {
     if (clientId == null) return;
     setActing(true);
     setActError(null);
+    setHostedEmpty(false);
     try {
-      await action(clientId);
+      if ((await action(clientId)) === 'empty') setHostedEmpty(true);
       await refreshLaunchedGamesRoute().catch(() => {});
     } catch (e) {
       setActError(e);
@@ -358,6 +362,9 @@ export function NetworkScreen() {
           </div>
           {action}
           {actError != null && <ErrorDetails error={actError} />}
+          {hostedEmpty && (
+            <p className="text-xs text-amber-400">{t('failover:hostedEmpty')}</p>
+          )}
           {searchResult === 'not_found' && (
             <p className="text-xs text-[var(--pg-text-dim)]">{t('statusSearchNotFound')}</p>
           )}

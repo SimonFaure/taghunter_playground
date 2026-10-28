@@ -6,7 +6,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { listLaunchDevices } from '../services/launchedGames';
+import { listBusyDeviceIds, listLaunchDevices } from '../services/launchedGames';
 import { isOperatorOnly } from '../services/operatorMode';
 import {
   appVersion,
@@ -204,10 +204,11 @@ async function handle(cmd: string, args: Args): Promise<unknown> {
     case 'retry_candidates':
       return retryList(args);
     case 'info': {
-      const [version, devices, operatorOnly] = await Promise.all([
+      const [version, devices, operatorOnly, busy] = await Promise.all([
         appVersion(),
         listLaunchDevices().catch(() => null),
         isOperatorOnly().catch(() => false),
+        listBusyDeviceIds().catch(() => new Set<number>()),
       ]);
       return {
         appVersion: version,
@@ -218,7 +219,10 @@ async function handle(cmd: string, args: Args): Promise<unknown> {
           self: d.id === devices.selfId,
           online: d.online,
           operatorOnly: !!d.operator_only,
+          // Informative only: simulated runs never need a reader.
           reader: !!d.has_reader,
+          // In an active game: the launch wizard won't pick it for a new run.
+          inGame: busy.has(d.id),
         })) ?? null,
         tester: testerName() || null,
         ...summary(getCampaign()),

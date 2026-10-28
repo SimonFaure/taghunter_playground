@@ -494,6 +494,35 @@ export async function getPromotableGameId(): Promise<number | null> {
   }
 }
 
+/**
+ * The OTHER games to take over along with `primaryId`: unfinished games of the
+ * same mother this device cached, seen running in the last half hour. Every
+ * satellite now caches all the mother's running games (Rust background
+ * snapshots), so a substitute can take over a mother running two games
+ * instead of just the one on screen (Coralie, 2026-10-27). Rust re-checks each
+ * one (`adopt_extra_cached_games`). Empty on any error: the primary game alone
+ * is still worth promoting.
+ */
+export async function getCompanionGameIds(primaryId: number): Promise<number[]> {
+  try {
+    const rows = await (await getDb()).select<Array<{ launched_game_id: number }>>(
+      `SELECT s.launched_game_id
+         FROM mother_snapshots s
+         JOIN mother_snapshots p ON p.launched_game_id = $1
+        WHERE s.launched_game_id <> $1
+          AND json_extract(s.snapshot_json, '$.mother_uuid') = json_extract(p.snapshot_json, '$.mother_uuid')
+          AND COALESCE(json_extract(s.snapshot_json, '$.game.ended'), 0) = 0
+          AND s.updated_at >= datetime('now', '-30 minutes')
+        ORDER BY s.updated_at DESC`,
+      [primaryId]
+    );
+    return rows.map((r) => r.launched_game_id);
+  } catch (e) {
+    console.warn('[motherFailover] companion games lookup failed:', e);
+    return [];
+  }
+}
+
 // ─── "someone already took over" (retours sept. #10: first click wins) ───────
 //
 // Every satellite gets "Reprendre la partie" once the mother is lost, so two

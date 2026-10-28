@@ -1,6 +1,6 @@
 {
   "name": "taghunter-playground-mcp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Claude Desktop extension: run Playground game-simulator campaigns (tester builds).",
   "type": "module",

@@ -43,6 +43,9 @@ export function MotherFailoverBanner() {
   const [hosting, setHosting] = useState(false);
   const [hostError, setHostError] = useState<unknown>(null);
   const [noMotherDismissed, setNoMotherDismissed] = useState(false);
+  // The substitute came up with no running game (`forceBecomeMother` → 'empty').
+  // Shown even on the device that now hosts, until dismissed.
+  const [hostedEmpty, setHostedEmpty] = useState(false);
   useEffect(
     () =>
       onHostingNotice((n) => {
@@ -98,7 +101,9 @@ export function MotherFailoverBanner() {
   const showBanner = !isMother && reach === 'lost' && !dismissed && promoteGameId == null && !showTakeover;
   const showNoMother =
     !isMother && notice.kind === 'no_mother' && reach === 'ok' && !noMotherDismissed && promoteGameId == null;
-  if (!showBanner && !showReconnecting && !showTakeover && !showNoMother && promoteGameId == null) return null;
+  if (!showBanner && !showReconnecting && !showTakeover && !showNoMother && !hostedEmpty && promoteGameId == null) {
+    return null;
+  }
 
   const hostAsSubstitute = async () => {
     const clientId = auth.user?.client_id;
@@ -106,8 +111,11 @@ export function MotherFailoverBanner() {
     setHosting(true);
     setHostError(null);
     try {
-      await forceBecomeMother(clientId, { allowIdle: true });
+      const outcome = await forceBecomeMother(clientId, { allowIdle: true });
       await refreshLaunchedGamesRoute().catch(() => {});
+      // This device hosts now, so the bar is about to go: carry the "nothing
+      // could be recovered here" warning past it.
+      if (outcome === 'empty') setHostedEmpty(true);
     } catch (e) {
       setHostError(e);
     } finally {
@@ -117,6 +125,24 @@ export function MotherFailoverBanner() {
 
   return (
     <>
+      {hostedEmpty && (
+        <div
+          className={`fixed ${edge} left-0 right-0 flex flex-wrap items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg`}
+          style={{ zIndex: 6000 }}
+          role="status"
+        >
+          <AlertTriangle size={18} className="shrink-0" />
+          <span className="text-sm font-medium">{t('failover:hostedEmpty')}</span>
+          <button
+            type="button"
+            onClick={() => setHostedEmpty(false)}
+            className="p-1 rounded hover:bg-black/20 transition-colors"
+            title={t('failover:dismiss')}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
       {showNoMother && (
         <div
           className={`fixed ${edge} left-0 right-0 flex flex-wrap items-center justify-center gap-3 px-4 py-2 bg-amber-500/95 text-black shadow-lg`}

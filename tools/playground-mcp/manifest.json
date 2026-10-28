@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "taghunter-playground",
   "display_name": "Tag Hunter Playground simulations",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Run game-simulator campaigns in the Tag Hunter Playground tester build on this PC and record a verdict for each run.",
   "long_description": "Say \"Launch the Playground simulations\": Claude checks which launch configurations are untested, starts a campaign that plays each one on the visible game page (mock teams, real game screens), then proposes a Pass/Partial/Fail verdict per run for the tester to confirm. Needs the Playground TESTER build running on the same PC.",
   "author": { "name": "Tag Hunter" },

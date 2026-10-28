@@ -1650,6 +1650,11 @@ export function TagQuestGamePage({ config, gameUniqid, launchedGameId, onBack, o
     // it, and we leave the register phase for play. Idempotent for the device
     // that started the game itself (its handleStart already set phase).
     onGameStarted: () => setPhase('playing'),
+    // Duration edited mid-game (config modal or "add time") on any device:
+    // move this HUD's deadline. Before start/duration are loaded, init and the
+    // start-time effect read the fresh value themselves.
+    onDurationChanged: (duration) =>
+      setLaunchedGameInfo((prev) => (prev && prev.duration !== duration ? { ...prev, duration } : prev)),
     // Self-register builds its roster dynamically (solo) or leaves empty teams
     // (team mode), so a momentary "all current teams finished" - including the
     // 0-teams state during registration - must not end the game. It ends via

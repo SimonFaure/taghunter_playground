@@ -20,9 +20,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { setLanOverride, getLanOverride, setLocalLaunchedGamesRoute, LOCAL_ONLY_ENDPOINTS } from './api';
 import {
-  notifyPromotedToMother, getPromotableGameId, findTakeoverMother, noteMotherTakeover, rejoinMotherNow,
-  type TakeoverMother,
+  notifyPromotedToMother, getPromotableGameId, getCompanionGameIds, findTakeoverMother, noteMotherTakeover,
+  rejoinMotherNow, type TakeoverMother,
 } from './motherFailover';
+import { getActiveLaunchedGameId } from './activeGameStore';
 import { discoverOtherMothers, joinMother, speaksOurLanProto } from './lanPairing';
 import { ensureFirewallRuleOnce } from './firewall';
 import { getAuthUser } from './authStore';
@@ -95,6 +96,10 @@ export async function defaultMotherLabel(): Promise<string | undefined> {
 
 export interface BecomeMotherInfo extends MotherServerInfo {
   epoch: number;
+  /** Every game taken over: the requested one first, then the companions. */
+  adopted_game_ids: number[];
+  /** Companion games left behind, with the Rust reason (`ended`, `no_content`...). */
+  skipped_games: Array<{ id: number; reason: string }>;
 }
 
 /**
@@ -108,10 +113,16 @@ export interface BecomeMotherInfo extends MotherServerInfo {
  * The device hosts in the role it is SET to: the mother when "Rôle de ce
  * poste" says so (it takes a running game back from a substitute), a
  * substitute otherwise. Taking a game over never changes that setting.
+ *
+ * `alsoGameIds`: the dead mother's other running games this device cached
+ * (`getCompanionGameIds`), taken over in the same step. Left empty when taking
+ * a game from a LIVE mother: its other games come back fresher through
+ * reconciliation than from our cache.
  */
 export async function becomeMother(
   launchedGameId: number,
-  mdnsLabel?: string
+  mdnsLabel?: string,
+  alsoGameIds: number[] = []
 ): Promise<BecomeMotherInfo> {
   const claim = await getHostingClaim();
   const info = await invoke<BecomeMotherInfo>('become_mother', {
@@ -120,7 +131,11 @@ export async function becomeMother(
     mdnsLabel: mdnsLabel ?? (await defaultMotherLabel()) ?? null,
     configured: claim.configured,
     designatedAt: claim.designatedAt,
+    alsoGameIds,
   });
+  if (info.skipped_games?.length) {
+    console.warn('[becomeMother] companion games not taken over:', info.skipped_games);
+  }
   // We are the mother now - route launched_games at our own server and let
   // ensureMotherServer pick this up on subsequent calls without restarting.
   localInfo = info;
@@ -182,7 +197,7 @@ export async function promoteUnlessTakenOver(launchedGameId: number, clientId?: 
  */
 async function becomeMotherOrServeOwn(launchedGameId: number, clientId?: number): Promise<MotherServerInfo> {
   try {
-    return await becomeMother(launchedGameId);
+    return await becomeMother(launchedGameId, undefined, await getCompanionGameIds(launchedGameId));
   } catch (e) {
     const msg = String((e as { message?: string })?.message ?? e);
     if (!msg.includes('stale_snapshot') || clientId == null) throw e;
@@ -306,7 +321,12 @@ export async function applyMotherSnapshot(launchedGameId: number): Promise<Apply
   return invoke<ApplyOutcome>('apply_mother_snapshot', { launchedGameId });
 }
 
-export type ForceMotherOutcome = 'takeover' | 'adopted' | 'restarted';
+/**
+ * 'empty': this device now hosts, but holds no unfinished game - nothing of the
+ * old mother's could be recovered here. Reported so the operator is not told
+ * "done" in front of an empty games list (Coralie, 2026-10-27).
+ */
+export type ForceMotherOutcome = 'takeover' | 'adopted' | 'restarted' | 'empty';
 
 /**
  * Operator-forced "host the games on THIS device", from the Network page. On a
@@ -347,7 +367,7 @@ export async function forceBecomeMother(
   console.log('[forceBecomeMother] promotable game id=', gid);
   if (gid != null) {
     try {
-      await becomeMother(gid);
+      await becomeMother(gid, undefined, await getCompanionGameIds(gid));
       return 'adopted';
     } catch (e) {
       // Only fall through when there's simply nothing cached for it; a content
@@ -374,7 +394,21 @@ export async function forceBecomeMother(
   if (!info) {
     throw new Error('failover:errTakeControl');
   }
-  return 'restarted';
+  return (await countUnfinishedLocalGames()) > 0 ? 'restarted' : 'empty';
+}
+
+/** Unfinished games in this device's own DB - what its games list shows as running. */
+async function countUnfinishedLocalGames(): Promise<number> {
+  try {
+    const { getDb } = await import('./db');
+    const rows = await (await getDb()).select<Array<{ n: number }>>(
+      'SELECT COUNT(*) AS n FROM lg_launched_games WHERE ended = 0'
+    );
+    return rows[0]?.n ?? 0;
+  } catch {
+    // Unknown: don't claim the takeover came back empty.
+    return 1;
+  }
 }
 
 /**
@@ -473,16 +507,24 @@ export async function autoJoinSameClientMother(clientId: number): Promise<boolea
   }
 }
 
-// Only adopt a cached game if it is plausibly THE game of the day: still
-// unfinished in our own rows, or cached within the last half hour.
-// `mother_snapshots` is never pruned, and hosting from an idle screen must not
-// resurrect last week's unfinished session.
+// Only adopt a cached game if it is plausibly THE game of the day: the one on
+// screen, still unfinished in our own rows, or seen running within the last
+// half hour. `mother_snapshots` is never pruned, and hosting from an idle
+// screen must not resurrect last week's unfinished session.
+// `updated_at` is refreshed by every ping that finds the copy current (Rust
+// `touch_cached_snapshot`); it used to move only when the game changed, so a
+// quiet game was refused here and the substitute came up empty.
+// The local row is matched by game (`summary_uuid`): ids are per device.
 async function isReclaimableGame(gameId: number): Promise<boolean> {
+  if (getActiveLaunchedGameId() === gameId) return true;
   try {
     const { getDb } = await import('./db');
     const rows = await (await getDb()).select<Array<{ n: number }>>(
       `SELECT
-         (SELECT COUNT(*) FROM lg_launched_games WHERE id = $1 AND ended = 0)
+         (SELECT COUNT(*) FROM mother_snapshots s
+            JOIN lg_launched_games g
+              ON g.summary_uuid = json_extract(s.snapshot_json, '$.game.summary_uuid')
+           WHERE s.launched_game_id = $1 AND g.ended = 0)
        + (SELECT COUNT(*) FROM mother_snapshots
             WHERE launched_game_id = $1 AND updated_at >= datetime('now', '-30 minutes')) AS n`,
       [gameId]
@@ -500,10 +542,14 @@ async function isReclaimableGame(gameId: number): Promise<boolean> {
 // at the snapshot's epoch and does NOT count. Counting every `ended = 0` row
 // made a device that said "I'm not a mother" start hosting again at the next
 // boot because of a mirrored copy (retours sept. #17).
+// The snapshot must be of the same game, not just the same id (ids are per
+// device): a cached copy of another game at that id hid ours.
 const HOSTED_ACTIVE_GAMES_SQL = `
   SELECT g.id AS id, g.name AS name
     FROM lg_launched_games g
-    LEFT JOIN mother_snapshots s ON s.launched_game_id = g.id
+    LEFT JOIN mother_snapshots s
+      ON s.launched_game_id = g.id
+     AND json_extract(s.snapshot_json, '$.game.summary_uuid') = g.summary_uuid
    WHERE g.ended = 0
      AND (s.launched_game_id IS NULL OR g.mother_epoch > s.mother_epoch)
    ORDER BY g.mother_epoch DESC, g.id DESC`;

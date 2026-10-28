@@ -43,6 +43,7 @@
   "bannerNoMother": "No mother found on the network.",
   "hostAsSubstitute": "Host the games as a substitute",
   "hostAsSubstituteWorking": "Starting…",
+  "hostedEmpty": "This device is hosting now, but no running game was found on it. To resume a game, use a device that was in the game.",
   "twoMothersTitle": "Two mother devices",
   "twoMothersBody": "This device and {{name}} are both set as mother. There can only be one per account. Which one do you keep?",
   "twoMothersNote": "Playground restarts on this device to apply your choice. The device that is not kept becomes a satellite and sends its games to the mother.",

@@ -23,6 +23,10 @@ interface UseGameStatePollingOptions {
   // a device sitting on the registration/inscription screen follow the device
   // that pressed "Start game" into play without the operator touching it.
   onGameStarted?: () => void;
+  // Fires with the server duration (minutes) on the first tick and whenever it
+  // changes afterwards (operator "add time" or a config-modal edit), so a
+  // running page's countdown follows it live on every device.
+  onDurationChanged?: (durationMin: number) => void;
   enabled?: boolean;
   // When true, suppress the all-teams-finished auto-end. Used by auto-register
   // / reuse-cards modes where teams are created dynamically, so a momentary
@@ -38,10 +42,14 @@ export function useGameStatePolling({
   onAllTeamsFinished,
   onNewBip,
   onGameStarted,
+  onDurationChanged,
   enabled = true,
   disableAllFinishedEnd = false,
 }: UseGameStatePollingOptions) {
   const lastRawIdRef = useRef<number>(0);
+  const lastDurationRef = useRef<number | null>(null);
+  const onDurationChangedRef = useRef(onDurationChanged);
+  useEffect(() => { onDurationChangedRef.current = onDurationChanged; }, [onDurationChanged]);
   const gameEndedRef = useRef(false);
   const gameStartedRef = useRef(false);
   const tickRunningRef = useRef(false);
@@ -67,7 +75,15 @@ export function useGameStatePolling({
     gameEndedRef.current = false;
     gameStartedRef.current = false;
     lastRawIdRef.current = 0;
+    lastDurationRef.current = null;
     tickRunningRef.current = false;
+
+    const signalDurationIfChanged = (state: { duration?: number | null }) => {
+      if (typeof state.duration !== 'number') return;
+      if (state.duration === lastDurationRef.current) return;
+      lastDurationRef.current = state.duration;
+      onDurationChangedRef.current?.(state.duration);
+    };
 
     // Fire onGameStarted exactly once, the first tick that sees the mother's
     // start flag flip. Idempotent for consumers whose "start" handler just sets
@@ -87,6 +103,7 @@ export function useGameStatePolling({
         const state = await getLaunchedGameState(launchedGameId, 0);
         lastRawIdRef.current = state.last_raw_id;
         signalStartedIfNeeded(state);
+        signalDurationIfChanged(state);
         if (state.ended) {
           gameEndedRef.current = true;
           onGameEndedRef.current();
@@ -109,6 +126,7 @@ export function useGameStatePolling({
         notFoundStreak = 0;
 
         signalStartedIfNeeded(state);
+        signalDurationIfChanged(state);
 
         if (state.ended) {
           gameEndedRef.current = true;

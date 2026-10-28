@@ -43,6 +43,7 @@
   "bannerNoMother": "No se encontró ningún puesto madre en la red.",
   "hostAsSubstitute": "Alojar las partidas en sustitución",
   "hostAsSubstituteWorking": "Iniciando…",
+  "hostedEmpty": "Este puesto aloja ahora, pero no se encontró ninguna partida en curso en él. Para retomar una partida, use un puesto que estaba en la partida.",
   "twoMothersTitle": "Dos puestos madre",
   "twoMothersBody": "Este equipo y {{name}} están configurados como puesto madre. Solo puede haber uno por cuenta. ¿Cuál conservar?",
   "twoMothersNote": "Playground se reinicia en este equipo para aplicar su elección. El equipo que no se conserva pasa a ser un satélite y envía sus partidas al puesto madre.",

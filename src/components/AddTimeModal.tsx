@@ -6,7 +6,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Clock } from 'lucide-react';
-import { addLaunchedGameTime } from '../services/launchedGames';
+import { addLaunchedGameTime, patchLaunchedGameMeta } from '../services/launchedGames';
 
 interface AddTimeModalProps {
   gameId: number;
@@ -30,6 +30,10 @@ export function AddTimeModal({ gameId, gameName, onClose, onAdded }: AddTimeModa
     setError(null);
     try {
       const res = await addLaunchedGameTime(gameId, minutes);
+      // Keep meta.duration (read by the config modal, Mystery/Tracks config,
+      // the simulator) equal to the server column. Best-effort: the column is
+      // what the timers read, so a failed meta write must not fail the bump.
+      void patchLaunchedGameMeta(gameId, { duration: String(res.duration) }).catch(() => {});
       onAdded?.(res.duration);
       onClose();
     } catch (err) {
